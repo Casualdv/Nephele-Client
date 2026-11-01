@@ -343,6 +343,261 @@ impl NoiseOctaves {
     }
 }
 
+/// `Math.sqrt(3.0)`, the simplex noise skew constant.
+const SQRT3: f64 = 1.732_050_807_568_877_2;
+/// `0.5 * (sqrt(3) - 1)`: the skew factor applied to the input.
+const SIMPLEX_SKEW: f64 = 0.5 * (SQRT3 - 1.0);
+/// `(3 - sqrt(3)) / 6`: the unskew factor coming back out.
+const SIMPLEX_UNSKEW: f64 = (3.0 - SQRT3) / 6.0;
+
+/// `field_151611_e`, flattened to the two components the 2D hash uses.
+const SIMPLEX_GRADIENTS: [[f64; 2]; 12] = [
+    [1.0, 1.0],
+    [-1.0, 1.0],
+    [1.0, -1.0],
+    [-1.0, -1.0],
+    [1.0, 0.0],
+    [-1.0, 0.0],
+    [1.0, 0.0],
+    [-1.0, 0.0],
+    [0.0, 1.0],
+    [0.0, -1.0],
+    [0.0, 1.0],
+    [0.0, -1.0],
+];
+
+/// `NoiseGeneratorSimplex`: simplex noise on a shuffled lattice.
+#[derive(Debug, Clone)]
+pub struct NoiseSimplex {
+    permutation: [i32; 512],
+    x_offset: f64,
+    y_offset: f64,
+}
+
+impl NoiseSimplex {
+    pub fn new(random: &mut JavaRandom) -> Self {
+        let x_offset = random.next_double() * 256.0;
+        let y_offset = random.next_double() * 256.0;
+        // Drawn and discarded: only the 3D path uses it, and the draw still
+        // has to happen to keep the shared stream aligned.
+        let _z_offset = random.next_double() * 256.0;
+
+        let mut permutation = [0i32; 512];
+        for (i, slot) in permutation.iter_mut().take(256).enumerate() {
+            *slot = i as i32;
+        }
+        for i in 0..256usize {
+            let j = random.next_int_bound((256 - i) as i32) as usize + i;
+            permutation.swap(i, j);
+            permutation[i + 256] = permutation[i];
+        }
+
+        Self {
+            permutation,
+            x_offset,
+            y_offset,
+        }
+    }
+
+    /// `func_151605_a`: a single sample.
+    pub fn sample_2d(&self, x: f64, z: f64) -> f64 {
+        let skew = (x + z) * SIMPLEX_SKEW;
+        let i = fast_floor(x + skew);
+        let j = fast_floor(z + skew);
+        let unskew = (i + j) as f64 * SIMPLEX_UNSKEW;
+        let cell_x = i as f64 - unskew;
+        let cell_z = j as f64 - unskew;
+        let d9 = x - cell_x;
+        let d10 = z - cell_z;
+
+        let (k, l) = if d9 > d10 { (1, 0) } else { (0, 1) };
+
+        let d11 = d9 - k as f64 + SIMPLEX_UNSKEW;
+        let d12 = d10 - l as f64 + SIMPLEX_UNSKEW;
+        let d13 = d9 - 1.0 + 2.0 * SIMPLEX_UNSKEW;
+        let d14 = d10 - 1.0 + 2.0 * SIMPLEX_UNSKEW;
+
+        let i1 = (i & 255) as usize;
+        let j1 = (j & 255) as usize;
+        let k1 = (self.permutation[i1 + self.permutation[j1] as usize] % 12) as usize;
+        let l1 = (self.permutation[i1 + k + self.permutation[j1 + l] as usize] % 12) as usize;
+        let i2 = (self.permutation[i1 + 1 + self.permutation[j1 + 1] as usize] % 12) as usize;
+
+        let d15 = 0.5 - d9 * d9 - d10 * d10;
+        let d0 = if d15 < 0.0 {
+            0.0
+        } else {
+            let d15 = d15 * d15;
+            d15 * d15 * gradient(SIMPLEX_GRADIENTS[k1], d9, d10)
+        };
+
+        let d16 = 0.5 - d11 * d11 - d12 * d12;
+        let d1 = if d16 < 0.0 {
+            0.0
+        } else {
+            let d16 = d16 * d16;
+            d16 * d16 * gradient(SIMPLEX_GRADIENTS[l1], d11, d12)
+        };
+
+        let d17 = 0.5 - d13 * d13 - d14 * d14;
+        let d2 = if d17 < 0.0 {
+            0.0
+        } else {
+            let d17 = d17 * d17;
+            d17 * d17 * gradient(SIMPLEX_GRADIENTS[i2], d13, d14)
+        };
+
+        70.0 * (d0 + d1 + d2)
+    }
+
+    /// `func_151606_a`: a `width * height` block of samples, accumulated into
+    /// `out` with the given amplitude.
+    #[allow(clippy::too_many_arguments)]
+    pub fn populate_2d(
+        &self,
+        out: &mut [f64],
+        x: f64,
+        z: f64,
+        width: usize,
+        height: usize,
+        scale_x: f64,
+        scale_z: f64,
+        amplitude: f64,
+    ) {
+        let mut index = 0;
+        for row in 0..height {
+            let d0 = (z + row as f64) * scale_z + self.y_offset;
+            for column in 0..width {
+                let d1 = (x + column as f64) * scale_x + self.x_offset;
+                out[index] += 70.0 * self.sample_scaled(d1, d0) * amplitude;
+                index += 1;
+            }
+        }
+    }
+
+    /// The body of `func_151606_a`, already offset by this generator's own
+    /// origin — the caller has done the scaling.
+    fn sample_scaled(&self, d1: f64, d0: f64) -> f64 {
+        let d5 = (d1 + d0) * SIMPLEX_SKEW;
+        let l = fast_floor(d1 + d5);
+        let i1 = fast_floor(d0 + d5);
+        let d6 = (l + i1) as f64 * SIMPLEX_UNSKEW;
+        let d7 = l as f64 - d6;
+        let d8 = i1 as f64 - d6;
+        let d9 = d1 - d7;
+        let d10 = d0 - d8;
+
+        let (j1, k1) = if d9 > d10 { (1, 0) } else { (0, 1) };
+
+        let d11 = d9 - j1 as f64 + SIMPLEX_UNSKEW;
+        let d12 = d10 - k1 as f64 + SIMPLEX_UNSKEW;
+        let d13 = d9 - 1.0 + 2.0 * SIMPLEX_UNSKEW;
+        let d14 = d10 - 1.0 + 2.0 * SIMPLEX_UNSKEW;
+
+        let l1 = (l & 255) as usize;
+        let i2 = (i1 & 255) as usize;
+        let j2 = (self.permutation[l1 + self.permutation[i2] as usize] % 12) as usize;
+        let k2 = (self.permutation[l1 + j1 + self.permutation[i2 + k1] as usize] % 12) as usize;
+        let l2 = (self.permutation[l1 + 1 + self.permutation[i2 + 1] as usize] % 12) as usize;
+
+        let d15 = 0.5 - d9 * d9 - d10 * d10;
+        let d2 = if d15 < 0.0 {
+            0.0
+        } else {
+            let d15 = d15 * d15;
+            d15 * d15 * gradient(SIMPLEX_GRADIENTS[j2], d9, d10)
+        };
+
+        let d16 = 0.5 - d11 * d11 - d12 * d12;
+        let d3 = if d16 < 0.0 {
+            0.0
+        } else {
+            let d16 = d16 * d16;
+            d16 * d16 * gradient(SIMPLEX_GRADIENTS[k2], d11, d12)
+        };
+
+        let d17 = 0.5 - d13 * d13 - d14 * d14;
+        let d4 = if d17 < 0.0 {
+            0.0
+        } else {
+            let d17 = d17 * d17;
+            d17 * d17 * gradient(SIMPLEX_GRADIENTS[l2], d13, d14)
+        };
+
+        d2 + d3 + d4
+    }
+}
+
+/// `NoiseGeneratorPerlin`: octaves of [`NoiseSimplex`], each at half the scale
+/// and twice the frequency of the one before.
+#[derive(Debug, Clone)]
+pub struct NoisePerlin {
+    generators: Vec<NoiseSimplex>,
+}
+
+impl NoisePerlin {
+    pub fn new(random: &mut JavaRandom, octaves: usize) -> Self {
+        let generators = (0..octaves).map(|_| NoiseSimplex::new(random)).collect();
+        Self { generators }
+    }
+
+    /// `func_151601_a`: a single sample summed over all octaves.
+    pub fn sample(&self, x: f64, z: f64) -> f64 {
+        let mut total = 0.0;
+        let mut scale = 1.0;
+        for generator in &self.generators {
+            total += generator.sample_2d(x * scale, z * scale) / scale;
+            scale /= 2.0;
+        }
+        total
+    }
+
+    /// `func_151599_a`: the stone-noise field `replaceBlocksForBiome` reads.
+    #[allow(clippy::too_many_arguments)]
+    pub fn populate(
+        &self,
+        out: &mut [f64],
+        x: f64,
+        z: f64,
+        width: usize,
+        height: usize,
+        scale_x: f64,
+        scale_z: f64,
+    ) {
+        out.fill(0.0);
+        let mut amplitude = 1.0;
+        let mut scale = 1.0;
+        for generator in &self.generators {
+            generator.populate_2d(
+                out,
+                x,
+                z,
+                width,
+                height,
+                scale_x * amplitude * scale,
+                scale_z * amplitude * scale,
+                0.55 / scale,
+            );
+            amplitude *= 1.0;
+            scale *= 0.5;
+        }
+    }
+}
+
+/// `func_151607_a`: truncation towards zero, not flooring.
+fn fast_floor(value: f64) -> i32 {
+    let truncated = value as i32;
+    if value > 0.0 {
+        truncated
+    } else {
+        truncated - 1
+    }
+}
+
+fn gradient(direction: [f64; 2], x: f64, z: f64) -> f64 {
+    direction[0] * x + direction[1] * z
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

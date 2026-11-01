@@ -20,7 +20,7 @@
 
 use crate::biome;
 use crate::genlayer::BiomeLayers;
-use crate::noise::{JavaRandom, NoiseOctaves};
+use crate::noise::{JavaRandom, NoiseOctaves, NoisePerlin};
 
 /// `ChunkProviderSettings.Factory.seaLevel`: everything below this is water
 /// wherever the density is not positive.
@@ -60,7 +60,7 @@ pub struct TerrainNoise {
     /// `replaceBlocksForBiome`. Held as an octave set for now: the two
     /// constructors draw from the shared [`JavaRandom`] in the same pattern,
     /// so this keeps the stream aligned for the generators after it.
-    _surface: NoiseOctaves,
+    surface: NoisePerlin,
     /// Created only to advance the shared random; vanilla uses it for trees.
     _spawner: NoiseOctaves,
     parabola: [f32; 25],
@@ -78,7 +78,7 @@ impl TerrainNoise {
         let lower_limit = NoiseOctaves::new(&mut random, 16);
         let upper_limit = NoiseOctaves::new(&mut random, 16);
         let main = NoiseOctaves::new(&mut random, 8);
-        let surface = NoiseOctaves::new(&mut random, 4);
+        let surface = NoisePerlin::new(&mut random, 4);
         let _forest = NoiseOctaves::new(&mut random, 10);
         let depth = NoiseOctaves::new(&mut random, 16);
         let spawner = NoiseOctaves::new(&mut random, 8);
@@ -96,7 +96,7 @@ impl TerrainNoise {
             upper_limit,
             main,
             depth,
-            _surface: surface,
+            surface,
             _spawner: spawner,
             parabola,
             density: [0.0; DENSITY_LEN],
@@ -309,6 +309,23 @@ impl TerrainNoise {
         surface
     }
 
+    /// `replaceBlocksForBiome`'s stone-noise field: one value per block of a
+    /// chunk, used to vary how deep the surface layer sits.
+    pub fn stone_noise(&self, chunk_x: i32, chunk_z: i32) -> [f64; 256] {
+        let mut noise = [0.0; 256];
+        let scale = 0.03125 * 2.0;
+        self.surface.populate(
+            &mut noise,
+            f64::from(chunk_x * 16),
+            f64::from(chunk_z * 16),
+            16,
+            16,
+            scale,
+            scale,
+        );
+        noise
+    }
+
     /// Convenience: the 10x10 biome sample, the lattice, and the surface.
     pub fn chunk_surface(
         &mut self,
@@ -372,6 +389,31 @@ mod tests {
     /// classes (`Nephele-private/oracle`, `Terrain.java`). This pins the noise
     /// pipeline and the interpolation on their own, with no biome data in the
     /// way.
+    /// The stone-noise field, checked against the oracle's real
+    /// `NoiseGeneratorPerlin` for the same seed and chunk.
+    #[test]
+    fn stone_noise_matches_the_java_reference() {
+        let expected = [
+            -1.700268253114639,
+            -1.7344816783366233,
+            -1.7267996354752175,
+            -1.690807821230924,
+            -1.6484226117240335,
+            -1.6243574595299737,
+            -1.638910039133802,
+            -1.70094759813542,
+        ];
+        let noise = TerrainNoise::new(12345);
+        let stone = noise.stone_noise(-28, 4);
+        for (index, want) in expected.iter().enumerate() {
+            assert!(
+                (stone[index] - want).abs() < 1e-12,
+                "column {index}: {} vs {want}",
+                stone[index]
+            );
+        }
+    }
+
     #[test]
     fn a_flat_biome_chunk_matches_the_java_reference() {
         let expected: [i32; 256] = [
