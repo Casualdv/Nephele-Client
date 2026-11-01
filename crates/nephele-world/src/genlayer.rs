@@ -630,6 +630,998 @@ impl Layer for GenLayerRiverMix {
     }
 }
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use crate::biome;
+
+/// A layer shared by two parents, as vanilla shares `genlayer4` and the river
+/// chain between the biome and river branches.
+#[derive(Clone)]
+pub struct SharedLayer(Rc<RefCell<Box<dyn Layer>>>);
+
+impl SharedLayer {
+    pub fn new(inner: Box<dyn Layer>) -> Self {
+        Self(Rc::new(RefCell::new(inner)))
+    }
+
+    fn boxed(&self) -> Box<dyn Layer> {
+        Box::new(self.clone())
+    }
+}
+
+impl Layer for SharedLayer {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        self.0.borrow_mut().get_ints(area_x, area_z, width, height)
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.0.borrow_mut().set_world_seed(seed);
+    }
+}
+
+/// `GenLayerAddIsland`: grow land into neighbouring ocean cells.
+pub struct GenLayerAddIsland {
+    seed: LayerSeed,
+    parent: Box<dyn Layer>,
+}
+
+impl GenLayerAddIsland {
+    pub fn new(base_seed: i64, parent: Box<dyn Layer>) -> Self {
+        Self {
+            seed: LayerSeed::new(base_seed),
+            parent,
+        }
+    }
+}
+
+impl Layer for GenLayerAddIsland {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        let parent_w = width + 2;
+        let parent = self
+            .parent
+            .get_ints(area_x - 1, area_z - 1, parent_w, height + 2);
+        let mut out = vec![0; width * height];
+
+        for z in 0..height {
+            for x in 0..width {
+                let northwest = parent[index(x, z, parent_w)];
+                let northeast = parent[index(x + 2, z, parent_w)];
+                let southwest = parent[index(x, z + 2, parent_w)];
+                let southeast = parent[index(x + 2, z + 2, parent_w)];
+                let centre = parent[index(x + 1, z + 1, parent_w)];
+                self.seed
+                    .init_chunk((x as i32 + area_x) as i64, (z as i32 + area_z) as i64);
+
+                let dry_neighbours =
+                    northwest == 0 && northeast == 0 && southwest == 0 && southeast == 0;
+                let value = if centre != 0 || dry_neighbours {
+                    let touches_water =
+                        northwest == 0 || northeast == 0 || southwest == 0 || southeast == 0;
+                    if centre > 0 && touches_water {
+                        if self.seed.next_int(5) == 0 {
+                            if centre == 4 {
+                                4
+                            } else {
+                                0
+                            }
+                        } else {
+                            centre
+                        }
+                    } else {
+                        centre
+                    }
+                } else {
+                    let mut choice = 1;
+                    let mut bound = 1;
+                    if northwest != 0 {
+                        let draw = self.seed.next_int(bound);
+                        bound += 1;
+                        if draw == 0 {
+                            choice = northwest;
+                        }
+                    }
+                    if northeast != 0 {
+                        let draw = self.seed.next_int(bound);
+                        bound += 1;
+                        if draw == 0 {
+                            choice = northeast;
+                        }
+                    }
+                    if southwest != 0 {
+                        let draw = self.seed.next_int(bound);
+                        bound += 1;
+                        if draw == 0 {
+                            choice = southwest;
+                        }
+                    }
+                    if southeast != 0 {
+                        let draw = self.seed.next_int(bound);
+                        if draw == 0 {
+                            choice = southeast;
+                        }
+                    }
+                    if self.seed.next_int(3) == 0 {
+                        choice
+                    } else if choice == 4 {
+                        4
+                    } else {
+                        0
+                    }
+                };
+                out[index(x, z, width)] = value;
+            }
+        }
+        out
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.parent.set_world_seed(seed);
+        self.seed.set_world_seed(seed);
+    }
+}
+
+/// `GenLayerAddMushroomIsland`: a 1-in-100 mushroom island in open sea.
+pub struct GenLayerAddMushroomIsland {
+    seed: LayerSeed,
+    parent: Box<dyn Layer>,
+}
+
+impl GenLayerAddMushroomIsland {
+    pub fn new(base_seed: i64, parent: Box<dyn Layer>) -> Self {
+        Self {
+            seed: LayerSeed::new(base_seed),
+            parent,
+        }
+    }
+}
+
+impl Layer for GenLayerAddMushroomIsland {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        let parent_w = width + 2;
+        let parent = self
+            .parent
+            .get_ints(area_x - 1, area_z - 1, parent_w, height + 2);
+        let mut out = vec![0; width * height];
+        for z in 0..height {
+            for x in 0..width {
+                let northwest = parent[index(x, z, parent_w)];
+                let northeast = parent[index(x + 2, z, parent_w)];
+                let southwest = parent[index(x, z + 2, parent_w)];
+                let southeast = parent[index(x + 2, z + 2, parent_w)];
+                let centre = parent[index(x + 1, z + 1, parent_w)];
+                self.seed
+                    .init_chunk((x as i32 + area_x) as i64, (z as i32 + area_z) as i64);
+                out[index(x, z, width)] = if centre == 0
+                    && northwest == 0
+                    && northeast == 0
+                    && southwest == 0
+                    && southeast == 0
+                    && self.seed.next_int(100) == 0
+                {
+                    biome_id::MUSHROOM_ISLAND
+                } else {
+                    centre
+                };
+            }
+        }
+        out
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.parent.set_world_seed(seed);
+        self.seed.set_world_seed(seed);
+    }
+}
+
+/// `GenLayerDeepOcean`: cells deep inside an ocean become deep ocean.
+pub struct GenLayerDeepOcean {
+    seed: LayerSeed,
+    parent: Box<dyn Layer>,
+}
+
+impl GenLayerDeepOcean {
+    pub fn new(base_seed: i64, parent: Box<dyn Layer>) -> Self {
+        Self {
+            seed: LayerSeed::new(base_seed),
+            parent,
+        }
+    }
+}
+
+impl Layer for GenLayerDeepOcean {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        let parent_w = width + 2;
+        let parent = self
+            .parent
+            .get_ints(area_x - 1, area_z - 1, parent_w, height + 2);
+        let mut out = vec![0; width * height];
+        for z in 0..height {
+            for x in 0..width {
+                let north = parent[index(x + 1, z, parent_w)];
+                let east = parent[index(x + 2, z + 1, parent_w)];
+                let west = parent[index(x, z + 1, parent_w)];
+                let south = parent[index(x + 1, z + 2, parent_w)];
+                let centre = parent[index(x + 1, z + 1, parent_w)];
+                let oceans = [north, east, west, south]
+                    .iter()
+                    .filter(|value| **value == 0)
+                    .count();
+                out[index(x, z, width)] = if centre == 0 && oceans > 3 {
+                    biome_id::DEEP_OCEAN
+                } else {
+                    centre
+                };
+            }
+        }
+        out
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.parent.set_world_seed(seed);
+        self.seed.set_world_seed(seed);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeMode {
+    CoolWarm,
+    HeatIce,
+    Special,
+}
+
+/// `GenLayerEdge`: inserts a transition band between temperature extremes.
+pub struct GenLayerEdge {
+    seed: LayerSeed,
+    parent: Box<dyn Layer>,
+    mode: EdgeMode,
+}
+
+impl GenLayerEdge {
+    pub fn new(base_seed: i64, parent: Box<dyn Layer>, mode: EdgeMode) -> Self {
+        Self {
+            seed: LayerSeed::new(base_seed),
+            parent,
+            mode,
+        }
+    }
+}
+
+impl Layer for GenLayerEdge {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        match self.mode {
+            EdgeMode::CoolWarm | EdgeMode::HeatIce => {
+                let parent_w = width + 2;
+                let parent = self
+                    .parent
+                    .get_ints(area_x - 1, area_z - 1, parent_w, height + 2);
+                let mut out = vec![0; width * height];
+
+                let (from, triggers) = if self.mode == EdgeMode::CoolWarm {
+                    (1, [3, 4])
+                } else {
+                    (4, [2, 1])
+                };
+
+                for z in 0..height {
+                    for x in 0..width {
+                        if self.mode == EdgeMode::CoolWarm {
+                            self.seed
+                                .init_chunk((x as i32 + area_x) as i64, (z as i32 + area_z) as i64);
+                        }
+                        let mut centre = parent[index(x + 1, z + 1, parent_w)];
+                        if centre == from {
+                            let north = parent[index(x + 1, z, parent_w)];
+                            let east = parent[index(x + 2, z + 1, parent_w)];
+                            let west = parent[index(x, z + 1, parent_w)];
+                            let south = parent[index(x + 1, z + 2, parent_w)];
+                            if [north, east, west, south]
+                                .iter()
+                                .any(|value| triggers.contains(value))
+                            {
+                                centre = if from == 1 { 2 } else { 3 };
+                            }
+                        }
+                        out[index(x, z, width)] = centre;
+                    }
+                }
+                out
+            }
+            EdgeMode::Special => {
+                let parent = self.parent.get_ints(area_x, area_z, width, height);
+                let mut out = vec![0; width * height];
+                for z in 0..height {
+                    for x in 0..width {
+                        self.seed
+                            .init_chunk((x as i32 + area_x) as i64, (z as i32 + area_z) as i64);
+                        let mut value = parent[index(x, z, width)];
+                        if value != 0 && self.seed.next_int(13) == 0 {
+                            value |= ((1 + self.seed.next_int(15)) << 8) & 3840;
+                        }
+                        out[index(x, z, width)] = value;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.parent.set_world_seed(seed);
+        self.seed.set_world_seed(seed);
+    }
+}
+
+/// `GenLayerBiome`: turns the temperature/rainfall bands into real biomes.
+pub struct GenLayerBiome {
+    seed: LayerSeed,
+    parent: Box<dyn Layer>,
+}
+
+const WARM: [i32; 6] = [
+    biome_id::DESERT,
+    biome_id::DESERT,
+    biome_id::DESERT,
+    35,
+    35,
+    biome_id::PLAINS,
+];
+const MEDIUM: [i32; 6] = [
+    4,
+    29,
+    biome_id::EXTREME_HILLS,
+    biome_id::PLAINS,
+    27,
+    biome_id::SWAMPLAND,
+];
+const COOL: [i32; 4] = [
+    4,
+    biome_id::EXTREME_HILLS,
+    biome_id::TAIGA,
+    biome_id::PLAINS,
+];
+const ICY: [i32; 4] = [
+    biome_id::ICE_PLAINS,
+    biome_id::ICE_PLAINS,
+    biome_id::ICE_PLAINS,
+    30,
+];
+
+impl GenLayerBiome {
+    pub fn new(base_seed: i64, parent: Box<dyn Layer>) -> Self {
+        Self {
+            seed: LayerSeed::new(base_seed),
+            parent,
+        }
+    }
+}
+
+impl Layer for GenLayerBiome {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        let parent = self.parent.get_ints(area_x, area_z, width, height);
+        let mut out = vec![0; width * height];
+        for z in 0..height {
+            for x in 0..width {
+                self.seed
+                    .init_chunk((x as i32 + area_x) as i64, (z as i32 + area_z) as i64);
+                let raw = parent[index(x, z, width)];
+                let special = (raw & 3840) >> 8;
+                let band = raw & !3840;
+                let value = if biome::is_oceanic(band) || band == biome_id::MUSHROOM_ISLAND {
+                    band
+                } else if band == 1 {
+                    if special > 0 {
+                        if self.seed.next_int(3) == 0 {
+                            biome_id::MESA_PLATEAU
+                        } else {
+                            biome_id::MESA_PLATEAU_F
+                        }
+                    } else {
+                        let choice = self.seed.next_int(WARM.len() as i32) as usize;
+                        WARM[choice]
+                    }
+                } else if band == 2 {
+                    if special > 0 {
+                        21
+                    } else {
+                        let choice = self.seed.next_int(MEDIUM.len() as i32) as usize;
+                        MEDIUM[choice]
+                    }
+                } else if band == 3 {
+                    if special > 0 {
+                        32
+                    } else {
+                        let choice = self.seed.next_int(COOL.len() as i32) as usize;
+                        COOL[choice]
+                    }
+                } else if band == 4 {
+                    let choice = self.seed.next_int(ICY.len() as i32) as usize;
+                    ICY[choice]
+                } else {
+                    biome_id::MUSHROOM_ISLAND
+                };
+                out[index(x, z, width)] = value;
+            }
+        }
+        out
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.parent.set_world_seed(seed);
+        self.seed.set_world_seed(seed);
+    }
+}
+
+/// `GenLayerBiomeEdge`: softens hard jumps between unrelated biomes.
+pub struct GenLayerBiomeEdge {
+    seed: LayerSeed,
+    parent: Box<dyn Layer>,
+}
+
+impl GenLayerBiomeEdge {
+    pub fn new(base_seed: i64, parent: Box<dyn Layer>) -> Self {
+        Self {
+            seed: LayerSeed::new(base_seed),
+            parent,
+        }
+    }
+
+    fn neighbours(parent: &[i32], parent_w: usize, x: usize, z: usize) -> [i32; 4] {
+        [
+            parent[index(x + 1, z, parent_w)],
+            parent[index(x + 2, z + 1, parent_w)],
+            parent[index(x, z + 1, parent_w)],
+            parent[index(x + 1, z + 2, parent_w)],
+        ]
+    }
+
+    fn replace_if_necessary(
+        parent: &[i32],
+        parent_w: usize,
+        x: usize,
+        z: usize,
+        centre: i32,
+        from: i32,
+        to: i32,
+    ) -> Option<i32> {
+        if !biome::equal_or_mesa_plateau(centre, from) {
+            return None;
+        }
+        let neighbours = Self::neighbours(parent, parent_w, x, z);
+        Some(
+            if neighbours
+                .iter()
+                .all(|value| biome::can_be_neighbors(*value, to))
+            {
+                from
+            } else {
+                to
+            },
+        )
+    }
+
+    fn replace(
+        parent: &[i32],
+        parent_w: usize,
+        x: usize,
+        z: usize,
+        centre: i32,
+        from: i32,
+        to: i32,
+    ) -> Option<i32> {
+        if centre != from {
+            return None;
+        }
+        let neighbours = Self::neighbours(parent, parent_w, x, z);
+        Some(
+            if neighbours
+                .iter()
+                .all(|value| biome::equal_or_mesa_plateau(*value, to))
+            {
+                from
+            } else {
+                to
+            },
+        )
+    }
+}
+
+impl Layer for GenLayerBiomeEdge {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        let parent_w = width + 2;
+        let parent = self
+            .parent
+            .get_ints(area_x - 1, area_z - 1, parent_w, height + 2);
+        let mut out = vec![0; width * height];
+        for z in 0..height {
+            for x in 0..width {
+                self.seed
+                    .init_chunk((x as i32 + area_x) as i64, (z as i32 + area_z) as i64);
+                let centre = parent[index(x + 1, z + 1, parent_w)];
+
+                let replaced = Self::replace_if_necessary(&parent, parent_w, x, z, centre, 3, 20)
+                    .or_else(|| Self::replace(&parent, parent_w, x, z, centre, 38, 37))
+                    .or_else(|| Self::replace(&parent, parent_w, x, z, centre, 39, 37))
+                    .or_else(|| Self::replace(&parent, parent_w, x, z, centre, 32, 5));
+
+                out[index(x, z, width)] = match replaced {
+                    Some(value) => value,
+                    None => {
+                        let neighbours = Self::neighbours(&parent, parent_w, x, z);
+                        if centre == biome_id::DESERT {
+                            if neighbours.contains(&biome_id::ICE_PLAINS) {
+                                34
+                            } else {
+                                centre
+                            }
+                        } else if centre == biome_id::SWAMPLAND {
+                            let hostile =
+                                neighbours.iter().any(|value| matches!(*value, 2 | 30 | 12));
+                            if hostile {
+                                biome_id::PLAINS
+                            } else if neighbours.contains(&21) {
+                                23
+                            } else {
+                                centre
+                            }
+                        } else {
+                            centre
+                        }
+                    }
+                };
+            }
+        }
+        out
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.parent.set_world_seed(seed);
+        self.seed.set_world_seed(seed);
+    }
+}
+
+/// `GenLayerHills`: promotes some cells to their hill variant.
+pub struct GenLayerHills {
+    seed: LayerSeed,
+    parent: Box<dyn Layer>,
+    hill_noise: Box<dyn Layer>,
+}
+
+impl GenLayerHills {
+    pub fn new(base_seed: i64, parent: Box<dyn Layer>, hill_noise: Box<dyn Layer>) -> Self {
+        Self {
+            seed: LayerSeed::new(base_seed),
+            parent,
+            hill_noise,
+        }
+    }
+
+    fn hill_variant(&mut self, value: i32) -> i32 {
+        match value {
+            biome_id::DESERT => 17,
+            4 => 18,
+            27 => 28,
+            29 => biome_id::PLAINS,
+            biome_id::TAIGA => 19,
+            32 => 33,
+            30 => 31,
+            biome_id::PLAINS => {
+                if self.seed.next_int(3) == 0 {
+                    18
+                } else {
+                    4
+                }
+            }
+            biome_id::ICE_PLAINS => 13,
+            21 => 22,
+            biome_id::OCEAN => biome_id::DEEP_OCEAN,
+            biome_id::EXTREME_HILLS => 34,
+            35 => 36,
+            other if biome::equal_or_mesa_plateau(other, biome_id::MESA_PLATEAU_F) => {
+                biome_id::MESA
+            }
+            biome_id::DEEP_OCEAN if self.seed.next_int(3) == 0 => {
+                if self.seed.next_int(2) == 0 {
+                    biome_id::PLAINS
+                } else {
+                    4
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+impl Layer for GenLayerHills {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        let parent_w = width + 2;
+        let parent = self
+            .parent
+            .get_ints(area_x - 1, area_z - 1, parent_w, height + 2);
+        let variance = self
+            .hill_noise
+            .get_ints(area_x - 1, area_z - 1, parent_w, height + 2);
+        let mut out = vec![0; width * height];
+
+        for z in 0..height {
+            for x in 0..width {
+                self.seed
+                    .init_chunk((x as i32 + area_x) as i64, (z as i32 + area_z) as i64);
+                let centre = parent[index(x + 1, z + 1, parent_w)];
+                let noise = variance[index(x + 1, z + 1, parent_w)];
+                let rare = (noise - 2) % 29 == 0;
+
+                let value = if centre != 0 && noise >= 2 && (noise - 2) % 29 == 1 && centre < 128 {
+                    if biome::any(centre + 128).is_some() {
+                        centre + 128
+                    } else {
+                        centre
+                    }
+                } else if self.seed.next_int(3) != 0 && !rare {
+                    centre
+                } else {
+                    let mut hills = self.hill_variant(centre);
+                    if rare && hills != centre {
+                        hills = if biome::any(hills + 128).is_some() {
+                            hills + 128
+                        } else {
+                            centre
+                        };
+                    }
+                    if hills == centre {
+                        centre
+                    } else {
+                        let neighbours = [
+                            parent[index(x + 1, z, parent_w)],
+                            parent[index(x + 2, z + 1, parent_w)],
+                            parent[index(x, z + 1, parent_w)],
+                            parent[index(x + 1, z + 2, parent_w)],
+                        ];
+                        let matching = neighbours
+                            .iter()
+                            .filter(|value| biome::equal_or_mesa_plateau(**value, centre))
+                            .count();
+                        if matching >= 3 {
+                            hills
+                        } else {
+                            centre
+                        }
+                    }
+                };
+                out[index(x, z, width)] = value;
+            }
+        }
+        out
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.parent.set_world_seed(seed);
+        self.hill_noise.set_world_seed(seed);
+        self.seed.set_world_seed(seed);
+    }
+}
+
+/// `GenLayerShore`: inserts beaches where land meets water.
+pub struct GenLayerShore {
+    seed: LayerSeed,
+    parent: Box<dyn Layer>,
+}
+
+impl GenLayerShore {
+    pub fn new(base_seed: i64, parent: Box<dyn Layer>) -> Self {
+        Self {
+            seed: LayerSeed::new(base_seed),
+            parent,
+        }
+    }
+
+    fn neighbours(parent: &[i32], parent_w: usize, x: usize, z: usize) -> [i32; 4] {
+        [
+            parent[index(x + 1, z, parent_w)],
+            parent[index(x + 2, z + 1, parent_w)],
+            parent[index(x, z + 1, parent_w)],
+            parent[index(x + 1, z + 2, parent_w)],
+        ]
+    }
+
+    fn edge_with(
+        parent: &[i32],
+        parent_w: usize,
+        x: usize,
+        z: usize,
+        centre: i32,
+        replacement: i32,
+    ) -> i32 {
+        if biome::is_oceanic(centre) {
+            return centre;
+        }
+        let neighbours = Self::neighbours(parent, parent_w, x, z);
+        if neighbours.iter().any(|value| biome::is_oceanic(*value)) {
+            replacement
+        } else {
+            centre
+        }
+    }
+}
+
+impl Layer for GenLayerShore {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        let parent_w = width + 2;
+        let parent = self
+            .parent
+            .get_ints(area_x - 1, area_z - 1, parent_w, height + 2);
+        let mut out = vec![0; width * height];
+
+        for z in 0..height {
+            for x in 0..width {
+                self.seed
+                    .init_chunk((x as i32 + area_x) as i64, (z as i32 + area_z) as i64);
+                let centre = parent[index(x + 1, z + 1, parent_w)];
+                let neighbours = Self::neighbours(&parent, parent_w, x, z);
+
+                let value = if centre == biome_id::MUSHROOM_ISLAND {
+                    if neighbours.contains(&biome_id::OCEAN) {
+                        biome_id::MUSHROOM_ISLAND_SHORE
+                    } else {
+                        centre
+                    }
+                } else if biome::is_jungle_class(centre) {
+                    if neighbours.iter().all(|value| biome::shore_accepts(*value)) {
+                        if neighbours.iter().any(|value| biome::is_oceanic(*value)) {
+                            biome_id::BEACH
+                        } else {
+                            centre
+                        }
+                    } else {
+                        23
+                    }
+                } else if matches!(centre, 3 | 34 | 20) {
+                    Self::edge_with(&parent, parent_w, x, z, centre, 25)
+                } else if biome::is_snowy(centre) {
+                    Self::edge_with(&parent, parent_w, x, z, centre, 26)
+                } else if matches!(centre, 37 | 38) {
+                    let touches_ocean = neighbours.iter().any(|value| biome::is_oceanic(*value));
+                    let all_mesa = neighbours.iter().all(|value| biome::is_mesa(*value));
+                    if touches_ocean || all_mesa {
+                        centre
+                    } else {
+                        biome_id::DESERT
+                    }
+                } else if !matches!(
+                    centre,
+                    biome_id::OCEAN | biome_id::DEEP_OCEAN | biome_id::RIVER | biome_id::SWAMPLAND
+                ) {
+                    if neighbours.iter().any(|value| biome::is_oceanic(*value)) {
+                        biome_id::BEACH
+                    } else {
+                        centre
+                    }
+                } else {
+                    centre
+                };
+                out[index(x, z, width)] = value;
+            }
+        }
+        out
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.parent.set_world_seed(seed);
+        self.seed.set_world_seed(seed);
+    }
+}
+
+/// `GenLayerVoronoiZoom`: the final 1:4 jittered zoom onto block resolution.
+pub struct GenLayerVoronoiZoom {
+    seed: LayerSeed,
+    parent: Box<dyn Layer>,
+}
+
+impl GenLayerVoronoiZoom {
+    pub fn new(base_seed: i64, parent: Box<dyn Layer>) -> Self {
+        Self {
+            seed: LayerSeed::new(base_seed),
+            parent,
+        }
+    }
+}
+
+impl Layer for GenLayerVoronoiZoom {
+    fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+        let area_x = area_x - 2;
+        let area_z = area_z - 2;
+        let cell_x = area_x >> 2;
+        let cell_z = area_z >> 2;
+        let parent_w = (width >> 2) + 2;
+        let parent_h = (height >> 2) + 2;
+        let parent = self.parent.get_ints(cell_x, cell_z, parent_w, parent_h);
+
+        let zoomed_w = (parent_w - 1) << 2;
+        let zoomed_h = (parent_h - 1) << 2;
+        let mut zoomed = vec![0; zoomed_w * zoomed_h];
+
+        for z in 0..parent_h - 1 {
+            let mut top_left = parent[index(0, z, parent_w)];
+            let mut bottom_left = parent[index(0, z + 1, parent_w)];
+            for x in 0..parent_w - 1 {
+                self.seed.init_chunk(
+                    ((x as i32 + cell_x) << 2) as i64,
+                    ((z as i32 + cell_z) << 2) as i64,
+                );
+                let top_left_x = (self.seed.next_int(1024) as f64 / 1024.0 - 0.5) * 3.6;
+                let top_left_z = (self.seed.next_int(1024) as f64 / 1024.0 - 0.5) * 3.6;
+
+                self.seed.init_chunk(
+                    ((x as i32 + cell_x + 1) << 2) as i64,
+                    ((z as i32 + cell_z) << 2) as i64,
+                );
+                let top_right_x = (self.seed.next_int(1024) as f64 / 1024.0 - 0.5) * 3.6 + 4.0;
+                let top_right_z = (self.seed.next_int(1024) as f64 / 1024.0 - 0.5) * 3.6;
+
+                self.seed.init_chunk(
+                    ((x as i32 + cell_x) << 2) as i64,
+                    ((z as i32 + cell_z + 1) << 2) as i64,
+                );
+                let bottom_left_x = (self.seed.next_int(1024) as f64 / 1024.0 - 0.5) * 3.6;
+                let bottom_left_z = (self.seed.next_int(1024) as f64 / 1024.0 - 0.5) * 3.6 + 4.0;
+
+                self.seed.init_chunk(
+                    ((x as i32 + cell_x + 1) << 2) as i64,
+                    ((z as i32 + cell_z + 1) << 2) as i64,
+                );
+                let bottom_right_x = (self.seed.next_int(1024) as f64 / 1024.0 - 0.5) * 3.6 + 4.0;
+                let bottom_right_z = (self.seed.next_int(1024) as f64 / 1024.0 - 0.5) * 3.6 + 4.0;
+
+                let top_right_biome = parent[index(x + 1, z, parent_w)] & 255;
+                let bottom_right_biome = parent[index(x + 1, z + 1, parent_w)] & 255;
+
+                for dz in 0..4usize {
+                    let row = ((z << 2) + dz) * zoomed_w + (x << 2);
+                    for dx in 0..4usize {
+                        let dxf = dx as f64;
+                        let dzf = dz as f64;
+                        let d0 = (dxf - top_left_z).powi(2) + (dzf - top_left_x).powi(2);
+                        let d1 = (dxf - top_right_z).powi(2) + (dzf - top_right_x).powi(2);
+                        let d2 = (dxf - bottom_left_z).powi(2) + (dzf - bottom_left_x).powi(2);
+                        let d3 = (dxf - bottom_right_z).powi(2) + (dzf - bottom_right_x).powi(2);
+                        zoomed[row + dx] = if d0 < d1 && d0 < d2 && d0 < d3 {
+                            top_left
+                        } else if d1 < d0 && d1 < d2 && d1 < d3 {
+                            top_right_biome
+                        } else if d2 < d0 && d2 < d1 && d2 < d3 {
+                            bottom_left
+                        } else {
+                            bottom_right_biome
+                        };
+                    }
+                }
+                top_left = top_right_biome;
+                bottom_left = bottom_right_biome;
+            }
+        }
+
+        let mut out = vec![0; width * height];
+        let x_offset = (area_x & 3) as usize;
+        let z_offset = (area_z & 3) as usize;
+        for z in 0..height {
+            let src = (z + z_offset) * zoomed_w + x_offset;
+            let len = width.min(zoomed_w.saturating_sub(x_offset));
+            out[index(0, z, width)..index(0, z, width) + len]
+                .copy_from_slice(&zoomed[src..src + len]);
+        }
+        out
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.parent.set_world_seed(seed);
+        self.seed.set_world_seed(seed);
+    }
+}
+
+/// The assembled biome stack: `GenLayer.initializeAllBiomeGenerators` for a
+/// default world.
+pub struct BiomeLayers {
+    voronoi: Box<dyn Layer>,
+    debug_mixed: SharedLayer,
+    debug_hills_noise: SharedLayer,
+    debug_base: SharedLayer,
+}
+
+impl BiomeLayers {
+    pub fn new(seed: i64) -> Self {
+        let mut layer: Box<dyn Layer> = Box::new(GenLayerIsland::new(1));
+        layer = Box::new(GenLayerZoom::fuzzy(2000, layer));
+        layer = Box::new(GenLayerAddIsland::new(1, layer));
+        layer = Box::new(GenLayerZoom::new(2001, layer));
+        layer = Box::new(GenLayerAddIsland::new(2, layer));
+        layer = Box::new(GenLayerAddIsland::new(50, layer));
+        layer = Box::new(GenLayerAddIsland::new(70, layer));
+        layer = Box::new(GenLayerRemoveTooMuchOcean::new(2, layer));
+        layer = Box::new(GenLayerAddSnow::new(2, layer));
+        layer = Box::new(GenLayerAddIsland::new(3, layer));
+        layer = Box::new(GenLayerEdge::new(2, layer, EdgeMode::CoolWarm));
+        layer = Box::new(GenLayerEdge::new(2, layer, EdgeMode::HeatIce));
+        layer = Box::new(GenLayerEdge::new(3, layer, EdgeMode::Special));
+        layer = Box::new(GenLayerZoom::new(2002, layer));
+        layer = Box::new(GenLayerZoom::new(2003, layer));
+        layer = Box::new(GenLayerAddIsland::new(4, layer));
+        layer = Box::new(GenLayerAddMushroomIsland::new(5, layer));
+        layer = Box::new(GenLayerDeepOcean::new(4, layer));
+
+        // Both branches read the same coarse map, as vanilla shares `genlayer4`.
+        let base = SharedLayer::new(layer);
+        let river_init = SharedLayer::new(Box::new(GenLayerRiverInit::new(100, base.boxed())));
+
+        let biome_source = Box::new(GenLayerBiome::new(200, base.boxed()));
+        let zoomed_biomes = magnify(1000, biome_source, 2);
+        let biome_edge = Box::new(GenLayerBiomeEdge::new(1000, zoomed_biomes));
+
+        let hill_noise = SharedLayer::new(magnify(1000, river_init.boxed(), 2));
+        let mut chain: Box<dyn Layer> =
+            Box::new(GenLayerHills::new(1000, biome_edge, hill_noise.boxed()));
+
+        let mut river_chain = magnify(1000, river_init.boxed(), 2);
+        river_chain = magnify(1000, river_chain, 4);
+        let river = Box::new(GenLayerRiver::new(1, river_chain));
+        let smoothed_river = Box::new(GenLayerSmooth::new(1000, river));
+
+        chain = Box::new(GenLayerRareBiome::new(1001, chain));
+
+        for step in 0..4i64 {
+            chain = Box::new(GenLayerZoom::new(1000 + step, chain));
+            if step == 0 {
+                chain = Box::new(GenLayerAddIsland::new(3, chain));
+            }
+            if step == 1 {
+                chain = Box::new(GenLayerShore::new(1000, chain));
+            }
+        }
+
+        let smoothed = Box::new(GenLayerSmooth::new(1000, chain));
+        let mixed = SharedLayer::new(Box::new(GenLayerRiverMix::new(
+            100,
+            smoothed,
+            smoothed_river,
+        )));
+        let voronoi = Box::new(GenLayerVoronoiZoom::new(10, mixed.boxed()));
+
+        let mut layers = Self {
+            voronoi,
+            debug_mixed: mixed,
+            debug_hills_noise: hill_noise,
+            debug_base: base,
+        };
+        layers.set_world_seed(seed);
+        layers
+    }
+
+    fn set_world_seed(&mut self, seed: i64) {
+        self.voronoi.set_world_seed(seed);
+    }
+
+    pub fn debug_base(&mut self, x: i32, z: i32, w: usize, h: usize) -> Vec<i32> {
+        self.debug_base.get_ints(x, z, w, h)
+    }
+
+    pub fn debug_mixed(&mut self, x: i32, z: i32, w: usize, h: usize) -> Vec<i32> {
+        self.debug_mixed.get_ints(x, z, w, h)
+    }
+
+    pub fn debug_hills_noise(&mut self, x: i32, z: i32, w: usize, h: usize) -> Vec<i32> {
+        self.debug_hills_noise.get_ints(x, z, w, h)
+    }
+
+    /// Biome ids for a block-space rectangle, one per block.
+    pub fn biomes(&mut self, block_x: i32, block_z: i32, width: usize, height: usize) -> Vec<i32> {
+        self.voronoi.get_ints(block_x, block_z, width, height)
+    }
+
+    /// The 16x16 biome map for one chunk, X fastest, as `Level.Biomes` stores it.
+    pub fn chunk_biomes(&mut self, chunk_x: i32, chunk_z: i32) -> Vec<i32> {
+        self.biomes(chunk_x * 16, chunk_z * 16, 16, 16)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,5 +1761,75 @@ mod tests {
         for (w, h) in [(1usize, 1usize), (16, 16), (3, 7), (33, 5)] {
             assert_eq!(zoom.get_ints(0, 0, w, h).len(), w * h);
         }
+    }
+
+    #[test]
+    fn the_full_stack_is_deterministic() {
+        let mut a = BiomeLayers::new(12345);
+        let mut b = BiomeLayers::new(12345);
+        assert_eq!(
+            a.chunk_biomes(-28, 4),
+            b.chunk_biomes(-28, 4),
+            "same seed, same world"
+        );
+
+        let mut c = BiomeLayers::new(54321);
+        assert_ne!(
+            a.chunk_biomes(-28, 4),
+            c.chunk_biomes(-28, 4),
+            "different seed, different world"
+        );
+    }
+
+    /// Currently ignored: the assembled stack disagrees with the reference
+    /// world (biome ids come out one temperature band too cold), so this is the
+    /// target, not a passing check. Fix by diffing layer by layer against a
+    /// Java oracle built from the MCP sources.
+    #[ignore = "the port does not match the reference world yet"]
+    #[test]
+    fn chunk_biomes_match_a_world_the_real_server_generated() {
+        use nephele_anvil::{parse_chunk, RegionFile};
+        use std::path::PathBuf;
+
+        let region_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Nephele-private/parity/server/world/region/r.-1.0.mca");
+        if !region_path.is_file() {
+            eprintln!("skipped: no reference world at Nephele-private/parity");
+            return;
+        }
+
+        let region = RegionFile::open(&region_path).expect("region opens");
+        // Chunk (-28, 4) sits in region (-1, 0) at local (4, 4).
+        let bytes = region
+            .chunk_nbt(4, 4)
+            .expect("chunk reads")
+            .expect("chunk present");
+        let stored = parse_chunk(&bytes).expect("chunk parses");
+        assert_eq!(
+            (stored.x, stored.z),
+            (-28, 4),
+            "reference chunk coordinates"
+        );
+
+        let mut layers = BiomeLayers::new(12345);
+        let ours = layers.chunk_biomes(stored.x, stored.z);
+        assert_eq!(ours.len(), stored.biomes.len());
+
+        let mut mismatches = Vec::new();
+        for z in 0..16 {
+            for x in 0..16 {
+                let index = z * 16 + x;
+                let expected = stored.biomes[index] as i32;
+                if ours[index] != expected {
+                    mismatches.push((x, z, ours[index], expected));
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} of 256 biomes differ, first few: {:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(8)]
+        );
     }
 }

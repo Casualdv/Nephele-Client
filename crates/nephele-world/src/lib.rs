@@ -14,6 +14,7 @@
 //! `Map Chunk Bulk` (0x26) reuses that payload per column, with the column
 //! sizes derived from each column's bitmask.
 
+pub mod biome;
 pub mod block;
 pub mod chunk;
 pub mod decode;

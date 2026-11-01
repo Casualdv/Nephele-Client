@@ -1422,6 +1422,7 @@ dependencies = [
 name = "nephele-world"
 version = "0.1.0"
 dependencies = [
+ "nephele-anvil",
  "nephele-protocol",
  "tokio",
  "tracing",
