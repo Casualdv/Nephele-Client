@@ -1527,6 +1527,8 @@ pub struct BiomeLayers {
     debug_mixed: SharedLayer,
     debug_hills_noise: SharedLayer,
     debug_base: SharedLayer,
+    debug_chain: SharedLayer,
+    debug_smoothed: SharedLayer,
 }
 
 impl BiomeLayers {
@@ -1579,10 +1581,11 @@ impl BiomeLayers {
             }
         }
 
-        let smoothed = Box::new(GenLayerSmooth::new(1000, chain));
+        let chain = SharedLayer::new(chain);
+        let smoothed = SharedLayer::new(Box::new(GenLayerSmooth::new(1000, chain.boxed())));
         let mixed = SharedLayer::new(Box::new(GenLayerRiverMix::new(
             100,
-            smoothed,
+            smoothed.boxed(),
             smoothed_river,
         )));
         let voronoi = Box::new(GenLayerVoronoiZoom::new(10, mixed.boxed()));
@@ -1592,6 +1595,8 @@ impl BiomeLayers {
             debug_mixed: mixed,
             debug_hills_noise: hill_noise,
             debug_base: base,
+            debug_chain: chain,
+            debug_smoothed: smoothed,
         };
         layers.set_world_seed(seed);
         layers
@@ -1611,6 +1616,16 @@ impl BiomeLayers {
 
     pub fn debug_hills_noise(&mut self, x: i32, z: i32, w: usize, h: usize) -> Vec<i32> {
         self.debug_hills_noise.get_ints(x, z, w, h)
+    }
+
+    /// The chain just before `GenLayerSmooth`.
+    pub fn debug_chain(&mut self, x: i32, z: i32, w: usize, h: usize) -> Vec<i32> {
+        self.debug_chain.get_ints(x, z, w, h)
+    }
+
+    /// The chain after `GenLayerSmooth`, before rivers are mixed in.
+    pub fn debug_smoothed(&mut self, x: i32, z: i32, w: usize, h: usize) -> Vec<i32> {
+        self.debug_smoothed.get_ints(x, z, w, h)
     }
 
     /// Biome ids for a block-space rectangle, one per block.
