@@ -1,3 +1,5 @@
+#![allow(dead_code)] // The screen that consumes this lands next.
+//!
 //! The saved server list behind the multiplayer screen.
 //!
 //! Kept deliberately separate from the UI: what a list *is* (add, remove,
