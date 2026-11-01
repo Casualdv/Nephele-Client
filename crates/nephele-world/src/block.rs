@@ -55,6 +55,13 @@ pub mod ids {
     pub const GLASS: u16 = 20;
     pub const SANDSTONE: u16 = 24;
     pub const SNOW_LAYER: u16 = 78;
+    pub const ICE: u16 = 79;
+    pub const CLAY: u16 = 82;
+    pub const MYCELIUM: u16 = 110;
+    pub const WATER_LILY: u16 = 111;
+    pub const STAINED_HARDENED_CLAY: u16 = 159;
+    pub const HARDENED_CLAY: u16 = 172;
+    pub const RED_SANDSTONE: u16 = 179;
 }
 
 impl BlockState {

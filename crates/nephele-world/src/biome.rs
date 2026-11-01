@@ -230,6 +230,13 @@ pub fn is_jungle_class(id: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// `BiomeGenSwamp`, including its mutation.
+pub fn is_swamp_class(id: i32) -> bool {
+    any(id)
+        .map(|biome| biome.class == BiomeClass::Swamp)
+        .unwrap_or(false)
+}
+
 pub fn is_mesa(id: i32) -> bool {
     any(id)
         .map(|biome| biome.class == BiomeClass::Mesa)

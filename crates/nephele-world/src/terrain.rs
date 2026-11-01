@@ -19,6 +19,8 @@
 //! stream and the later ones would otherwise be seeded differently.
 
 use crate::biome;
+use crate::block::{self, BlockState};
+use crate::chunk::ChunkColumn;
 use crate::genlayer::BiomeLayers;
 use crate::noise::{JavaRandom, NoiseOctaves, NoisePerlin};
 
@@ -243,12 +245,9 @@ impl TerrainNoise {
         }
     }
 
-    /// The same density lattice, interpolated to blocks, reduced to the top
-    /// solid `y` of each column. `-1` means the column is empty all the way
-    /// down (open ocean).
-    pub fn surface_heights(&self) -> [i32; 256] {
-        let mut surface = [-1i32; 256];
-
+    /// Walks every block of the interpolated density field, calling `visit`
+    /// with the block position and its density value.
+    fn interpolate(&self, mut visit: impl FnMut(usize, usize, usize, f64)) {
         for cell_x in 0..4usize {
             let base_x = cell_x * LATTICE_XZ;
             let next_x = (cell_x + 1) * LATTICE_XZ;
@@ -282,15 +281,10 @@ impl TerrainNoise {
 
                             for sub_z in 0..4usize {
                                 value += between;
-                                if value > 0.0 {
-                                    let block_x = cell_x * 4 + sub_x;
-                                    let block_y = step as i32 * VERTICAL + sub_y;
-                                    let block_z = cell_z * 4 + sub_z;
-                                    let column = block_z * 16 + block_x;
-                                    if block_y > surface[column] {
-                                        surface[column] = block_y;
-                                    }
-                                }
+                                let block_x = cell_x * 4 + sub_x;
+                                let block_y = step as i32 * VERTICAL + sub_y;
+                                let block_z = cell_z * 4 + sub_z;
+                                visit(block_x, block_y as usize, block_z, value);
                             }
 
                             across_a += slope_a;
@@ -305,8 +299,42 @@ impl TerrainNoise {
                 }
             }
         }
+    }
 
+    /// The same density lattice, interpolated to blocks, reduced to the top
+    /// solid `y` of each column. `-1` means the column is empty all the way
+    /// down (open ocean).
+    pub fn surface_heights(&self) -> [i32; 256] {
+        let mut surface = [-1i32; 256];
+        self.interpolate(|x, y, z, value| {
+            if value > 0.0 {
+                let column = z * 16 + x;
+                if y as i32 > surface[column] {
+                    surface[column] = y as i32;
+                }
+            }
+        });
         surface
+    }
+
+    /// A whole chunk column of bare terrain: stone where the density is
+    /// positive, water below sea level where it is not, air elsewhere. This is
+    /// `ChunkProviderGenerate.setBlocksInChunk`; the surface pass runs after it.
+    pub fn primer(&mut self, layers: &mut BiomeLayers, chunk_x: i32, chunk_z: i32) -> ChunkColumn {
+        let biomes = layers.terrain_biomes(chunk_x * 4 - 2, chunk_z * 4 - 2, 10, 10);
+        self.fill_density(chunk_x, chunk_z, &biomes);
+        let mut column = ChunkColumn::empty(chunk_x, chunk_z);
+        self.interpolate(|x, y, z, value| {
+            let block = if value > 0.0 {
+                BlockState::new(block::ids::STONE, 0)
+            } else if (y as i32) < SEA_LEVEL {
+                BlockState::new(block::ids::WATER, 0)
+            } else {
+                BlockState::AIR
+            };
+            column.set_block(x, y, z, block);
+        });
+        column
     }
 
     /// `replaceBlocksForBiome`'s stone-noise field: one value per block of a
