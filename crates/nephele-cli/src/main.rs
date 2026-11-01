@@ -181,6 +181,7 @@ fn main() -> ExitCode {
                 seed,
                 online,
                 session_path: project_root().join(".local/auth.json"),
+                servers_path: project_root().join(".local/servers.json"),
             }) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {

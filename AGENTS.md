@@ -117,7 +117,7 @@ crates/
       viewer.rs         offline world viewer
       ui.rs             immediate-mode UI batch + screens (draw_*)
       mesher.rs         CLI-side mesh helpers
-      servers.rs        saved server list (data layer only — see Next)
+      servers.rs        saved server list: entries, ordering, JSON persistence
       settings.rs       persisted options
       skins.rs          skin fetch/cache
 ```
@@ -366,7 +366,9 @@ not) and smooth lighting. Then M1 is closed.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **109 tests** in `nephele-world`; ~285 across the workspace; 8 in the server list.
+- **109 tests** in `nephele-world`; **366 across the workspace** (1 ignored); 10 in
+  the server list, plus 7 `ui` tests covering the multiplayer screen's buttons,
+  index mapping and layout.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
 
@@ -374,14 +376,18 @@ not) and smooth lighting. Then M1 is closed.
 
 ## 15. Next move
 
-1. **Server list screen** — `servers.rs` (data layer, done, 8 tests) is waiting on UI:
-   - `ui::draw_servers(...) -> Vec<Button>`, copying the shape of `draw_connect`
-     (it returns `Vec<Button>`; that's the established pattern).
-   - `Screen::Servers` variant — `Screen::Connect` appears in six places in `live.rs`
-     (≈685 parse, 1322 draw, 1492 open, 1580 input, 1612 back, 1622 no-op).
-   - Address entry should reuse the connect screen's existing input handling (~1580)
-     rather than a second widget.
-   - Join → set the address and call the existing `start_network`.
+1. ~~**Server list screen**~~ — done. `ui::draw_servers` (multiplayer screen: 5
+   visible rows, wheel-scrolled, favourites first) + `Screen::Servers`, which
+   `Action::Multiplayer` now opens. The address field is the *same* `address_input`
+   buffer and the *same* keyboard block as `Screen::Connect`, so there is still only
+   one text widget in the project. Joining (possible in 3 ways: typed address, row
+   click, Enter) runs through `start_network`; every successful parse also does
+   `ServerList::add` + save to `.local/servers.json`, so the list fills itself from
+   where you have played. `Screen::Connect` is now only reachable via
+   `NEPHELE_SCREEN=connect` and kept as a debug/deep-link target.
+   **Rows act by storage index, not display position** — `ServerList::ordered_indices`
+   exists because favourites sort to the top while `toggle_favourite`/`remove` take
+   the slot in `entries()`. Do not "simplify" that away.
 2. **World creation screen** — smaller. `local_loop` already takes a seed and
    `play --seed` already parses one; v1 creates but does not save (region writing is
    M2).

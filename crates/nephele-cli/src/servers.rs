@@ -1,5 +1,3 @@
-#![allow(dead_code)] // The screen that consumes this lands next.
-//!
 //! The saved server list behind the multiplayer screen.
 //!
 //! Kept deliberately separate from the UI: what a list *is* (add, remove,
@@ -83,10 +81,14 @@ impl ServerList {
         }
     }
 
-    /// Favourites are listed first, otherwise the saved order is kept.
-    pub fn ordered(&self) -> Vec<&ServerEntry> {
-        let mut out: Vec<&ServerEntry> = self.entries.iter().collect();
-        out.sort_by_key(|entry| !entry.favourite);
+    /// Storage indices in display order: favourites first, otherwise the
+    /// saved order is kept.
+    ///
+    /// Indices rather than references because the screen acts on an entry with
+    /// [`ServerList::toggle_favourite`] / [`ServerList::remove`], which take one.
+    pub fn ordered_indices(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = (0..self.entries.len()).collect();
+        out.sort_by_key(|&index| !self.entries[index].favourite);
         out
     }
 
@@ -156,8 +158,24 @@ mod tests {
         list.add(ServerEntry::new("two", "2.example.net"));
         list.add(ServerEntry::new("three", "3.example.net"));
         list.toggle_favourite(2);
-        let ordered: Vec<&str> = list.ordered().iter().map(|e| e.name.as_str()).collect();
+        let ordered: Vec<&str> = list
+            .ordered_indices()
+            .into_iter()
+            .map(|index| list.entries()[index].name.as_str())
+            .collect();
         assert_eq!(ordered, vec!["three", "one", "two"]);
+    }
+
+    /// The screen acts on entries by index, so ordering must hand back the
+    /// storage slot rather than a position in the sorted view.
+    #[test]
+    fn display_order_reports_storage_indices() {
+        let mut list = ServerList::default();
+        list.add(ServerEntry::new("one", "1.example.net"));
+        list.add(ServerEntry::new("two", "2.example.net"));
+        list.add(ServerEntry::new("three", "3.example.net"));
+        list.toggle_favourite(2);
+        assert_eq!(list.ordered_indices(), vec![2, 0, 1]);
     }
 
     #[test]

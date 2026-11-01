@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::mesher::MeshPool;
+use crate::servers::{ServerEntry, ServerList};
 use crate::settings::Settings;
 use crate::skins::SkinLoader;
 use crate::ui::{self, Action, HudState, Screen};
@@ -55,6 +56,8 @@ pub struct PlayOptions {
     pub online: bool,
     /// Where the cached session lives.
     pub session_path: std::path::PathBuf,
+    /// Where the saved multiplayer list lives.
+    pub servers_path: std::path::PathBuf,
 }
 
 enum NetMsg {
@@ -661,6 +664,10 @@ struct LiveApp {
     splash: String,
     time: f32,
     address_input: String,
+    /// Saved servers behind the multiplayer screen.
+    servers: ServerList,
+    /// First visible row of `servers`.
+    servers_scroll: usize,
     settings_return: Screen,
     /// When the window last gained focus; clicks right after it are ignored.
     focus_gained: Option<Instant>,
@@ -683,10 +690,13 @@ impl LiveApp {
             Ok("pause") => Some(Screen::Pause),
             Ok("settings") => Some(Screen::Settings),
             Ok("connect") => Some(Screen::Connect),
+            Ok("servers") => Some(Screen::Servers),
             Ok("game") => Some(Screen::Game),
             Ok("title") => Some(Screen::Title),
             _ => None,
         };
+
+        let servers = ServerList::load(&options.servers_path);
 
         let has_address = options.address.is_some();
         let mut app = Self {
@@ -732,6 +742,8 @@ impl LiveApp {
             splash: String::new(),
             time: 0.0,
             address_input: String::new(),
+            servers,
+            servers_scroll: 0,
             settings_return: Screen::Pause,
             focus_gained: None,
             settings: initial_settings(),
@@ -1319,6 +1331,17 @@ impl LiveApp {
                 width,
                 height,
             ),
+            Screen::Servers => ui::draw_servers(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &self.servers,
+                &self.address_input,
+                self.servers_scroll,
+                self.pointer,
+                scale,
+                width,
+                height,
+            ),
             Screen::Connect => ui::draw_connect(
                 &mut self.ui_bg,
                 &mut self.ui_fg,
@@ -1443,6 +1466,9 @@ impl LiveApp {
     }
 
     /// Parse the typed address and connect, or report it on the screen.
+    ///
+    /// A successful join is also what remembers the server: the list is a
+    /// history of everywhere you have played.
     fn connect_from_input(&mut self) {
         let text = self.address_input.trim().to_string();
         if text.is_empty() {
@@ -1451,12 +1477,50 @@ impl LiveApp {
         match ServerAddress::parse(&text) {
             Ok(address) => {
                 self.address_input.clear();
+                self.remember_server(&text);
                 self.start_network(address);
             }
             Err(err) => {
                 self.shared.lock().unwrap().status = format!("bad address: {err}");
             }
         }
+    }
+
+    /// Add `address` to the saved list and write it back to disk.
+    fn remember_server(&mut self, address: &str) {
+        self.servers.add(ServerEntry::new("", address));
+        self.save_servers();
+    }
+
+    fn save_servers(&self) {
+        if let Err(err) = self.servers.save(&self.options.servers_path) {
+            eprintln!("could not save the server list: {err}");
+        }
+    }
+
+    /// Join a saved server by its storage index.
+    fn join_server(&mut self, index: usize) {
+        let Some(entry) = self.servers.entries().get(index) else {
+            return;
+        };
+        let address = entry.address.clone();
+        match ServerAddress::parse(&address) {
+            Ok(address) => self.start_network(address),
+            Err(err) => {
+                self.shared.lock().unwrap().status = format!("bad address: {err}");
+            }
+        }
+    }
+
+    /// Number of entries the list can scroll past the last visible row.
+    fn servers_max_scroll(&self) -> usize {
+        self.servers.entries().len().saturating_sub(ui::SERVER_ROWS)
+    }
+
+    /// Move the saved-server list, clamped to the entries it has.
+    fn scroll_servers(&mut self, steps: i32) {
+        let next = self.servers_scroll as i32 - steps;
+        self.servers_scroll = next.clamp(0, self.servers_max_scroll() as i32) as usize;
     }
 
     /// Push settings that live outside the UI into the renderer and network.
@@ -1489,7 +1553,20 @@ impl LiveApp {
             Action::Singleplayer => self.start_local(),
             Action::Multiplayer => {
                 self.address_input.clear();
-                self.screen = Screen::Connect;
+                self.servers_scroll = 0;
+                self.screen = Screen::Servers;
+            }
+            Action::ServersSubmit => self.connect_from_input(),
+            Action::ServersBack => self.screen = Screen::Title,
+            Action::ServerJoin(index) => self.join_server(index),
+            Action::ServerFavourite(index) => {
+                self.servers.toggle_favourite(index);
+                self.save_servers();
+            }
+            Action::ServerRemove(index) => {
+                self.servers.remove(index);
+                self.save_servers();
+                self.servers_scroll = self.servers_scroll.min(self.servers_max_scroll());
             }
             Action::TitleOptions => {
                 self.settings_return = Screen::Title;
@@ -1576,8 +1653,10 @@ impl ApplicationHandler for LiveApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // The connect screen is a text field.
-                if self.screen == Screen::Connect && event.state == ElementState::Pressed {
+                // The multiplayer and direct-connect screens share one text field.
+                if matches!(self.screen, Screen::Servers | Screen::Connect)
+                    && event.state == ElementState::Pressed
+                {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::Enter) => {
                             self.connect_from_input();
@@ -1609,6 +1688,7 @@ impl ApplicationHandler for LiveApp {
                             Screen::Pause | Screen::Creative => self.enter_game(),
                             Screen::Settings => self.screen = self.settings_return,
                             Screen::Title => {}
+                            Screen::Servers => self.screen = Screen::Title,
                             Screen::Connect => self.screen = Screen::Title,
                         },
                         (KeyCode::KeyE, ElementState::Pressed) => match self.screen {
@@ -1619,7 +1699,11 @@ impl ApplicationHandler for LiveApp {
                                 }
                             }
                             Screen::Creative => self.enter_game(),
-                            Screen::Pause | Screen::Settings | Screen::Title | Screen::Connect => {}
+                            Screen::Pause
+                            | Screen::Settings
+                            | Screen::Title
+                            | Screen::Servers
+                            | Screen::Connect => {}
                         },
                         (KeyCode::KeyF, ElementState::Pressed) if self.screen == Screen::Game => {
                             let mut state = self.shared.lock().unwrap();
@@ -1674,6 +1758,15 @@ impl ApplicationHandler for LiveApp {
                         shared.use_pressed = true;
                     }
                     _ => {}
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.screen == Screen::Servers => {
+                let steps = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                    MouseScrollDelta::PixelDelta(position) => (position.y / 40.0).round() as i32,
+                };
+                if steps != 0 {
+                    self.scroll_servers(steps);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } if self.screen == Screen::Game => {

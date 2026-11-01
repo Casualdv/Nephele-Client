@@ -9,6 +9,7 @@
 
 use std::sync::OnceLock;
 
+use crate::servers::ServerList;
 use crate::settings::{SettingId, Settings};
 use nephele_assets::{face_textures, font, sprites, TextureArray, MISSING_TEXTURE};
 use nephele_protocol::packets::play::{ItemStack, HOTBAR_FIRST_SLOT, HOTBAR_SLOTS};
@@ -22,11 +23,18 @@ const BUTTON_BORDER: [f32; 4] = [0.05, 0.05, 0.05, 1.0];
 const PANEL: [f32; 4] = [0.16, 0.16, 0.16, 0.96];
 const SLOT_BG: [f32; 4] = [0.35, 0.35, 0.35, 1.0];
 const SLOT_HOVER: [f32; 4] = [0.55, 0.55, 0.55, 1.0];
+const ROW: [f32; 4] = [0.18, 0.18, 0.18, 1.0];
+const ROW_ALT: [f32; 4] = [0.15, 0.15, 0.15, 1.0];
+const ROW_HOVER: [f32; 4] = [0.30, 0.30, 0.30, 1.0];
+const STAR: [f32; 4] = [1.0, 0.85, 0.25, 1.0];
+const REMOVE_HOVER: [f32; 4] = [1.0, 0.4, 0.4, 1.0];
 
 /// Which screen is on top of the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Title,
+    /// The saved-server list and its address field.
+    Servers,
     Connect,
     Game,
     Pause,
@@ -41,6 +49,13 @@ pub enum Action {
     Multiplayer,
     TitleOptions,
     Quit,
+    /// Join the address typed into the multiplayer screen's field.
+    ServersSubmit,
+    ServersBack,
+    /// Join a saved entry, by storage index.
+    ServerJoin(usize),
+    ServerFavourite(usize),
+    ServerRemove(usize),
     ConnectSubmit,
     ConnectCancel,
     Resume,
@@ -767,6 +782,225 @@ pub fn draw_connect(
     ]
 }
 
+/// How many saved servers fit in the list before it needs scrolling.
+pub const SERVER_ROWS: usize = 5;
+
+/// The multiplayer screen: the saved server list, an address field and the
+/// Join / Back buttons.
+///
+/// The address field is the same widget `draw_connect` draws and feeds the same
+/// buffer, so both screens share one piece of input handling.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_servers(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    list: &ServerList,
+    address: &str,
+    scroll: usize,
+    pointer: Option<[f32; 2]>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Vec<Button> {
+    let s = |v: f32| v * scale;
+    let cx = width / 2.0;
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.08, 0.08, 0.08, 1.0]);
+
+    let row_h = s(22.0);
+    let list_h = s(4.0) + row_h * SERVER_ROWS as f32 + s(4.0);
+    // Heading, list, field, buttons and hint, stacked and centred as one block
+    // so a 5-row list still fits a 240 px-tall GUI.
+    let block_h =
+        s(12.0) + s(8.0) + list_h + s(12.0) + s(20.0) + s(8.0) + s(20.0) + s(8.0) + s(8.0);
+    let top = ((height - block_h) / 2.0).max(s(2.0));
+    let panel_w = s(320.0).min(width - s(8.0));
+    let panel_x = cx - panel_w / 2.0;
+
+    fg.text_centered("Play Multiplayer", cx, top, scale * 1.5, TEXT);
+
+    let order = list.ordered_indices();
+    if order.len() > SERVER_ROWS {
+        let label = format!("1-{} of {}", scroll + SERVER_ROWS, order.len());
+        let label_w = UiBatch::text_width(&label, scale);
+        fg.text(
+            &label,
+            panel_x + panel_w - label_w,
+            top + s(4.0),
+            scale,
+            TEXT_DIM,
+        );
+    }
+
+    let list_rect = Rect::new(panel_x, top + s(20.0), panel_w, list_h);
+    bg.rect(list_rect, PANEL);
+    bg.rect_outline(list_rect, scale.max(1.0), BUTTON_BORDER);
+
+    let visible = order.len().saturating_sub(scroll).min(SERVER_ROWS);
+    if order.is_empty() {
+        fg.text_centered(
+            "No servers saved yet",
+            cx,
+            list_rect.y + list_h / 2.0 - s(4.0),
+            scale,
+            TEXT_DIM,
+        );
+    }
+
+    let mut buttons = Vec::new();
+    for slot in 0..visible {
+        let Some(&index) = order.get(scroll + slot) else {
+            continue;
+        };
+        let Some(entry) = list.entries().get(index) else {
+            continue;
+        };
+
+        let row = Rect::new(
+            list_rect.x + s(2.0),
+            list_rect.y + s(4.0) + slot as f32 * row_h,
+            panel_w - s(4.0),
+            row_h - s(1.0),
+        );
+        let is_hovered = hovered(pointer, &row);
+        bg.rect(
+            row,
+            if is_hovered {
+                ROW_HOVER
+            } else if slot % 2 == 0 {
+                ROW
+            } else {
+                ROW_ALT
+            },
+        );
+        // The whole row joins; the small buttons below are hit-tested first
+        // because `hit_test` keeps the last match.
+        buttons.push(Button {
+            action: Action::ServerJoin(index),
+            rect: row,
+        });
+
+        let star = Rect::new(row.x + s(2.0), row.y + s(3.0), s(10.0), s(16.0));
+        fg.text_centered(
+            "*",
+            star.x + star.w / 2.0,
+            star.y + s(4.0),
+            scale,
+            if entry.favourite { STAR } else { TEXT_DIM },
+        );
+        buttons.push(Button {
+            action: Action::ServerFavourite(index),
+            rect: star,
+        });
+
+        let remove = Rect::new(row.x + row.w - s(13.0), row.y + s(3.0), s(11.0), s(16.0));
+        fg.text_centered(
+            "x",
+            remove.x + remove.w / 2.0,
+            remove.y + s(4.0),
+            scale,
+            if hovered(pointer, &remove) {
+                REMOVE_HOVER
+            } else {
+                TEXT_DIM
+            },
+        );
+        buttons.push(Button {
+            action: Action::ServerRemove(index),
+            rect: remove,
+        });
+
+        let text_x = row.x + s(15.0);
+        let text_w = row.w - s(31.0);
+        fg.text(
+            &fit_text(entry.label(), text_w, scale),
+            text_x,
+            row.y + s(2.0),
+            scale,
+            TEXT,
+        );
+        fg.text(
+            &fit_text(&entry.address, text_w, scale),
+            text_x,
+            row.y + s(11.0),
+            scale,
+            TEXT_DIM,
+        );
+    }
+
+    let field = Rect::new(panel_x, list_rect.y + list_h + s(12.0), panel_w, s(20.0));
+    bg.rect(field, [0.0, 0.0, 0.0, 0.75]);
+    bg.rect_outline(field, scale.max(1.0), BUTTON_BORDER);
+    let text = if address.is_empty() {
+        "Server address".to_string()
+    } else {
+        address.to_string()
+    };
+    let colour = if address.is_empty() { TEXT_DIM } else { TEXT };
+    fg.text(
+        &fit_text(&text, field.w - s(8.0), scale),
+        field.x + s(4.0),
+        field.y + s(6.0),
+        scale,
+        colour,
+    );
+
+    let button_w = (panel_w - s(6.0)) / 2.0;
+    let button_y = field.y + field.h + s(8.0);
+    let join = Rect::new(panel_x, button_y, button_w, s(20.0));
+    let back = Rect::new(panel_x + button_w + s(6.0), button_y, button_w, s(20.0));
+    let can_join = !address.trim().is_empty();
+    draw_button(
+        bg,
+        fg,
+        join,
+        "Join Server",
+        scale,
+        can_join && hovered(pointer, &join),
+    );
+    draw_button(bg, fg, back, "Back", scale, hovered(pointer, &back));
+    if can_join {
+        buttons.push(Button {
+            action: Action::ServersSubmit,
+            rect: join,
+        });
+    }
+    buttons.push(Button {
+        action: Action::ServersBack,
+        rect: back,
+    });
+
+    fg.text_centered(
+        "Click a server to join it.  * favourite, x remove.  Esc goes back.",
+        cx,
+        button_y + s(28.0),
+        scale,
+        TEXT_DIM,
+    );
+
+    buttons
+}
+
+/// Trim `text` with a trailing `...` until it fits `max_width`.
+fn fit_text(text: &str, max_width: f32, scale: f32) -> String {
+    if UiBatch::text_width(text, scale) <= max_width {
+        return text.to_owned();
+    }
+    const ELLIPSIS: &str = "...";
+    let budget = (max_width - UiBatch::text_width(ELLIPSIS, scale)).max(0.0);
+    let mut out = String::new();
+    let mut width = 0.0;
+    for ch in text.chars() {
+        let advance = font::advance(ch) * scale;
+        if width + advance > budget {
+            break;
+        }
+        out.push(ch);
+        width += advance;
+    }
+    out.push_str(ELLIPSIS);
+    out
+}
+
 /// Topmost button under the pointer.
 pub fn hit_test(buttons: &[Button], pointer: [f32; 2]) -> Option<Action> {
     buttons
@@ -779,6 +1013,7 @@ pub fn hit_test(buttons: &[Button], pointer: [f32; 2]) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::servers::ServerEntry;
 
     #[test]
     fn gui_scale_is_integral_and_bounded() {
@@ -878,5 +1113,134 @@ mod tests {
         assert_eq!(hit_test(&buttons, [15.0, 15.0]), Some(Action::Disconnect));
         assert_eq!(hit_test(&buttons, [45.0, 45.0]), Some(Action::Resume));
         assert_eq!(hit_test(&buttons, [200.0, 200.0]), None);
+    }
+
+    fn server_screen(list: &ServerList, address: &str, scroll: usize) -> Vec<Button> {
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        draw_servers(
+            &mut bg, &mut fg, list, address, scroll, None, 2.0, 1280.0, 720.0,
+        )
+    }
+
+    fn three_servers() -> ServerList {
+        let mut list = ServerList::default();
+        list.add(ServerEntry::new("one", "1.example.net"));
+        list.add(ServerEntry::new("two", "2.example.net"));
+        list.add(ServerEntry::new("three", "3.example.net"));
+        list
+    }
+
+    fn rect_of(buttons: &[Button], action: Action) -> Rect {
+        buttons
+            .iter()
+            .find(|button| button.action == action)
+            .map(|button| button.rect)
+            .unwrap_or_else(|| panic!("{action:?} was not drawn"))
+    }
+
+    #[test]
+    fn the_server_screen_needs_an_address_before_it_can_join() {
+        let list = three_servers();
+        let buttons = server_screen(&list, "  ", 0);
+        assert!(!buttons.iter().any(|b| b.action == Action::ServersSubmit));
+        assert!(buttons.iter().any(|b| b.action == Action::ServersBack));
+
+        let buttons = server_screen(&list, "play.example.net", 0);
+        assert!(buttons.iter().any(|b| b.action == Action::ServersSubmit));
+    }
+
+    #[test]
+    fn every_saved_server_gets_a_row_that_acts_on_its_storage_index() {
+        let list = three_servers();
+        let buttons = server_screen(&list, "", 0);
+        for index in 0..3 {
+            rect_of(&buttons, Action::ServerJoin(index));
+            rect_of(&buttons, Action::ServerFavourite(index));
+            rect_of(&buttons, Action::ServerRemove(index));
+        }
+        assert!(!buttons.iter().any(|b| b.action == Action::ServerJoin(3)));
+    }
+
+    #[test]
+    fn favourites_are_drawn_above_the_other_servers() {
+        let mut list = three_servers();
+        list.toggle_favourite(2);
+        let buttons = server_screen(&list, "", 0);
+        assert!(
+            rect_of(&buttons, Action::ServerJoin(2)).y < rect_of(&buttons, Action::ServerJoin(0)).y
+        );
+    }
+
+    /// The small controls must win the hit test against the row behind them.
+    #[test]
+    fn the_star_and_remove_buttons_beat_the_row_itself() {
+        let list = three_servers();
+        let buttons = server_screen(&list, "", 0);
+        let star = rect_of(&buttons, Action::ServerFavourite(0));
+        let remove = rect_of(&buttons, Action::ServerRemove(0));
+        assert_eq!(
+            hit_test(&buttons, [star.x + 1.0, star.y + 1.0]),
+            Some(Action::ServerFavourite(0))
+        );
+        assert_eq!(
+            hit_test(&buttons, [remove.x + 1.0, remove.y + 1.0]),
+            Some(Action::ServerRemove(0))
+        );
+        let row = rect_of(&buttons, Action::ServerJoin(0));
+        assert_eq!(
+            hit_test(&buttons, [row.x + row.w / 2.0, row.y + row.h / 2.0]),
+            Some(Action::ServerJoin(0))
+        );
+    }
+
+    #[test]
+    fn the_list_shows_one_page_and_scrolls_to_the_rest() {
+        let mut list = ServerList::default();
+        for index in 0..SERVER_ROWS + 2 {
+            list.add(ServerEntry::new(
+                &format!("server {index}"),
+                &format!("{index}.example.net"),
+            ));
+        }
+
+        let first = server_screen(&list, "", 0);
+        let rows: Vec<Rect> = (0..SERVER_ROWS)
+            .map(|index| rect_of(&first, Action::ServerJoin(index)))
+            .collect();
+        assert_eq!(rows.len(), SERVER_ROWS);
+        assert!(!first
+            .iter()
+            .any(|b| b.action == Action::ServerJoin(SERVER_ROWS)));
+
+        let last = server_screen(&list, "", 2);
+        rect_of(&last, Action::ServerJoin(SERVER_ROWS + 1));
+        assert!(!last.iter().any(|b| b.action == Action::ServerJoin(1)));
+    }
+
+    #[test]
+    fn rows_and_bottom_controls_do_not_overlap() {
+        let list = three_servers();
+        let buttons = server_screen(&list, "address", 0);
+        let mut rows: Vec<Rect> = (0..3)
+            .map(|index| rect_of(&buttons, Action::ServerJoin(index)))
+            .collect();
+        rows.sort_by(|a, b| a.y.total_cmp(&b.y));
+        for pair in rows.windows(2) {
+            assert!(pair[0].y + pair[0].h <= pair[1].y);
+        }
+        let join = rect_of(&buttons, Action::ServersSubmit);
+        let back = rect_of(&buttons, Action::ServersBack);
+        assert!(rows.last().unwrap().y + rows.last().unwrap().h <= join.y);
+        assert!(join.x + join.w <= back.x);
+    }
+
+    #[test]
+    fn long_labels_are_trimmed_to_fit() {
+        let label = "a-very-long-server-name-that-will-not-fit-in-the-row";
+        let fitted = fit_text(label, 100.0, 2.0);
+        assert!(fitted.ends_with("..."));
+        assert!(UiBatch::text_width(&fitted, 2.0) <= 100.0);
+        assert_eq!(fit_text("short", 100.0, 2.0), "short");
     }
 }
