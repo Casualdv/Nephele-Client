@@ -327,7 +327,9 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
                         .map(|face| face.normal())
                         .unwrap_or([0, 1, 0]);
                     let (bx, by, bz) = (aim.x + normal[0], aim.y + normal[1], aim.z + normal[2]);
-                    if world.get_block(bx, by, bz).is_air() {
+                    if world.get_block(bx, by, bz).is_air()
+                        && !placement_hits_player(&aim, [position.x, position.y, position.z])
+                    {
                         world.set_block(bx, by, bz, BlockState::from_raw(state_block));
                         dirty.insert((bx.div_euclid(16), bz.div_euclid(16)));
                     }

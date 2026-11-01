@@ -139,8 +139,10 @@ impl Miner {
             events.push(MiningEvent::Stop(aim));
             self.current = None;
             self.progress = 0.0;
-            // Creative has no cooldown: the whole point is chaining blocks.
-            self.hit_delay = if creative { 0 } else { HIT_DELAY_TICKS };
+            // Vanilla's `blockHitDelay`: without it a single click that spans
+            // two ticks clears two blocks, and holding the button would mine
+            // twenty blocks a second.
+            self.hit_delay = HIT_DELAY_TICKS;
             if creative {
                 self.pending = Some(aim.pos());
                 self.pending_ticks = PENDING_TICKS;
@@ -310,10 +312,18 @@ mod tests {
     }
 
     #[test]
-    fn creative_chains_straight_onto_the_next_block() {
+    fn creative_chains_onto_the_next_block_after_the_hit_delay() {
         let world = two_blocks(BlockState::STONE);
         let mut miner = Miner::default();
         assert_eq!(miner.tick(&world, Some(aim()), true, true).len(), 2);
+
+        // Vanilla's `blockHitDelay` keeps the next block from being hit on the
+        // same click; it lasts HIT_DELAY_TICKS ticks.
+        for _ in 0..HIT_DELAY_TICKS {
+            assert!(miner
+                .tick(&world, Some(next_to_aim()), true, true)
+                .is_empty());
+        }
         assert_eq!(
             miner.tick(&world, Some(next_to_aim()), true, true),
             vec![
@@ -321,6 +331,18 @@ mod tests {
                 MiningEvent::Stop(next_to_aim())
             ]
         );
+    }
+
+    #[test]
+    fn one_click_breaks_one_block_even_if_it_spans_several_ticks() {
+        let world = two_blocks(BlockState::STONE);
+        let mut miner = Miner::default();
+        // The click is held for four ticks, as a normal one is.
+        let mut broken = 0;
+        for _ in 0..4 {
+            broken += miner.tick(&world, Some(aim()), true, true).len() / 2;
+        }
+        assert_eq!(broken, 1, "a single click must not clear two blocks");
     }
 
     #[test]
@@ -338,7 +360,8 @@ mod tests {
         let world = world_with(BlockState::STONE);
         let mut miner = Miner::default();
         assert_eq!(miner.tick(&world, Some(aim()), true, true).len(), 2);
-        for _ in 0..PENDING_TICKS {
+        // The pending window and then the hit delay both have to run out.
+        for _ in 0..(PENDING_TICKS + HIT_DELAY_TICKS) {
             miner.tick(&world, Some(aim()), true, true);
         }
         assert_eq!(

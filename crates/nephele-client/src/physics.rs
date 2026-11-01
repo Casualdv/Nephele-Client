@@ -396,6 +396,28 @@ mod tests {
         world
     }
 
+    /// A player resting on the floor must not creep upward. The unstick
+    /// routine that lifts a player out of terrain must not mistake "standing
+    /// exactly on a block" for "buried in one".
+    #[test]
+    fn resting_on_the_floor_does_not_drift_upward() {
+        let world = flat_world(9);
+        let mut player = PlayerState::at(0.5, 12.0, 0.5);
+        let idle = Input::default();
+        run_ticks(&mut player, &idle, 120, &world);
+
+        let settled = player.y;
+        let mut highest = settled;
+        for _ in 0..200 {
+            player.step(0.05, &idle, 0.0, &world);
+            highest = highest.max(player.y);
+        }
+        assert!(
+            highest - settled < 1e-6,
+            "the player drifted upward from {settled} to {highest}"
+        );
+        assert!((settled - 10.0).abs() < 0.01, "settled at {settled}");
+    }
     #[test]
     fn sneaking_keeps_you_on_the_edge() {
         let world = pillar();
