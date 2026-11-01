@@ -559,6 +559,30 @@ impl GameClient {
                     name: String::new(),
                 })
             }
+            play::clientbound::SPAWN_OBJECT => {
+                let object = play::parse_spawn_object(&packet)?;
+                if object.kind != play::OBJECT_TYPE_ITEM {
+                    // Arrows, falling blocks, boats, ... are not drawn yet, but
+                    // parsing them keeps the packet stream understood.
+                    return Ok(Event::Packet(packet.id));
+                }
+                let (item, meta) = play::item_from_object_data(object.data);
+                self.entities.spawn_item(
+                    object.entity_id,
+                    item,
+                    meta,
+                    [object.x, object.y, object.z],
+                );
+                Ok(Event::EntitySpawned {
+                    entity_id: object.entity_id,
+                    name: String::new(),
+                })
+            }
+            play::clientbound::COLLECT_ITEM => {
+                let collect = play::parse_collect_item(&packet)?;
+                self.entities.remove(collect.collected);
+                Ok(Event::EntitiesRemoved(1))
+            }
             play::clientbound::ENTITY_RELATIVE_MOVE => {
                 let update = play::parse_entity_relative_move(&packet)?;
                 self.entities

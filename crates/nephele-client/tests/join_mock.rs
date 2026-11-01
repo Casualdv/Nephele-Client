@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use nephele_client::GameClient;
+use nephele_client::{Aim, EntityKind, GameClient};
 use nephele_mock::{MockConfig, MockServer};
 use nephele_protocol::{ping, ServerAddress};
 
@@ -124,4 +124,93 @@ async fn status_ping_reports_protocol_47() {
     assert_eq!(status.protocol, Some(47));
     assert_eq!(status.version_name.as_deref(), Some("1.8.9"));
     assert!(status.description.contains("Nephele mock server"));
+}
+
+/// The whole survival drop chain against a real socket: break a block, watch
+/// the item entity arrive, then watch it be collected into the hotbar.
+#[tokio::test]
+async fn a_broken_block_drops_an_item_that_is_picked_up() {
+    let server = MockServer::start(MockConfig {
+        radius: 1,
+        greeting: false,
+        survival: true,
+        ..MockConfig::default()
+    })
+    .await
+    .unwrap();
+    let address = address_of(&server);
+
+    let mut client = GameClient::join(&address, "Digger").await.unwrap();
+    client
+        .pump(Duration::from_millis(800), Duration::from_millis(50))
+        .await
+        .unwrap();
+    assert!(client.spawned, "the server positions us on join");
+
+    // Break the block we are standing on. A single digging packet is all the
+    // mock needs; it is the same packet the survival miner sends when a block
+    // finishes.
+    let x = client.position.x.floor() as i32;
+    let z = client.position.z.floor() as i32;
+    let y = client.position.y.floor() as i32 - 1;
+    let block = client.world.get_block(x, y, z);
+    assert!(!block.is_air(), "expected ground under the spawn");
+    let aim = Aim {
+        x,
+        y,
+        z,
+        face: 1,
+        cursor: [0.5, 1.0, 0.5],
+    };
+    client
+        .dig(
+            nephele_protocol::packets::play::digging::STOP_DESTROY_BLOCK,
+            &aim,
+        )
+        .await
+        .unwrap();
+
+    // The drop is an item entity at the broken block.
+    let mut saw_item = false;
+    for _ in 0..30 {
+        client
+            .pump(Duration::from_millis(100), Duration::from_millis(20))
+            .await
+            .unwrap();
+        if client.entities.iter().any(|entity| {
+            matches!(
+                entity.kind,
+                EntityKind::Item { id, .. } if id == block.id() as i16
+            )
+        }) {
+            saw_item = true;
+            break;
+        }
+    }
+    assert!(saw_item, "no item entity was spawned for {block:?}");
+
+    // A second later the mock collects it and puts it in the first hotbar slot.
+    for _ in 0..40 {
+        client
+            .pump(Duration::from_millis(100), Duration::from_millis(20))
+            .await
+            .unwrap();
+        if client.inventory[nephele_protocol::packets::play::HOTBAR_FIRST_SLOT].is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        client.inventory[nephele_protocol::packets::play::HOTBAR_FIRST_SLOT].map(|item| item.id),
+        Some(block.id() as i16),
+        "the pickup should land in the held hotbar slot"
+    );
+    assert!(
+        !client
+            .entities
+            .iter()
+            .any(|entity| matches!(entity.kind, EntityKind::Item { .. })),
+        "the collected entity should have been removed"
+    );
+
+    client.disconnect().await;
 }

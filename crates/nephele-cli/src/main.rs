@@ -92,6 +92,9 @@ enum Command {
         /// Spawn fake walking players, for testing entity rendering
         #[arg(long)]
         bots: bool,
+        /// Join as survival: mining timing, drops and pickups are exercised
+        #[arg(long)]
+        survival: bool,
     },
     /// Join a server and play it in a window (offline mode, WASD + right-drag).
     Play {
@@ -363,7 +366,8 @@ async fn run_command(command: Command) -> Result<()> {
             radius,
             no_compression,
             bots,
-        } => run_mock_server(port, radius, no_compression, bots).await,
+            survival,
+        } => run_mock_server(port, radius, no_compression, bots, survival).await,
     }
 }
 
@@ -701,12 +705,19 @@ async fn run_join(
     Ok(())
 }
 
-async fn run_mock_server(port: u16, radius: i32, no_compression: bool, bots: bool) -> Result<()> {
+async fn run_mock_server(
+    port: u16,
+    radius: i32,
+    no_compression: bool,
+    bots: bool,
+    survival: bool,
+) -> Result<()> {
     let config = MockConfig {
         radius,
         compression_threshold: if no_compression { None } else { Some(64) },
         greeting: true,
         bots,
+        survival,
     };
     let server = MockServer::start_on(port, config).await?;
     println!("Nephele mock server listening on {}", server.address());

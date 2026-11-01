@@ -38,6 +38,9 @@ pub struct MockConfig {
     /// Spawn fake walking players around the spawn point, so entity tracking,
     /// interpolation and the humanoid renderer can be exercised offline.
     pub bots: bool,
+    /// Join as survival instead of creative, so mining timing and drops are
+    /// exercised instead of the creative one-click path.
+    pub survival: bool,
 }
 
 impl Default for MockConfig {
@@ -47,6 +50,7 @@ impl Default for MockConfig {
             compression_threshold: Some(64),
             greeting: true,
             bots: false,
+            survival: false,
         }
     }
 }
@@ -193,17 +197,17 @@ async fn serve_login(connection: &mut Connection, config: Arc<MockConfig>) -> Re
     for column in columns {
         world.insert(column);
     }
-    play_loop(connection, &username, &mut world, config.bots).await
+    play_loop(connection, &username, &mut world, &config).await
 }
 
 async fn send_join_sequence(
     connection: &mut Connection,
     config: &MockConfig,
 ) -> Result<Vec<nephele_world::ChunkColumn>> {
-    // Join Game (creative, overworld, survival difficulty, 20 slots)
+    // Join Game (creative or survival, overworld, survival difficulty, 20 slots)
     let mut w = PacketWriter::new();
     w.write_i32(1)
-        .write_u8(1)
+        .write_u8(if config.survival { 0 } else { 1 })
         .write_i8(0)
         .write_u8(1)
         .write_u8(20)
@@ -497,13 +501,76 @@ async fn send_block_change(
         .await
 }
 
+/// The mock always gives the player entity id 1 (see the Join Game packet).
+const PLAYER_ENTITY_ID: i32 = 1;
+/// Player container slots: crafting and armour, then storage, then the hotbar.
+const PLAY_CONTAINER_SLOTS: usize = play::PLAYER_CONTAINER_SLOTS;
+/// A dropped item is picked up this long after the block breaks.
+const PICKUP_DELAY: Duration = Duration::from_millis(1000);
+
+struct PendingPickup {
+    due: tokio::time::Instant,
+    entity_id: i32,
+    item: play::ItemStack,
+}
+
+/// First empty hotbar slot, then storage, then the crafting/armour slots — so
+/// a pickup shows up in the player's hand rather than somewhere invisible.
+fn first_free_slot(inventory: &[Option<play::ItemStack>; PLAY_CONTAINER_SLOTS]) -> Option<usize> {
+    (play::HOTBAR_FIRST_SLOT..PLAY_CONTAINER_SLOTS)
+        .chain(9..PLAY_CONTAINER_SLOTS - play::HOTBAR_SLOTS)
+        .chain(0..9)
+        .find(|&slot| inventory[slot].is_none())
+}
+
+/// Drop `block` as an item entity where it was broken, and schedule its pickup.
+///
+/// Real servers pop the drop out with a little velocity and let gravity settle
+/// it; the mock puts it straight on the ground, which is enough to exercise the
+/// client's spawn, interpolation, render and collect paths.
+async fn send_drop(
+    connection: &mut Connection,
+    entity_id: i32,
+    block: BlockState,
+    x: i32,
+    y: i32,
+    z: i32,
+    pending: &mut std::collections::VecDeque<PendingPickup>,
+) -> Result<()> {
+    let item = play::ItemStack::new(block.id() as i16, 1, block.meta() as i16);
+    connection
+        .write_packet(&play::spawn_object(
+            entity_id,
+            play::OBJECT_TYPE_ITEM,
+            [x as f64 + 0.5, y as f64, z as f64 + 0.5],
+            0.0,
+            0.0,
+            play::item_object_data(item.id, item.damage),
+            [0.0; 3],
+        ))
+        .await?;
+    pending.push_back(PendingPickup {
+        due: tokio::time::Instant::now() + PICKUP_DELAY,
+        entity_id,
+        item,
+    });
+    Ok(())
+}
+
 async fn play_loop(
     connection: &mut Connection,
     username: &str,
     world: &mut World,
-    bots_enabled: bool,
+    config: &MockConfig,
 ) -> Result<()> {
     let bots = make_bots(0.0);
+    // Everything the player has collected, by container slot (36..45 is the
+    // hotbar). Pickups land here and are mirrored to the client as SET_SLOT.
+    let mut inventory: [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS] =
+        [None; PLAY_CONTAINER_SLOTS];
+    let mut next_drop_id: i32 = 1_000;
+    let mut picks_up_at: std::collections::VecDeque<PendingPickup> =
+        std::collections::VecDeque::new();
     let mut interval = tokio::time::interval(KEEP_ALIVE_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut keep_alive_id: i32 = 0;
@@ -511,6 +578,10 @@ async fn play_loop(
     let mut bot_ticker = tokio::time::interval(Duration::from_millis(50));
     bot_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut bot_tick: u64 = 0;
+    // Dropped items are picked up a moment after they spawn; a hundred
+    // milliseconds is plenty for a demo server.
+    let mut pickup_ticker = tokio::time::interval(Duration::from_millis(100));
+    pickup_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -522,7 +593,22 @@ async fn play_loop(
                     .write_packet(&Packet::new(play::clientbound::KEEP_ALIVE, w.into_bytes()))
                     .await?;
             }
-            _ = bot_ticker.tick(), if bots_enabled => {
+            _ = pickup_ticker.tick(), if !picks_up_at.is_empty() => {
+                let now = tokio::time::Instant::now();
+                while picks_up_at.front().is_some_and(|drop| drop.due <= now) {
+                    let drop = picks_up_at.pop_front().expect("front checked above");
+                    connection
+                        .write_packet(&play::collect_item(drop.entity_id, PLAYER_ENTITY_ID))
+                        .await?;
+                    if let Some(slot) = first_free_slot(&inventory) {
+                        inventory[slot] = Some(drop.item);
+                        connection
+                            .write_packet(&play::set_slot(0, slot as i16, Some(&drop.item)))
+                            .await?;
+                    }
+                }
+            }
+            _ = bot_ticker.tick(), if config.bots => {
                 send_bot_tick(connection, &bots, bot_tick).await?;
                 bot_tick = bot_tick.wrapping_add(1);
             }
@@ -543,8 +629,20 @@ async fn play_loop(
                             let breaks = status == play::digging::START_DESTROY_BLOCK
                                 || status == play::digging::STOP_DESTROY_BLOCK;
                             if breaks && !world.get_block(x, y, z).is_air() {
+                                let block = world.get_block(x, y, z);
                                 world.set_block(x, y, z, BlockState::AIR);
                                 send_block_change(connection, x, y, z, 0).await?;
+                                send_drop(
+                                    connection,
+                                    next_drop_id,
+                                    block,
+                                    x,
+                                    y,
+                                    z,
+                                    &mut picks_up_at,
+                                )
+                                .await?;
+                                next_drop_id += 1;
                             }
                         }
                         play::serverbound::PLAYER_BLOCK_PLACEMENT => {
@@ -639,6 +737,34 @@ mod tests {
         assert_ne!(a, fake_uuid("Other"));
         assert_eq!(a.len(), 36);
         assert_eq!(a.matches('-').count(), 4);
+    }
+
+    /// Pickups go to the hotbar first, so the player sees what they collected.
+    #[test]
+    fn a_pickup_lands_in_the_first_free_hotbar_slot() {
+        let mut inventory: [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS] =
+            [None; PLAY_CONTAINER_SLOTS];
+        assert_eq!(first_free_slot(&inventory), Some(play::HOTBAR_FIRST_SLOT));
+
+        for slot in inventory
+            .iter_mut()
+            .take(PLAY_CONTAINER_SLOTS)
+            .skip(play::HOTBAR_FIRST_SLOT)
+        {
+            *slot = Some(play::ItemStack::new(1, 1, 0));
+        }
+        // Hotbar full: storage starts at 9, not at 0.
+        assert_eq!(first_free_slot(&inventory), Some(9));
+
+        for slot in inventory.iter_mut().take(36).skip(9) {
+            *slot = Some(play::ItemStack::new(1, 1, 0));
+        }
+        assert_eq!(first_free_slot(&inventory), Some(0));
+
+        for slot in inventory.iter_mut().take(9) {
+            *slot = Some(play::ItemStack::new(1, 1, 0));
+        }
+        assert_eq!(first_free_slot(&inventory), None);
     }
 
     #[test]

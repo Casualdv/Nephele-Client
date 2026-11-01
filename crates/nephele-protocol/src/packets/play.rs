@@ -15,6 +15,10 @@ pub mod clientbound {
     pub const PLAYER_POSITION_AND_LOOK: i32 = 0x08;
     pub const HELD_ITEM_CHANGE: i32 = 0x09;
     pub const SPAWN_PLAYER: i32 = 0x0C;
+    /// An entity was picked up or absorbed by another one.
+    pub const COLLECT_ITEM: i32 = 0x0D;
+    /// A non-living object: dropped items, arrows, falling blocks, ...
+    pub const SPAWN_OBJECT: i32 = 0x0E;
     pub const SPAWN_MOB: i32 = 0x0F;
     pub const ENTITY_VELOCITY: i32 = 0x12;
     pub const DESTROY_ENTITIES: i32 = 0x13;
@@ -443,6 +447,15 @@ pub fn parse_set_slot(packet: &Packet) -> Result<SetSlot> {
     })
 }
 
+/// `S2F` written from the server side — the mock server uses it when a pickup
+/// lands in a slot.
+pub fn set_slot(window_id: i8, slot: i16, item: Option<&ItemStack>) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_i8(window_id).write_i16(slot);
+    write_slot(&mut w, item);
+    Packet::new(clientbound::SET_SLOT, w.into_bytes())
+}
+
 /// `S09 Held Item Change` — the server confirming which slot we're holding.
 pub fn parse_held_item_change(packet: &Packet) -> Result<i16> {
     packet.reader().read_i16()
@@ -542,6 +555,11 @@ pub const VELOCITY_SCALE: f64 = 1.0 / 8000.0;
 /// Entity angles are a full turn over 256 unsigned bytes.
 fn angle_from_byte(value: u8) -> f32 {
     value as f32 * (360.0 / 256.0)
+}
+
+/// The inverse of [`angle_from_byte`], truncating like vanilla's cast.
+fn angle_to_byte(degrees: f32) -> u8 {
+    (degrees.rem_euclid(360.0) * (256.0 / 360.0)) as u8
 }
 
 /// Shortest-path wrap used for head yaw and deltas.
@@ -761,6 +779,115 @@ pub fn parse_destroy_entities(packet: &Packet) -> Result<Vec<i32>> {
 /// client's own entity cache).
 pub fn parse_entity(packet: &Packet) -> Result<i32> {
     packet.reader().read_varint()
+}
+
+/// The object type used for a dropped item stack.
+pub const OBJECT_TYPE_ITEM: u8 = 2;
+
+/// `S0E`: a non-living object. Dropped items are the only kind the client
+/// tracks; the rest are parsed so the wire format stays honest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpawnObject {
+    pub entity_id: i32,
+    /// Type of object; [`OBJECT_TYPE_ITEM`] is a dropped stack.
+    pub kind: u8,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub pitch: f32,
+    pub yaw: f32,
+    /// Type-specific payload. For an item this is [`item_object_data`].
+    pub data: i32,
+    /// Blocks per tick, in vanilla's 1/8000 units.
+    pub velocity: [f64; 3],
+}
+
+pub fn parse_spawn_object(packet: &Packet) -> Result<SpawnObject> {
+    let mut r = packet.reader();
+    let entity_id = r.read_varint()?;
+    let kind = r.read_u8()?;
+    let x = read_fixed_point(&mut r)?;
+    let y = read_fixed_point(&mut r)?;
+    let z = read_fixed_point(&mut r)?;
+    let pitch = angle_from_byte(r.read_u8()?);
+    let yaw = angle_from_byte(r.read_u8()?);
+    let data = r.read_i32()?;
+    let vx = r.read_i16()? as f64 * VELOCITY_SCALE;
+    let vy = r.read_i16()? as f64 * VELOCITY_SCALE;
+    let vz = r.read_i16()? as f64 * VELOCITY_SCALE;
+    Ok(SpawnObject {
+        entity_id,
+        kind,
+        x,
+        y,
+        z,
+        pitch,
+        yaw,
+        data,
+        velocity: [vx, vy, vz],
+    })
+}
+
+/// Unpack an item object's `data`: the item id in the low half, metadata in
+/// the high half, both signed.
+pub fn item_from_object_data(data: i32) -> (i16, i16) {
+    (
+        (data & 0xFFFF) as u16 as i16,
+        ((data >> 16) & 0xFFFF) as u16 as i16,
+    )
+}
+
+/// The inverse of [`item_from_object_data`].
+pub fn item_object_data(item: i16, meta: i16) -> i32 {
+    i32::from(item as u16) | (i32::from(meta as u16) << 16)
+}
+
+/// `S0E` written from the server side — used by the mock server, and by the
+/// round-trip test that keeps the writer and the parser in step.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_object(
+    entity_id: i32,
+    kind: u8,
+    position: [f64; 3],
+    pitch: f32,
+    yaw: f32,
+    data: i32,
+    velocity: [f64; 3],
+) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_varint(entity_id).write_u8(kind);
+    for value in position {
+        w.write_i32((value * 32.0) as i32);
+    }
+    w.write_u8(angle_to_byte(pitch))
+        .write_u8(angle_to_byte(yaw));
+    w.write_i32(data);
+    for value in velocity {
+        w.write_i16((value / VELOCITY_SCALE) as i16);
+    }
+    Packet::new(clientbound::SPAWN_OBJECT, w.into_bytes())
+}
+
+/// `S0D`: `collected` was picked up by `collector`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectItem {
+    pub collected: i32,
+    pub collector: i32,
+}
+
+pub fn parse_collect_item(packet: &Packet) -> Result<CollectItem> {
+    let mut r = packet.reader();
+    Ok(CollectItem {
+        collected: r.read_varint()?,
+        collector: r.read_varint()?,
+    })
+}
+
+/// `S0D` from the server side.
+pub fn collect_item(collected: i32, collector: i32) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_varint(collected).write_varint(collector);
+    Packet::new(clientbound::COLLECT_ITEM, w.into_bytes())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1174,5 +1301,54 @@ mod entity_tests {
         assert_eq!(wrap_degrees(-350.0), 10.0);
         assert_eq!(wrap_degrees(190.0), -170.0);
         assert_eq!(wrap_degrees(10.0), 10.0);
+    }
+
+    /// The writer is the mock server's side of the same format, so a
+    /// round-trip is the only test that keeps the two in step.
+    #[test]
+    fn a_dropped_item_survives_a_round_trip() {
+        let packet = spawn_object(
+            7,
+            OBJECT_TYPE_ITEM,
+            [10.5, 64.0, -3.25],
+            0.0,
+            90.0,
+            item_object_data(17, 2),
+            [0.0, 0.1, 0.0],
+        );
+        let object = parse_spawn_object(&packet).expect("spawn object");
+        assert_eq!(object.entity_id, 7);
+        assert_eq!(object.kind, OBJECT_TYPE_ITEM);
+        assert_eq!(object.x, 10.5);
+        assert_eq!(object.y, 64.0);
+        assert_eq!(object.z, -3.25);
+        assert!((object.yaw - 90.0).abs() < 1.5);
+        assert_eq!(item_from_object_data(object.data), (17, 2));
+        assert!((object.velocity[1] - 0.1).abs() < 1e-3);
+    }
+
+    #[test]
+    fn item_object_data_packs_signed_halves() {
+        for (id, meta) in [(1i16, 0i16), (17, 3), (i16::MAX, i16::MIN)] {
+            assert_eq!(
+                item_from_object_data(item_object_data(id, meta)),
+                (id, meta)
+            );
+        }
+        // Item ids are positive in practice, but the low half is signed on the
+        // wire, so an empty-ish id must not bleed into the metadata half.
+        assert_eq!(item_object_data(0, 5), 0x0005_0000);
+    }
+
+    #[test]
+    fn a_collect_item_round_trips() {
+        let packet = collect_item(314, 1);
+        assert_eq!(
+            parse_collect_item(&packet).expect("collect"),
+            CollectItem {
+                collected: 314,
+                collector: 1
+            }
+        );
     }
 }

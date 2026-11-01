@@ -16,7 +16,7 @@ pub use entity::{build_entities, EntityDraw, EntityMesh, EntityVertex};
 pub use gpu::{DrawOutcome, Renderer, RendererError};
 pub use lines::{block_outline, LineMesh, LineVertex};
 pub use mesh::{
-    break_overlay_texture, build_break_overlay, build_column_mesh, build_world_mesh, mesh_column,
-    ColumnMeshJob, MeshData, Vertex,
+    break_overlay_texture, build_break_overlay, build_column_mesh, build_item_mesh,
+    build_world_mesh, mesh_column, ColumnMeshJob, ItemDraw, MeshData, Vertex,
 };
 pub use ui::{Rect, UiBatch, UiVertex};

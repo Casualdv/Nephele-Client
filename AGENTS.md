@@ -316,6 +316,21 @@ nothing writes there any more.
 non-full-cube shape. Fixing those needs a real per-state vertex-box model system —
 bigger than everything else in M1 combined.
 
+### Dropped items — done
+
+`build_item_mesh(&[ItemDraw], &TextureArray, time)` in `mesh.rs` builds a
+**0.25-block spinning, bobbing cube per stack** (reusing `FACES`, so the shading
+matches blocks). It is drawn by the *terrain* pipeline and texture array — not
+the entity pipeline, which is bound to the skin atlas — via
+`Renderer::set_items(&MeshData)` and one extra draw call after the chunks.
+
+- Block items use their own `[top, bottom, side]` textures.
+- Non-block items (sticks, tools) have no texture in the prepared asset set yet
+  and draw `MISSING_TEXTURE` — visible rather than invisible. The item atlas is
+  prepared (`textures/items`) but not uploaded to any texture array.
+- `ItemDraw.position` is the **feet** (block-bottom) position; the mesh adds
+  `ITEM_HOVER = 0.1` and centres the cube on the block centre.
+
 ### Smooth lighting — planned, not started
 
 Light **is** decoded: `Section` stores `block_light: Vec<u8>` and
@@ -346,6 +361,24 @@ and produced the "pushing me up" bug.
 **Physics** (`physics.rs`): sneak edge protection via `edge_clamped` + `has_ground`,
 per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards drift.
 
+**Items and drops** (M2, first slice):
+
+- `S0E Spawn Object` with `OBJECT_TYPE_ITEM = 2` becomes `EntityKind::Item { id, meta }`
+  in `Entities`; the item id/meta are packed in the object's `data`
+  (`item_object_data` / `item_from_object_data`). Other object types (arrows,
+  falling blocks) are parsed and ignored.
+- `S0D Collect Item` removes the collected entity. The inventory update arrives
+  separately as `S2F Set Slot` / `S30 Window Items`, which the client already
+  applied long before this slice — so pickup is **despawn + server-authoritative
+  inventory**, never a client-side guess.
+- The simulation is still 20 Hz: `step_player` is the only place physics runs.
+- The mock server drops the block it breaks, collects it a second later and puts
+  it in the first free hotbar slot, so the whole chain is testable without Java:
+  `cargo run -p nephele -- mock-server --survival`, and the integration test
+  `a_broken_block_drops_an_item_that_is_picked_up` in
+  `crates/nephele-client/tests/join_mock.rs`. `--survival` also joins as
+  game mode 0 so the survival mining path (not the creative one-click path) runs.
+
 ---
 
 ## 12. Milestones
@@ -354,7 +387,17 @@ M0 bootstrap → **M1 worldgen + renderer** → M2 survival loop → M3 multipla
 M4 PvP features → M5 performance → M6 release. Details in `Future.md`.
 
 **M1 remaining:** block shapes (cross-plants done; slabs/stairs/fences panes/torches
-not) and smooth lighting. Then M1 is closed.
+not) and smooth lighting. Then M1 is closed. **M1 has been deliberately parked** —
+M2 work goes ahead of it (2026-11-01 decision).
+
+**M2 in progress.** Already present before the first slice: the fixed 20 Hz tick
+with render interpolation, and the whole server-driven survival data path
+(`UPDATE_HEALTH` health/food/saturation, `EXPERIENCE`, `RESPAWN`, `SET_SLOT`,
+`WINDOW_ITEMS`). Done in the first slice: block drops → item entities → pickup →
+hotbar. **Still missing:** the survival inventory screen (only the creative
+palette exists), crafting and recipe matching, container windows
+(`OPEN_WINDOW`/`CLOSE_WINDOW`/`CLICK_WINDOW`/`CONFIRM_TRANSACTION` are not even in
+the protocol crate), a death screen, and eating.
 
 ---
 
@@ -414,9 +457,10 @@ not) and smooth lighting. Then M1 is closed.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **109 tests** in `nephele-world`; **375 across the workspace** (1 ignored);
-  13 in the server list (9 list + 4 ping board), plus 9 `ui` tests for the
-  multiplayer screen's buttons, columns and layout, and 3 for the paths module.
+- **109 tests** in `nephele-world`; **383 across the workspace** (1 ignored);
+  13 in the server list (9 list + 4 ping board), 9 `ui` tests for the multiplayer
+  screen, 3 for the paths module, and one real-socket integration test for the
+  whole drop → pickup → hotbar chain (`join_mock.rs`).
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
 
@@ -424,16 +468,19 @@ not) and smooth lighting. Then M1 is closed.
 
 ## 15. Next move
 
-1. ~~**Server list screen**~~ — done, and now with live pings. How it is wired is
-   in §5 ("The multiplayer screen"); the short version: saved list + async
-   ping/MOTD/version columns, select-then-join, Direct Connect, Refresh, and the
-   list persists to `servers.json` in the user data directory. Still missing from
-   it: **player counts** (`online`/`max` are in the ping response but `servers::Status`
-   drops them), a history list distinct from the saved list, and drag-to-reorder.
-2. **World creation screen** — smaller. `local_loop` already takes a seed and
+1. **M2: the survival inventory screen.** Vanilla layout (armour, 2×2 crafting,
+   27 storage, hotbar) with click / place / take, then recipe matching for
+   planks, sticks, the crafting table and a pickaxe — that is the milestone's own
+   exit criterion ("punch a tree and make a pickaxe"). Needs two packets that do
+   not exist yet: `C0E Click Window` and `S32 Confirm Transaction`. The data half
+   is already in place (see §11), so this is UI plus recipe matching.
+2. **Death screen + eating.** Small, and the other half of the survival loop.
+3. **World creation screen** — smaller. `local_loop` already takes a seed and
    `play --seed` already parses one; v1 creates but does not save (region writing is
    M2).
-3. Then smooth lighting, then slabs/stairs, closing M1.
+4. **M1 leftovers** (smooth lighting, block shapes) whenever rendering comes back
+   to the top of the queue; parked, not dropped. The server-list screen is done;
+   its remaining gaps (player counts, history, drag-to-reorder) are in Future.md §8.
 
 ---
 

@@ -17,6 +17,8 @@ pub enum EntityKind {
     Player { name: String, uuid: [u8; 16] },
     /// Any other mob, rendered as a plain box tinted by its type.
     Mob { kind: u8 },
+    /// A dropped item stack (`S0E` with object type 2).
+    Item { id: i16, meta: i16 },
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +208,21 @@ impl Entities {
             .insert(id, Entity::new(id, kind, position, yaw, pitch, self.tick));
     }
 
+    /// Track a dropped item (`S0E`, object type 2).
+    pub fn spawn_item(&mut self, id: i32, item: i16, meta: i16, position: [f64; 3]) {
+        self.map.insert(
+            id,
+            Entity::new(
+                id,
+                EntityKind::Item { id: item, meta },
+                position,
+                0.0,
+                0.0,
+                self.tick,
+            ),
+        );
+    }
+
     pub fn relative_move(&mut self, id: i32, dx: f64, dy: f64, dz: f64) {
         if let Some(entity) = self.map.get_mut(&id) {
             entity.move_to(dx, dy, dz);
@@ -281,6 +298,19 @@ impl Entities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dropped_item_is_tracked_like_any_other_entity() {
+        let mut entities = Entities::new();
+        entities.spawn_item(9, 17, 2, [1.0, 64.0, 2.0]);
+
+        let entity = entities.get(9).expect("item entity");
+        assert_eq!(entity.kind, EntityKind::Item { id: 17, meta: 2 });
+        assert_eq!(entity.position, [1.0, 64.0, 2.0]);
+
+        entities.relative_move(9, 1.0, 0.0, 0.0);
+        assert!((entities.get(9).unwrap().interpolated(0.5)[0] - 1.5).abs() < 1e-9);
+    }
 
     #[test]
     fn relative_moves_accumulate_and_interpolate() {

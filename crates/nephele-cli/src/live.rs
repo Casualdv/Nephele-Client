@@ -23,8 +23,8 @@ use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
 use nephele_render::{
-    block_outline, break_overlay_texture, build_break_overlay, build_entities, Camera,
-    ColumnMeshJob, EntityDraw, LineMesh, MeshData, Renderer, UiBatch,
+    block_outline, break_overlay_texture, build_break_overlay, build_entities, build_item_mesh,
+    Camera, ColumnMeshJob, EntityDraw, ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
 };
 use nephele_world::{raycast, ChunkColumn, ChunkCoord, World};
 use winit::application::ApplicationHandler;
@@ -97,6 +97,8 @@ struct EntitySnapshot {
     pitch: f32,
     /// Mob type, used to tint non-player entities.
     kind: u8,
+    /// Item id and metadata for a dropped stack, `None` for players and mobs.
+    item: Option<(i16, i16)>,
 }
 
 impl EntitySnapshot {
@@ -104,6 +106,11 @@ impl EntitySnapshot {
         let (player, uuid, kind) = match &entity.kind {
             nephele_client::EntityKind::Player { uuid, .. } => (true, *uuid, 0),
             nephele_client::EntityKind::Mob { kind } => (false, [0; 16], *kind),
+            nephele_client::EntityKind::Item { .. } => (false, [0; 16], 0),
+        };
+        let item = match entity.kind {
+            nephele_client::EntityKind::Item { id, meta } => Some((id, meta)),
+            _ => None,
         };
         Self {
             player,
@@ -116,6 +123,7 @@ impl EntitySnapshot {
             prev_head_yaw: entity.prev_head_yaw,
             pitch: entity.pitch,
             kind,
+            item,
         }
     }
 }
@@ -955,14 +963,27 @@ impl LiveApp {
     /// Positions come from the 20 Hz network tick and are blended by `alpha`, so
     /// other players move as smoothly as the local camera does.
     fn draw_entities(&mut self, alpha: f64) {
+        let Some(textures) = self.textures.as_ref() else {
+            return;
+        };
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
         let mut draws = Vec::with_capacity(self.entities.len());
+        let mut items = Vec::new();
         for entity in &self.entities {
             let x = entity.prev[0] + (entity.position[0] - entity.prev[0]) * alpha;
             let y = entity.prev[1] + (entity.position[1] - entity.prev[1]) * alpha;
             let z = entity.prev[2] + (entity.position[2] - entity.prev[2]) * alpha;
+
+            if let Some((item, meta)) = entity.item {
+                items.push(ItemDraw {
+                    position: [x as f32, y as f32, z as f32],
+                    item,
+                    meta,
+                });
+                continue;
+            }
 
             let slot = self
                 .skin_slots
@@ -986,6 +1007,7 @@ impl LiveApp {
             draws.push(draw);
         }
         renderer.set_entities(&build_entities(&draws));
+        renderer.set_items(&build_item_mesh(&items, textures, self.time));
     }
 
     fn drain_network(&mut self) {

@@ -24,6 +24,7 @@ talks protocol 47, and joins offline-mode servers.
 - Movement and interaction: vanilla travel physics, sprinting, mining, block
   placement, creative item palette, chat
 - Players: entity tracking, skins and skin loading, humanoid rendering
+- Items: block drops spawn as spinning item entities and are collected into the hotbar
 - UI: title, multiplayer (live ping, MOTD and version), direct connect, pause, settings
   and creative screens; HUD, hotbar, hearts
 

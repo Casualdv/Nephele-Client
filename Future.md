@@ -123,16 +123,15 @@ biome cells, **96%** of surface heights, **98.8%** of surface block types.
 
 ### 3. The tick loop, movement and physics
 
-**Architectural item first:** physics currently runs per render frame with a
-clamped `dt`. Vanilla is a fixed **20 ticks/second** simulation, and every
-constant below is expressed in ticks. Frame-rate-dependent physics means jump
-height and sprint timing drift with fps — exactly the thing PvP players notice.
-Move to a fixed-step accumulator (20 Hz) with render interpolation between
-ticks. **Size: M, do it before further movement work.**
+**Fixed tick: done.** Physics runs at a fixed **20 ticks/second** (`TICK = 50 ms`,
+`step_player`) from both the network and single-player loops, and the renderer
+interpolates between ticks with `alpha`. The earlier note here said physics ran
+per render frame — it no longer does. Keep new simulation work inside
+`step_player`, never in the render loop.
 
 | Item | Size | Notes |
 |---|---|---|
-| 20 Hz fixed tick + interpolation | M | Above. |
+| 20 Hz fixed tick + interpolation | **done** | `step_player`, `TICK`, `alpha` interpolation. |
 | Movement constants parity | S | Walk `0.1`, sprint `×1.3`, sneak `×0.3`, gravity `0.08/tick²`, drag `0.98`, ground friction `0.546`, air `0.91`, jump `0.42`, terminal `3.92`, width `0.6`, height `1.8` (sneak `1.65`), eye `1.62`, reach `4.5`/`5.0` |
 | Sprint rules: only forward, not while sneaking, cancels on hit | S | |
 | Sprint FOV modifier | S | |
@@ -151,8 +150,8 @@ ticks. **Size: M, do it before further movement work.**
 |---|---|---|
 | Mob models + walk animation (humanoid, quadruped, creeper, slime, squid, bat, chicken, spider, enderman) | **L** | Port from Leafish `entity/`. |
 | Entity metadata: equipment, nametags, invisibility, crouch, arm swing, health | M | |
-| Dropped items, XP orbs, arrows, fireworks, paintings, falling blocks | M | |
-| Item entities rendering with correct spin/bob | S | |
+| Dropped items, XP orbs, arrows, fireworks, paintings, falling blocks | M | **Block drops done**: `SPAWN_OBJECT`/`COLLECT_ITEM` tracked, rendered, collected into the hotbar. XP orbs, arrows and the rest are parsed but not drawn. |
+| Item entities rendering with correct spin/bob | **done** | `build_item_mesh`: a 0.25-block textured cube, spinning and bobbing. Non-block items draw the missing-texture tile until the item atlas exists. |
 | Slim (Alex) player model, capes | S | |
 | Player nametags above heads | S | |
 | Particles (block break, splash, smoke, flame, crit, portal) | M | Port from Leafish `particle/`. |
@@ -261,9 +260,10 @@ field, launcher, CI.
 lighting, block shapes. *Exit:* singleplayer world looks like Minecraft from
 above and from underground.
 
-**M2 — Survival loop.** Fixed 20 Hz tick, inventory + containers, crafting,
-hunger/XP, drops, death/respawn. *Exit:* you can punch a tree and make a
-pickaxe.
+**M2 — Survival loop.** Fixed 20 Hz tick (*done*), hunger/XP (*done, received
+from the server*), drops (*done: block drops, pickup, hotbar*), inventory +
+containers (*in progress — no survival inventory screen yet*), crafting, death
+screen. *Exit:* you can punch a tree and make a pickaxe.
 
 **M3 — Join a real server.** Microsoft auth (**done**, missing only a shippable
 Azure client id), server list (**done**), online-mode handshake (**done**),

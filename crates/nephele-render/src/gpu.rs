@@ -91,6 +91,12 @@ pub struct Renderer {
     entity_vertex_capacity: wgpu::BufferAddress,
     entity_index_capacity: wgpu::BufferAddress,
     entity_index_count: u32,
+    /// Dropped items, drawn with the terrain pipeline (same texture array).
+    item_vertices: wgpu::Buffer,
+    item_indices: wgpu::Buffer,
+    item_vertex_capacity: wgpu::BufferAddress,
+    item_index_capacity: wgpu::BufferAddress,
+    item_index_count: u32,
     panorama: Option<PanoramaGpu>,
     show_panorama: bool,
     /// Chunks that survived frustum culling in the last [`Renderer::draw`].
@@ -637,6 +643,21 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // Item buffers start small: a dropped stack is six quads.
+        let (item_vertex_capacity, item_index_capacity) = (1024, 1024);
+        let item_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("item vertices"),
+            size: item_vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let item_indices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("item indices"),
+            size: item_index_capacity,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let panorama = panorama.map(|panorama| {
             create_panorama(
                 &device,
@@ -685,6 +706,11 @@ impl Renderer {
             entity_vertex_capacity,
             entity_index_capacity,
             entity_index_count: 0,
+            item_vertices,
+            item_indices,
+            item_vertex_capacity,
+            item_index_capacity,
+            item_index_count: 0,
             panorama,
             show_panorama: false,
             drawn_chunks: 0,
@@ -842,6 +868,41 @@ impl Renderer {
 
     pub fn entity_index_count(&self) -> u32 {
         self.entity_index_count
+    }
+
+    /// Replace every dropped item's geometry. Like entities, the whole buffer
+    /// is rebuilt each frame — a handful of 24-vertex cubes is nothing.
+    pub fn set_items(&mut self, mesh: &MeshData) {
+        self.item_index_count = mesh.indices.len() as u32;
+        if mesh.vertices.is_empty() {
+            return;
+        }
+
+        let vertex_bytes = std::mem::size_of_val(mesh.vertices.as_slice()) as wgpu::BufferAddress;
+        if vertex_bytes > self.item_vertex_capacity {
+            self.item_vertex_capacity = allocate_size(vertex_bytes);
+            self.item_vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("item vertices"),
+                size: self.item_vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue
+            .write_buffer(&self.item_vertices, 0, bytemuck::cast_slice(&mesh.vertices));
+
+        let index_bytes = std::mem::size_of_val(mesh.indices.as_slice()) as wgpu::BufferAddress;
+        if index_bytes > self.item_index_capacity {
+            self.item_index_capacity = allocate_size(index_bytes);
+            self.item_indices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("item indices"),
+                size: self.item_index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue
+            .write_buffer(&self.item_indices, 0, bytemuck::cast_slice(&mesh.indices));
     }
 
     /// Upload the crack overlay drawn on the block being mined. Pass an empty
@@ -1022,6 +1083,16 @@ impl Renderer {
                     pass.draw_indexed(0..chunk.index_count, 0, 0..1);
                 }
                 self.drawn_chunks = visible.len();
+            }
+
+            // Dropped items are ordinary block-textured cubes, so they share
+            // the terrain pipeline and its texture array.
+            if self.item_index_count > 0 {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.item_vertices.slice(..));
+                pass.set_index_buffer(self.item_indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.item_index_count, 0, 0..1);
             }
 
             // Entities are depth-tested against the terrain but drawn after it,

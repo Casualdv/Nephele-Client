@@ -1,4 +1,4 @@
-use nephele_assets::{face_textures, is_transparent, TextureArray};
+use nephele_assets::{face_textures, is_transparent, TextureArray, MISSING_TEXTURE};
 use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World};
 
 #[repr(C)]
@@ -470,6 +470,79 @@ pub fn build_world_mesh(world: &World, atlas: &TextureArray) -> MeshData {
     mesh
 }
 
+/// One dropped item to draw this frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ItemDraw {
+    /// Feet position in world space, i.e. the block corner the item sits on.
+    pub position: [f32; 3],
+    /// Item id. Block items (1..255) use that block's textures.
+    pub item: i16,
+    pub meta: i16,
+}
+
+/// Edge length of a dropped item, in blocks. Vanilla's is 0.25 tip to tip.
+const ITEM_SIZE: f32 = 0.25;
+/// How far above the block below it an item rests.
+const ITEM_HOVER: f32 = 0.1;
+/// Amplitude of the idle bob.
+const ITEM_BOB: f32 = 0.04;
+
+/// Dropped items: a small spinning, bobbing cube per stack.
+///
+/// Block items get their real textures; anything else (sticks, tools) has no
+/// texture in the prepared asset set yet, so it draws as the missing-texture
+/// tile — visible rather than silently absent, the same content gap as card art
+/// on the other project.
+pub fn build_item_mesh(items: &[ItemDraw], atlas: &TextureArray, time: f32) -> MeshData {
+    let mut mesh = MeshData::default();
+    for item in items {
+        let state = BlockState::new(item.item.max(0) as u16, item.meta.clamp(0, 15) as u8);
+        let layers = match face_textures(state) {
+            Some(faces) => [
+                atlas.layer_or_missing(faces.top),
+                atlas.layer_or_missing(faces.bottom),
+                atlas.layer_or_missing(faces.side),
+            ],
+            None => [atlas.layer_or_missing(MISSING_TEXTURE); 3],
+        };
+
+        // A per-item phase so a pile of drops doesn't spin in lockstep.
+        let phase = item.position[0] * 1.7 + item.position[2] * 0.9;
+        let (sin, cos) = (time * 1.2 + phase).sin_cos();
+        let bob = (time * 2.0 + phase).sin() * ITEM_BOB;
+        let centre = [
+            item.position[0] + 0.5,
+            item.position[1] + ITEM_HOVER + ITEM_SIZE * 0.5 + bob,
+            item.position[2] + 0.5,
+        ];
+
+        for face in &FACES {
+            let base = mesh.vertices.len() as u32;
+            for (corner, uv) in face.corners.iter().zip(face.uvs.iter()) {
+                // Centre the cube on the origin, shrink it, then spin about Y.
+                let local = [
+                    (corner[0] - 0.5) * ITEM_SIZE,
+                    (corner[1] - 0.5) * ITEM_SIZE,
+                    (corner[2] - 0.5) * ITEM_SIZE,
+                ];
+                mesh.vertices.push(Vertex {
+                    position: [
+                        centre[0] + local[0] * cos - local[2] * sin,
+                        centre[1] + local[1],
+                        centre[2] + local[0] * sin + local[2] * cos,
+                    ],
+                    uv: *uv,
+                    shade: face.shade,
+                    layer: layers[face.slot],
+                });
+            }
+            mesh.indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+    mesh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,6 +571,52 @@ mod tests {
         let mesh = build_column_mesh(&column, &world, &atlas());
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(mesh.indices.len(), 36);
+    }
+
+    /// One dropped stack is a single small spinning cube.
+    #[test]
+    fn a_dropped_item_is_a_small_cube() {
+        let items = [ItemDraw {
+            position: [10.0, 64.0, -3.0],
+            item: 1,
+            meta: 0,
+        }];
+        let mesh = build_item_mesh(&items, &atlas(), 0.0);
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(mesh.indices.len(), 36);
+
+        // Centred on the block centre, and no larger than the cube's own
+        // diagonal once it is rotated.
+        let xs: Vec<f32> = mesh.vertices.iter().map(|v| v.position[0]).collect();
+        let ys: Vec<f32> = mesh.vertices.iter().map(|v| v.position[1]).collect();
+        let zs: Vec<f32> = mesh.vertices.iter().map(|v| v.position[2]).collect();
+        let (min_x, max_x) = xs
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(*x), hi.max(*x)));
+        assert!(((min_x + max_x) / 2.0 - 10.5).abs() < 0.001);
+        let span = max_x - min_x;
+        assert!((0.249..=0.36).contains(&span), "span {span}");
+        // The item floats just above the block it sits on rather than sinking
+        // into it.
+        assert!(ys.iter().cloned().fold(f32::MIN, f32::max) <= 64.4);
+        assert!(zs.iter().cloned().fold(f32::MIN, f32::max) >= -3.0);
+    }
+
+    #[test]
+    fn an_item_without_a_block_texture_still_produces_geometry() {
+        // Stick: an item id above 255, so there is no block texture for it yet.
+        let items = [ItemDraw {
+            position: [0.0, 64.0, 0.0],
+            item: 280,
+            meta: 0,
+        }];
+        let mesh = build_item_mesh(&items, &atlas(), 0.0);
+        assert_eq!(mesh.vertices.len(), 24);
+        // Everything falls back to the missing-texture layer, together.
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|v| v.layer == mesh.vertices[0].layer));
     }
 
     #[test]
