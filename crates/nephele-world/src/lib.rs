@@ -21,6 +21,7 @@ pub mod caves;
 pub mod chunk;
 pub mod decode;
 pub mod encode;
+pub mod features;
 pub mod generation;
 pub mod genlayer;
 pub mod mesa;

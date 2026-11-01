@@ -43,6 +43,7 @@ impl VanillaGenerator {
         crate::caves::Caves::new(self.seed).carve(&mut column, &biomes);
         crate::ravines::Ravines::new(self.seed).carve(&mut column, &biomes);
         crate::ores::decorate(&mut column);
+        crate::features::decorate(&mut column, &biomes);
         column
     }
 
@@ -363,7 +364,13 @@ mod tests {
                 assert!(
                     matches!(
                         id,
-                        ids::GRASS
+                        ids::LOG
+                            | ids::LEAVES
+                            | 31
+                            | 37
+                            | 38
+                            | 81
+                            | ids::GRASS
                             | ids::DIRT
                             | ids::SAND
                             | ids::GRAVEL

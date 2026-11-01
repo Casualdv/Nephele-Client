@@ -60,7 +60,7 @@ const ORES: [OreSpec; 11] = [
 ];
 
 /// `ChunkProviderGenerate.populate`'s seed for a chunk's decoration.
-fn decoration_seed(chunk_x: i32, chunk_z: i32) -> i64 {
+pub(crate) fn decoration_seed(chunk_x: i32, chunk_z: i32) -> i64 {
     i64::from(chunk_x)
         .wrapping_mul(341_873_128_712)
         .wrapping_add(i64::from(chunk_z).wrapping_mul(132_897_987_541))
