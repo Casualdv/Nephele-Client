@@ -250,15 +250,52 @@ async fn run_command(command: Command) -> Result<()> {
 /// Nephele ships none of it: `nephele-prepare` derives it from the player's own
 /// client jar. A preparation under `.local/prepared` wins over the older in-repo
 /// cache, and `NEPHELE_MINECRAFT_ASSETS` overrides both.
+/// The workspace root, which is where `.local/prepared` and `assets/vanilla`
+/// live.
+///
+/// Resolved from the working directory first, then by walking up from the
+/// executable — launching `nephele.exe` from Explorer or from `target\debug`
+/// sets the working directory to the binary's folder, and looking for
+/// resources there finds nothing.
+fn project_root() -> PathBuf {
+    fn is_root(dir: &std::path::Path) -> bool {
+        if dir.join(".local/prepared").is_dir() {
+            return true;
+        }
+        std::fs::read_to_string(dir.join("Cargo.toml"))
+            .map(|manifest| manifest.contains("[workspace]"))
+            .unwrap_or(false)
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if is_root(&cwd) {
+            return cwd;
+        }
+    }
+
+    let mut candidate = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from));
+    while let Some(dir) = candidate {
+        if is_root(&dir) {
+            return dir;
+        }
+        candidate = dir.parent().map(PathBuf::from);
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 fn minecraft_assets_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("NEPHELE_MINECRAFT_ASSETS").map(PathBuf::from) {
         return dir;
     }
-    let prepared = PathBuf::from(".local/prepared/1.8.9/assets/minecraft");
+    let root = project_root();
+    let prepared = root.join(".local/prepared/1.8.9/assets/minecraft");
     if prepared.is_dir() {
         return prepared;
     }
-    PathBuf::from("assets/vanilla/1.8.9/assets/minecraft")
+    root.join("assets/vanilla/1.8.9/assets/minecraft")
 }
 
 fn default_assets_dir() -> PathBuf {

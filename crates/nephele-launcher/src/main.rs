@@ -226,13 +226,25 @@ impl Launcher {
             ),
             Activity::Idle => return,
         };
+        let mut args = args;
+        // Pass the assets explicitly: the game resolves them itself too, but
+        // doing it here means the root the launcher found is the one used,
+        // whatever working directory the child ends up with.
+        if let Some(root) = minecraft_root() {
+            args.push("--assets-dir".to_string());
+            args.push(root.join("textures").join("blocks").display().to_string());
+        }
 
         let Some(path) = sibling_binary(binary) else {
             self.status = format!("{binary} is not next to the launcher; build the workspace");
             return;
         };
 
-        match Command::new(path).args(&args).spawn() {
+        match Command::new(path)
+            .args(&args)
+            .current_dir(project_root())
+            .spawn()
+        {
             Ok(child) => {
                 self.child = Some(child);
                 self.activity = activity;
@@ -451,7 +463,12 @@ impl ApplicationHandler for Launcher {
 /// the binary's folder) resolves the same tree as `cargo run`.
 fn project_root() -> PathBuf {
     fn looks_like_root(dir: &std::path::Path) -> bool {
-        dir.join("Cargo.toml").is_file() || dir.join(".local/prepared").is_dir()
+        if dir.join(".local/prepared").is_dir() {
+            return true;
+        }
+        std::fs::read_to_string(dir.join("Cargo.toml"))
+            .map(|manifest| manifest.contains("[workspace]"))
+            .unwrap_or(false)
     }
 
     if let Ok(cwd) = std::env::current_dir() {
