@@ -17,11 +17,15 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-/// The scope Microsoft's legacy Live endpoint expects for Xbox Live sign-in.
-const SCOPE: &str = "service::user.auth.xboxlive.com::MBI_SSL";
+/// Sign in to Xbox Live and keep a refresh token so the session survives.
+const SCOPE: &str = "XboxLive.signin offline_access";
 
-const DEVICE_CODE_URL: &str = "https://login.live.com/oauth20_connect.srf";
-const TOKEN_URL: &str = "https://login.live.com/oauth20_token.srf";
+// The consumer tenant is what personal Microsoft accounts live in. The legacy
+// `login.live.com` endpoints only accept legacy Live application ids, so an
+// app registered in Entra answers "the account does not exist in tenant
+// Microsoft Services" when pointed at them.
+const DEVICE_CODE_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode";
+const TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const XBL_URL: &str = "https://user.auth.xboxlive.com/user/authenticate";
 const XSTS_URL: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
 const MINECRAFT_LOGIN_URL: &str =
@@ -204,7 +208,7 @@ pub fn wait_for_token(
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ]);
 
-        match post(&format!("{TOKEN_URL}?client_id={client_id}"), &body) {
+        match post(TOKEN_URL, &body) {
             Ok(text) => {
                 let token: TokenResponse = serde_json::from_str(&text)
                     .map_err(|err| AuthError::Unexpected(format!("{err}: {text}")))?;
@@ -214,7 +218,10 @@ pub fn wait_for_token(
             // not finished; anything else is a real failure.
             Err(err) => {
                 let text = err.to_string();
-                if !(text.contains("authorization_pending") || text.contains("400")) {
+                if !(text.contains("authorization_pending")
+                    || text.contains("slow_down")
+                    || text.contains("400"))
+                {
                     return Err(AuthError::Microsoft(text));
                 }
             }

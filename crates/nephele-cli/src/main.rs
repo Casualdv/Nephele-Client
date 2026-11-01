@@ -222,6 +222,19 @@ fn main() -> ExitCode {
     }
 }
 
+/// The two failures people actually hit, with what to change.
+fn explain_auth_failure(message: &str) {
+    if message.contains("AADSTS700016") || message.contains("does not exist in tenant") {
+        eprintln!();
+        eprintln!("  That client id is not an app in the consumer tenant.");
+        eprintln!("  Check it is the Application (client) id from your own App registration,");
+        eprintln!("  and that its supported account types include personal Microsoft accounts.");
+    } else if message.contains("AADSTS7000218") || message.contains("public client") {
+        eprintln!();
+        eprintln!("  The app must allow public client flows:");
+        eprintln!("  App registration -> Authentication -> Allow public client flows -> Yes.");
+    }
+}
 fn run_auth(client_id: Option<String>, out: Option<PathBuf>) -> ExitCode {
     use std::io::Write;
 
@@ -238,10 +251,13 @@ fn run_auth(client_id: Option<String>, out: Option<PathBuf>) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    println!("  client id: {client_id}");
+
     let code = match nephele_auth::begin(&client_id) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("error: {err}");
+            explain_auth_failure(&err.to_string());
             return ExitCode::FAILURE;
         }
     };
