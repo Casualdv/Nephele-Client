@@ -1,0 +1,14 @@
+[package]
+name = "nephele-world"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Minecraft 1.8.9 world storage and chunk (de)serialisation for Nephele"
+
+[dependencies]
+nephele-protocol = { path = "../nephele-protocol" }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

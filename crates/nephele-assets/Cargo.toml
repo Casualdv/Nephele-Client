@@ -1,0 +1,14 @@
+﻿[package]
+name = "nephele-assets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Vanilla 1.8.9 asset loading: block texture atlas and block -> texture table"
+
+[dependencies]
+nephele-world = { path = "../nephele-world" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+

@@ -1,0 +1,18 @@
+{
+  "minecraft": {
+    "version": "1.8.9",
+    "protocol": 47,
+    "client": {
+      "sha1": "3870888a6c3d349d3771a3e9d16c9bf5e076b908",
+      "size": 8461484
+    },
+    "assetIndex": {
+      "id": "1.8",
+      "sha1": "f6ad102bcaa53b1a58358f16e376d548d44933ec",
+      "size": 78494
+    }
+  },
+  "preparer": {
+    "outputVersion": 1
+  }
+}

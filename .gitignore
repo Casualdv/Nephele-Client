@@ -1,0 +1,43 @@
+# Nephele is an original client. Nothing Mojang ships - the game jar, extracted
+# assets, asset indexes, libraries, worlds or installers - may enter this tree.
+# `scripts/check_public_tree.ps1` enforces this; this file is the first line of
+# defence.
+
+# Build output
+/target
+
+# --- Mojang artifacts -------------------------------------------------------
+*.jar
+*.class
+*.exe
+*.msi
+*.dll
+/assets/vanilla
+/assets/objects
+/assets/indexes
+/assets/*.jar
+/assets/*.json
+/versions/
+/libraries/
+/.local/
+
+# --- Third-party reference material ----------------------------------------
+# Decompiled Minecraft used for behaviour research. Kept outside the project
+# tree (see Nephele-private/) and never published.
+/references/
+
+# Worlds and saves (regions, level.dat, player data)
+*.mca
+*.mcr
+*.dat
+*.dat_old
+/run/
+/saves/
+
+# Editor / OS noise
+Cargo.lock.bak
+*.log
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

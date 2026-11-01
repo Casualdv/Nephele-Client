@@ -1,0 +1,28 @@
+[package]
+name = "nephele"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Nephele Client command-line tools (status ping, login smoke test)"
+
+[[bin]]
+name = "nephele"
+path = "src/main.rs"
+
+[dependencies]
+nephele-protocol = { path = "../nephele-protocol" }
+nephele-world = { path = "../nephele-world" }
+nephele-client = { path = "../nephele-client" }
+nephele-mock = { path = "../nephele-mock" }
+nephele-assets = { path = "../nephele-assets" }
+nephele-render = { path = "../nephele-render" }
+glam = { workspace = true }
+winit = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+image = { workspace = true }

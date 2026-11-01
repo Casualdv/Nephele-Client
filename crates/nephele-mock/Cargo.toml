@@ -1,0 +1,13 @@
+[package]
+name = "nephele-mock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "In-process fake Minecraft 1.8.9 server used by Nephele tests and demos"
+
+[dependencies]
+nephele-protocol = { path = "../nephele-protocol" }
+nephele-world = { path = "../nephele-world" }
+tokio = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,559 @@
+//! Client-side player movement and collision.
+//!
+//! This is vanilla 1.8's `EntityLivingBase.travel`, reimplemented in blocks per
+//! tick: input adds `aiMoveSpeed * 0.16277136 / friction^3` of velocity on the
+//! ground (0.02 in the air), the move happens, then friction and gravity are
+//! applied. That acceleration curve is what makes walking feel like Minecraft
+//! rather than a teleport.
+//!
+//! Velocities are stored in blocks per second (`vx`, `vy`, `vz`) so callers can
+//! reason in real units; the tick maths converts at the boundary.
+
+use nephele_world::World;
+
+pub const WIDTH: f64 = 0.6;
+pub const HEIGHT: f64 = 1.8;
+pub const EYE_HEIGHT: f64 = 1.62;
+
+/// Steady-state speeds the vanilla constants below produce, for reference.
+pub const WALK_SPEED: f64 = 4.405;
+pub const SPRINT_SPEED: f64 = 5.726;
+pub const SNEAK_SPEED: f64 = 1.322;
+pub const FLY_SPEED: f64 = 10.9;
+pub const FLY_SPRINT_SPEED: f64 = 21.8;
+
+/// Vanilla's player movement-speed attribute.
+const MOVEMENT_SPEED: f64 = 0.1;
+/// Default block slipperiness; friction is `slipperiness * 0.91`.
+const SLIPPERINESS: f64 = 0.6;
+/// `jumpMovementFactor`: the much smaller acceleration available in the air.
+const AIR_ACCEL: f64 = 0.02;
+/// 0.08 blocks/tick of gravity.
+const GRAVITY_TICK: f64 = 0.08;
+/// `0.42` blocks/tick launch velocity: a ~1.25 block jump.
+pub const JUMP_VELOCITY_TICK: f64 = 0.42;
+/// `3.92` blocks/tick terminal velocity.
+pub const TERMINAL_VELOCITY_TICK: f64 = 3.92;
+
+const EPS: f64 = 1e-7;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Input {
+    /// -1 (back) .. 1 (forward)
+    pub forward: f64,
+    /// -1 (left) .. 1 (right)
+    pub strafe: f64,
+    pub jump: bool,
+    pub sneak: bool,
+    pub sprint: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerState {
+    /// Feet position in world coordinates.
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub vx: f64,
+    pub vy: f64,
+    pub vz: f64,
+    pub on_ground: bool,
+    pub flying: bool,
+}
+
+impl Default for PlayerState {
+    fn default() -> Self {
+        Self {
+            x: 0.5,
+            y: 80.0,
+            z: 0.5,
+            vx: 0.0,
+            vy: 0.0,
+            vz: 0.0,
+            on_ground: false,
+            flying: false,
+        }
+    }
+}
+
+impl PlayerState {
+    pub fn at(x: f64, y: f64, z: f64) -> Self {
+        Self {
+            x,
+            y,
+            z,
+            ..Self::default()
+        }
+    }
+
+    pub fn eye(&self) -> [f64; 3] {
+        [self.x, self.y + EYE_HEIGHT, self.z]
+    }
+
+    pub fn teleport(&mut self, x: f64, y: f64, z: f64) {
+        self.x = x;
+        self.y = y;
+        self.z = z;
+        self.vx = 0.0;
+        self.vy = 0.0;
+        self.vz = 0.0;
+    }
+
+    /// Advance by `dt` seconds. `yaw` uses the camera convention (0 = -Z).
+    pub fn step(&mut self, dt: f64, input: &Input, yaw: f32, world: &World) {
+        let dt = dt.clamp(0.0, 0.1);
+        if dt == 0.0 {
+            return;
+        }
+
+        // A teleport can land us before the target chunk has arrived, leaving
+        // the box inside terrain once it does. Lift out of any overlap.
+        if self.collides(world) {
+            for step in 1..=16 {
+                self.y += 0.25;
+                if !self.collides(world) {
+                    self.vy = 0.0;
+                    break;
+                }
+                if step == 16 {
+                    // Give up and let gravity sort it out next frame.
+                    self.y -= 4.0;
+                }
+            }
+        }
+
+        let (sin_yaw, cos_yaw) = (yaw as f64).sin_cos();
+        let forward = (sin_yaw, -cos_yaw);
+        let right = (cos_yaw, sin_yaw);
+
+        if self.flying {
+            let mut dx = forward.0 * input.forward + right.0 * input.strafe;
+            let mut dz = forward.1 * input.forward + right.1 * input.strafe;
+            let length = (dx * dx + dz * dz).sqrt();
+            if length > 1.0 {
+                dx /= length;
+                dz /= length;
+            }
+            let speed = if input.sprint {
+                FLY_SPRINT_SPEED
+            } else {
+                FLY_SPEED
+            };
+            self.vx = dx * speed;
+            self.vz = dz * speed;
+            self.vy = if input.jump {
+                speed
+            } else if input.sneak {
+                -speed
+            } else {
+                0.0
+            };
+            self.on_ground = false;
+            self.move_axis(world, 1, self.vy * dt);
+            self.move_axis(world, 0, self.vx * dt);
+            self.move_axis(world, 2, self.vz * dt);
+            return;
+        }
+
+        let mut vx = self.vx * dt;
+        let mut vy = self.vy * dt;
+        let mut vz = self.vz * dt;
+
+        let ground_friction = SLIPPERINESS * 0.91;
+        let ai_speed = MOVEMENT_SPEED
+            * if input.sneak {
+                0.3
+            } else if input.sprint {
+                1.3
+            } else {
+                1.0
+            };
+        let accel = if self.on_ground {
+            ai_speed * 0.16277136 / (ground_friction * ground_friction * ground_friction)
+        } else {
+            AIR_ACCEL
+        };
+
+        let mut fwd = input.forward;
+        let mut strafe = input.strafe;
+        let length_sq = fwd * fwd + strafe * strafe;
+        if length_sq >= 1.0e-4 {
+            // Vanilla's `moveFlying`: normalise, then scale by the acceleration.
+            let mut length = length_sq.sqrt();
+            if length < 1.0 {
+                length = 1.0;
+            }
+            let scale = accel / length;
+            fwd *= scale;
+            strafe *= scale;
+            vx += forward.0 * fwd + right.0 * strafe;
+            vz += forward.1 * fwd + right.1 * strafe;
+        }
+
+        if input.jump && self.on_ground {
+            vy = JUMP_VELOCITY_TICK;
+        }
+
+        self.on_ground = false;
+        if self.move_axis(world, 1, vy) {
+            vy = 0.0;
+        }
+        if self.move_axis(world, 0, vx) {
+            vx = 0.0;
+        }
+        if self.move_axis(world, 2, vz) {
+            vz = 0.0;
+        }
+
+        let friction = if self.on_ground {
+            ground_friction
+        } else {
+            0.91
+        };
+        vx *= friction;
+        vz *= friction;
+        vy = ((vy - GRAVITY_TICK) * 0.98).max(-TERMINAL_VELOCITY_TICK);
+
+        self.vx = vx / dt;
+        self.vy = vy / dt;
+        self.vz = vz / dt;
+    }
+
+    /// Move along one axis, stopping against blocks. Returns `true` if blocked.
+    fn move_axis(&mut self, world: &World, axis: usize, delta: f64) -> bool {
+        if delta == 0.0 {
+            return false;
+        }
+
+        // Sub-step so fast movement can't tunnel, then bisect against a blocked
+        // step so the player rests exactly on the surface.
+        let steps = (delta.abs() / 0.5).ceil().max(1.0) as usize;
+        let step = delta / steps as f64;
+
+        for _ in 0..steps {
+            let start = self.axis(axis);
+            self.set_axis(axis, start + step);
+            if !self.collides(world) {
+                continue;
+            }
+
+            let mut free = start;
+            let mut blocked = start + step;
+            for _ in 0..10 {
+                let mid = 0.5 * (free + blocked);
+                self.set_axis(axis, mid);
+                if self.collides(world) {
+                    blocked = mid;
+                } else {
+                    free = mid;
+                }
+            }
+            self.set_axis(axis, free);
+
+            if axis == 1 && delta < 0.0 {
+                self.on_ground = true;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn axis(&self, axis: usize) -> f64 {
+        match axis {
+            0 => self.x,
+            1 => self.y,
+            _ => self.z,
+        }
+    }
+
+    fn set_axis(&mut self, axis: usize, value: f64) {
+        match axis {
+            0 => self.x = value,
+            1 => self.y = value,
+            _ => self.z = value,
+        }
+    }
+
+    fn collides(&self, world: &World) -> bool {
+        let min_x = self.x - WIDTH / 2.0;
+        let max_x = self.x + WIDTH / 2.0;
+        let min_y = self.y;
+        let max_y = self.y + HEIGHT;
+        let min_z = self.z - WIDTH / 2.0;
+        let max_z = self.z + WIDTH / 2.0;
+
+        let x0 = min_x.floor() as i32;
+        let x1 = (max_x - EPS).floor() as i32;
+        let y0 = min_y.floor() as i32;
+        let y1 = (max_y - EPS).floor() as i32;
+        let z0 = min_z.floor() as i32;
+        let z1 = (max_z - EPS).floor() as i32;
+
+        for bx in x0..=x1 {
+            for by in y0..=y1 {
+                for bz in z0..=z1 {
+                    if is_solid_block(world, bx, by, bz) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+fn is_solid_block(world: &World, x: i32, y: i32, z: i32) -> bool {
+    let id = world.get_block(x, y, z).id();
+    !matches!(id, 0 | 8 | 9 | 10 | 11 | 31 | 78 | 101 | 102 | 160)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nephele_world::{BlockState, ChunkColumn};
+
+    /// A 5x5-chunk stone plane, so long walks don't run off the edge.
+    fn flat_world(floor_y: usize) -> World {
+        let mut world = World::new(0);
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                let mut column = ChunkColumn::empty(cx, cz);
+                for x in 0..16 {
+                    for z in 0..16 {
+                        column.set_block(x, floor_y, z, BlockState::STONE);
+                    }
+                }
+                world.insert(column);
+            }
+        }
+        world
+    }
+
+    fn run_ticks(player: &mut PlayerState, input: &Input, ticks: usize, world: &World) {
+        for _ in 0..ticks {
+            player.step(0.05, input, 0.0, world);
+        }
+    }
+
+    #[test]
+    fn falls_until_it_rests_on_the_floor() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 70.0, 8.5);
+        run_ticks(&mut player, &Input::default(), 200, &world);
+        assert!(player.on_ground, "should land");
+        assert!((player.y - 65.0).abs() < 1e-3, "y = {}", player.y);
+        // Vanilla keeps pulling down every tick even when standing.
+    }
+
+    #[test]
+    fn walking_forward_moves_towards_minus_z() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        let input = Input {
+            forward: 1.0,
+            ..Input::default()
+        };
+        run_ticks(&mut player, &input, 20, &world);
+        assert!(player.z < 8.5 - 1.0, "z = {}", player.z);
+        assert!((player.x - 8.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn acceleration_ramps_up_instead_of_snapping() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        let input = Input {
+            forward: 1.0,
+            ..Input::default()
+        };
+        player.step(0.05, &input, 0.0, &world);
+        // A vanilla walk starts at ~0.1 blocks/tick, nowhere near top speed.
+        let first = 8.5 - player.z;
+        assert!(first > 0.05 && first < 0.15, "first tick moved {first}");
+    }
+
+    #[test]
+    fn walk_sprint_and_sneak_match_vanilla_speeds() {
+        let world = flat_world(64);
+        let measure = |input: Input| -> f64 {
+            let mut player = PlayerState::at(8.5, 65.0, 8.5);
+            player.on_ground = true;
+            // Settle at the steady state first.
+            run_ticks(&mut player, &input, 60, &world);
+            let start = player.z;
+            run_ticks(&mut player, &input, 20, &world);
+            (start - player.z) / (20.0 * 0.05)
+        };
+
+        let walk = measure(Input {
+            forward: 1.0,
+            ..Input::default()
+        });
+        let sprint = measure(Input {
+            forward: 1.0,
+            sprint: true,
+            ..Input::default()
+        });
+        let sneak = measure(Input {
+            forward: 1.0,
+            sneak: true,
+            ..Input::default()
+        });
+
+        assert!((walk - 4.4).abs() < 0.3, "walk = {walk} b/s");
+        assert!((sprint - 5.7).abs() < 0.4, "sprint = {sprint} b/s");
+        assert!((sneak - 1.3).abs() < 0.2, "sneak = {sneak} b/s");
+        assert!(sprint > walk && walk > sneak);
+    }
+
+    #[test]
+    fn releasing_input_slides_to_a_stop() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        let input = Input {
+            forward: 1.0,
+            ..Input::default()
+        };
+        run_ticks(&mut player, &input, 40, &world);
+        // Vanilla stores the *post-friction* motion, so measure displacement.
+        let before = player.z;
+        player.step(0.05, &input, 0.0, &world);
+        let per_tick = (before - player.z).abs();
+        assert!(per_tick > 0.15, "should be at speed, moved {per_tick}");
+
+        run_ticks(&mut player, &Input::default(), 30, &world);
+        let before = player.z;
+        player.step(0.05, &Input::default(), 0.0, &world);
+        let per_tick = (before - player.z).abs();
+        assert!(per_tick < 0.01, "still sliding {per_tick}");
+    }
+
+    #[test]
+    fn walls_block_movement() {
+        let mut column = ChunkColumn::empty(0, 0);
+        for x in 0..16 {
+            for z in 0..16 {
+                column.set_block(x, 64, z, BlockState::STONE);
+            }
+            // Wall two blocks in front of the player (towards -Z).
+            for y in 65..67 {
+                column.set_block(x, y, 6, BlockState::STONE);
+            }
+        }
+        let mut world = World::new(0);
+        world.insert(column);
+
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        let input = Input {
+            forward: 1.0,
+            ..Input::default()
+        };
+        run_ticks(&mut player, &input, 100, &world);
+        assert!(
+            player.z > 7.0 - 1e-6,
+            "walked through the wall: z = {}",
+            player.z
+        );
+    }
+
+    #[test]
+    fn a_jump_clears_a_full_block() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        let jump = Input {
+            jump: true,
+            ..Input::default()
+        };
+        let mut peak: f64 = player.y;
+        for tick in 0..40 {
+            let input = if tick == 0 { jump } else { Input::default() };
+            player.step(0.05, &input, 0.0, &world);
+            peak = peak.max(player.y);
+        }
+        assert!(
+            peak - 65.0 >= 1.05,
+            "apex was {:.2} blocks, a full block needs 1.0+",
+            peak - 65.0
+        );
+    }
+
+    #[test]
+    fn you_can_jump_onto_a_one_block_step() {
+        let mut column = ChunkColumn::empty(0, 0);
+        for x in 0..16 {
+            for z in 0..16 {
+                column.set_block(x, 64, z, BlockState::STONE);
+            }
+            // A one-block step two blocks in front of the player.
+            column.set_block(x, 65, 6, BlockState::STONE);
+        }
+        let mut world = World::new(0);
+        world.insert(column);
+
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        let mut landed_on_step = false;
+        for tick in 0..80 {
+            let input = Input {
+                forward: 1.0,
+                sprint: true,
+                jump: tick % 10 == 0,
+                ..Input::default()
+            };
+            player.step(0.05, &input, 0.0, &world);
+            if player.on_ground && player.y > 65.5 {
+                landed_on_step = true;
+                break;
+            }
+        }
+        assert!(landed_on_step, "never climbed the step, y = {}", player.y);
+    }
+
+    #[test]
+    fn jumping_leaves_the_ground_and_lands_again() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        let jump = Input {
+            jump: true,
+            ..Input::default()
+        };
+        player.step(0.05, &jump, 0.0, &world);
+        assert!(!player.on_ground);
+        assert!(player.y > 65.2, "peak {}", player.y);
+
+        run_ticks(&mut player, &Input::default(), 100, &world);
+        assert!(player.on_ground);
+        assert!((player.y - 65.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn flying_ignores_gravity() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 90.0, 8.5);
+        player.flying = true;
+        run_ticks(&mut player, &Input::default(), 40, &world);
+        assert!((player.y - 90.0).abs() < 1e-6, "y = {}", player.y);
+    }
+
+    #[test]
+    fn stuck_players_are_lifted_out_of_blocks() {
+        let world = flat_world(64);
+        // Start with the feet inside the floor block.
+        let mut player = PlayerState::at(8.5, 64.4, 8.5);
+        player.step(0.05, &Input::default(), 0.0, &world);
+        assert!(player.y >= 65.0 - 1e-3, "still stuck at {}", player.y);
+        assert!(!player.collides(&world));
+    }
+
+    #[test]
+    fn eye_height_is_above_the_feet() {
+        let player = PlayerState::at(1.0, 2.0, 3.0);
+        assert_eq!(player.eye(), [1.0, 2.0 + EYE_HEIGHT, 3.0]);
+    }
+}

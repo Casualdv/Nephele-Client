@@ -1,0 +1,3 @@
+# Normalise everything to LF in the repository, so a Windows checkout and a
+# Linux CI run produce identical bytes.
+* text=auto eol=lf

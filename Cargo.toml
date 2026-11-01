@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nephele-protocol",
+    "crates/nephele-world",
+    "crates/nephele-client",
+    "crates/nephele-mock",
+    "crates/nephele-assets",
+    "crates/nephele-render",
+    "crates/nephele-cli",
+    "crates/nephele-prepare",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "time",
+  "sync",
+] }
+thiserror = "2"
+aes = "0.8"
+sha1 = "0.10"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+wgpu = "30"
+winit = "0.30"
+glam = "0.34"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# Debug builds stay fast to compile for Nephele's own crates, but every
+# dependency (wgpu, glam, flate2, image …) is optimised. Without this, wgpu's
+# per-draw-call validation alone costs several milliseconds a frame.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

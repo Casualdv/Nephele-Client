@@ -1,0 +1,19 @@
+[package]
+name = "nephele-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless Nephele game client: login, world sync and play-state packet handling"
+
+[dependencies]
+nephele-protocol = { path = "../nephele-protocol" }
+nephele-world = { path = "../nephele-world" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+nephele-mock = { path = "../nephele-mock" }
+tokio = { workspace = true, features = ["test-util"] }

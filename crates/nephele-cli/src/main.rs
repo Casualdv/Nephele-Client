@@ -1,0 +1,585 @@
+mod live;
+mod mesher;
+mod settings;
+mod skins;
+mod ui;
+mod viewer;
+
+use std::future::Future;
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use clap::{Parser, Subcommand};
+use nephele_client::GameClient;
+use nephele_mock::{MockConfig, MockServer};
+use nephele_protocol::packets::play;
+use nephele_protocol::{Connection, Error, LoginOutcome, NextState, Result, ServerAddress};
+
+#[derive(Parser)]
+#[command(
+    name = "nephele",
+    version,
+    about = "Nephele Client tools - Minecraft Java Edition 1.8.9 (protocol 47)"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Ping a server: MOTD, version, player counts and round-trip latency.
+    Status {
+        /// host, host:port, or [ipv6]:port (port defaults to 25565)
+        address: String,
+        /// Print the raw JSON response instead of a summary
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 5)]
+        timeout: u64,
+    },
+    /// Log in to an offline-mode server, wait for Join Game, then stay connected.
+    Login {
+        /// host, host:port, or [ipv6]:port (port defaults to 25565)
+        address: String,
+        /// Username to present
+        #[arg(short = 'u', long, default_value = "Nephele")]
+        username: String,
+        /// How long to hold the connection open after joining
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+        /// Optional chat message to send once in-game
+        #[arg(long)]
+        chat: Option<String>,
+        /// Connect/read timeout in seconds
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+    },
+    /// Join a server headlessly, load chunks, and print a world summary.
+    Join {
+        /// host, host:port, or [ipv6]:port (port defaults to 25565)
+        address: String,
+        /// Username to present
+        #[arg(short = 'u', long, default_value = "Nephele")]
+        username: String,
+        /// How long to stay connected
+        #[arg(long, default_value_t = 8)]
+        seconds: u64,
+        /// Optional chat message to send
+        #[arg(long)]
+        chat: Option<String>,
+        /// Connect timeout in seconds
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+        /// Don't print the block histogram
+        #[arg(long)]
+        no_blocks: bool,
+    },
+    /// Run a local fake 1.8.9 server with a deterministic world (for testing).
+    MockServer {
+        /// Port to listen on
+        #[arg(long, default_value_t = 25565)]
+        port: u16,
+        /// Chunk radius sent on join
+        #[arg(long, default_value_t = 2)]
+        radius: i32,
+        /// Disable zlib compression
+        #[arg(long)]
+        no_compression: bool,
+        /// Spawn fake walking players, for testing entity rendering
+        #[arg(long)]
+        bots: bool,
+    },
+    /// Join a server and play it in a window (offline mode, WASD + right-drag).
+    Play {
+        /// host, host:port, or [ipv6]:port. Omit it to open the title screen.
+        address: Option<String>,
+        /// Username to present
+        #[arg(short = 'u', long, default_value = "Nephele")]
+        username: String,
+        /// Override the vanilla `textures/blocks` directory
+        #[arg(long)]
+        assets_dir: Option<PathBuf>,
+        /// Start flying (F toggles in game)
+        #[arg(long)]
+        fly: bool,
+        /// Single-player world seed (random when omitted)
+        #[arg(long)]
+        seed: Option<u64>,
+    },
+    /// Render the synthetic world in a window (WASD + right-drag to look).
+    View {
+        /// Chunk radius to generate
+        #[arg(long, default_value_t = 3)]
+        radius: i32,
+        /// Override the vanilla `textures/blocks` directory
+        #[arg(long)]
+        assets_dir: Option<PathBuf>,
+        /// Flight speed in blocks per second
+        #[arg(long, default_value_t = 24.0)]
+        speed: f32,
+    },
+}
+
+fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "nephele=info,nephele_protocol=info".into()),
+        )
+        .with_target(false)
+        .without_time()
+        .init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Command::Play {
+            address,
+            username,
+            assets_dir,
+            fly,
+            seed,
+        } => {
+            let address = match address {
+                Some(address) => match ServerAddress::parse(&address) {
+                    Ok(address) => Some(address),
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => None,
+            };
+            let assets_dir = assets_dir.unwrap_or_else(default_assets_dir);
+            match live::run(live::PlayOptions {
+                address,
+                username,
+                assets_dir,
+                fly,
+                seed,
+            }) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::View {
+            radius,
+            assets_dir,
+            speed,
+        } => {
+            let assets_dir = assets_dir.unwrap_or_else(default_assets_dir);
+            match viewer::run(viewer::ViewerOptions {
+                radius,
+                assets_dir,
+                speed,
+            }) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        command => {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to start tokio runtime");
+            match runtime.block_on(run_command(command)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+async fn run_command(command: Command) -> Result<()> {
+    match command {
+        Command::View { .. } | Command::Play { .. } => {
+            unreachable!("windowed commands are handled synchronously")
+        }
+        Command::Status {
+            address,
+            json,
+            timeout,
+        } => run_status(&address, json, timeout).await,
+        Command::Login {
+            address,
+            username,
+            seconds,
+            chat,
+            timeout,
+        } => run_login(&address, &username, seconds, chat.as_deref(), timeout).await,
+        Command::Join {
+            address,
+            username,
+            seconds,
+            chat,
+            timeout,
+            no_blocks,
+        } => {
+            run_join(
+                &address,
+                &username,
+                seconds,
+                chat.as_deref(),
+                timeout,
+                no_blocks,
+            )
+            .await
+        }
+        Command::MockServer {
+            port,
+            radius,
+            no_compression,
+            bots,
+        } => run_mock_server(port, radius, no_compression, bots).await,
+    }
+}
+
+/// The vanilla `assets/minecraft` tree.
+///
+/// Nephele ships none of it: `nephele-prepare` derives it from the player's own
+/// client jar. A preparation under `.local/prepared` wins over the older in-repo
+/// cache, and `NEPHELE_MINECRAFT_ASSETS` overrides both.
+fn minecraft_assets_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("NEPHELE_MINECRAFT_ASSETS").map(PathBuf::from) {
+        return dir;
+    }
+    let prepared = PathBuf::from(".local/prepared/1.8.9/assets/minecraft");
+    if prepared.is_dir() {
+        return prepared;
+    }
+    PathBuf::from("assets/vanilla/1.8.9/assets/minecraft")
+}
+
+fn default_assets_dir() -> PathBuf {
+    minecraft_assets_root().join("textures").join("blocks")
+}
+
+async fn run_status(input: &str, json: bool, timeout_secs: u64) -> Result<()> {
+    let address = ServerAddress::parse(input)?;
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+
+    let mut connection = with_timeout(timeout, Connection::connect(&address)).await?;
+    connection.handshake(&address, NextState::Status).await?;
+    let status = with_timeout(timeout, connection.status()).await?;
+    connection.shutdown().await;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status.raw)?);
+        return Ok(());
+    }
+
+    let protocol_ok = match status.protocol {
+        Some(protocol) => protocol == nephele_protocol::PROTOCOL_VERSION,
+        None => false,
+    };
+
+    println!("Server   {}", address);
+    println!(
+        "Version  {} (protocol {}){}",
+        status.version_name.as_deref().unwrap_or("unknown"),
+        status
+            .protocol
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "?".into()),
+        if protocol_ok {
+            "  [compatible]"
+        } else {
+            "  [not protocol 47]"
+        }
+    );
+    println!(
+        "Players  {}/{}",
+        status
+            .online_players
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into()),
+        status
+            .max_players
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".into())
+    );
+    if let Some(latency) = status.latency {
+        println!("Latency  {} ms", latency.as_millis());
+    }
+    println!("MOTD");
+    for line in strip_formatting(&status.description).lines() {
+        println!("  {line}");
+    }
+
+    Ok(())
+}
+
+async fn run_login(
+    input: &str,
+    username: &str,
+    seconds: u64,
+    chat: Option<&str>,
+    timeout_secs: u64,
+) -> Result<()> {
+    let address = ServerAddress::parse(input)?;
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+
+    let mut connection = with_timeout(timeout, Connection::connect(&address)).await?;
+    println!("Connected to {address}");
+
+    connection.handshake(&address, NextState::Login).await?;
+    match with_timeout(timeout, connection.login_start(username)).await? {
+        LoginOutcome::Success(success) => {
+            println!("Logged in as {} ({})", success.username, success.uuid);
+        }
+        LoginOutcome::Disconnect(reason) => {
+            println!("Server rejected the login: {reason}");
+            connection.shutdown().await;
+            return Ok(());
+        }
+        LoginOutcome::EncryptionRequest(_) => {
+            println!(
+                "Server is in online mode (it sent an Encryption Request). \
+                 Nephele currently supports offline-mode servers only."
+            );
+            connection.shutdown().await;
+            return Ok(());
+        }
+    }
+
+    if let Some(threshold) = connection.compression_threshold() {
+        println!("Compression threshold: {threshold} bytes");
+    }
+
+    let join = with_timeout(timeout, connection.wait_for_join_game()).await?;
+    println!(
+        "Joined game: entity {}, gamemode {}, dimension {}, level type \"{}\", {}/{} players",
+        join.entity_id,
+        join.gamemode,
+        join.dimension,
+        join.level_type,
+        join.max_players,
+        join.max_players
+    );
+
+    if let Some(message) = chat {
+        connection.send_chat(message).await?;
+        println!("Sent chat: {message}");
+    }
+
+    println!("Holding the connection for {seconds}s (Ctrl+C to stop)...");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
+    let mut printed_position = false;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+
+        let packet = match tokio::time::timeout(remaining, connection.next_play_packet()).await {
+            Err(_) => break,
+            Ok(Ok(packet)) => packet,
+            Ok(Err(err @ Error::Disconnected(_))) => {
+                println!("Disconnected: {err}");
+                break;
+            }
+            Ok(Err(err)) => return Err(err),
+        };
+
+        match packet.id {
+            play::clientbound::KEEP_ALIVE => tracing::debug!("answered keep-alive"),
+            play::clientbound::CHAT_MESSAGE => {
+                if let Ok((text, position)) = play::parse_chat_message(&packet) {
+                    println!("[chat:{position}] {}", strip_formatting(&text));
+                }
+            }
+            play::clientbound::PLAYER_POSITION_AND_LOOK if !printed_position => {
+                if let Ok(pos) = play::parse_player_position_and_look(&packet) {
+                    println!(
+                        "Spawn position: {:.2} / {:.2} / {:.2} (yaw {:.1}, pitch {:.1})",
+                        pos.x, pos.y, pos.z, pos.yaw, pos.pitch
+                    );
+                    printed_position = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    connection.shutdown().await;
+    println!("Connection closed.");
+    Ok(())
+}
+
+async fn run_join(
+    input: &str,
+    username: &str,
+    seconds: u64,
+    chat: Option<&str>,
+    timeout_secs: u64,
+    no_blocks: bool,
+) -> Result<()> {
+    let address = ServerAddress::parse(input)?;
+    let timeout = Duration::from_secs(timeout_secs.max(1));
+
+    let mut client = with_timeout(timeout, GameClient::join(&address, username)).await?;
+    println!("Connected to {address}");
+    println!(
+        "Logged in as {} ({})",
+        client.info.username, client.info.uuid
+    );
+    println!(
+        "Join Game: entity {}, gamemode {}, dimension {}, level type \"{}\", max {} players",
+        client.info.entity_id,
+        client.info.gamemode,
+        client.info.dimension,
+        client.info.level_type,
+        client.info.max_players
+    );
+    if let Some(threshold) = client.info.compression {
+        println!("Compression threshold: {threshold} bytes");
+    }
+
+    // Give the server time to send the spawn position and its chunk batch.
+    client
+        .pump(Duration::from_secs(2), Duration::from_millis(50))
+        .await?;
+
+    if let Some(message) = chat {
+        client.send_chat(message).await?;
+        client
+            .pump(Duration::from_millis(800), Duration::from_millis(50))
+            .await?;
+    }
+
+    let remaining = Duration::from_secs(seconds).saturating_sub(Duration::from_secs(2));
+    if !remaining.is_zero() {
+        client.pump(remaining, Duration::from_millis(100)).await?;
+    }
+
+    println!();
+    println!("Position   {}", client.position);
+    if let Some((x, y, z)) = client.spawn_position {
+        println!("Spawn      {x} / {y} / {z}");
+    }
+    println!(
+        "Chunks     {} loaded ({} columns received), {} unloaded",
+        client.world.loaded_chunks(),
+        client.chunks_loaded,
+        client.chunks_unloaded
+    );
+    let column_top = client
+        .world
+        .height_at(
+            client.position.x.floor() as i32,
+            client.position.z.floor() as i32,
+        )
+        .map(|y| y.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    println!(
+        "Blocks     {} non-air, top of this column at y={}",
+        client.world.total_non_air(),
+        column_top
+    );
+    println!(
+        "Time       day {}, health {:.1}, food {}",
+        client.time_of_day % 24_000,
+        client.health,
+        client.food
+    );
+    println!("Packets    {} received", client.packets_received);
+
+    if !no_blocks {
+        let histogram = client.world.block_histogram();
+        if !histogram.is_empty() {
+            println!();
+            println!("Top blocks:");
+            for (id, count) in histogram.iter().take(6) {
+                println!("  {:<5} {count:>10}", block_name(*id));
+            }
+        }
+    }
+
+    client.disconnect().await;
+    Ok(())
+}
+
+async fn run_mock_server(port: u16, radius: i32, no_compression: bool, bots: bool) -> Result<()> {
+    let config = MockConfig {
+        radius,
+        compression_threshold: if no_compression { None } else { Some(64) },
+        greeting: true,
+        bots,
+    };
+    let server = MockServer::start_on(port, config).await?;
+    println!("Nephele mock server listening on {}", server.address());
+    if bots {
+        println!("Spawning 4 walking players around spawn.");
+    }
+    println!(
+        "World: {} chunk columns, compression {}",
+        (radius * 2 + 1).pow(2),
+        if no_compression {
+            "off"
+        } else {
+            "on (64 bytes)"
+        }
+    );
+    println!("Press Ctrl+C to stop.");
+
+    loop {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+}
+
+fn block_name(id: u16) -> &'static str {
+    match id {
+        0 => "air",
+        1 => "stone",
+        2 => "grass",
+        3 => "dirt",
+        4 => "cobble",
+        5 => "planks",
+        7 => "bedrock",
+        9 => "water",
+        12 => "sand",
+        13 => "gravel",
+        17 => "log",
+        18 => "leaves",
+        20 => "glass",
+        24 => "sandstone",
+        78 => "snow",
+        _ => "block",
+    }
+}
+
+async fn with_timeout<T>(duration: Duration, future: impl Future<Output = Result<T>>) -> Result<T> {
+    match tokio::time::timeout(duration, future).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::Protocol(format!(
+            "timed out after {}s",
+            duration.as_secs()
+        ))),
+    }
+}
+
+/// Strip legacy `Â§` formatting codes so MOTDs are readable in a terminal.
+fn strip_formatting(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{00a7}' {
+            chars.next();
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}

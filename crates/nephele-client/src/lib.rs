@@ -1,0 +1,748 @@
+//! `nephele-client` â€” the headless side of Nephele.
+//!
+//! Owns the connection, the loaded world and the local player state, and
+//! translates play-state packets into structured [`Event`]s. The renderer will
+//! consume this later; for now the CLI drives it and prints statistics.
+
+pub mod entities;
+pub mod mining;
+pub mod physics;
+pub mod skins;
+
+use std::fmt;
+use std::time::Duration;
+
+use nephele_protocol::packets::play;
+use nephele_protocol::packets::play::ItemStack;
+use nephele_protocol::{Connection, Error, LoginOutcome, NextState, Packet, Result, ServerAddress};
+use nephele_world::{decode_chunk_bulk, decode_chunk_data, ChunkCoord, ChunkUpdate, World};
+
+pub use entities::{Entities, Entity, EntityKind};
+pub use mining::{Aim, Miner, MiningEvent};
+pub use skins::{SkinInfo, Skins};
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Vec3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl Vec3 {
+    pub const fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
+    pub fn chunk(&self) -> ChunkCoord {
+        ChunkCoord::from((self.x, self.z))
+    }
+}
+
+impl fmt::Display for Vec3 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.2} / {:.2} / {:.2}", self.x, self.y, self.z)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct JoinInfo {
+    pub username: String,
+    pub uuid: String,
+    pub entity_id: i32,
+    pub gamemode: u8,
+    pub dimension: i8,
+    pub level_type: String,
+    pub max_players: u8,
+    pub compression: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// No packet arrived within the tick timeout.
+    Idle,
+    /// A chunk column was loaded.
+    ChunkLoaded {
+        x: i32,
+        z: i32,
+    },
+    /// A chunk column was unloaded.
+    ChunkUnloaded {
+        x: i32,
+        z: i32,
+    },
+    /// The server placed us; `spawned` flips true on the first one.
+    Position {
+        position: Vec3,
+        yaw: f32,
+        pitch: f32,
+    },
+    Chat(String),
+    Health {
+        health: f32,
+        food: i32,
+    },
+    Respawn {
+        dimension: i8,
+    },
+    /// One or more blocks changed in the world.
+    BlocksChanged(usize),
+    /// The held hotbar slot was changed by the server.
+    HeldSlot(i16),
+    /// The player inventory changed (contents, not a specific slot).
+    Inventory,
+    /// Another player is breaking a block (`S25`). `stage` 255 = stopped.
+    BreakAnimation {
+        breaker: i32,
+        x: i32,
+        y: i32,
+        z: i32,
+        stage: u8,
+    },
+    /// Our own entity appeared in the world (`S0C` for our id).
+    Spawned,
+    /// A remote player or mob appeared.
+    EntitySpawned {
+        entity_id: i32,
+        name: String,
+    },
+    /// A tracked entity's position or angles changed.
+    EntityMoved,
+    /// Entities were removed; carries how many.
+    EntitiesRemoved(usize),
+    /// The tab list (and therefore skins) changed.
+    PlayerList,
+    /// Any other packet; carries its id so callers can log/trace.
+    Packet(i32),
+}
+
+/// Default view distance reported to the server, in chunks.
+pub const VIEW_DISTANCE: u8 = 8;
+
+/// Minecraft yaw (degrees, 0 = +Z, increasing towards -X) to Nephele's camera
+/// yaw (radians, 0 = -Z, increasing towards +X).
+fn yaw_from_mc(yaw_degrees: f32) -> f32 {
+    (yaw_degrees.to_radians() + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+}
+
+/// Nephele camera yaw back to Minecraft's convention, in degrees.
+fn yaw_to_mc(yaw_radians: f32) -> f32 {
+    (yaw_radians - std::f32::consts::PI)
+        .to_degrees()
+        .rem_euclid(360.0)
+}
+
+/// Minecraft pitch is positive looking *down*; Nephele's is positive looking up.
+fn pitch_from_mc(pitch_degrees: f32) -> f32 {
+    -pitch_degrees.to_radians()
+}
+
+fn pitch_to_mc(pitch_radians: f32) -> f32 {
+    -pitch_radians.to_degrees()
+}
+
+/// What a creative player spawns holding, so block placement works immediately.
+pub const STARTER_HOTBAR: [nephele_world::BlockState; 9] = [
+    nephele_world::BlockState::COBBLESTONE,
+    nephele_world::BlockState::PLANKS,
+    nephele_world::BlockState::STONE,
+    nephele_world::BlockState::DIRT,
+    nephele_world::BlockState::GRASS,
+    nephele_world::BlockState::GLASS,
+    nephele_world::BlockState::LOG,
+    nephele_world::BlockState::SAND,
+    nephele_world::BlockState::SNOW_BLOCK,
+];
+
+pub struct GameClient {
+    connection: Connection,
+    pub info: JoinInfo,
+    pub world: World,
+    pub position: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub on_ground: bool,
+    pub spawned: bool,
+    pub health: f32,
+    pub food: i32,
+    pub saturation: f32,
+    /// XP bar progress towards the next level, 0..1.
+    pub xp_bar: f32,
+    /// Experience level.
+    pub xp_level: i32,
+    /// Lifetime experience points.
+    pub xp_total: i32,
+    pub world_age: i64,
+    pub time_of_day: i64,
+    pub spawn_position: Option<(i32, i32, i32)>,
+    /// Player container contents (`S30` / `S2F`), 45 slots; 36..=44 is the hotbar.
+    pub inventory: Vec<Option<ItemStack>>,
+    pub held_slot: i16,
+    pub chat: Vec<String>,
+    /// Every entity the server has told us about except ourselves.
+    pub entities: Entities,
+    /// Skins advertised on the tab list, keyed by UUID.
+    pub skins: Skins,
+    pub packets_received: u64,
+    pub chunks_loaded: u64,
+    pub chunks_unloaded: u64,
+    pub address: ServerAddress,
+}
+
+impl GameClient {
+    /// Connect, authenticate offline, and enter the play state. The world is
+    /// empty until [`GameClient::tick`] has run for a while.
+    pub async fn join(address: &ServerAddress, username: &str) -> Result<Self> {
+        let mut connection = Connection::connect(address).await?;
+        connection.handshake(address, NextState::Login).await?;
+
+        let (uuid, name) = match connection.login_start(username).await? {
+            LoginOutcome::Success(success) => (success.uuid, success.username),
+            LoginOutcome::Disconnect(reason) => return Err(Error::Disconnected(reason)),
+            LoginOutcome::EncryptionRequest(_) => return Err(Error::EncryptionUnsupported),
+        };
+
+        let join = connection.wait_for_join_game().await?;
+        let compression = connection.compression_threshold();
+
+        connection
+            .write_packet(&play::client_settings(
+                "en_US",
+                VIEW_DISTANCE,
+                0,
+                true,
+                0x7F,
+            ))
+            .await?;
+        // Vanilla's "perform respawn"; tells the server we are ready.
+        connection.write_packet(&play::client_status(0)).await?;
+
+        let world = World::new(join.dimension);
+        Ok(Self {
+            connection,
+            world,
+            info: JoinInfo {
+                username: name,
+                uuid,
+                entity_id: join.entity_id,
+                gamemode: join.gamemode,
+                dimension: join.dimension,
+                level_type: join.level_type,
+                max_players: join.max_players,
+                compression,
+            },
+            position: Vec3::default(),
+            yaw: 0.0,
+            pitch: 0.0,
+            on_ground: true,
+            spawned: false,
+            health: 20.0,
+            food: 20,
+            saturation: 5.0,
+            xp_bar: 0.0,
+            xp_level: 0,
+            xp_total: 0,
+            world_age: 0,
+            time_of_day: 0,
+            spawn_position: None,
+            inventory: vec![None; play::PLAYER_CONTAINER_SLOTS],
+            held_slot: 0,
+            chat: Vec::new(),
+            entities: Entities::new(),
+            skins: Skins::new(),
+            packets_received: 0,
+            chunks_loaded: 0,
+            chunks_unloaded: 0,
+            address: address.clone(),
+        })
+    }
+
+    /// Read one packet (waiting at most `timeout`) and apply it.
+    pub async fn tick(&mut self, timeout: Duration) -> Result<Event> {
+        let packet = match tokio::time::timeout(timeout, self.connection.next_play_packet()).await {
+            Err(_) => return Ok(Event::Idle),
+            Ok(Ok(packet)) => packet,
+            Ok(Err(err)) => return Err(err),
+        };
+        self.packets_received += 1;
+        self.handle(packet).await
+    }
+
+    /// Run ticks until `duration` has elapsed, returning the number of events
+    /// applied.
+    pub async fn pump(&mut self, duration: Duration, tick_timeout: Duration) -> Result<u64> {
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut events = 0u64;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let wait = remaining.min(tick_timeout);
+            match self.tick(wait).await? {
+                Event::Idle => {}
+                Event::Chat(text) => {
+                    tracing::info!(target: "nephele::chat", "{text}");
+                    events += 1;
+                }
+                _ => events += 1,
+            }
+        }
+        Ok(events)
+    }
+
+    async fn handle(&mut self, packet: Packet) -> Result<Event> {
+        match packet.id {
+            play::clientbound::CHUNK_DATA => {
+                match decode_chunk_data(&packet, self.world.has_skylight()) {
+                    Ok(ChunkUpdate::Load(column)) => {
+                        let (x, z) = (column.x, column.z);
+                        self.world.insert(column);
+                        self.chunks_loaded += 1;
+                        Ok(Event::ChunkLoaded { x, z })
+                    }
+                    Ok(ChunkUpdate::Unload { x, z }) => {
+                        self.world.remove(ChunkCoord::new(x, z));
+                        self.chunks_unloaded += 1;
+                        Ok(Event::ChunkUnloaded { x, z })
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            play::clientbound::MAP_CHUNK_BULK => {
+                let columns = decode_chunk_bulk(&packet)?;
+                let mut last = (0, 0);
+                for column in columns {
+                    last = (column.x, column.z);
+                    self.world.insert(column);
+                    self.chunks_loaded += 1;
+                }
+                Ok(Event::ChunkLoaded {
+                    x: last.0,
+                    z: last.1,
+                })
+            }
+            play::clientbound::PLAYER_POSITION_AND_LOOK => {
+                let pos = play::parse_player_position_and_look(&packet)?;
+                self.position = Vec3::new(pos.x, pos.y, pos.z);
+                self.yaw = yaw_from_mc(pos.yaw);
+                self.pitch = pitch_from_mc(pos.pitch);
+                self.on_ground = true;
+                self.spawned = true;
+                // Confirm the teleport, echoing the packet's own values.
+                self.connection
+                    .write_packet(&play::player_position_and_look(
+                        pos.x, pos.y, pos.z, pos.yaw, pos.pitch, true,
+                    ))
+                    .await?;
+                Ok(Event::Position {
+                    position: self.position,
+                    yaw: self.yaw,
+                    pitch: self.pitch,
+                })
+            }
+            play::clientbound::CHAT_MESSAGE => {
+                let (text, _position) = play::parse_chat_message(&packet)?;
+                self.chat.push(text.clone());
+                if self.chat.len() > 512 {
+                    self.chat.remove(0);
+                }
+                Ok(Event::Chat(text))
+            }
+            play::clientbound::UPDATE_HEALTH => {
+                let health = play::parse_update_health(&packet)?;
+                self.health = health.health;
+                self.food = health.food;
+                self.saturation = health.saturation;
+                Ok(Event::Health {
+                    health: health.health,
+                    food: health.food,
+                })
+            }
+            play::clientbound::EXPERIENCE => {
+                let xp = play::parse_experience(&packet)?;
+                self.xp_bar = xp.bar;
+                self.xp_level = xp.level;
+                self.xp_total = xp.total;
+                Ok(Event::Packet(packet.id))
+            }
+            play::clientbound::TIME_UPDATE => {
+                let time = play::parse_time_update(&packet)?;
+                self.world_age = time.world_age;
+                self.time_of_day = time.time_of_day;
+                Ok(Event::Packet(packet.id))
+            }
+            play::clientbound::SPAWN_POSITION => {
+                let pos = play::parse_spawn_position(&packet)?;
+                self.spawn_position = Some(pos);
+                Ok(Event::Packet(packet.id))
+            }
+            play::clientbound::PLAYER_ABILITIES => {
+                let abilities = play::parse_player_abilities(&packet)?;
+                tracing::debug!(
+                    flags = abilities.flags,
+                    fly = abilities.flying_speed,
+                    walk = abilities.walk_speed,
+                    "player abilities"
+                );
+                Ok(Event::Packet(packet.id))
+            }
+            play::clientbound::RESPAWN => {
+                let respawn = play::parse_respawn(&packet)?;
+                self.world.set_dimension(respawn.dimension);
+                self.info.dimension = respawn.dimension;
+                self.spawned = false;
+                Ok(Event::Respawn {
+                    dimension: respawn.dimension,
+                })
+            }
+            play::clientbound::BLOCK_CHANGE => {
+                let change = play::parse_block_change(&packet)?;
+                self.world.set_block(
+                    change.x,
+                    change.y,
+                    change.z,
+                    nephele_world::BlockState::from_raw(change.state),
+                );
+                Ok(Event::BlocksChanged(1))
+            }
+            play::clientbound::MULTI_BLOCK_CHANGE => {
+                let update = play::parse_multi_block_change(&packet)?;
+                let mut applied = 0;
+                for change in &update.changes {
+                    if self.world.set_block(
+                        change.x,
+                        change.y,
+                        change.z,
+                        nephele_world::BlockState::from_raw(change.state),
+                    ) {
+                        applied += 1;
+                    }
+                }
+                Ok(Event::BlocksChanged(applied))
+            }
+            play::clientbound::BLOCK_BREAK_ANIMATION => {
+                let animation = play::parse_block_break_animation(&packet)?;
+                Ok(Event::BreakAnimation {
+                    breaker: animation.breaker_entity_id,
+                    x: animation.x,
+                    y: animation.y,
+                    z: animation.z,
+                    stage: animation.stage,
+                })
+            }
+            play::clientbound::HELD_ITEM_CHANGE => {
+                let slot = play::parse_held_item_change(&packet)?;
+                self.held_slot = slot.clamp(0, (play::HOTBAR_SLOTS - 1) as i16);
+                Ok(Event::HeldSlot(self.held_slot))
+            }
+            play::clientbound::SET_SLOT => {
+                let update = play::parse_set_slot(&packet)?;
+                if update.window_id == 0 && update.slot >= 0 {
+                    let slot = update.slot as usize;
+                    if slot < self.inventory.len() {
+                        self.inventory[slot] = update.item;
+                    }
+                }
+                Ok(Event::Inventory)
+            }
+            play::clientbound::WINDOW_ITEMS => {
+                let update = play::parse_window_items(&packet)?;
+                if update.window_id == 0 {
+                    self.inventory.resize(play::PLAYER_CONTAINER_SLOTS, None);
+                    for (slot, item) in update.items.iter().enumerate() {
+                        if slot < self.inventory.len() {
+                            self.inventory[slot] = *item;
+                        }
+                    }
+                    for slot in update.items.len()..self.inventory.len() {
+                        self.inventory[slot] = None;
+                    }
+                }
+                Ok(Event::Inventory)
+            }
+            play::clientbound::SPAWN_PLAYER => {
+                let spawn = play::parse_spawn_player(&packet)?;
+                if spawn.entity_id == self.info.entity_id {
+                    return Ok(Event::Spawned);
+                }
+                self.entities.spawn_player(
+                    spawn.entity_id,
+                    spawn.uuid,
+                    spawn.name.clone(),
+                    [spawn.x, spawn.y, spawn.z],
+                    spawn.yaw,
+                    spawn.pitch,
+                );
+                Ok(Event::EntitySpawned {
+                    entity_id: spawn.entity_id,
+                    name: spawn.name,
+                })
+            }
+            play::clientbound::SPAWN_MOB => {
+                let spawn = play::parse_spawn_mob(&packet)?;
+                self.entities.spawn_mob(
+                    spawn.entity_id,
+                    spawn.kind,
+                    spawn.kind == play::MOB_TYPE_PLAYER,
+                    [spawn.x, spawn.y, spawn.z],
+                    spawn.yaw,
+                    spawn.pitch,
+                );
+                Ok(Event::EntitySpawned {
+                    entity_id: spawn.entity_id,
+                    name: String::new(),
+                })
+            }
+            play::clientbound::ENTITY_RELATIVE_MOVE => {
+                let update = play::parse_entity_relative_move(&packet)?;
+                self.entities
+                    .relative_move(update.entity_id, update.dx, update.dy, update.dz);
+                Ok(Event::EntityMoved)
+            }
+            play::clientbound::ENTITY_LOOK => {
+                let update = play::parse_entity_look(&packet)?;
+                self.entities
+                    .look(update.entity_id, update.yaw, update.pitch);
+                Ok(Event::EntityMoved)
+            }
+            play::clientbound::ENTITY_LOOK_AND_RELATIVE_MOVE => {
+                let update = play::parse_entity_look_and_relative_move(&packet)?;
+                self.entities.relative_move_and_look(
+                    update.entity_id,
+                    update.dx,
+                    update.dy,
+                    update.dz,
+                    update.yaw,
+                    update.pitch,
+                );
+                Ok(Event::EntityMoved)
+            }
+            play::clientbound::ENTITY_TELEPORT => {
+                let teleport = play::parse_entity_teleport(&packet)?;
+                self.entities.teleport(
+                    teleport.entity_id,
+                    [teleport.x, teleport.y, teleport.z],
+                    teleport.yaw,
+                    teleport.pitch,
+                );
+                Ok(Event::EntityMoved)
+            }
+            play::clientbound::ENTITY_HEAD_LOOK => {
+                let (entity_id, yaw) = play::parse_entity_head_look(&packet)?;
+                self.entities.head_look(entity_id, yaw);
+                Ok(Event::EntityMoved)
+            }
+            play::clientbound::ENTITY_VELOCITY => {
+                let update = play::parse_entity_velocity(&packet)?;
+                self.entities
+                    .set_velocity(update.entity_id, update.vx, update.vy, update.vz);
+                Ok(Event::EntityMoved)
+            }
+            play::clientbound::DESTROY_ENTITIES => {
+                let ids = play::parse_destroy_entities(&packet)?;
+                self.entities.despawn_all(&ids);
+                Ok(Event::EntitiesRemoved(ids.len()))
+            }
+            play::clientbound::ENTITY => {
+                // Keep-alive; the entity is still alive but nothing to update.
+                let _ = play::parse_entity(&packet)?;
+                Ok(Event::Packet(packet.id))
+            }
+            play::clientbound::ENTITY_METADATA => Ok(Event::Packet(packet.id)),
+            play::clientbound::PLAYER_LIST_ITEM => {
+                let update = play::parse_player_list_item(&packet)?;
+                if let play::PlayerListUpdate::Add(entries) = &update {
+                    for entry in entries {
+                        self.skins.record(entry);
+                    }
+                }
+                Ok(Event::PlayerList)
+            }
+            play::clientbound::DISCONNECT => {
+                Err(Error::Disconnected(play::parse_disconnect(&packet)?))
+            }
+            id => Ok(Event::Packet(id)),
+        }
+    }
+
+    /// Creative mode (`JoinGame.gamemode`'s low three bits).
+    pub fn is_creative(&self) -> bool {
+        self.info.gamemode & 0x07 == 1
+    }
+
+    /// The stack in the selected hotbar slot.
+    pub fn held_item(&self) -> Option<ItemStack> {
+        let slot = play::HOTBAR_FIRST_SLOT + self.held_slot.max(0) as usize;
+        self.inventory.get(slot).copied().flatten()
+    }
+
+    /// Ask the server to select a hotbar slot. The server confirms with `S09`.
+    pub async fn set_held_slot(&mut self, slot: i16) -> Result<()> {
+        let slot = slot.clamp(0, (play::HOTBAR_SLOTS - 1) as i16);
+        self.held_slot = slot;
+        self.connection
+            .write_packet(&play::held_item_change(slot))
+            .await
+    }
+
+    /// Send a `C07 Player Digging` action for `aim`.
+    pub async fn dig(&mut self, status: u8, aim: &Aim) -> Result<()> {
+        let packet = play::player_digging(status, aim.x, aim.y, aim.z, aim.face);
+        self.connection.write_packet(&packet).await
+    }
+
+    /// Swing the arm (`C0A`).
+    pub async fn swing(&mut self) -> Result<()> {
+        self.connection.write_packet(&play::swing_arm()).await
+    }
+
+    /// Right-click `aim`: place the held stack against the hit face.
+    ///
+    /// Returns the position the block would land on, or `None` when nothing
+    /// placeable is held.
+    pub async fn place(&mut self, aim: &Aim) -> Result<Option<(i32, i32, i32)>> {
+        let Some(held) = self.held_item() else {
+            return Ok(None);
+        };
+        if held.block_state().is_none() {
+            return Ok(None);
+        }
+        let normal = nephele_world::Face::from_protocol_id(aim.face)
+            .map(|face| face.normal())
+            .unwrap_or([0, 1, 0]);
+        let target = (aim.x + normal[0], aim.y + normal[1], aim.z + normal[2]);
+
+        let packet = play::block_placement(aim.x, aim.y, aim.z, aim.face, aim.cursor, Some(&held));
+        self.connection.write_packet(&packet).await?;
+        self.connection.write_packet(&play::swing_arm()).await?;
+        Ok(Some(target))
+    }
+
+    /// Put `item` into a player-container slot (creative only). `slot` uses
+    /// container numbering, so the hotbar is 36..=44.
+    pub async fn creative_set_slot(&mut self, slot: i16, item: Option<ItemStack>) -> Result<()> {
+        self.connection
+            .write_packet(&play::creative_set_slot(slot, item.as_ref()))
+            .await?;
+        if slot >= 0 && (slot as usize) < self.inventory.len() {
+            self.inventory[slot as usize] = item;
+        }
+        Ok(())
+    }
+
+    /// Fill the hotbar with a starter palette (creative mode only). Vanilla's
+    /// creative client does the same thing from the inventory screen.
+    pub async fn give_starter_hotbar(&mut self) -> Result<()> {
+        if !self.is_creative() {
+            return Ok(());
+        }
+        for (index, state) in STARTER_HOTBAR.iter().enumerate() {
+            let slot = (play::HOTBAR_FIRST_SLOT + index) as i16;
+            let item = ItemStack::new(state.id() as i16, 64, state.meta() as i16);
+            self.creative_set_slot(slot, Some(item)).await?;
+        }
+        Ok(())
+    }
+
+    /// Re-send client settings, e.g. after the player changes render distance.
+    pub async fn send_client_settings(&mut self, view_distance: u8) -> Result<()> {
+        self.connection
+            .write_packet(&play::client_settings(
+                "en_US",
+                view_distance,
+                0,
+                true,
+                0x7F,
+            ))
+            .await
+    }
+
+    pub async fn send_chat(&mut self, message: &str) -> Result<()> {
+        self.connection.send_chat(message).await
+    }
+
+    /// Send a position update (used once client-side movement exists).
+    pub async fn send_position(&mut self, position: Vec3, on_ground: bool) -> Result<()> {
+        self.position = position;
+        self.on_ground = on_ground;
+        self.connection
+            .write_packet(&play::player_position(
+                position.x, position.y, position.z, on_ground,
+            ))
+            .await
+    }
+
+    /// Send position *and* look, which is what a walking client does each tick.
+    pub async fn send_move(
+        &mut self,
+        position: Vec3,
+        yaw: f32,
+        pitch: f32,
+        on_ground: bool,
+    ) -> Result<()> {
+        self.position = position;
+        self.yaw = yaw;
+        self.pitch = pitch;
+        self.on_ground = on_ground;
+        self.connection
+            .write_packet(&play::player_position_and_look(
+                position.x,
+                position.y,
+                position.z,
+                yaw_to_mc(yaw),
+                pitch_to_mc(pitch),
+                on_ground,
+            ))
+            .await
+    }
+
+    pub async fn disconnect(&mut self) {
+        self.connection.shutdown().await;
+    }
+}
+
+impl fmt::Debug for GameClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GameClient")
+            .field("info", &self.info)
+            .field("position", &self.position)
+            .field("chunks", &self.world.loaded_chunks())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::FRAC_PI_2;
+
+    #[test]
+    fn minecraft_yaw_zero_faces_south() {
+        let yaw = yaw_from_mc(0.0);
+        // Nephele yaw of PI points towards +Z.
+        assert!((yaw - std::f32::consts::PI).abs() < 1e-4);
+        assert!(yaw.sin().abs() < 1e-4);
+        assert!((-yaw.cos() - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn minecraft_yaw_ninety_faces_west() {
+        let yaw = yaw_from_mc(90.0);
+        assert!((yaw.sin() + 1.0).abs() < 1e-4);
+        assert!((-yaw.cos()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn yaw_round_trips() {
+        for degrees in [0.0f32, 45.0, 90.0, 180.0, 270.0, 359.0] {
+            let back = yaw_to_mc(yaw_from_mc(degrees));
+            assert!((back - degrees).abs() < 1e-3, "{degrees} -> {back}");
+        }
+    }
+
+    #[test]
+    fn pitch_sign_is_inverted() {
+        assert!(pitch_from_mc(90.0) < 0.0);
+        assert!((pitch_to_mc(-FRAC_PI_2) - 90.0).abs() < 1e-3);
+    }
+}
