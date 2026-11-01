@@ -198,6 +198,15 @@ impl PlayerState {
         if self.move_axis(world, 1, vy) {
             vy = 0.0;
         }
+
+        // Vanilla's sneak edge protection: a crouched player on the ground
+        // refuses a step that would put them over a drop, rather than walking
+        // off the edge of the block.
+        if input.sneak && self.on_ground {
+            vx = self.edge_clamped(world, 0, vx);
+            vz = self.edge_clamped(world, 2, vz);
+        }
+
         if self.move_axis(world, 0, vx) {
             vx = 0.0;
         }
@@ -254,6 +263,48 @@ impl PlayerState {
                 self.on_ground = true;
             }
             return true;
+        }
+        false
+    }
+
+    /// The largest part of `delta` that still leaves ground under the player.
+    ///
+    /// Failing every step means the player is already at the edge, so nothing
+    /// of the movement is allowed — which is the point of sneaking.
+    fn edge_clamped(&self, world: &World, axis: usize, delta: f64) -> f64 {
+        if delta.abs() < 1e-9 {
+            return 0.0;
+        }
+        let start = self.axis(axis);
+        for fraction in [1.0, 0.5, 0.25, 0.125, 0.0625] {
+            let mut probe = *self;
+            probe.set_axis(axis, start + delta * fraction);
+            if probe.has_ground(world) {
+                return delta * fraction;
+            }
+        }
+        0.0
+    }
+
+    /// True when a solid block sits directly beneath the feet.
+    ///
+    /// Only the block layer the feet rest on is checked, and the footprint is
+    /// inset slightly, so standing flush against a wall is not mistaken for
+    /// standing on a floor.
+    fn has_ground(&self, world: &World) -> bool {
+        let foot = self.y - 0.05;
+        let layer = foot.floor() as i32;
+        let min_x = self.x - WIDTH / 2.0 + EPS;
+        let max_x = self.x + WIDTH / 2.0 - EPS;
+        let min_z = self.z - WIDTH / 2.0 + EPS;
+        let max_z = self.z + WIDTH / 2.0 - EPS;
+
+        for block_x in (min_x.floor() as i32)..=(max_x.floor() as i32) {
+            for block_z in (min_z.floor() as i32)..=(max_z.floor() as i32) {
+                if is_solid_block(world, block_x, layer, block_z) {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -333,6 +384,81 @@ mod tests {
         for _ in 0..ticks {
             player.step(0.05, input, 0.0, world);
         }
+    }
+
+    /// One stone block at (0, 9, 0) with nothing around it, so its top face is
+    /// the only place to stand.
+    fn pillar() -> World {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(0, 9, 0, BlockState::STONE);
+        let mut world = World::new(0);
+        world.insert(column);
+        world
+    }
+
+    #[test]
+    fn sneaking_keeps_you_on_the_edge() {
+        let world = pillar();
+        let mut player = PlayerState::at(0.5, 10.0, 0.5);
+        player.on_ground = true;
+
+        let input = Input {
+            forward: 1.0,
+            sneak: true,
+            ..Input::default()
+        };
+        run_ticks(&mut player, &input, 60, &world);
+
+        assert!(
+            (player.y - 10.0).abs() < 0.05,
+            "sneaking walked off the block and fell to y = {}",
+            player.y
+        );
+        assert!(
+            player.z > -0.35,
+            "sneaking should stop at the edge, not at z = {}",
+            player.z
+        );
+    }
+
+    #[test]
+    fn walking_off_the_edge_still_falls_without_sneaking() {
+        let world = pillar();
+        let mut player = PlayerState::at(0.5, 10.0, 0.5);
+        player.on_ground = true;
+
+        let input = Input {
+            forward: 1.0,
+            ..Input::default()
+        };
+        run_ticks(&mut player, &input, 60, &world);
+
+        assert!(
+            player.y < 9.0,
+            "without sneaking the player should walk off and fall, y = {}",
+            player.y
+        );
+    }
+
+    #[test]
+    fn sneaking_still_lets_you_walk_along_a_wide_floor() {
+        let world = flat_world(9);
+        let mut player = PlayerState::at(0.5, 10.0, 0.5);
+        player.on_ground = true;
+
+        let input = Input {
+            forward: 1.0,
+            sneak: true,
+            ..Input::default()
+        };
+        run_ticks(&mut player, &input, 40, &world);
+
+        assert!(
+            player.z < -1.0,
+            "sneaking must not freeze movement, z = {}",
+            player.z
+        );
+        assert!((player.y - 10.0).abs() < 0.05, "y = {}", player.y);
     }
 
     #[test]

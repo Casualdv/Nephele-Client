@@ -988,7 +988,8 @@ impl LiveApp {
             input.strafe -= 1.0;
         }
         input.jump = self.keys.contains(&KeyCode::Space);
-        input.sneak = self.keys.contains(&KeyCode::ShiftLeft);
+        input.sneak =
+            self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight);
         input.sprint = self.keys.contains(&KeyCode::ControlLeft);
 
         let mut state = self.shared.lock().unwrap();
