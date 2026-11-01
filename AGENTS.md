@@ -92,6 +92,10 @@ cargo run -p nephele -- play <host:port>         # offline-mode join
 cargo run -p nephele -- play <host:port> --online  # Microsoft-authed join
 cargo run -p nephele -- auth [--legacy] [--client-id <id>]
 cargo run -p nephele-launcher                    # the launcher UI
+
+# development shortcuts (never the only way to reach a screen):
+$env:NEPHELE_SCREEN="servers"   # title|servers|connect|settings|creative|pause|local
+$env:NEPHELE_DATA_DIR="..."     # override the user data directory
 ```
 
 CI runs fmt, clippy with `-D warnings`, tests, and the publish gate. **A commit that
@@ -116,11 +120,52 @@ crates/
       live.rs           network + local game loops, screens, input
       viewer.rs         offline world viewer
       ui.rs             immediate-mode UI batch + screens (draw_*)
+      paths.rs          per-user data directory + legacy `.local/` migration
       mesher.rs         CLI-side mesh helpers
-      servers.rs        saved server list: entries, ordering, JSON persistence
+      servers.rs        saved server list: entries, ordering, persistence, ping board
       settings.rs       persisted options
       skins.rs          skin fetch/cache
 ```
+
+### User files (`.local/` is legacy)
+
+`paths::user_data_dir()` is the single answer to "where do user files go":
+`NEPHELE_DATA_DIR` → `%APPDATA%\Nephele` → `$XDG_DATA_HOME/nephele` →
+`~/.local/share/nephele`. **`auth.json` and `servers.json` both live there** and
+nothing writes anywhere else. A game directory is often read-only and is
+per-install, so `.local/` was the wrong home for a token; `migrate_legacy_state`
+(`main.rs`, Play command only) runs `paths::migrate_legacy_file` once per file,
+which **copies** (never moves, never overwrites) a legacy `.local/` file when the
+new one is absent. Leave the legacy file alone — it is the fallback. `.local/`
+still owns the *prepared resources*, which are per-install by design.
+
+### The multiplayer screen (`Screen::Servers`)
+
+`Action::Multiplayer` opens it; `ui::draw_servers` draws it. Four columns per
+row: **name+address, MOTD, version, ping**. `servers.rs` owns the data
+(`ServerList`, `PingBoard`, `Ping`, `Status`), `live.rs` owns the fetching:
+
+- Pings are asynchronous, one short-lived thread per address, each with its own
+  current-thread tokio runtime and `nephele_protocol::ping(.., PING_TIMEOUT = 1s)`.
+  Results return over an mpsc channel drained in `frame()`; the render thread
+  never blocks. **There is no polling loop** — a fetch happens when the screen
+  opens and when Refresh is pressed, and `PingBoard::begin` refuses to duplicate
+  an already in-flight address.
+- **Single click selects; it does not join.** Joining is the Join Server button,
+  Enter, or a double-click (two clicks on the same address within
+  `DOUBLE_CLICK = 400 ms`). This is deliberate: with per-row delete/favourite
+  buttons, click-to-join was a misclick factory.
+- Selection is stored as the **address string**, not a row index, because
+  deleting an entry or favouriting one re-sorts the list. Rows still *act* by
+  storage index (`ServerList::ordered_indices`) because `toggle_favourite` and
+  `remove` take one.
+- `Direct Connect` is a real button on this screen and the only UI route to
+  `Screen::Connect`; its Escape/Cancel returns to the multiplayer screen.
+  `NEPHELE_SCREEN=servers|connect|…` remains a development shortcut and must
+  never be the *only* way to reach a screen.
+- Note `sprites::BUTTON_DISABLED` **overlaps the hotbar-selection art** in this
+  GUI atlas, so `draw_button_state` never draws it: a disabled button keeps the
+  normal face and greys its label, exactly like vanilla 1.8.
 
 `Future.md` at the repo root holds the product plan, milestone table, and open
 decisions. Keep it in sync when direction changes; it is not auto-updated.
@@ -237,7 +282,10 @@ university tenant `didadec.onmicrosoft.com` / `a6eb79fa-c4a9-4cce-818d-b85274d15
 returns 401). Azure for Students (no card) or Azure free is the path. The code is
 otherwise complete and works; only the shippable app id is missing.
 
-`StoredSession` persists to `.local/auth.json`.
+`StoredSession` persists to `auth.json` in the per-user data directory
+(`%APPDATA%\Nephele\` on Windows) — see §5. `.local/auth.json` is the legacy
+location; `paths::migrate_legacy_file` copies it across once on launch, and
+nothing writes there any more.
 
 ---
 
@@ -366,9 +414,9 @@ not) and smooth lighting. Then M1 is closed.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **109 tests** in `nephele-world`; **366 across the workspace** (1 ignored); 10 in
-  the server list, plus 7 `ui` tests covering the multiplayer screen's buttons,
-  index mapping and layout.
+- **109 tests** in `nephele-world`; **375 across the workspace** (1 ignored);
+  13 in the server list (9 list + 4 ping board), plus 9 `ui` tests for the
+  multiplayer screen's buttons, columns and layout, and 3 for the paths module.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
 
@@ -376,18 +424,12 @@ not) and smooth lighting. Then M1 is closed.
 
 ## 15. Next move
 
-1. ~~**Server list screen**~~ — done. `ui::draw_servers` (multiplayer screen: 5
-   visible rows, wheel-scrolled, favourites first) + `Screen::Servers`, which
-   `Action::Multiplayer` now opens. The address field is the *same* `address_input`
-   buffer and the *same* keyboard block as `Screen::Connect`, so there is still only
-   one text widget in the project. Joining (possible in 3 ways: typed address, row
-   click, Enter) runs through `start_network`; every successful parse also does
-   `ServerList::add` + save to `.local/servers.json`, so the list fills itself from
-   where you have played. `Screen::Connect` is now only reachable via
-   `NEPHELE_SCREEN=connect` and kept as a debug/deep-link target.
-   **Rows act by storage index, not display position** — `ServerList::ordered_indices`
-   exists because favourites sort to the top while `toggle_favourite`/`remove` take
-   the slot in `entries()`. Do not "simplify" that away.
+1. ~~**Server list screen**~~ — done, and now with live pings. How it is wired is
+   in §5 ("The multiplayer screen"); the short version: saved list + async
+   ping/MOTD/version columns, select-then-join, Direct Connect, Refresh, and the
+   list persists to `servers.json` in the user data directory. Still missing from
+   it: **player counts** (`online`/`max` are in the ping response but `servers::Status`
+   drops them), a history list distinct from the saved list, and drag-to-reorder.
 2. **World creation screen** — smaller. `local_loop` already takes a seed and
    `play --seed` already parses one; v1 creates but does not save (region writing is
    M2).
@@ -397,7 +439,18 @@ not) and smooth lighting. Then M1 is closed.
 
 ## 16. Working agreement
 
-- Update **this file** when behaviour changes. Do not create new `.md` files.
+**Which doc gets updated, and how much:**
+
+| File | When | How much |
+|---|---|---|
+| `AGENTS.md` | always, when behaviour changes | as much as staying accurate needs |
+| `Future.md` | when an item lands, changes shape or is dropped | tick it, note the status change |
+| `README.md` | when a **user-visible** feature lands | one line in "Working", nothing more |
+| `docs/`, `BUGS.md`, anything else | explicit request only | asked-for scope only |
+
+Rationale: a stale roadmap is worse than none, and a README that undersells the
+product is a sales problem — but neither is a place to narrate internals. This
+file is the only one that carries the full story.
 - Don't re-litigate settled decisions without new evidence: the compliance model, the
   licence table, the `IntCache` caveat, and the scale model are all settled by evidence
   already gathered.

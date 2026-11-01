@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::mesher::MeshPool;
-use crate::servers::{ServerEntry, ServerList};
+use crate::servers::{Ping, PingBoard, ServerEntry, ServerList, Status};
 use crate::settings::Settings;
 use crate::skins::SkinLoader;
 use crate::ui::{self, Action, HudState, Screen};
@@ -43,6 +43,10 @@ const REACH_CREATIVE: f64 = 5.0;
 const REACH_SURVIVAL: f64 = 4.5;
 /// Selection outline colour, matching vanilla's black wireframe.
 const OUTLINE_COLOR: [f32; 3] = [0.0, 0.0, 0.0];
+/// How long a status ping may take before the row is shown as offline.
+const PING_TIMEOUT: Duration = Duration::from_secs(1);
+/// Two clicks on the same server within this window join it (`double-click`).
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 pub struct PlayOptions {
     /// None opens the title screen instead of connecting straight away.
@@ -69,6 +73,12 @@ enum NetMsg {
     /// Tab-list skin hashes (uuid, texture hash).
     Skins(Vec<([u8; 16], String)>),
     Error(String),
+}
+
+/// One finished server-list ping, sent from its worker thread.
+struct PingReply {
+    address: String,
+    ping: Ping,
 }
 
 /// One tracked entity, copied out of the client so the render thread can
@@ -668,6 +678,15 @@ struct LiveApp {
     servers: ServerList,
     /// First visible row of `servers`.
     servers_scroll: usize,
+    /// Address of the selected server, not its index: indices shift when an
+    /// entry is deleted or a favourite re-sorts the list.
+    servers_selected: Option<String>,
+    /// Ping results, filled in asynchronously by `spawn_ping`.
+    pings: PingBoard,
+    ping_tx: Sender<PingReply>,
+    ping_rx: Receiver<PingReply>,
+    /// Previous row click, for the double-click-to-join gesture.
+    last_server_click: Option<(Instant, String)>,
     settings_return: Screen,
     /// When the window last gained focus; clicks right after it are ignored.
     focus_gained: Option<Instant>,
@@ -697,6 +716,7 @@ impl LiveApp {
         };
 
         let servers = ServerList::load(&options.servers_path);
+        let (ping_tx, ping_rx) = mpsc::channel();
 
         let has_address = options.address.is_some();
         let mut app = Self {
@@ -744,6 +764,11 @@ impl LiveApp {
             address_input: String::new(),
             servers,
             servers_scroll: 0,
+            servers_selected: None,
+            pings: PingBoard::default(),
+            ping_tx,
+            ping_rx,
+            last_server_click: None,
             settings_return: Screen::Pause,
             focus_gained: None,
             settings: initial_settings(),
@@ -755,6 +780,9 @@ impl LiveApp {
 
         if let Some(screen) = env_screen {
             app.screen = screen;
+        }
+        if app.screen == Screen::Servers {
+            app.refresh_server_list();
         }
         if std::env::var("NEPHELE_SCREEN").as_deref() == Ok("local") {
             app.start_local();
@@ -1070,6 +1098,7 @@ impl LiveApp {
         self.last_frame = now;
 
         self.drain_network();
+        self.drain_pings();
         self.push_input();
 
         let view = {
@@ -1335,7 +1364,8 @@ impl LiveApp {
                 &mut self.ui_bg,
                 &mut self.ui_fg,
                 &self.servers,
-                &self.address_input,
+                &self.pings,
+                self.servers_selected.as_deref(),
                 self.servers_scroll,
                 self.pointer,
                 scale,
@@ -1492,6 +1522,84 @@ impl LiveApp {
         self.save_servers();
     }
 
+    /// Ping every saved server whose state is not already in flight.
+    ///
+    /// Called when the screen opens and by the Refresh button — there is no
+    /// polling loop. Each server gets its own short-lived thread, the same shape
+    /// vanilla uses; a saved list is small, and one slow host must not hold up
+    /// the rest.
+    fn refresh_server_list(&mut self) {
+        let addresses: Vec<String> = self
+            .servers
+            .entries()
+            .iter()
+            .map(|entry| entry.address.clone())
+            .collect();
+        for address in addresses {
+            if !self.pings.begin(&address) {
+                continue;
+            }
+            let tx = self.ping_tx.clone();
+            let _ = std::thread::Builder::new()
+                .name("nephele-ping".into())
+                .spawn(move || {
+                    let ping = ping_server(&address);
+                    let _ = tx.send(PingReply { address, ping });
+                });
+        }
+    }
+
+    fn drain_pings(&mut self) {
+        while let Ok(reply) = self.ping_rx.try_recv() {
+            self.pings.finish(&reply.address, reply.ping);
+        }
+    }
+
+    /// The Multiplayer button: show the list and ask every row how it is.
+    fn open_servers(&mut self) {
+        self.screen = Screen::Servers;
+        self.servers_scroll = 0;
+        self.servers_selected = None;
+        self.refresh_server_list();
+    }
+
+    /// Select a row. A second click on the same row within [`DOUBLE_CLICK`]
+    /// joins it — 1.8's gesture, and the reason a single click must not join.
+    fn select_server(&mut self, index: usize) {
+        let Some(entry) = self.servers.entries().get(index) else {
+            return;
+        };
+        let address = entry.address.clone();
+        let now = Instant::now();
+        let double = self
+            .last_server_click
+            .as_ref()
+            .is_some_and(|(at, previous)| {
+                previous == &address && now.duration_since(*at) < DOUBLE_CLICK
+            });
+        self.last_server_click = Some((now, address.clone()));
+        self.servers_selected = Some(address);
+        if double {
+            self.join_server(index);
+        }
+    }
+
+    /// Join whatever `Join Server` / Enter would join.
+    fn join_selected_server(&mut self) {
+        let Some(selected) = self.servers_selected.clone() else {
+            return;
+        };
+        let Some(index) = self
+            .servers
+            .entries()
+            .iter()
+            .position(|entry| entry.address == selected)
+        else {
+            return;
+        };
+        self.join_server(index);
+    }
+
     fn save_servers(&self) {
         if let Err(err) = self.servers.save(&self.options.servers_path) {
             eprintln!("could not save the server list: {err}");
@@ -1551,20 +1659,29 @@ impl LiveApp {
     fn handle_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
         match action {
             Action::Singleplayer => self.start_local(),
-            Action::Multiplayer => {
+            Action::Multiplayer => self.open_servers(),
+            Action::ServersJoin => self.join_selected_server(),
+            Action::ServersDirectConnect => {
                 self.address_input.clear();
-                self.servers_scroll = 0;
-                self.screen = Screen::Servers;
+                self.screen = Screen::Connect;
             }
-            Action::ServersSubmit => self.connect_from_input(),
+            Action::ServersRefresh => self.refresh_server_list(),
             Action::ServersBack => self.screen = Screen::Title,
-            Action::ServerJoin(index) => self.join_server(index),
+            Action::ServerSelect(index) => self.select_server(index),
             Action::ServerFavourite(index) => {
                 self.servers.toggle_favourite(index);
                 self.save_servers();
             }
             Action::ServerRemove(index) => {
+                let removed = self
+                    .servers
+                    .entries()
+                    .get(index)
+                    .map(|entry| entry.address.clone());
                 self.servers.remove(index);
+                if removed == self.servers_selected {
+                    self.servers_selected = None;
+                }
                 self.save_servers();
                 self.servers_scroll = self.servers_scroll.min(self.servers_max_scroll());
             }
@@ -1574,7 +1691,7 @@ impl LiveApp {
             }
             Action::Quit => event_loop.exit(),
             Action::ConnectSubmit => self.connect_from_input(),
-            Action::ConnectCancel => self.screen = Screen::Title,
+            Action::ConnectCancel => self.screen = Screen::Servers,
             Action::Resume => self.enter_game(),
             Action::OpenSettings => {
                 self.settings_return = Screen::Pause;
@@ -1653,17 +1770,15 @@ impl ApplicationHandler for LiveApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                // The multiplayer and direct-connect screens share one text field.
-                if matches!(self.screen, Screen::Servers | Screen::Connect)
-                    && event.state == ElementState::Pressed
-                {
+                // The direct-connect screen is a text field.
+                if self.screen == Screen::Connect && event.state == ElementState::Pressed {
                     match event.physical_key {
                         PhysicalKey::Code(KeyCode::Enter) => {
                             self.connect_from_input();
                             return;
                         }
                         PhysicalKey::Code(KeyCode::Escape) => {
-                            self.screen = Screen::Title;
+                            self.screen = Screen::Servers;
                             return;
                         }
                         PhysicalKey::Code(KeyCode::Backspace) => {
@@ -1679,6 +1794,15 @@ impl ApplicationHandler for LiveApp {
                             }
                         }
                     }
+                    return;
+                }
+                // Enter joins the selected server; letters do nothing here, the
+                // list has no text field of its own.
+                if self.screen == Screen::Servers
+                    && event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::Enter)
+                {
+                    self.join_selected_server();
                     return;
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -1821,6 +1945,32 @@ fn initial_settings() -> Settings {
 /// Chunk radius to generate around the player for a given render distance.
 fn view_radius(view_distance: u8) -> i32 {
     i32::from(view_distance).clamp(2, 16)
+}
+
+/// Ping one server for the multiplayer screen. Runs on its own thread — this
+/// blocks for up to [`PING_TIMEOUT`] and must never touch the render thread.
+fn ping_server(address: &str) -> Ping {
+    let Ok(parsed) = ServerAddress::parse(address) else {
+        return Ping::Offline;
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("could not start the ping runtime: {err}");
+            return Ping::Offline;
+        }
+    };
+    match runtime.block_on(nephele_protocol::ping(&parsed, PING_TIMEOUT)) {
+        Ok(status) => Ping::Online(Status {
+            motd: crate::strip_formatting(&status.description),
+            version: status.version_name.unwrap_or_else(|| "?".to_string()),
+            ping_ms: status.latency.map(|d| d.as_millis() as u32).unwrap_or(0),
+        }),
+        Err(_) => Ping::Offline,
+    }
 }
 
 /// Interpolate between two Minecraft angles the short way round.

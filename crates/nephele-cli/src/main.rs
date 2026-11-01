@@ -1,5 +1,6 @@
 mod live;
 mod mesher;
+mod paths;
 mod servers;
 mod settings;
 mod skins;
@@ -173,6 +174,7 @@ fn main() -> ExitCode {
                 None => None,
             };
             let assets_dir = assets_dir.unwrap_or_else(default_assets_dir);
+            migrate_legacy_state();
             match live::run(live::PlayOptions {
                 address,
                 username,
@@ -180,8 +182,8 @@ fn main() -> ExitCode {
                 fly,
                 seed,
                 online,
-                session_path: project_root().join(".local/auth.json"),
-                servers_path: project_root().join(".local/servers.json"),
+                session_path: session_path(),
+                servers_path: servers_path(),
             }) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -304,7 +306,7 @@ fn run_auth(client_id: Option<String>, out: Option<PathBuf>, legacy: bool) -> Ex
         session.profile.name, session.profile.id
     );
 
-    let path = out.unwrap_or_else(|| project_root().join(".local/auth.json"));
+    let path = out.unwrap_or_else(session_path);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -426,6 +428,31 @@ fn minecraft_assets_root() -> PathBuf {
 
 fn default_assets_dir() -> PathBuf {
     minecraft_assets_root().join("textures").join("blocks")
+}
+
+/// Where the cached Microsoft session lives. Per-user, not per-install: a game
+/// directory can be read-only, and two installs of the client have no business
+/// sharing an identity.
+fn session_path() -> PathBuf {
+    paths::user_data_dir().join("auth.json")
+}
+
+fn servers_path() -> PathBuf {
+    paths::user_data_dir().join("servers.json")
+}
+
+/// Copy any `auth.json` / `servers.json` left in the old per-install `.local/`
+/// directory into the user-data directory, once.
+fn migrate_legacy_state() {
+    let root = project_root();
+    for (new, legacy) in [
+        (session_path(), root.join(".local/auth.json")),
+        (servers_path(), root.join(".local/servers.json")),
+    ] {
+        if let Err(err) = paths::migrate_legacy_file(&new, &legacy) {
+            eprintln!("could not migrate {}: {err}", legacy.display());
+        }
+    }
 }
 
 async fn run_status(input: &str, json: bool, timeout_secs: u64) -> Result<()> {

@@ -212,7 +212,7 @@ No audio exists yet.
 | **Microsoft device-code OAuth → Xbox Live → Minecraft services** | **done** | `nephele-auth` + `nephele auth`; `play --online` uses the cached session. Still needs an Azure client id. |
 | Token storage + refresh | M | `azalea-auth` has a cache; encrypt at rest. |
 | Online-mode encryption handshake | **done** | AES-CFB8, server id hash, RSA PKCS#1 and the session-server join all implemented. |
-| Server list screen (ping, MOTD, version, favourites, history) | M | |
+| Server list screen (ping, MOTD, version, favourites, history) | **done** | Saved list with a live ping per row (MOTD, version, latency, 1s timeout, refreshed on open and by a Refresh button), favourites, select / double-click / Enter to join. No history list and no player counts yet. |
 | Dimension change, respawn packets, portals | L | |
 | Resource packs (server-sent) | M | |
 | Full C→S action coverage (entity action, use entity, spectate, plugin channels) | M | |
@@ -265,8 +265,9 @@ above and from underground.
 hunger/XP, drops, death/respawn. *Exit:* you can punch a tree and make a
 pickaxe.
 
-**M3 — Join a real server.** Microsoft auth, server list, online-mode
-handshake, dimension change. *Exit:* join a public 1.8.9 server and play.
+**M3 — Join a real server.** Microsoft auth (**done**, missing only a shippable
+Azure client id), server list (**done**), online-mode handshake (**done**),
+dimension change. *Exit:* join a public 1.8.9 server and play.
 
 **M4 — PvP client.** HUD modules, toggle sprint, zoom, crosshair/hit indicators,
 chat, scoreboard, tab list. *Exit:* playable at a competitive level on an old

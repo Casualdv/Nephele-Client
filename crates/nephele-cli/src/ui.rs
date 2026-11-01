@@ -9,7 +9,7 @@
 
 use std::sync::OnceLock;
 
-use crate::servers::ServerList;
+use crate::servers::{Ping, PingBoard, ServerList};
 use crate::settings::{SettingId, Settings};
 use nephele_assets::{face_textures, font, sprites, TextureArray, MISSING_TEXTURE};
 use nephele_protocol::packets::play::{ItemStack, HOTBAR_FIRST_SLOT, HOTBAR_SLOTS};
@@ -26,8 +26,15 @@ const SLOT_HOVER: [f32; 4] = [0.55, 0.55, 0.55, 1.0];
 const ROW: [f32; 4] = [0.18, 0.18, 0.18, 1.0];
 const ROW_ALT: [f32; 4] = [0.15, 0.15, 0.15, 1.0];
 const ROW_HOVER: [f32; 4] = [0.30, 0.30, 0.30, 1.0];
+const ROW_SELECTED: [f32; 4] = [0.20, 0.30, 0.45, 1.0];
+const SELECTION_BORDER: [f32; 4] = [0.55, 0.70, 0.95, 1.0];
 const STAR: [f32; 4] = [1.0, 0.85, 0.25, 1.0];
 const REMOVE_HOVER: [f32; 4] = [1.0, 0.4, 0.4, 1.0];
+const MOTD: [f32; 4] = [0.75, 0.75, 0.75, 1.0];
+const OFFLINE: [f32; 4] = [0.95, 0.42, 0.42, 1.0];
+const PING_GOOD: [f32; 4] = [0.45, 0.95, 0.45, 1.0];
+const PING_WARN: [f32; 4] = [0.95, 0.85, 0.30, 1.0];
+const PING_BAD: [f32; 4] = [0.95, 0.42, 0.42, 1.0];
 
 /// Which screen is on top of the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,11 +56,13 @@ pub enum Action {
     Multiplayer,
     TitleOptions,
     Quit,
-    /// Join the address typed into the multiplayer screen's field.
-    ServersSubmit,
+    /// Join whichever saved entry is selected.
+    ServersJoin,
+    ServersDirectConnect,
+    ServersRefresh,
     ServersBack,
-    /// Join a saved entry, by storage index.
-    ServerJoin(usize),
+    /// Select a saved entry, by storage index.
+    ServerSelect(usize),
     ServerFavourite(usize),
     ServerRemove(usize),
     ConnectSubmit,
@@ -309,7 +318,23 @@ fn draw_button(
     scale: f32,
     hover: bool,
 ) {
-    // Vanilla's button face: three stacked 200x20 strips in widgets.png.
+    draw_button_state(bg, fg, rect, label, scale, hover, true);
+}
+
+/// A vanilla button, greyed out when `enabled` is false.
+#[allow(clippy::too_many_arguments)]
+fn draw_button_state(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    rect: Rect,
+    label: &str,
+    scale: f32,
+    hover: bool,
+    enabled: bool,
+) {
+    // Vanilla 1.8 has no disabled strip: a disabled button keeps the normal
+    // face and greys its label. (`BUTTON_DISABLED` in this atlas overlaps the
+    // hotbar-selection art, so drawing it would show stray pixels.)
     let sprite = if hover {
         sprites::BUTTON_HOVER
     } else {
@@ -321,7 +346,7 @@ fn draw_button(
         rect.x + rect.w / 2.0,
         rect.y + (rect.h - 8.0 * scale) / 2.0,
         scale,
-        TEXT,
+        if enabled { TEXT } else { TEXT_DIM },
     );
 }
 
@@ -783,19 +808,21 @@ pub fn draw_connect(
 }
 
 /// How many saved servers fit in the list before it needs scrolling.
-pub const SERVER_ROWS: usize = 5;
+pub const SERVER_ROWS: usize = 6;
 
-/// The multiplayer screen: the saved server list, an address field and the
-/// Join / Back buttons.
+/// The multiplayer screen: the saved list with its ping columns, and the
+/// Join / Direct Connect / Refresh / Back buttons.
 ///
-/// The address field is the same widget `draw_connect` draws and feeds the same
-/// buffer, so both screens share one piece of input handling.
+/// The four columns are name+address, MOTD, version and ping. Everything but
+/// the name is a placeholder until the screen's pings come back — see
+/// [`crate::servers::PingBoard`].
 #[allow(clippy::too_many_arguments)]
 pub fn draw_servers(
     bg: &mut UiBatch,
     fg: &mut UiBatch,
     list: &ServerList,
-    address: &str,
+    pings: &PingBoard,
+    selected: Option<&str>,
     scroll: usize,
     pointer: Option<[f32; 2]>,
     scale: f32,
@@ -808,12 +835,14 @@ pub fn draw_servers(
 
     let row_h = s(22.0);
     let list_h = s(4.0) + row_h * SERVER_ROWS as f32 + s(4.0);
-    // Heading, list, field, buttons and hint, stacked and centred as one block
-    // so a 5-row list still fits a 240 px-tall GUI.
+    // Heading, list, two button rows and hint, stacked and centred as one block
+    // so the screen still fits a 240 px-tall GUI.
     let block_h =
         s(12.0) + s(8.0) + list_h + s(12.0) + s(20.0) + s(8.0) + s(20.0) + s(8.0) + s(8.0);
     let top = ((height - block_h) / 2.0).max(s(2.0));
-    let panel_w = s(320.0).min(width - s(8.0));
+    // Wide enough that a truncated MOTD still says something: at GUI scale 3
+    // the columns get ~30 characters.
+    let panel_w = s(400.0).min(width - s(8.0));
     let panel_x = cx - panel_w / 2.0;
 
     fg.text_centered("Play Multiplayer", cx, top, scale * 1.5, TEXT);
@@ -838,7 +867,7 @@ pub fn draw_servers(
     let visible = order.len().saturating_sub(scroll).min(SERVER_ROWS);
     if order.is_empty() {
         fg.text_centered(
-            "No servers saved yet",
+            "No servers saved yet - use Direct Connect",
             cx,
             list_rect.y + list_h / 2.0 - s(4.0),
             scale,
@@ -846,6 +875,7 @@ pub fn draw_servers(
         );
     }
 
+    let name_w = s(112.0);
     let mut buttons = Vec::new();
     for slot in 0..visible {
         let Some(&index) = order.get(scroll + slot) else {
@@ -861,10 +891,13 @@ pub fn draw_servers(
             panel_w - s(4.0),
             row_h - s(1.0),
         );
+        let is_selected = selected == Some(entry.address.as_str());
         let is_hovered = hovered(pointer, &row);
         bg.rect(
             row,
-            if is_hovered {
+            if is_selected {
+                ROW_SELECTED
+            } else if is_hovered {
                 ROW_HOVER
             } else if slot % 2 == 0 {
                 ROW
@@ -872,10 +905,13 @@ pub fn draw_servers(
                 ROW_ALT
             },
         );
-        // The whole row joins; the small buttons below are hit-tested first
+        if is_selected {
+            bg.rect_outline(row, scale.max(1.0), SELECTION_BORDER);
+        }
+        // Selecting is the row's job; the small buttons below win the hit test
         // because `hit_test` keeps the last match.
         buttons.push(Button {
-            action: Action::ServerJoin(index),
+            action: Action::ServerSelect(index),
             rect: row,
         });
 
@@ -909,75 +945,151 @@ pub fn draw_servers(
             rect: remove,
         });
 
-        let text_x = row.x + s(15.0);
-        let text_w = row.w - s(31.0);
+        // Column positions, right to left: remove, ping, version, MOTD.
+        let name_x = row.x + s(15.0);
+        let motd_x = row.x + s(130.0);
+        let motd_w = (row.w - s(239.0)).max(s(24.0));
+        let version_x = row.x + row.w - s(105.0);
+        let ping_x = row.x + row.w - s(51.0);
+
         fg.text(
-            &fit_text(entry.label(), text_w, scale),
-            text_x,
+            &fit_text(entry.label(), name_w, scale),
+            name_x,
             row.y + s(2.0),
             scale,
             TEXT,
         );
         fg.text(
-            &fit_text(&entry.address, text_w, scale),
-            text_x,
+            &fit_text(&entry.address, name_w, scale),
+            name_x,
             row.y + s(11.0),
             scale,
             TEXT_DIM,
         );
+
+        match pings.of(&entry.address) {
+            Ping::Unknown => {}
+            Ping::Pending => {
+                fg.text(
+                    &fit_text("Pinging...", motd_w, scale),
+                    motd_x,
+                    row.y + s(2.0),
+                    scale,
+                    TEXT_DIM,
+                );
+            }
+            Ping::Offline => {
+                fg.text(
+                    &fit_text("Can't reach server", motd_w, scale),
+                    motd_x,
+                    row.y + s(2.0),
+                    scale,
+                    OFFLINE,
+                );
+            }
+            Ping::Online(status) => {
+                for (line_index, line) in status.motd.lines().take(2).enumerate() {
+                    fg.text(
+                        &fit_text(line, motd_w, scale),
+                        motd_x,
+                        row.y + s(2.0) + line_index as f32 * s(9.0),
+                        scale,
+                        MOTD,
+                    );
+                }
+                fg.text(
+                    &fit_text(&status.version, s(50.0), scale),
+                    version_x,
+                    row.y + s(2.0),
+                    scale,
+                    TEXT_DIM,
+                );
+                fg.text(
+                    &fit_text(&format!("{} ms", status.ping_ms), s(36.0), scale),
+                    ping_x,
+                    row.y + s(2.0),
+                    scale,
+                    ping_colour(status.ping_ms),
+                );
+            }
+        }
     }
 
-    let field = Rect::new(panel_x, list_rect.y + list_h + s(12.0), panel_w, s(20.0));
-    bg.rect(field, [0.0, 0.0, 0.0, 0.75]);
-    bg.rect_outline(field, scale.max(1.0), BUTTON_BORDER);
-    let text = if address.is_empty() {
-        "Server address".to_string()
-    } else {
-        address.to_string()
-    };
-    let colour = if address.is_empty() { TEXT_DIM } else { TEXT };
-    fg.text(
-        &fit_text(&text, field.w - s(8.0), scale),
-        field.x + s(4.0),
-        field.y + s(6.0),
-        scale,
-        colour,
-    );
-
     let button_w = (panel_w - s(6.0)) / 2.0;
-    let button_y = field.y + field.h + s(8.0);
-    let join = Rect::new(panel_x, button_y, button_w, s(20.0));
-    let back = Rect::new(panel_x + button_w + s(6.0), button_y, button_w, s(20.0));
-    let can_join = !address.trim().is_empty();
-    draw_button(
+    let first_row = list_rect.y + list_h + s(12.0);
+    let second_row = first_row + s(28.0);
+    let join = Rect::new(panel_x, first_row, button_w, s(20.0));
+    let direct = Rect::new(panel_x + button_w + s(6.0), first_row, button_w, s(20.0));
+    let refresh = Rect::new(panel_x, second_row, button_w, s(20.0));
+    let back = Rect::new(panel_x + button_w + s(6.0), second_row, button_w, s(20.0));
+
+    let can_join = selected.is_some();
+    draw_button_state(
         bg,
         fg,
         join,
         "Join Server",
         scale,
         can_join && hovered(pointer, &join),
+        can_join,
+    );
+    draw_button(
+        bg,
+        fg,
+        direct,
+        "Direct Connect",
+        scale,
+        hovered(pointer, &direct),
+    );
+    draw_button(
+        bg,
+        fg,
+        refresh,
+        "Refresh",
+        scale,
+        hovered(pointer, &refresh),
     );
     draw_button(bg, fg, back, "Back", scale, hovered(pointer, &back));
+
     if can_join {
         buttons.push(Button {
-            action: Action::ServersSubmit,
+            action: Action::ServersJoin,
             rect: join,
         });
     }
+    buttons.push(Button {
+        action: Action::ServersDirectConnect,
+        rect: direct,
+    });
+    buttons.push(Button {
+        action: Action::ServersRefresh,
+        rect: refresh,
+    });
     buttons.push(Button {
         action: Action::ServersBack,
         rect: back,
     });
 
     fg.text_centered(
-        "Click a server to join it.  * favourite, x remove.  Esc goes back.",
+        "Click to select, double-click or Enter to join.  * favourite, x delete.",
         cx,
-        button_y + s(28.0),
+        second_row + s(28.0),
         scale,
         TEXT_DIM,
     );
 
     buttons
+}
+
+/// Green / amber / red for a round-trip time, in the PvP-client convention.
+fn ping_colour(ms: u32) -> [f32; 4] {
+    if ms < 80 {
+        PING_GOOD
+    } else if ms < 160 {
+        PING_WARN
+    } else {
+        PING_BAD
+    }
 }
 
 /// Trim `text` with a trailing `...` until it fits `max_width`.
@@ -1115,11 +1227,16 @@ mod tests {
         assert_eq!(hit_test(&buttons, [200.0, 200.0]), None);
     }
 
-    fn server_screen(list: &ServerList, address: &str, scroll: usize) -> Vec<Button> {
+    fn server_screen(
+        list: &ServerList,
+        pings: &PingBoard,
+        selected: Option<&str>,
+        scroll: usize,
+    ) -> Vec<Button> {
         let mut bg = UiBatch::default();
         let mut fg = UiBatch::default();
         draw_servers(
-            &mut bg, &mut fg, list, address, scroll, None, 2.0, 1280.0, 720.0,
+            &mut bg, &mut fg, list, pings, selected, scroll, None, 2.0, 1280.0, 720.0,
         )
     }
 
@@ -1140,35 +1257,44 @@ mod tests {
     }
 
     #[test]
-    fn the_server_screen_needs_an_address_before_it_can_join() {
+    fn joining_needs_a_selection_but_the_other_buttons_are_always_there() {
         let list = three_servers();
-        let buttons = server_screen(&list, "  ", 0);
-        assert!(!buttons.iter().any(|b| b.action == Action::ServersSubmit));
-        assert!(buttons.iter().any(|b| b.action == Action::ServersBack));
+        let pings = PingBoard::default();
 
-        let buttons = server_screen(&list, "play.example.net", 0);
-        assert!(buttons.iter().any(|b| b.action == Action::ServersSubmit));
+        let buttons = server_screen(&list, &pings, None, 0);
+        assert!(!buttons.iter().any(|b| b.action == Action::ServersJoin));
+        for action in [
+            Action::ServersDirectConnect,
+            Action::ServersRefresh,
+            Action::ServersBack,
+        ] {
+            rect_of(&buttons, action);
+        }
+
+        let buttons = server_screen(&list, &pings, Some("1.example.net"), 0);
+        rect_of(&buttons, Action::ServersJoin);
     }
 
     #[test]
     fn every_saved_server_gets_a_row_that_acts_on_its_storage_index() {
         let list = three_servers();
-        let buttons = server_screen(&list, "", 0);
+        let buttons = server_screen(&list, &PingBoard::default(), None, 0);
         for index in 0..3 {
-            rect_of(&buttons, Action::ServerJoin(index));
+            rect_of(&buttons, Action::ServerSelect(index));
             rect_of(&buttons, Action::ServerFavourite(index));
             rect_of(&buttons, Action::ServerRemove(index));
         }
-        assert!(!buttons.iter().any(|b| b.action == Action::ServerJoin(3)));
+        assert!(!buttons.iter().any(|b| b.action == Action::ServerSelect(3)));
     }
 
     #[test]
     fn favourites_are_drawn_above_the_other_servers() {
         let mut list = three_servers();
         list.toggle_favourite(2);
-        let buttons = server_screen(&list, "", 0);
+        let buttons = server_screen(&list, &PingBoard::default(), None, 0);
         assert!(
-            rect_of(&buttons, Action::ServerJoin(2)).y < rect_of(&buttons, Action::ServerJoin(0)).y
+            rect_of(&buttons, Action::ServerSelect(2)).y
+                < rect_of(&buttons, Action::ServerSelect(0)).y
         );
     }
 
@@ -1176,7 +1302,7 @@ mod tests {
     #[test]
     fn the_star_and_remove_buttons_beat_the_row_itself() {
         let list = three_servers();
-        let buttons = server_screen(&list, "", 0);
+        let buttons = server_screen(&list, &PingBoard::default(), None, 0);
         let star = rect_of(&buttons, Action::ServerFavourite(0));
         let remove = rect_of(&buttons, Action::ServerRemove(0));
         assert_eq!(
@@ -1187,10 +1313,10 @@ mod tests {
             hit_test(&buttons, [remove.x + 1.0, remove.y + 1.0]),
             Some(Action::ServerRemove(0))
         );
-        let row = rect_of(&buttons, Action::ServerJoin(0));
+        let row = rect_of(&buttons, Action::ServerSelect(0));
         assert_eq!(
             hit_test(&buttons, [row.x + row.w / 2.0, row.y + row.h / 2.0]),
-            Some(Action::ServerJoin(0))
+            Some(Action::ServerSelect(0))
         );
     }
 
@@ -1204,35 +1330,68 @@ mod tests {
             ));
         }
 
-        let first = server_screen(&list, "", 0);
+        let first = server_screen(&list, &PingBoard::default(), None, 0);
         let rows: Vec<Rect> = (0..SERVER_ROWS)
-            .map(|index| rect_of(&first, Action::ServerJoin(index)))
+            .map(|index| rect_of(&first, Action::ServerSelect(index)))
             .collect();
         assert_eq!(rows.len(), SERVER_ROWS);
         assert!(!first
             .iter()
-            .any(|b| b.action == Action::ServerJoin(SERVER_ROWS)));
+            .any(|b| b.action == Action::ServerSelect(SERVER_ROWS)));
 
-        let last = server_screen(&list, "", 2);
-        rect_of(&last, Action::ServerJoin(SERVER_ROWS + 1));
-        assert!(!last.iter().any(|b| b.action == Action::ServerJoin(1)));
+        let last = server_screen(&list, &PingBoard::default(), None, 2);
+        rect_of(&last, Action::ServerSelect(SERVER_ROWS + 1));
+        assert!(!last.iter().any(|b| b.action == Action::ServerSelect(1)));
     }
 
     #[test]
     fn rows_and_bottom_controls_do_not_overlap() {
         let list = three_servers();
-        let buttons = server_screen(&list, "address", 0);
+        let buttons = server_screen(&list, &PingBoard::default(), Some("1.example.net"), 0);
         let mut rows: Vec<Rect> = (0..3)
-            .map(|index| rect_of(&buttons, Action::ServerJoin(index)))
+            .map(|index| rect_of(&buttons, Action::ServerSelect(index)))
             .collect();
         rows.sort_by(|a, b| a.y.total_cmp(&b.y));
         for pair in rows.windows(2) {
             assert!(pair[0].y + pair[0].h <= pair[1].y);
         }
-        let join = rect_of(&buttons, Action::ServersSubmit);
+        let join = rect_of(&buttons, Action::ServersJoin);
+        let direct = rect_of(&buttons, Action::ServersDirectConnect);
+        let refresh = rect_of(&buttons, Action::ServersRefresh);
         let back = rect_of(&buttons, Action::ServersBack);
         assert!(rows.last().unwrap().y + rows.last().unwrap().h <= join.y);
-        assert!(join.x + join.w <= back.x);
+        assert!(join.x + join.w <= direct.x);
+        assert!(join.y + join.h <= refresh.y);
+        assert!(refresh.x + refresh.w <= back.x);
+    }
+
+    #[test]
+    fn every_ping_state_draws_without_losing_the_row() {
+        let list = three_servers();
+        let mut pings = PingBoard::default();
+        pings.finish(
+            "1.example.net",
+            Ping::Online(crate::servers::Status {
+                motd: "A Nephele Test\nsecond line".to_string(),
+                version: "1.8.9".to_string(),
+                ping_ms: 42,
+            }),
+        );
+        pings.begin("2.example.net");
+        pings.finish("3.example.net", Ping::Offline);
+
+        let buttons = server_screen(&list, &pings, None, 0);
+        for index in 0..3 {
+            rect_of(&buttons, Action::ServerSelect(index));
+        }
+    }
+
+    #[test]
+    fn ping_colours_follow_the_latency_bands() {
+        assert_eq!(ping_colour(12), PING_GOOD);
+        assert_eq!(ping_colour(80), PING_WARN);
+        assert_eq!(ping_colour(159), PING_WARN);
+        assert_eq!(ping_colour(160), PING_BAD);
     }
 
     #[test]

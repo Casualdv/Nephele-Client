@@ -1,9 +1,10 @@
 //! The saved server list behind the multiplayer screen.
 //!
 //! Kept deliberately separate from the UI: what a list *is* (add, remove,
-//! reorder, deduplicate, persist) is testable without a window, and the screen
-//! only has to draw it.
+//! reorder, deduplicate, persist) and what a ping found out about each entry
+//! are testable without a window, and the screen only has to draw them.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,58 @@ impl ServerList {
     }
 }
 
+/// What a server-list ping learned, in the columns the screen shows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Status {
+    /// The MOTD, formatting codes already stripped. May be empty or two lines.
+    pub motd: String,
+    /// The version string the server advertises, e.g. `1.8.9`.
+    pub version: String,
+    /// Round-trip time of the status exchange.
+    pub ping_ms: u32,
+}
+
+/// One row's ping state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Ping {
+    /// Not asked yet.
+    #[default]
+    Unknown,
+    /// A request is in flight.
+    Pending,
+    Online(Status),
+    /// The ping failed or timed out.
+    Offline,
+}
+
+static UNKNOWN: Ping = Ping::Unknown;
+
+/// Ping results, keyed by the address a row shows.
+#[derive(Debug, Clone, Default)]
+pub struct PingBoard {
+    states: HashMap<String, Ping>,
+}
+
+impl PingBoard {
+    pub fn of(&self, address: &str) -> &Ping {
+        self.states.get(address).unwrap_or(&UNKNOWN)
+    }
+
+    /// Mark `address` as in flight. Returns whether a request should be
+    /// started, so opening the screen twice cannot double up on one server.
+    pub fn begin(&mut self, address: &str) -> bool {
+        if self.of(address) == &Ping::Pending {
+            return false;
+        }
+        self.states.insert(address.to_owned(), Ping::Pending);
+        true
+    }
+
+    pub fn finish(&mut self, address: &str, ping: Ping) {
+        self.states.insert(address.to_owned(), ping);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +263,54 @@ mod tests {
         assert!(ServerList::load(Path::new("does-not-exist.json"))
             .entries()
             .is_empty());
+    }
+
+    #[test]
+    fn a_fresh_board_knows_nothing() {
+        let board = PingBoard::default();
+        assert_eq!(board.of("a.example.net"), &Ping::Unknown);
+    }
+
+    #[test]
+    fn starting_a_ping_marks_the_row_and_does_not_duplicate_it() {
+        let mut board = PingBoard::default();
+        assert!(board.begin("a.example.net"), "first ask starts a request");
+        assert_eq!(board.of("a.example.net"), &Ping::Pending);
+        assert!(!board.begin("a.example.net"), "already in flight");
+        assert_eq!(board.of("a.example.net"), &Ping::Pending);
+    }
+
+    #[test]
+    fn a_finished_ping_replaces_the_pending_state() {
+        let mut board = PingBoard::default();
+        board.begin("a.example.net");
+        board.finish(
+            "a.example.net",
+            Ping::Online(Status {
+                motd: "Hello".to_string(),
+                version: "1.8.9".to_string(),
+                ping_ms: 42,
+            }),
+        );
+        assert_eq!(
+            board.of("a.example.net"),
+            &Ping::Online(Status {
+                motd: "Hello".to_string(),
+                version: "1.8.9".to_string(),
+                ping_ms: 42,
+            })
+        );
+        // A finished server can be asked again.
+        assert!(board.begin("a.example.net"));
+    }
+
+    #[test]
+    fn addresses_are_tracked_independently() {
+        let mut board = PingBoard::default();
+        board.begin("a.example.net");
+        board.finish("b.example.net", Ping::Offline);
+        assert_eq!(board.of("a.example.net"), &Ping::Pending);
+        assert_eq!(board.of("b.example.net"), &Ping::Offline);
+        assert_eq!(board.of("c.example.net"), &Ping::Unknown);
     }
 }
