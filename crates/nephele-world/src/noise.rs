@@ -60,6 +60,13 @@ impl JavaRandom {
         self.next(1) != 0
     }
 
+    /// `Random.nextLong`: two 32-bit draws, high word first, both signed.
+    pub fn next_long(&mut self) -> i64 {
+        let high = self.next(32) as i32 as i64;
+        let low = self.next(32) as i32 as i64;
+        (high << 32).wrapping_add(low)
+    }
+
     /// `Random.nextFloat`: 24 bits over 2^24.
     pub fn next_float(&mut self) -> f32 {
         self.next(24) as f32 / (1u32 << 24) as f32

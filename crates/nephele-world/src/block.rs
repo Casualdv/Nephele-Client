@@ -48,6 +48,7 @@ pub mod ids {
     pub const PLANKS: u16 = 5;
     pub const BEDROCK: u16 = 7;
     pub const WATER: u16 = 9;
+    pub const LAVA: u16 = 11;
     pub const SAND: u16 = 12;
     pub const GRAVEL: u16 = 13;
     pub const LOG: u16 = 17;

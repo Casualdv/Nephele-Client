@@ -38,7 +38,9 @@ impl VanillaGenerator {
         let stone_noise = self.terrain.stone_noise(chunk_x, chunk_z);
         let mut rand = JavaRandom::new(chunk_seed(self.seed, chunk_x, chunk_z));
         surface::apply(&mut column, &biomes, &stone_noise, &self.surface, &mut rand);
-        // Veins, like vanilla, come after the surface and before decoration.
+        // Vanilla order: caves and ravines carve the terrain, then veins are
+        // placed into what is left.
+        crate::caves::Caves::new(self.seed).carve(&mut column, &biomes);
         crate::ores::decorate(&mut column);
         column
     }
@@ -91,6 +93,61 @@ mod tests {
     use super::*;
     use crate::block::ids;
 
+    #[test]
+    fn cave_volume_is_in_the_same_range_as_the_reference_world() {
+        use nephele_anvil::{parse_chunk, RegionFile};
+        use std::path::PathBuf;
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Nephele-private/parity/server/world/region");
+        if !dir.is_dir() {
+            eprintln!("skipped: no reference world at Nephele-private/parity");
+            return;
+        }
+
+        let mut theirs = 0usize;
+        let mut ours = 0usize;
+        let mut chunks = 0usize;
+
+        let mut generator = VanillaGenerator::new(12345);
+        let path = dir.join("r.-1.0.mca");
+        let region = RegionFile::open(&path).expect("region opens");
+        for lz in 0..32 {
+            for lx in 0..32 {
+                let Some(bytes) = region.chunk_nbt(lx, lz).ok().flatten() else {
+                    continue;
+                };
+                let Ok(stored) = parse_chunk(&bytes) else {
+                    continue;
+                };
+                chunks += 1;
+                let column = generator.column(stored.x, stored.z);
+
+                // Air well below the surface is what caves and ravines leave.
+                for x in 0..16usize {
+                    for z in 0..16usize {
+                        for y in 1..56usize {
+                            if column.get_block(x, y, z).is_air() {
+                                ours += 1;
+                            }
+                            if stored.state(x, y, z) >> 4 == 0 {
+                                theirs += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mine = ours as f64 / chunks as f64;
+        let real = theirs as f64 / chunks as f64;
+        println!("cave air below y=56: ours {mine:.0}/chunk, reference {real:.0}/chunk");
+        assert!(chunks > 100);
+        assert!(
+            (mine - real).abs() < real * 0.5,
+            "cave volume off: {mine:.0} vs {real:.0}"
+        );
+    }
     #[test]
     fn ore_density_matches_the_reference_world() {
         use nephele_anvil::{parse_chunk, RegionFile};
@@ -270,9 +327,11 @@ mod tests {
         }
 
         assert!(mesa_columns > 0, "the chunk has no mesa columns");
-        assert_eq!(
-            banded, mesa_columns,
-            "every mesa column should expose coloured clay"
+        // Caves can break through the surface, so allow a few columns to be
+        // punched open.
+        assert!(
+            banded * 10 >= mesa_columns * 8,
+            "{banded} of {mesa_columns} mesa columns expose coloured clay"
         );
         assert_eq!(grass, 0, "mesa must not fall back to the grass surface");
     }
