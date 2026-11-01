@@ -21,6 +21,7 @@ pub mod decode;
 pub mod encode;
 pub mod generation;
 pub mod genlayer;
+pub mod mesa;
 pub mod noise;
 pub mod raycast;
 pub mod surface;

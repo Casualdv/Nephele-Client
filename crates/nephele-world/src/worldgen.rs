@@ -27,7 +27,7 @@ impl VanillaGenerator {
             seed,
             layers: BiomeLayers::new(seed),
             terrain: TerrainNoise::new(seed),
-            surface: SurfaceNoise::new(),
+            surface: SurfaceNoise::with_seed(seed),
         }
     }
 
@@ -159,6 +159,49 @@ mod tests {
         assert!(water > 0, "expected water below sea level");
     }
 
+    #[test]
+    fn a_mesa_chunk_is_made_of_coloured_clay() {
+        // Seed 22 has mesa at this chunk; mesa is rare enough that picking a
+        // seed by hand is cheaper than scanning inside the test.
+        let mut generator = VanillaGenerator::new(22);
+        let biomes = generator.biomes(-19, -30);
+        let column = generator.column(-19, -30);
+
+        let mut mesa_columns = 0;
+        let mut banded = 0;
+        let mut grass = 0;
+
+        for (index, biome) in biomes.iter().enumerate() {
+            if !matches!(biome, 37..=39) {
+                continue;
+            }
+            mesa_columns += 1;
+            let x = index % 16;
+            let z = index / 16;
+
+            let mut clay = 0;
+            for y in (0..256usize).rev() {
+                match column.get_block(x, y, z).id() {
+                    ids::STAINED_HARDENED_CLAY | ids::HARDENED_CLAY => clay += 1,
+                    ids::GRASS => grass += 1,
+                    _ => {}
+                }
+                if clay > 0 {
+                    break;
+                }
+            }
+            if clay > 0 {
+                banded += 1;
+            }
+        }
+
+        assert!(mesa_columns > 0, "the chunk has no mesa columns");
+        assert_eq!(
+            banded, mesa_columns,
+            "every mesa column should expose coloured clay"
+        );
+        assert_eq!(grass, 0, "mesa must not fall back to the grass surface");
+    }
     #[test]
     fn height_at_agrees_with_the_generated_column() {
         let mut generator = VanillaGenerator::new(12345);

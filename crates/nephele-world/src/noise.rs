@@ -55,6 +55,11 @@ impl JavaRandom {
         }
     }
 
+    /// `Random.nextBoolean`: a single bit, not `nextInt(2)`.
+    pub fn next_boolean(&mut self) -> bool {
+        self.next(1) != 0
+    }
+
     pub fn next_double(&mut self) -> f64 {
         let high = self.next(26) as u64;
         let low = self.next(27) as u64;

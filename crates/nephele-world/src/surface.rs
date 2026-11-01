@@ -56,16 +56,24 @@ pub fn biome_surface(biome_id: i32) -> (u16, u16) {
 pub struct SurfaceNoise {
     temperature: NoisePerlin,
     grass_color: NoisePerlin,
+    mesa: crate::mesa::MesaTerrain,
 }
 
 impl SurfaceNoise {
     pub fn new() -> Self {
+        Self::with_seed(0)
+    }
+
+    /// The mesa band table depends on the world seed, so terrain passes its
+    /// own seed here.
+    pub fn with_seed(seed: i64) -> Self {
         // Vanilla's own static seeds, unrelated to the world seed.
         let mut temperature = JavaRandom::new(1234);
         let mut grass = JavaRandom::new(2345);
         Self {
             temperature: NoisePerlin::new(&mut temperature, 1),
             grass_color: NoisePerlin::new(&mut grass, 1),
+            mesa: crate::mesa::MesaTerrain::new(seed),
         }
     }
 
@@ -141,6 +149,30 @@ pub fn apply(
                         filler = block::ids::STONE;
                     }
                 }
+            }
+
+            // Mesa replaces the generic routine entirely.
+            if biome::any(biome_id)
+                .map(|biome| biome.class == biome::BiomeClass::Mesa)
+                .unwrap_or(false)
+            {
+                let base = if biome_id >= 128 {
+                    biome_id - 128
+                } else {
+                    biome_id
+                };
+                noise.mesa.generate(
+                    column,
+                    x,
+                    z,
+                    world_x,
+                    world_z,
+                    stone_noise[z * 16 + x],
+                    biome_id == 165,
+                    base == 38,
+                    rand,
+                );
+                continue;
             }
 
             if biome::is_swamp_class(biome_id) {
