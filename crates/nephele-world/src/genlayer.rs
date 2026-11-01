@@ -235,8 +235,8 @@ impl Layer for GenLayerZoom {
             let mut bottom_left = parent[index(0, z + 1, parent_w)];
             while cursor < parent_w - 1 {
                 self.seed.init_chunk(
-                    (cursor as i32 + (parent_x << 1)) as i64,
-                    (z as i32 + (parent_z << 1)) as i64,
+                    ((cursor as i32 + parent_x) << 1) as i64,
+                    ((z as i32 + parent_z) << 1) as i64,
                 );
                 let top_right = parent[index(cursor + 1, z, parent_w)];
                 let bottom_right = parent[index(cursor + 1, z + 1, parent_w)];
