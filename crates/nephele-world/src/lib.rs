@@ -19,6 +19,7 @@ pub mod chunk;
 pub mod decode;
 pub mod encode;
 pub mod generation;
+pub mod noise;
 pub mod raycast;
 pub mod world;
 
@@ -27,5 +28,6 @@ pub use chunk::{section_index, ChunkColumn, Section, SECTION_COUNT, SECTION_DIM,
 pub use decode::{decode_chunk_bulk, decode_chunk_data, ChunkUpdate};
 pub use encode::{encode_chunk_bulk, encode_chunk_data};
 pub use generation::{TerrainGenerator, SEA_LEVEL, SNOW_LINE};
+pub use noise::{JavaRandom, NoiseImproved, NoiseOctaves};
 pub use raycast::{raycast, raycast_to, Face, RayHit};
 pub use world::{ChunkCoord, World};

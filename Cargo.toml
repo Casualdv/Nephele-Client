@@ -9,6 +9,7 @@ members = [
     "crates/nephele-render",
     "crates/nephele-cli",
     "crates/nephele-prepare",
+    "crates/nephele-anvil",
 ]
 
 [workspace.package]

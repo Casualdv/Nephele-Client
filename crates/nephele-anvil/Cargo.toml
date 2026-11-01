@@ -1,0 +1,11 @@
+[package]
+name = "nephele-anvil"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Anvil region and NBT reading, for world saves and parity checks against the real game"
+
+[dependencies]
+flate2 = { workspace = true }
+thiserror = { workspace = true }
