@@ -99,6 +99,8 @@ pub struct HudState<'a> {
     pub pointer: Option<[f32; 2]>,
     /// Whether the mouse is captured (playing) rather than free (in a menu).
     pub captured: bool,
+    /// The chat line is open, so the "click to look" hint would be wrong.
+    pub chatting: bool,
 }
 
 /// Vanilla's automatic GUI scale: integers only so the pixel font stays crisp.
@@ -297,7 +299,7 @@ pub fn draw_hud(
     );
     fg.text(&debug, s(4.0), s(4.0), scale, TEXT);
     fg.crosshair(cx, height / 2.0, scale);
-    if !hud.captured {
+    if !hud.captured && !hud.chatting {
         fg.text_centered(
             "Click to look around  (Esc for the menu)",
             cx,
@@ -308,6 +310,53 @@ pub fn draw_hud(
     }
 
     buttons
+}
+
+/// Recent chat in the bottom-left, and the input line while it is open.
+///
+/// `lines` carries `(text, alpha)` pairs so the caller owns the fade timing;
+/// the input line sits just above the hotbar so the two never overlap.
+pub fn draw_chat(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    lines: &[(String, f32)],
+    input: Option<&str>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) {
+    let s = |v: f32| v * scale;
+    let line_h = s(9.0);
+
+    if let Some(input) = input {
+        let strip = Rect::new(0.0, height - s(34.0), width, s(12.0));
+        bg.rect(strip, [0.0, 0.0, 0.0, 0.62]);
+        let text = format!("> {input}");
+        fg.text(&text, s(4.0), height - s(31.0), scale, TEXT);
+        let caret_x = s(4.0) + UiBatch::text_width(&text, scale) + s(1.0);
+        bg.rect(Rect::new(caret_x, height - s(31.0), s(5.0), s(8.0)), TEXT);
+    }
+
+    if lines.is_empty() {
+        return;
+    }
+    let bottom = if input.is_some() {
+        height - s(36.0)
+    } else {
+        height - s(24.0)
+    };
+    for (index, (text, alpha)) in lines.iter().rev().enumerate() {
+        let y = bottom - (index as f32 + 1.0) * line_h;
+        if y < 0.0 {
+            break;
+        }
+        let text_w = UiBatch::text_width(text, scale);
+        bg.rect(
+            Rect::new(s(2.0), y - s(1.0), text_w + s(4.0), line_h),
+            [0.0, 0.0, 0.0, 0.35 * alpha],
+        );
+        fg.text(text, s(4.0), y, scale, [TEXT[0], TEXT[1], TEXT[2], *alpha]);
+    }
 }
 
 fn draw_button(
@@ -1166,6 +1215,7 @@ mod tests {
             creative_page: 0,
             pointer: None,
             captured: false,
+            chatting: false,
         }
     }
 
@@ -1401,5 +1451,34 @@ mod tests {
         assert!(fitted.ends_with("..."));
         assert!(UiBatch::text_width(&fitted, 2.0) <= 100.0);
         assert_eq!(fit_text("short", 100.0, 2.0), "short");
+    }
+
+    #[test]
+    fn chat_draws_its_lines_and_the_input_strip() {
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let lines = vec![("hello".to_string(), 1.0), ("fading".to_string(), 0.4)];
+        draw_chat(
+            &mut bg,
+            &mut fg,
+            &lines,
+            Some("/gamemode creative"),
+            2.0,
+            1280.0,
+            720.0,
+        );
+        assert!(!bg.is_empty());
+        assert!(!fg.is_empty());
+        // Each line gets a backdrop plus the strip gets one; the caret is a
+        // fourth rectangle on the background layer.
+        assert_eq!(bg.indices.len() / 6, 4);
+
+        let mut quiet = UiBatch::default();
+        let mut quiet_fg = UiBatch::default();
+        draw_chat(&mut quiet, &mut quiet_fg, &[], None, 2.0, 1280.0, 720.0);
+        assert!(
+            quiet.is_empty(),
+            "nothing to draw with no lines and no input"
+        );
     }
 }

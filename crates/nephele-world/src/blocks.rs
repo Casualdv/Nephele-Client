@@ -1402,6 +1402,31 @@ pub fn ids() -> impl Iterator<Item = u16> {
     seen.into_iter()
 }
 
+/// Reverse lookup for commands and tests: `"stone"` -> `(1, 0)`.
+///
+/// Accepts an optional namespace (`minecraft:stone`) and an explicit metadata
+/// suffix (`wool:14`). Unknown names return `None`; the caller decides what to
+/// say about it.
+pub fn by_name(name: &str) -> Option<(u16, u8)> {
+    let name = name.trim();
+    let name = name.strip_prefix("minecraft:").unwrap_or(name);
+    match name.split_once(':') {
+        Some((base, meta)) => {
+            let meta: u8 = meta.parse().ok()?;
+            VARIANTS
+                .iter()
+                .find(|(_, entry_meta, entry_name)| *entry_name == base && *entry_meta == meta)
+                .map(|(id, meta, _)| (*id, *meta))
+        }
+        None => VARIANTS
+            .iter()
+            // Names are per-variant in this table (`red_wool`, not `wool:14`),
+            // so a bare name selects that variant and its metadata.
+            .find(|(_, _, entry_name)| *entry_name == name)
+            .map(|(id, meta, _)| (*id, *meta)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1422,6 +1447,19 @@ mod tests {
         assert_eq!(name(31), "dead_bush");
         assert_eq!(name(6), "oak_sapling");
         assert!(name(39) == "brown_mushroom");
+    }
+
+    /// Commands address blocks by name, so the reverse lookup has to agree with
+    /// `name()` and understand variants.
+    #[test]
+    fn blocks_can_be_looked_up_by_name() {
+        assert_eq!(by_name("stone"), Some((1, 0)));
+        assert_eq!(by_name("minecraft:stone"), Some((1, 0)));
+        assert_eq!(by_name("  grass_block "), Some((2, 0)));
+        assert_eq!(by_name("red_wool"), Some((35, 14)));
+        assert_eq!(by_name("red_wool:14"), Some((35, 14)));
+        assert_eq!(by_name("white_wool:1"), None, "no such variant");
+        assert_eq!(by_name("not_a_block"), None);
     }
 
     #[test]

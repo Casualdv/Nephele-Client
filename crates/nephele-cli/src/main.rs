@@ -1,3 +1,4 @@
+mod commands;
 mod live;
 mod mesher;
 mod paths;

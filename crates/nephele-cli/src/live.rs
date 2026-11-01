@@ -10,6 +10,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::commands;
 use crate::mesher::MeshPool;
 use crate::servers::{Ping, PingBoard, ServerEntry, ServerList, Status};
 use crate::settings::Settings;
@@ -157,6 +158,12 @@ struct Shared {
     chunks: usize,
     /// Requested by the creative inventory, applied by the network thread.
     give_item: Option<(i16, ItemStack)>,
+    /// Chat lines typed by the player; the game thread sends them on.
+    chat_out: Vec<String>,
+    /// `/setblock` requests, applied to the game thread's own world copy.
+    world_edits: Vec<(i32, i32, i32, u16)>,
+    /// `/gamemode` requests; `true` is creative.
+    creative_override: Option<bool>,
     /// Render distance, pushed to the server as a client-settings update.
     view_distance: u8,
     /// Position at the start of the current tick, and when that tick began, so
@@ -189,6 +196,9 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         xp_level: 0,
         chunks: 0,
         give_item: None,
+        chat_out: Vec::new(),
+        world_edits: Vec::new(),
+        creative_override: None,
         view_distance: nephele_client::VIEW_DISTANCE,
         prev_position: [0.5, 80.0, 0.5],
         tick_at: Instant::now(),
@@ -307,13 +317,16 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
             ],
         });
 
-        let (attacking, use_pressed, pending_slot, give) = {
+        let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode) = {
             let mut state = shared.lock().unwrap();
             (
                 state.attacking,
                 std::mem::take(&mut state.use_pressed),
                 state.pending_slot.take(),
                 state.give_item.take(),
+                std::mem::take(&mut state.chat_out),
+                std::mem::take(&mut state.world_edits),
+                state.creative_override.take(),
             )
         };
         if let Some(slot) = pending_slot {
@@ -329,9 +342,21 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
                 *entry = Some(item);
             }
         }
+        if let Some(creative) = gamemode {
+            shared.lock().unwrap().creative = creative;
+        }
+        for line in chat {
+            // Singleplayer has no chat server; echo it like one would.
+            let _ = tx.send(NetMsg::Chat(line));
+        }
 
         let mut dirty: HashSet<(i32, i32)> = HashSet::new();
-        for event in miner.tick(&world, aim, attacking, true) {
+        for (x, y, z, state) in edits {
+            world.set_block(x, y, z, BlockState::from_raw(state));
+            dirty.insert((x.div_euclid(16), z.div_euclid(16)));
+        }
+        let creative = shared.lock().unwrap().creative;
+        for event in miner.tick(&world, aim, attacking, creative) {
             if let MiningEvent::Stop(target) = event {
                 world.set_block(target.x, target.y, target.z, BlockState::AIR);
                 dirty.insert((target.x.div_euclid(16), target.z.div_euclid(16)));
@@ -409,7 +434,7 @@ async fn net_loop(
             .map_err(|err| err.to_string())?,
     };
 
-    let creative = client.is_creative();
+    let mut creative = client.is_creative();
     if creative {
         if let Err(err) = client.give_starter_hotbar().await {
             eprintln!("could not fill the creative hotbar: {err}");
@@ -435,15 +460,35 @@ async fn net_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 let (position, yaw, pitch, on_ground) = step_player(&shared, &client.world);
-                let (attacking, use_pressed, pending_slot, give) = {
+                let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode) = {
                     let mut state = shared.lock().unwrap();
                     (
                         state.attacking,
                         std::mem::take(&mut state.use_pressed),
                         state.pending_slot.take(),
                         state.give_item.take(),
+                        std::mem::take(&mut state.chat_out),
+                        std::mem::take(&mut state.world_edits),
+                        state.creative_override.take(),
                     )
                 };
+                for line in chat {
+                    client
+                        .send_chat(&line)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
+                for (x, y, z, state) in edits {
+                    client
+                        .world
+                        .set_block(x, y, z, nephele_world::BlockState::from_raw(state));
+                    world_dirty = true;
+                }
+                if let Some(creative_flag) = gamemode {
+                    client.info.gamemode = if creative_flag { 1 } else { 0 };
+                    creative = creative_flag;
+                    shared.lock().unwrap().creative = creative_flag;
+                }
 
                 let requested_view_distance = shared.lock().unwrap().view_distance;
                 if requested_view_distance != sent_view_distance {
@@ -613,6 +658,12 @@ async fn net_loop(
     }
 }
 
+/// One line of the on-screen chat log.
+struct ChatLine {
+    text: String,
+    at: Instant,
+}
+
 /// Everything one frame needs from the game thread.
 struct FrameView {
     camera: Camera,
@@ -682,6 +733,10 @@ struct LiveApp {
     splash: String,
     time: f32,
     address_input: String,
+    /// Chat overlay: recent lines and the input line while it is open.
+    chat_open: bool,
+    chat_input: String,
+    chat_log: std::collections::VecDeque<ChatLine>,
     /// Saved servers behind the multiplayer screen.
     servers: ServerList,
     /// First visible row of `servers`.
@@ -770,6 +825,9 @@ impl LiveApp {
             splash: String::new(),
             time: 0.0,
             address_input: String::new(),
+            chat_open: false,
+            chat_input: String::new(),
+            chat_log: std::collections::VecDeque::new(),
             servers,
             servers_scroll: 0,
             servers_selected: None,
@@ -1032,7 +1090,10 @@ impl LiveApp {
                     }
                     self.mark_neighbours_dirty((x, z));
                 }
-                Ok(NetMsg::Chat(text)) => println!("[chat] {text}"),
+                Ok(NetMsg::Chat(text)) => {
+                    println!("[chat] {text}");
+                    self.push_chat(text);
+                }
                 Ok(NetMsg::Entities(snapshot)) => {
                     self.entities = snapshot;
                 }
@@ -1369,6 +1430,7 @@ impl LiveApp {
             creative_page: self.creative_page,
             pointer: self.pointer,
             captured: self.mouse_captured,
+            chatting: self.chat_open,
         };
 
         self.buttons = match self.screen {
@@ -1447,6 +1509,10 @@ impl LiveApp {
             }
         };
 
+        if self.screen == Screen::Game {
+            self.draw_chat(scale, width, height);
+        }
+
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_ui(&self.ui_bg, &self.ui_icons, &self.ui_fg);
         }
@@ -1500,6 +1566,9 @@ impl LiveApp {
     fn start_local(&mut self) {
         self.screen = Screen::Game;
         self.set_mouse_capture(false);
+        // Singleplayer starts in creative, like the offline demo always has;
+        // `/gamemode survival` switches it for testing.
+        self.shared.lock().unwrap().creative = true;
         let shared = Arc::clone(&self.shared);
         let tx = self.tx.clone();
         let seed = self.options.seed.unwrap_or_else(|| {
@@ -1583,6 +1652,145 @@ impl LiveApp {
         self.servers_scroll = 0;
         self.servers_selected = None;
         self.refresh_server_list();
+    }
+
+    /// Open the chat line. `/` prefills the slash so commands are one key away.
+    fn open_chat(&mut self, prefill_slash: bool) {
+        self.chat_open = true;
+        self.chat_input.clear();
+        if prefill_slash {
+            self.chat_input.push('/');
+        }
+        self.keys.clear();
+        self.set_mouse_capture(false);
+    }
+
+    fn push_chat(&mut self, text: impl Into<String>) {
+        self.chat_log.push_back(ChatLine {
+            text: text.into(),
+            at: Instant::now(),
+        });
+        while self.chat_log.len() > 100 {
+            self.chat_log.pop_front();
+        }
+    }
+
+    /// Enter: run it if it is one of ours, otherwise send it to the server.
+    fn send_chat_line(&mut self) {
+        let line = std::mem::take(&mut self.chat_input);
+        self.chat_open = false;
+        self.enter_game();
+        if line.trim().is_empty() {
+            return;
+        }
+        match line.strip_prefix('/') {
+            Some(command) => self.run_command(command),
+            None => self.shared.lock().unwrap().chat_out.push(line),
+        }
+    }
+
+    fn run_command(&mut self, line: &str) {
+        let position = {
+            let state = self.shared.lock().unwrap();
+            [state.player.x, state.player.y, state.player.z]
+        };
+        match commands::parse(line, position) {
+            // A command we do not implement goes to the server unchanged, the
+            // way vanilla's client forwards everything and lets the server
+            // decide whether the player may run it.
+            commands::Parsed::Unknown => {
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .chat_out
+                    .push(format!("/{line}"));
+            }
+            commands::Parsed::Error(message) => self.push_chat(message),
+            commands::Parsed::Command(command) => self.apply_command(command),
+        }
+    }
+
+    fn apply_command(&mut self, command: commands::Command) {
+        use commands::{Command, GameMode};
+        match command {
+            Command::Help => {
+                for line in commands::help_lines() {
+                    self.push_chat(line);
+                }
+            }
+            Command::Seed => {
+                let seed = self.options.seed.unwrap_or(0);
+                self.push_chat(format!("Seed: {seed}"));
+            }
+            Command::Gamemode(mode) => {
+                let creative = mode == GameMode::Creative;
+                self.shared.lock().unwrap().creative_override = Some(creative);
+                self.push_chat(if creative {
+                    "Game mode set to creative"
+                } else {
+                    "Game mode set to survival"
+                });
+            }
+            Command::Teleport { x, y, z } => {
+                self.shared.lock().unwrap().teleport = Some([x, y, z]);
+                self.push_chat(format!("Teleported to {x:.1} {y:.1} {z:.1}"));
+            }
+            Command::SetBlock { x, y, z, id, meta } => {
+                let state = nephele_world::BlockState::new(id, meta).raw();
+                self.shared
+                    .lock()
+                    .unwrap()
+                    .world_edits
+                    .push((x, y, z, state));
+                self.push_chat(format!(
+                    "Set {x} {y} {z} to {}",
+                    nephele_world::blocks::name(id)
+                ));
+            }
+            Command::Give { id, meta, count } => {
+                let slot =
+                    play::HOTBAR_FIRST_SLOT as i16 + self.shared.lock().unwrap().held_slot.max(0);
+                let item = ItemStack::new(id as i16, count, meta as i16);
+                self.shared.lock().unwrap().give_item = Some((slot, item));
+                self.push_chat(format!(
+                    "Gave {count} x {}",
+                    nephele_world::blocks::name(id)
+                ));
+            }
+        }
+    }
+
+    /// Recent chat and, while it is open, the input line.
+    fn draw_chat(&mut self, scale: f32, width: f32, height: f32) {
+        let now = Instant::now();
+        self.chat_log
+            .retain(|line| now.duration_since(line.at).as_secs_f32() < 14.0);
+        let lines: Vec<(String, f32)> = self
+            .chat_log
+            .iter()
+            .rev()
+            .take(10)
+            .rev()
+            .map(|line| {
+                let age = now.duration_since(line.at).as_secs_f32();
+                let alpha = if age <= 10.0 {
+                    1.0
+                } else {
+                    (1.0 - (age - 10.0) / 4.0).clamp(0.0, 1.0)
+                };
+                (line.text.clone(), alpha)
+            })
+            .collect();
+        let input = self.chat_open.then_some(self.chat_input.as_str());
+        ui::draw_chat(
+            &mut self.ui_bg,
+            &mut self.ui_fg,
+            &lines,
+            input,
+            scale,
+            width,
+            height,
+        );
     }
 
     /// Select a row. A second click on the same row within [`DOUBLE_CLICK`]
@@ -1792,6 +2000,34 @@ impl ApplicationHandler for LiveApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // While the chat line is open it owns the keyboard.
+                if self.chat_open && event.state == ElementState::Pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Enter) => {
+                            self.send_chat_line();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            self.chat_open = false;
+                            self.chat_input.clear();
+                            self.enter_game();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Backspace) => {
+                            self.chat_input.pop();
+                            return;
+                        }
+                        _ => {}
+                    }
+                    if let Some(text) = event.text.as_ref() {
+                        for ch in text.chars() {
+                            if !ch.is_control() && self.chat_input.len() < 256 {
+                                self.chat_input.push(ch);
+                            }
+                        }
+                    }
+                    return;
+                }
                 // The direct-connect screen is a text field.
                 if self.screen == Screen::Connect && event.state == ElementState::Pressed {
                     match event.physical_key {
@@ -1837,6 +2073,12 @@ impl ApplicationHandler for LiveApp {
                             Screen::Servers => self.screen = Screen::Title,
                             Screen::Connect => self.screen = Screen::Title,
                         },
+                        (KeyCode::KeyT, ElementState::Pressed) if self.screen == Screen::Game => {
+                            self.open_chat(false);
+                        }
+                        (KeyCode::Slash, ElementState::Pressed) if self.screen == Screen::Game => {
+                            self.open_chat(true);
+                        }
                         (KeyCode::KeyE, ElementState::Pressed) => match self.screen {
                             Screen::Game => {
                                 let creative = self.shared.lock().unwrap().creative;

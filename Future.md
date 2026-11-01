@@ -181,7 +181,7 @@ This is what separates a PvP client from a compatible one.
 |---|---|---|
 | Hunger / XP / armour / air HUD | M | |
 | Hotbar selection highlight, item counts, durability | S | |
-| Chat overlay + input + command suggestions | M | Received and printed to console today; `azalea-brigadier` and `azalea-chat` are MIT references. |
+| Chat overlay + input + command suggestions | M | **Overlay + input done** (fade, `T`/`/`, Enter/Esc). Client-side `/help /gamemode /tp /setblock /give /seed`; unknown commands go to the server. No tab-completion or chat colours yet. `azalea-brigadier` and `azalea-chat` are MIT references. |
 | Scoreboard sidebar, tab player list, boss bar, titles | M | |
 | **Client modules:** FPS, CPS, keystrokes, coordinates, ping, armour status, potion timers, reach display | M | The Lunar/Badlion basics. |
 | **Toggle sprint, toggle sneak** | S | |

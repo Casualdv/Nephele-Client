@@ -43,6 +43,7 @@ This is the single most important constraint in the project.
 | `Lea-fish/Leafish` | MIT / Apache-2.0 | May copy with attribution in `NOTICE` |
 | `azalea-rs/azalea` | MIT | May copy with attribution |
 | `Oery/origami` | MIT | May copy with attribution |
+| `horizon-rust/horizon` | MIT | **Pattern only.** A from-scratch 1.26-era reimplementation with ~281 differential harnesses (`tests/`, `tools/lab.py`) diffed against vanilla. Its corpus/oracle methodology is the same one we should use; its protocol and packet ids are a different version, so none of it runs against 1.8.9 unchanged. |
 | `Thinkofname/steven`, `iceiix/stevenarella` | permissive | May copy with attribution |
 | `PommeMC/Client`, `minecrab` | **GPL-3.0** | **Never copy.** Read-only reference |
 | `Exopteron/opengl-classic-client` | none stated | Off limits |
@@ -120,6 +121,7 @@ crates/
       live.rs           network + local game loops, screens, input
       viewer.rs         offline world viewer
       ui.rs             immediate-mode UI batch + screens (draw_*)
+      commands.rs       client-side chat commands (/gamemode, /setblock, ...)
       paths.rs          per-user data directory + legacy `.local/` migration
       mesher.rs         CLI-side mesh helpers
       servers.rs        saved server list: entries, ordering, persistence, ping board
@@ -379,6 +381,29 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   `crates/nephele-client/tests/join_mock.rs`. `--survival` also joins as
   game mode 0 so the survival mining path (not the creative one-click path) runs.
 
+**Chat and client-side commands** (added 2026-11-01):
+
+- `T` opens the chat line, `/` opens it with a slash prefilled, `Enter` sends,
+  `Esc` closes. While it is open it owns the keyboard, the mouse is released and
+  movement keys are dropped; the HUD's "click to look around" hint is suppressed
+  via `HudState.chatting`.
+- Recent chat is drawn bottom-left and fades after 10 s (`draw_chat` in `ui.rs`,
+  14 s hard expiry in `LiveApp::draw_chat`). Colour codes are **not** parsed yet —
+  chat arrives as plain text.
+- `commands.rs` parses `/help`, `/gamemode`, `/tp`, `/setblock`, `/give`, `/seed`.
+  `~` relative coordinates and `~5` offsets work; `setblock`/`give` take block
+  names through `nephele_world::blocks::by_name` (names are per-variant:
+  `red_wool`, not `wool:14`).
+- **Commands are client-side.** That is a testing decision, not parity: the mock
+  and singleplayer have nothing to execute them. A command the module does not
+  recognise is forwarded to the server unchanged, so real server commands still
+  work. Effects travel through `Shared` (`chat_out`, `world_edits`,
+  `creative_override`); `/give` uses the creative-slot packet, so it needs
+  creative mode.
+- `local_loop` now reads `Shared.creative` instead of hardcoding creative, and
+  `start_local` sets it true, so `/gamemode survival` changes mining timing in
+  singleplayer without breaking the old default.
+
 ---
 
 ## 12. Milestones
@@ -457,9 +482,9 @@ the protocol crate), a death screen, and eating.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **109 tests** in `nephele-world`; **383 across the workspace** (1 ignored);
+- **110 tests** in `nephele-world`; **391 across the workspace** (1 ignored);
   13 in the server list (9 list + 4 ping board), 9 `ui` tests for the multiplayer
-  screen, 3 for the paths module, and one real-socket integration test for the
+  screen, 8 for the command parser, 3 for the paths module, and one real-socket integration test for the
   whole drop → pickup → hotbar chain (`join_mock.rs`).
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
@@ -472,8 +497,11 @@ the protocol crate), a death screen, and eating.
    27 storage, hotbar) with click / place / take, then recipe matching for
    planks, sticks, the crafting table and a pickaxe — that is the milestone's own
    exit criterion ("punch a tree and make a pickaxe"). Needs two packets that do
-   not exist yet: `C0E Click Window` and `S32 Confirm Transaction`. The data half
-   is already in place (see §11), so this is UI plus recipe matching.
+   not exist yet: `C0E Click Window` and `S32 Confirm Transaction`, plus a
+   `Click Window` handler and a 2×2 recipe table in the mock so it works offline.
+   The data half is already in place (see §11), so this is UI + click protocol +
+   recipes. **Chat/commands landed first** (see §11) because they are what make
+   the inventory testable (`/give`, `/setblock`, `/gamemode`).
 2. **Death screen + eating.** Small, and the other half of the survival loop.
 3. **World creation screen** — smaller. `local_loop` already takes a seed and
    `play --seed` already parses one; v1 creates but does not save (region writing is
