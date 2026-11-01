@@ -1366,6 +1366,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nephele-launcher"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "nephele-assets",
+ "nephele-render",
+ "tracing",
+ "tracing-subscriber",
+ "winit",
+]
+
+[[package]]
 name = "nephele-mock"
 version = "0.1.0"
 dependencies = [

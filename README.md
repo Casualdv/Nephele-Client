@@ -63,6 +63,17 @@ cargo run -p nephele -- play 127.0.0.1:25565          # terminal 2
 `cargo run -p nephele -- view` renders a generated world with no networking at
 all, which is the quickest way to see the renderer work.
 
+### The launcher
+
+```sh
+cargo run -p nephele-launcher
+```
+
+A window with Play, a demo-world button and the resource status. It runs
+`nephele-prepare` by itself the first time resources are needed, and launches
+the game as a **child process**, so a crash in the client leaves the launcher
+open with a message instead of taking the whole app down with it.
+
 ### Preparing the resources
 
 `nephele-prepare` reads the 1.8.9 client jar you already have, checks it against
