@@ -43,6 +43,8 @@ pub enum AuthError {
     Expired,
     #[error("unexpected response: {0}")]
     Unexpected(String),
+    #[error("storage: {0}")]
+    Io(String),
     #[error("no client id configured")]
     NoClientId,
 }
@@ -113,6 +115,60 @@ pub struct Session {
     pub refresh_token: Option<String>,
 }
 
+/// A session as written to disk, so a later run can join without signing in.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredSession {
+    pub client_id: String,
+    pub access_token: String,
+    pub expires_at: u64,
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+}
+
+impl StoredSession {
+    pub fn from_session(client_id: &str, session: &Session) -> Self {
+        Self {
+            client_id: client_id.to_owned(),
+            access_token: session.access_token.clone(),
+            expires_at: session.expires_at,
+            id: session.profile.id.clone(),
+            name: session.profile.name.clone(),
+            refresh_token: session.refresh_token.clone(),
+        }
+    }
+
+    pub fn session(&self) -> Session {
+        Session {
+            access_token: self.access_token.clone(),
+            expires_at: self.expires_at,
+            profile: Profile {
+                id: self.id.clone(),
+                name: self.name.clone(),
+            },
+            refresh_token: self.refresh_token.clone(),
+        }
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self, AuthError> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| AuthError::Io(format!("{}: {err}", path.display())))?;
+        serde_json::from_str(&text)
+            .map_err(|err| AuthError::Io(format!("{}: {err}", path.display())))
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> Result<(), AuthError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| AuthError::Io(format!("{}: {err}", parent.display())))?;
+        }
+        let json =
+            serde_json::to_string_pretty(self).map_err(|err| AuthError::Io(err.to_string()))?;
+        std::fs::write(path, json)
+            .map_err(|err| AuthError::Io(format!("{}: {err}", path.display())))
+    }
+}
 /// Start a sign-in: ask Microsoft for a device code.
 pub fn begin(client_id: &str) -> Result<DeviceCode, AuthError> {
     if client_id.is_empty() {

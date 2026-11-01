@@ -107,6 +107,9 @@ enum Command {
         /// Single-player world seed (random when omitted)
         #[arg(long)]
         seed: Option<u64>,
+        /// Join with the cached Microsoft session (online-mode servers)
+        #[arg(long)]
+        online: bool,
     },
     /// Sign in with a Microsoft account (device code) and cache the session.
     Auth {
@@ -153,6 +156,7 @@ fn main() -> ExitCode {
             assets_dir,
             fly,
             seed,
+            online,
         } => {
             let address = match address {
                 Some(address) => match ServerAddress::parse(&address) {
@@ -171,6 +175,8 @@ fn main() -> ExitCode {
                 assets_dir,
                 fly,
                 seed,
+                online,
+                session_path: project_root().join(".local/auth.json"),
             }) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {
@@ -214,19 +220,6 @@ fn main() -> ExitCode {
             }
         }
     }
-}
-
-/// A session is a credential, so it lives beside the prepared resources, not in
-/// the repository root, and it is gitignored with the rest of `.local`.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct CachedSession {
-    client_id: String,
-    access_token: String,
-    expires_at: u64,
-    id: String,
-    name: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
 }
 
 fn run_auth(client_id: Option<String>, out: Option<PathBuf>) -> ExitCode {
@@ -291,19 +284,8 @@ fn run_auth(client_id: Option<String>, out: Option<PathBuf>) -> ExitCode {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    let cached = CachedSession {
-        client_id: client_id.clone(),
-        access_token: session.access_token.clone(),
-        expires_at: session.expires_at,
-        id: session.profile.id.clone(),
-        name: session.profile.name.clone(),
-        refresh_token: session.refresh_token.clone(),
-    };
-
-    match serde_json::to_string_pretty(&cached)
-        .map_err(|err| err.to_string())
-        .and_then(|json| std::fs::write(&path, json).map_err(|err| err.to_string()))
-    {
+    let stored = nephele_auth::StoredSession::from_session(&client_id, &session);
+    match stored.save(&path) {
         Ok(()) => {
             println!("  session saved to {}", path.display());
             ExitCode::SUCCESS

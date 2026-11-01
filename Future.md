@@ -209,9 +209,9 @@ No audio exists yet.
 
 | Item | Size | Notes |
 |---|---|---|
-| **Microsoft device-code OAuth → Xbox Live → Minecraft services** | **M** | `nephele-auth` does the whole flow; `nephele auth` signs in and caches a session. Needs a client id. |
+| **Microsoft device-code OAuth → Xbox Live → Minecraft services** | **done** | `nephele-auth` + `nephele auth`; `play --online` uses the cached session. Still needs an Azure client id. |
 | Token storage + refresh | M | `azalea-auth` has a cache; encrypt at rest. |
-| Online-mode encryption handshake | M | `azalea-crypto` (MIT) has AES/RSA + PKCS#1; mirror it. |
+| Online-mode encryption handshake | **done** | AES-CFB8, server id hash, RSA PKCS#1 and the session-server join all implemented. |
 | Server list screen (ping, MOTD, version, favourites, history) | M | |
 | Dimension change, respawn packets, portals | L | |
 | Resource packs (server-sent) | M | |

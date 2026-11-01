@@ -51,6 +51,10 @@ pub struct PlayOptions {
     pub fly: bool,
     /// Single-player world seed; random when absent.
     pub seed: Option<u64>,
+    /// Sign in with the cached Microsoft session instead of connecting offline.
+    pub online: bool,
+    /// Where the cached session lives.
+    pub session_path: std::path::PathBuf,
 }
 
 enum NetMsg {
@@ -367,12 +371,22 @@ fn look_direction(yaw: f32, pitch: f32) -> [f64; 3] {
 async fn net_loop(
     address: ServerAddress,
     username: String,
+    session_path: Option<std::path::PathBuf>,
     shared: Arc<Mutex<Shared>>,
     tx: Sender<NetMsg>,
 ) -> Result<(), String> {
-    let mut client = GameClient::join(&address, &username)
-        .await
-        .map_err(|err| err.to_string())?;
+    let mut client = match &session_path {
+        Some(path) => {
+            let stored = nephele_auth::StoredSession::load(path)
+                .map_err(|err| format!("no Microsoft session ({err}); run `nephele auth` first"))?;
+            GameClient::join_online(&address, &stored.session())
+                .await
+                .map_err(|err| err.to_string())?
+        }
+        None => GameClient::join(&address, &username)
+            .await
+            .map_err(|err| err.to_string())?,
+    };
 
     let creative = client.is_creative();
     if creative {
@@ -1379,6 +1393,11 @@ impl LiveApp {
         self.set_mouse_capture(false);
         let shared = Arc::clone(&self.shared);
         let username = self.options.username.clone();
+        let session_path = if self.options.online {
+            Some(self.options.session_path.clone())
+        } else {
+            None
+        };
         let tx = self.tx.clone();
         let error_tx = tx.clone();
         let _ = std::thread::Builder::new()
@@ -1394,7 +1413,9 @@ impl LiveApp {
                         return;
                     }
                 };
-                if let Err(err) = runtime.block_on(net_loop(address, username, shared, tx)) {
+                if let Err(err) =
+                    runtime.block_on(net_loop(address, username, session_path, shared, tx))
+                {
                     let _ = error_tx.send(NetMsg::Error(err));
                 }
             });
