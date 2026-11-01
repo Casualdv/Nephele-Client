@@ -201,6 +201,72 @@ impl GameClient {
             LoginOutcome::EncryptionRequest(_) => return Err(Error::EncryptionUnsupported),
         };
 
+        Self::finish(connection, address, uuid, name).await
+    }
+
+    /// Connect to an online-mode server with a signed-in account.
+    ///
+    /// The server answers Login Start with an Encryption Request. We prove
+    /// ownership to Mojang first, then hand back the RSA-encrypted shared
+    /// secret and verify token, and the connection switches to AES for the
+    /// rest of the session.
+    pub async fn join_online(
+        address: &ServerAddress,
+        session: &nephele_auth::Session,
+    ) -> Result<Self> {
+        let mut connection = Connection::connect(address).await?;
+        connection.handshake(address, NextState::Login).await?;
+
+        let (uuid, name) = match connection.login_start(&session.profile.name).await? {
+            LoginOutcome::Success(success) => (success.uuid, success.username),
+            LoginOutcome::Disconnect(reason) => return Err(Error::Disconnected(reason)),
+            LoginOutcome::EncryptionRequest(request) => {
+                let secret = nephele_protocol::crypto::new_shared_secret();
+                let hash = nephele_protocol::crypto::server_id_hash(
+                    &request.server_id,
+                    &secret,
+                    &request.public_key,
+                );
+
+                // The session server call is blocking HTTP; keep it off the
+                // async worker.
+                let token = session.access_token.clone();
+                let profile = session.profile.id.clone();
+                let join_hash = hash.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    nephele_auth::join_server(&token, &profile, &join_hash)
+                        .map_err(|err| err.to_string())
+                })
+                .await
+                .map_err(|err| Error::Disconnected(format!("join task failed: {err}")))?;
+                joined.map_err(Error::Disconnected)?;
+
+                let encrypted = nephele_protocol::crypto::rsa_encrypt(
+                    &request.public_key,
+                    &request.verify_token,
+                )
+                .map_err(Error::Disconnected)?;
+                connection
+                    .send_encryption_response(&secret, &encrypted)
+                    .await?;
+
+                match connection.read_login_outcome().await? {
+                    LoginOutcome::Success(success) => (success.uuid, success.username),
+                    LoginOutcome::Disconnect(reason) => return Err(Error::Disconnected(reason)),
+                    LoginOutcome::EncryptionRequest(_) => return Err(Error::EncryptionUnsupported),
+                }
+            }
+        };
+
+        Self::finish(connection, address, uuid, name).await
+    }
+    /// Finish a login once the connection is authenticated, offline or online.
+    async fn finish(
+        mut connection: Connection,
+        address: &ServerAddress,
+        uuid: String,
+        name: String,
+    ) -> Result<Self> {
         let join = connection.wait_for_join_game().await?;
         let compression = connection.compression_threshold();
 

@@ -7,6 +7,7 @@ license.workspace = true
 description = "Headless Nephele game client: login, world sync and play-state packet handling"
 
 [dependencies]
+nephele-auth = { path = "../nephele-auth" }
 nephele-protocol = { path = "../nephele-protocol" }
 nephele-world = { path = "../nephele-world" }
 tokio = { workspace = true }

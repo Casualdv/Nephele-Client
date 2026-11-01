@@ -168,3 +168,129 @@ mod tests {
         }
     }
 }
+
+/// A fresh 16-byte shared secret for the login handshake.
+pub fn new_shared_secret() -> [u8; 16] {
+    use rand::RngCore;
+    let mut secret = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut secret);
+    secret
+}
+
+/// `CryptManager.getServerIdHash`, hashed and rendered the way the client sends
+/// it to the session server.
+///
+/// The digest is `SHA-1(serverId as ISO-8859-1 || secret || publicKey)`, and the
+/// string is Java's `new BigInteger(digest).toString(16)`: big-endian two's
+/// complement, so a digest whose top bit is set comes out with a leading `-`
+/// and magnitudes lose their leading zeros. Servers see exactly this string.
+pub fn server_id_hash(server_id: &str, secret: &[u8], public_key: &[u8]) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(server_id.as_bytes());
+    hasher.update(secret);
+    hasher.update(public_key);
+    java_big_integer_hex(&hasher.finalize())
+}
+
+fn java_big_integer_hex(bytes: &[u8]) -> String {
+    let negative = bytes.first().is_some_and(|byte| byte & 0x80 != 0);
+
+    let mut magnitude = bytes.to_vec();
+    if negative {
+        for byte in magnitude.iter_mut() {
+            *byte = !*byte;
+        }
+        let mut carry = 1u16;
+        for byte in magnitude.iter_mut().rev() {
+            let sum = u16::from(*byte) + carry;
+            *byte = (sum & 0xFF) as u8;
+            carry = sum >> 8;
+        }
+    }
+
+    let start = magnitude
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(magnitude.len());
+    let digits: String = magnitude[start..]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let digits = digits.trim_start_matches('0');
+
+    if digits.is_empty() {
+        "0".to_string()
+    } else if negative {
+        format!("-{digits}")
+    } else {
+        digits.to_string()
+    }
+}
+
+/// RSA-encrypt with the server's public key, as `Cipher.getInstance("RSA/ECB/PKCS1Padding")`
+/// does on the vanilla client.
+pub fn rsa_encrypt(public_key_der: &[u8], data: &[u8]) -> Result<Vec<u8>, String> {
+    use rsa::pkcs8::DecodePublicKey;
+    use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
+
+    let key = RsaPublicKey::from_public_key_der(public_key_der)
+        .map_err(|err| format!("server public key: {err}"))?;
+    key.encrypt(&mut rand::rngs::OsRng, Pkcs1v15Encrypt, data)
+        .map_err(|err| format!("RSA encryption failed: {err}"))
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::*;
+
+    #[test]
+    fn a_positive_digest_is_plain_hex() {
+        // 0x01 0x02 -> "102"
+        assert_eq!(java_big_integer_hex(&[0x01, 0x02]), "102");
+        assert_eq!(java_big_integer_hex(&[0x7f, 0xff]), "7fff");
+    }
+
+    #[test]
+    fn a_negative_digest_starts_with_a_minus() {
+        // 0xff is -1 in two's complement.
+        assert_eq!(java_big_integer_hex(&[0xff]), "-1");
+        // 0x80 0x00 is -32768.
+        assert_eq!(java_big_integer_hex(&[0x80, 0x00]), "-8000");
+    }
+
+    #[test]
+    fn leading_zeros_are_dropped() {
+        assert_eq!(java_big_integer_hex(&[0x00, 0x00, 0x2a]), "2a");
+        assert_eq!(java_big_integer_hex(&[0x00]), "0");
+    }
+
+    #[test]
+    fn the_hash_is_stable_and_hex() {
+        let secret = [7u8; 16];
+        let key = [9u8; 162];
+        let hash = server_id_hash("", &secret, &key);
+        assert_eq!(hash, server_id_hash("", &secret, &key));
+        assert!(hash
+            .trim_start_matches('-')
+            .chars()
+            .all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn the_server_id_is_part_of_the_hash() {
+        let secret = [1u8; 16];
+        let key = [2u8; 162];
+        assert_ne!(
+            server_id_hash("", &secret, &key),
+            server_id_hash("x", &secret, &key)
+        );
+    }
+
+    #[test]
+    fn a_fresh_secret_is_sixteen_bytes_and_not_constant() {
+        let a = new_shared_secret();
+        let b = new_shared_secret();
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, b);
+    }
+}

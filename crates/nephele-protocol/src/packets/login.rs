@@ -30,6 +30,13 @@ pub struct EncryptionRequest {
     pub verify_token: Vec<u8>,
 }
 
+pub fn encryption_response(shared_secret: &[u8], verify_token: &[u8]) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_byte_array(shared_secret);
+    w.write_byte_array(verify_token);
+    Packet::new(SERVERBOUND_ENCRYPTION_RESPONSE, w.into_bytes())
+}
+
 pub fn parse_login_success(packet: &Packet) -> Result<LoginSuccess> {
     let mut r = packet.reader();
     Ok(LoginSuccess {

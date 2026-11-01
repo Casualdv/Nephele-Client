@@ -27,6 +27,7 @@ const XSTS_URL: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
 const MINECRAFT_LOGIN_URL: &str =
     "https://api.minecraftservices.com/authentication/login_with_xbox";
 const PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/profile";
+const JOIN_URL: &str = "https://sessionserver.mojang.com/session/minecraft/join";
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -211,6 +212,33 @@ pub fn to_minecraft(client_id: &str, ms_access_token: &str) -> Result<Session, A
     })
 }
 
+/// Tell Mojang that this account is joining a server with `server_hash`.
+///
+/// This is the step people miss: the server asks Mojang whether anyone claimed
+/// that hash, and without this call it answers "Failed to verify username".
+/// The hash is the one computed from the shared secret and the server's key.
+pub fn join_server(access_token: &str, uuid: &str, server_hash: &str) -> Result<(), AuthError> {
+    let body = serde_json::json!({
+        "accessToken": access_token,
+        "selectedProfile": uuid.replace('-', ""),
+        "serverId": server_hash,
+    });
+
+    let payload = body.to_string();
+    match ureq::post(JOIN_URL)
+        .set("Content-Type", "application/json")
+        .send_string(&payload)
+    {
+        // Success is 204 No Content, so there is nothing to parse.
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(204, _)) => Ok(()),
+        Err(ureq::Error::Status(code, response)) => {
+            let text = response.into_string().unwrap_or_default();
+            Err(AuthError::Microsoft(format!("{code}: {text}")))
+        }
+        Err(err) => Err(AuthError::Network(err.to_string())),
+    }
+}
 /// The signed-in account's name and UUID.
 pub fn fetch_profile(access_token: &str) -> Result<Profile, AuthError> {
     let text = get_with_bearer(PROFILE_URL, access_token)?;
@@ -364,6 +392,16 @@ fn unix_now() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_join_body_uses_the_dashless_uuid() {
+        let body = serde_json::json!({
+            "accessToken": "token",
+            "selectedProfile": "069a79f4-44e9-4726-a5be-fca90e38aaf5".replace('-', ""),
+            "serverId": "-1a2b3c",
+        });
+        assert_eq!(body["selectedProfile"], "069a79f444e94726a5befca90e38aaf5");
+        assert_eq!(body["serverId"], "-1a2b3c");
+    }
     #[test]
     fn form_bodies_are_percent_encoded() {
         let body = form(&[("scope", "service::user.auth.xboxlive.com::MBI_SSL")]);

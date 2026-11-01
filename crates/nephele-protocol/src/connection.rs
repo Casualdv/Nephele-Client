@@ -198,7 +198,28 @@ impl Connection {
     pub async fn login_start(&mut self, username: &str) -> Result<LoginOutcome> {
         self.state = State::Login;
         self.write_packet(&login::login_start(username)).await?;
+        self.read_login_outcome().await
+    }
 
+    /// Answer an Encryption Request and switch the connection to AES.
+    ///
+    /// The response goes out in the clear and encryption starts immediately
+    /// afterwards, which is the order the server expects.
+    pub async fn send_encryption_response(
+        &mut self,
+        shared_secret: &[u8; 16],
+        encrypted_verify_token: &[u8],
+    ) -> Result<()> {
+        let packet = login::encryption_response(shared_secret, encrypted_verify_token);
+        self.write_packet(&packet).await?;
+        self.enable_encryption(shared_secret, shared_secret);
+        self.state = State::Login;
+        Ok(())
+    }
+
+    /// Read the login response after the handshake continues — used after an
+    /// Encryption Response to wait for Login Success.
+    pub async fn read_login_outcome(&mut self) -> Result<LoginOutcome> {
         loop {
             let packet = self.read_packet().await?;
             match packet.id {
