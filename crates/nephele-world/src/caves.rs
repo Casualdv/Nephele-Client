@@ -285,7 +285,7 @@ impl Caves {
                                                 column_y as usize,
                                                 column_z as usize,
                                             );
-                                            let above = if column_y + 1 <= 255 {
+                                            let above = if column_y < 255 {
                                                 column.get_block(
                                                     column_x as usize,
                                                     (column_y + 1) as usize,
