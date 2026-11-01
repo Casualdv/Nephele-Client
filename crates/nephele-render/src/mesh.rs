@@ -351,6 +351,55 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             let y = section_y + local_y;
             let id = raw >> 4;
 
+            // Plants are two crossed quads, not a cube. Rendering them as
+            // cubes is what makes flowers and grass look like solid boxes.
+            if is_cross_plant(id) {
+                let layer = layers[2];
+                let bx = (base_x + local_x) as f32;
+                let by = y as f32;
+                let bz = (base_z + local_z) as f32;
+                let (lo, hi) = (0.1f32, 0.9f32);
+                let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+
+                let quads = [
+                    [
+                        [bx + lo, by, bz + lo],
+                        [bx + hi, by, bz + hi],
+                        [bx + hi, by + 1.0, bz + hi],
+                        [bx + lo, by + 1.0, bz + lo],
+                    ],
+                    [
+                        [bx + lo, by, bz + hi],
+                        [bx + hi, by, bz + lo],
+                        [bx + hi, by + 1.0, bz + lo],
+                        [bx + lo, by + 1.0, bz + hi],
+                    ],
+                ];
+
+                for quad in quads {
+                    // Both windings, so the plant is visible from either side.
+                    for order in [[0usize, 1, 2, 3], [3, 2, 1, 0]] {
+                        let base = mesh.vertices.len() as u32;
+                        for index in order {
+                            mesh.vertices.push(Vertex {
+                                position: quad[index],
+                                uv: uvs[index],
+                                shade: 1.0,
+                                layer,
+                            });
+                        }
+                        mesh.indices.extend_from_slice(&[
+                            base,
+                            base + 1,
+                            base + 2,
+                            base,
+                            base + 2,
+                            base + 3,
+                        ]);
+                    }
+                }
+                continue;
+            }
             for face in &FACES {
                 let neighbour = job.block(
                     local_x + face.normal[0],
@@ -394,6 +443,16 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
     mesh
 }
 
+/// Blocks drawn as two crossed quads rather than a cube.
+///
+/// Saplings, grass, flowers, mushrooms, crops, sugar cane and the double
+/// plants. Everything else keeps the cube path.
+fn is_cross_plant(id: u16) -> bool {
+    matches!(
+        id,
+        6 | 31 | 32 | 37 | 38 | 39 | 40 | 59 | 83 | 141 | 142 | 175
+    )
+}
 /// Mesh one chunk column straight from the world.
 pub fn build_column_mesh(column: &ChunkColumn, world: &World, atlas: &TextureArray) -> MeshData {
     let job = ColumnMeshJob::from_column(column, world);
@@ -546,6 +605,34 @@ mod tests {
         assert_eq!(mesh.indices.len(), 72);
     }
 
+    #[test]
+    fn plants_are_crossed_quads_not_cubes() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::new(2, 0));
+        // A flower on top of the grass.
+        column.set_block(3, 65, 3, BlockState::new(38, 0));
+        let world = World::new(0);
+        let job = ColumnMeshJob::from_column(&column, &world);
+        let mesh = build_column_mesh(
+            &column,
+            &world,
+            &nephele_assets::TextureArray::from_tiles(Vec::new()),
+        );
+        // The cube contributes 6 faces, the plant 4 quads (2 shapes x 2 sides);
+        // a cube plant would have contributed 6 instead.
+        let _ = job;
+        let mut quads = 0;
+        for window in mesh.indices.chunks(6) {
+            let positions: Vec<[f32; 3]> = window
+                .iter()
+                .map(|index| mesh.vertices[*index as usize].position)
+                .collect();
+            if positions.iter().all(|p| p[1] >= 65.0) {
+                quads += 1;
+            }
+        }
+        assert_eq!(quads, 4, "expected two crossed quads drawn both ways");
+    }
     #[test]
     fn mesh_job_snapshot_matches_live_world() {
         let mut column = ChunkColumn::empty(0, 0);
