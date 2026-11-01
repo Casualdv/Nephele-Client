@@ -437,20 +437,17 @@ fn resolve_texture(reference: &str, textures: &HashMap<String, String>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
-    fn assets() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/vanilla/1.8.9/assets/minecraft")
-    }
-
-    fn library() -> BlockModels {
-        BlockModels::load(&assets()).expect("vanilla models are extracted")
+    fn library() -> Option<BlockModels> {
+        let dir = crate::test_support::minecraft()?;
+        Some(BlockModels::load(&dir).expect("vanilla models load"))
     }
 
     #[test]
     fn loads_every_blockstate_and_model() {
-        let models = library();
+        let Some(models) = library() else {
+            return;
+        };
         assert!(
             models.blockstates.len() > 300,
             "{} blockstates",
@@ -465,7 +462,9 @@ mod tests {
 
     #[test]
     fn resolves_a_parent_chain() {
-        let mut models = library();
+        let Some(mut models) = library() else {
+            return;
+        };
         // oak_stairs parents block/stairs, which defines the geometry.
         let model = models.model("oak_stairs").expect("oak_stairs");
         assert!(!model.elements.is_empty(), "geometry comes from the parent");
@@ -490,7 +489,9 @@ mod tests {
 
     #[test]
     fn slabs_are_half_height() {
-        let mut models = library();
+        let Some(mut models) = library() else {
+            return;
+        };
         let state = models.blockstate("stone_slab").expect("stone_slab").clone();
         let variant = state.variants.get("half=bottom").expect("bottom slab");
         let name = variant.model.clone();
@@ -503,7 +504,9 @@ mod tests {
 
     #[test]
     fn stairs_blockstate_has_all_facings() {
-        let models = library();
+        let Some(models) = library() else {
+            return;
+        };
         let state = models.blockstate("oak_stairs").expect("oak_stairs");
         assert_eq!(state.variants.len(), 40, "4 facings x 2 halves x 5 shapes");
         assert!(state
@@ -513,7 +516,9 @@ mod tests {
 
     #[test]
     fn uv_is_normalised_and_rotations_are_valid() {
-        let mut models = library();
+        let Some(mut models) = library() else {
+            return;
+        };
         let model = models.model("oak_stairs").expect("oak_stairs");
         for element in &model.elements {
             for face in element.faces.iter().flatten() {

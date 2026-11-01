@@ -22,3 +22,29 @@ pub use block_textures::{face_textures, is_transparent, FaceTextures, MISSING_TE
 pub use skin_atlas::{default_skin, SkinAtlas, ATLAS_SIZE, SKIN_SIZE, SLOT_SIZE};
 pub use title::{Panorama, SplashTexts, PANORAMA_FACES};
 pub use ui_atlas::{font, sheets, sprites, SpriteRect, UiAtlas};
+
+/// Locates the player's own copy of the game for the tests that read it.
+///
+/// The repository ships no Minecraft files, so a fresh clone has none. Those
+/// tests step aside rather than fail, which keeps `cargo test` meaningful for
+/// anyone browsing the source. Run `nephele-prepare` to exercise them.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+
+    pub(crate) fn minecraft() -> Option<PathBuf> {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for candidate in [
+            manifest.join("../../assets/vanilla/1.8.9/assets/minecraft"),
+            manifest.join("../../.local/prepared/1.8.9/assets/minecraft"),
+        ] {
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+        eprintln!(
+            "skipped: no Minecraft 1.8.9 assets here; run `cargo run -p nephele-prepare` to enable this test"
+        );
+        None
+    }
+}

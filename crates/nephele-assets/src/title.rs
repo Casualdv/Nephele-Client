@@ -110,16 +110,13 @@ fn splitmix64(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn minecraft() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/vanilla/1.8.9/assets/minecraft")
-    }
 
     #[test]
     fn loads_the_six_panorama_faces() {
-        let panorama = Panorama::load(&minecraft().join("textures")).expect("panorama");
+        let Some(minecraft) = crate::test_support::minecraft() else {
+            return;
+        };
+        let panorama = Panorama::load(&minecraft.join("textures")).expect("panorama");
         assert_eq!(panorama.faces.len(), 6);
         assert_eq!(panorama.size, 256);
         assert_eq!(panorama.pixels().len(), 6 * 256 * 256 * 4, "six RGBA faces");
@@ -127,7 +124,10 @@ mod tests {
 
     #[test]
     fn loads_splashes_and_picks_stably() {
-        let splashes = SplashTexts::load(&minecraft().join("texts")).expect("splashes");
+        let Some(minecraft) = crate::test_support::minecraft() else {
+            return;
+        };
+        let splashes = SplashTexts::load(&minecraft.join("texts")).expect("splashes");
         assert!(splashes.len() > 100, "{} splashes", splashes.len());
         assert_eq!(splashes.pick(42), splashes.pick(42));
         assert!(!splashes.pick(1).is_empty());
