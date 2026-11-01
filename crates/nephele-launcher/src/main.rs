@@ -443,9 +443,38 @@ impl ApplicationHandler for Launcher {
     }
 }
 
-/// Where `nephele-prepare` writes, relative to the current directory.
+/// The directory `nephele-prepare` writes into, and where the prepared
+/// resources live.
+///
+/// Found from the current directory first, then by walking up from the
+/// executable, so launching from Explorer (which sets the working directory to
+/// the binary's folder) resolves the same tree as `cargo run`.
+fn project_root() -> PathBuf {
+    fn looks_like_root(dir: &std::path::Path) -> bool {
+        dir.join("Cargo.toml").is_file() || dir.join(".local/prepared").is_dir()
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if looks_like_root(&cwd) {
+            return cwd;
+        }
+    }
+
+    let mut candidate = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from));
+    while let Some(dir) = candidate {
+        if looks_like_root(&dir) {
+            return dir;
+        }
+        candidate = dir.parent().map(PathBuf::from);
+    }
+
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 fn prepared_dir() -> PathBuf {
-    PathBuf::from(".local/prepared/1.8.9/assets/minecraft")
+    project_root().join(".local/prepared/1.8.9/assets/minecraft")
 }
 
 /// The prepared resources, or the legacy layout, or `NEPHELE_MINECRAFT_ASSETS`.
@@ -458,7 +487,7 @@ fn minecraft_root() -> Option<PathBuf> {
     }
     [
         prepared_dir(),
-        PathBuf::from("assets/vanilla/1.8.9/assets/minecraft"),
+        project_root().join("assets/vanilla/1.8.9/assets/minecraft"),
     ]
     .into_iter()
     .find(|candidate| candidate.is_dir())
@@ -488,6 +517,7 @@ fn ensure_resources() -> bool {
     };
     println!("nephele-launcher: building resources from your Minecraft install");
     let status = Command::new(prepare)
+        .current_dir(project_root())
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
