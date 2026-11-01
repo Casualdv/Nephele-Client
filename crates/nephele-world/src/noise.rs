@@ -60,6 +60,11 @@ impl JavaRandom {
         self.next(1) != 0
     }
 
+    /// `Random.nextFloat`: 24 bits over 2^24.
+    pub fn next_float(&mut self) -> f32 {
+        self.next(24) as f32 / (1u32 << 24) as f32
+    }
+
     pub fn next_double(&mut self) -> f64 {
         let high = self.next(26) as u64;
         let low = self.next(27) as u64;

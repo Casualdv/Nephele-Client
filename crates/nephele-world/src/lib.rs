@@ -23,6 +23,7 @@ pub mod generation;
 pub mod genlayer;
 pub mod mesa;
 pub mod noise;
+pub mod ores;
 pub mod raycast;
 pub mod surface;
 pub mod terrain;

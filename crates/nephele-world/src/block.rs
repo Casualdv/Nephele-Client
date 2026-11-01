@@ -62,6 +62,12 @@ pub mod ids {
     pub const STAINED_HARDENED_CLAY: u16 = 159;
     pub const HARDENED_CLAY: u16 = 172;
     pub const RED_SANDSTONE: u16 = 179;
+    pub const GOLD_ORE: u16 = 14;
+    pub const IRON_ORE: u16 = 15;
+    pub const COAL_ORE: u16 = 16;
+    pub const LAPIS_ORE: u16 = 21;
+    pub const DIAMOND_ORE: u16 = 56;
+    pub const REDSTONE_ORE: u16 = 73;
 }
 
 impl BlockState {

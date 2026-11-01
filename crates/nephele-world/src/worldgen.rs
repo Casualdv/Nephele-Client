@@ -38,6 +38,8 @@ impl VanillaGenerator {
         let stone_noise = self.terrain.stone_noise(chunk_x, chunk_z);
         let mut rand = JavaRandom::new(chunk_seed(self.seed, chunk_x, chunk_z));
         surface::apply(&mut column, &biomes, &stone_noise, &self.surface, &mut rand);
+        // Veins, like vanilla, come after the surface and before decoration.
+        crate::ores::decorate(&mut column);
         column
     }
 
@@ -89,6 +91,78 @@ mod tests {
     use super::*;
     use crate::block::ids;
 
+    #[test]
+    fn ore_density_matches_the_reference_world() {
+        use nephele_anvil::{parse_chunk, RegionFile};
+        use std::path::PathBuf;
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Nephele-private/parity/server/world/region");
+        if !dir.is_dir() {
+            eprintln!("skipped: no reference world at Nephele-private/parity");
+            return;
+        }
+
+        let tracked = [
+            ids::COAL_ORE,
+            ids::IRON_ORE,
+            ids::GOLD_ORE,
+            ids::REDSTONE_ORE,
+            ids::DIAMOND_ORE,
+            ids::LAPIS_ORE,
+        ];
+        let mut theirs = [0usize; 6];
+        let mut ours = [0usize; 6];
+        let mut chunks = 0usize;
+
+        let mut generator = VanillaGenerator::new(12345);
+        let path = dir.join("r.-1.0.mca");
+        let region = RegionFile::open(&path).expect("region opens");
+        for lz in 0..32 {
+            for lx in 0..32 {
+                let Some(bytes) = region.chunk_nbt(lx, lz).ok().flatten() else {
+                    continue;
+                };
+                let Ok(stored) = parse_chunk(&bytes) else {
+                    continue;
+                };
+                chunks += 1;
+
+                let column = generator.column(stored.x, stored.z);
+                for (index, block) in tracked.iter().enumerate() {
+                    for x in 0..16usize {
+                        for y in 0..256usize {
+                            for z in 0..16usize {
+                                if column.get_block(x, y, z).id() == *block {
+                                    ours[index] += 1;
+                                }
+                                if stored.state(x, y, z) >> 4 == *block {
+                                    theirs[index] += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let names = ["coal", "iron", "gold", "redstone", "diamond", "lapis"];
+        let mut failures = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let mine = ours[index] as f64 / chunks as f64;
+            let real = theirs[index] as f64 / chunks as f64;
+            println!("{name}: ours {mine:.1}/chunk, reference {real:.1}/chunk");
+
+            // Ours runs a little high because caves are not carved yet, and a
+            // vein that a cave would have eaten still lands. Once caves exist
+            // this should close up.
+            if (mine - real).abs() > real * 0.3 {
+                failures.push(format!("{name}: {mine:.1} vs {real:.1}"));
+            }
+        }
+        assert!(chunks > 100, "only {chunks} chunks compared");
+        assert!(failures.is_empty(), "ore density off: {failures:?}");
+    }
     #[test]
     fn the_same_chunk_is_generated_twice_identically() {
         let mut generator = VanillaGenerator::new(12345);
