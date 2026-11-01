@@ -1,0 +1,320 @@
+# Nephele — Future
+
+A living plan. Everything below is tagged with a rough size: **S** (under a day),
+**M** (a few days), **L** (a week or more), **XL** (multi-week, needs its own
+design pass). Re-order freely; the point is that nothing important is forgotten
+and that the big calls are written down with their reasons.
+
+---
+
+## Target product
+
+A legitimate 1.8.9 PvP client in Rust, released like Lunar / Feather / Badlion:
+a launcher plus a fast client that runs well on **low-end laptops** and older
+integrated graphics. That target drives three decisions that would otherwise
+look odd:
+
+- **Performance is a feature**, not a nice-to-have. 60 fps on Intel HD graphics
+  is the bar, not 300 fps on a 4090.
+- **OpenGL matters.** Lunar, Feather and Badlion are all GL. Vulkan/DX12 drivers
+  on old laptops are frequently broken or missing. See "Open decisions".
+- **Online-mode servers must work.** A PvP client that cannot join
+  `hypixel.net` has no users.
+
+Nephele ships **no Mojang code or assets**. Resources are built from the player's
+own 1.8.9 jar by `nephele-prepare`, verified against `research-lock.json`.
+
+---
+
+## Reference projects
+
+| Project | Licence | What it is | What we may do |
+|---|---|---|---|
+| `Thinkofname/steven` | MIT / Apache-2.0 | The original 2015 Rust client | Copy with attribution. Superseded. |
+| `iceiix/stevenarella` | MIT / Apache-2.0 | Actively-kept fork of steven | **Copy with attribution** |
+| `Lea-fish/Leafish` | MIT / Apache-2.0 | Furthest-along fork: entities, inventory, screens, lighting | **Copy with attribution** |
+| `PommeMC/Client` | **GPL-3.0** | Most complete (265 files): auth, audio, singleplayer, renderer | **Read only.** Never copy. |
+| Our own oracle (`Nephele-private`) | private | Decompiled 1.8.9 + Java harness | Never published |
+
+### Licence rules
+
+- MIT/Apache code may be copied into this repository. Keep the original
+  copyright lines and add a `NOTICE` crediting Thinkofdeath, iceiix and
+  terrarier2111.
+- **GPL-3.0 (`PommeMC/Client`) cannot be linked into a proprietary binary.**
+  Reading it to understand a protocol is fine; copying code is not. Anything we
+  learn there must be re-implemented from Microsoft's public documentation and
+  our own oracle.
+- Never vendor decompiled Minecraft into this repository. `Nephele-private` is
+  private and stays that way.
+
+### What the references actually contain
+
+- **None of them generate terrain.** Leafish and stevenarella have a 119-line
+  biome colour table and nothing else. Our worldgen is already ahead.
+- **None of the MIT/Apache ones implement Microsoft auth.** `stevenarella`'s
+  `auth.rs` is 57 lines and offline only. `PommeMC` has device-code OAuth
+  (`pomme-auth`, ~500 lines) but is GPL — read it, re-implement it.
+- The useful, borrowable material is: Leafish `entity/` (19 files),
+  `inventory/` (24), `screen/` (12), `world/lighting.rs`, `entity/block_entity/`,
+  `particle/`.
+
+---
+
+## Where we are today
+
+Working: protocol 47 handshake / login / status / join, chunk codec + light,
+wgpu renderer, worker-pooled meshing, player skins, bitmap font + UI atlas,
+title / pause / settings / connect / creative screens, HUD (hotbar, crosshair,
+health), physics (walk, sprint, sneak, fly, jump, sneak edge protection),
+mining + placement, creative inventory, anvil **reading**, biomes + density
+height field + surface pass, launcher, CI, verified-resource preparation.
+
+Measured parity against a world the real 1.8.9 server generated: **92.8%** of
+biome cells, **96%** of surface heights, **98.8%** of surface block types.
+
+---
+
+## Pillars
+
+### 1. Renderer and low-end performance
+
+| Item | Size | Notes |
+|---|---|---|
+| Decide the backend: wgpu vs OpenGL vs both | **XL** | See open decisions. Blocks almost everything else. |
+| GLES/Vulkan fallback path or a GL renderer | XL | Only if the above says "support old drivers". |
+| Smooth lighting + ambient occlusion | L | We decode light but do not apply it per vertex. Biggest visual win. |
+| Block shapes from vanilla models (stairs, slabs, fences, panes, cross plants) | L | Everything currently renders as a cube. |
+| Animated textures (`.mcmeta`, water/lava/fire/portal) | M | |
+| Sky: sun, moon, stars, clouds, day-night, fog per biome/dimension | L | |
+| Frustum + occlusion culling | M | |
+| Chunk upload budget per frame; async mesh results already exist | M | Avoid hitches when flying fast. |
+| Mipmapping / texture filtering parity with vanilla | S | |
+| Held item in first person + swing animation | M | PvP clients care about this. |
+| Damage overlay, hurt flash, vignette | S | |
+
+### 2. World generation
+
+| Item | Size | Notes |
+|---|---|---|
+| **Mesa** stratified hardened clay | M | The last missing biome override. |
+| Caves (`MapGenCaves`) and ravines | L | Needed before the world feels real underground. |
+| Ores + granite/diorite/andesite, dirt/gravel/clay pockets | M | |
+| Trees (6 species + large variants), flowers, tall grass, cacti, sugar cane, lily pads, pumpkins, melons | L | |
+| Lakes (water/lava), dungeons, spawners | M | |
+| Snow and ice, podzol, vines, sand patches | S | |
+| Structures: villages, mineshafts, strongholds, temples, witch huts, monuments | XL | |
+| World types: superflat, large biomes, amplified, customized JSON | M | |
+| Nether and End generation, portals | XL | Out of scope for a PvP client v1. |
+| Chunk generation on worker threads, streamed around the player | M | Singleplayer only; servers send chunks. |
+
+### 3. The tick loop, movement and physics
+
+**Architectural item first:** physics currently runs per render frame with a
+clamped `dt`. Vanilla is a fixed **20 ticks/second** simulation, and every
+constant below is expressed in ticks. Frame-rate-dependent physics means jump
+height and sprint timing drift with fps — exactly the thing PvP players notice.
+Move to a fixed-step accumulator (20 Hz) with render interpolation between
+ticks. **Size: M, do it before further movement work.**
+
+| Item | Size | Notes |
+|---|---|---|
+| 20 Hz fixed tick + interpolation | M | Above. |
+| Movement constants parity | S | Walk `0.1`, sprint `×1.3`, sneak `×0.3`, gravity `0.08/tick²`, drag `0.98`, ground friction `0.546`, air `0.91`, jump `0.42`, terminal `3.92`, width `0.6`, height `1.8` (sneak `1.65`), eye `1.62`, reach `4.5`/`5.0` |
+| Sprint rules: only forward, not while sneaking, cancels on hit | S | |
+| Sprint FOV modifier | S | |
+| Ladders, vines, cobwebs | M | |
+| Water and lava movement, swimming, buoyancy | M | |
+| Ice, slime blocks, soul sand | S | |
+| Fall damage, drowning, fire, cactus | M | |
+| Boats and minecarts riding | M | |
+| Elytra | — | Not in 1.8. |
+| Burst movement / anti-cheat-safe packet cadence | M | Vanilla sends a position packet every tick plus when moved; many servers flag anything else. |
+| Tick-accurate block break timing in survival | M | Server is authoritative; mirror its timing. |
+
+### 4. Entities, mobs and items
+
+| Item | Size | Notes |
+|---|---|---|
+| Mob models + walk animation (humanoid, quadruped, creeper, slime, squid, bat, chicken, spider, enderman) | **L** | Port from Leafish `entity/`. |
+| Entity metadata: equipment, nametags, invisibility, crouch, arm swing, health | M | |
+| Dropped items, XP orbs, arrows, fireworks, paintings, falling blocks | M | |
+| Item entities rendering with correct spin/bob | S | |
+| Slim (Alex) player model, capes | S | |
+| Player nametags above heads | S | |
+| Particles (block break, splash, smoke, flame, crit, portal) | M | Port from Leafish `particle/`. |
+| Block entities: signs, chests, banners, beacon beam, enchanting table book | L | Port from Leafish `entity/block_entity/`. |
+
+### 5. Inventory, containers and survival
+
+| Item | Size | Notes |
+|---|---|---|
+| Survival inventory screen (2×2 crafting, armour slots) | L | |
+| Crafting table, furnace, chest, hopper, dispenser, brewing, enchanting, anvil, beacon | XL | Port the GUI model from Leafish `inventory/`. |
+| Shift-click, drag-split, item dragging, hotbar swap keys | M | |
+| Item tooltips: name, rarity colour, enchantments | M | |
+| Durability bar, stack counts, item icons | M | |
+| Crafting recipe matching | L | |
+| Eating, potions, status effects | L | |
+| Enchantments | L | |
+| Health, hunger, saturation, XP, air supply | M | Server-driven; we render and predict. |
+| Death screen, respawn, keep-inventory | M | |
+| Armour bar + armour slots | S | |
+
+### 6. HUD and PvP quality-of-life
+
+This is what separates a PvP client from a compatible one.
+
+| Item | Size | Notes |
+|---|---|---|
+| Hunger / XP / armour / air HUD | M | |
+| Hotbar selection highlight, item counts, durability | S | |
+| Chat overlay + input + command suggestions | M | Currently received and printed to console. |
+| Scoreboard sidebar, tab player list, boss bar, titles | M | |
+| **Client modules:** FPS, CPS, keystrokes, coordinates, ping, armour status, potion timers, reach display | M | The Lunar/Badlion basics. |
+| **Toggle sprint, toggle sneak** | S | |
+| **Zoom** (OptiFine-style smooth zoom) | S | |
+| **Custom crosshair, hit colour, hit delay indicator**, block outline toggle | M | |
+| **Motion blur off, brightness/gamma slider, fullbright** | S | |
+| Freelook / 360 view | S | |
+| Nametag scaling, entity hurt tint | S | |
+| Settings screen: keybinds, GUI scale, render distance, particles, graphics, language, resource packs | L | |
+| Debug screen (F3) parity | M | |
+
+### 7. Audio
+
+No audio exists yet.
+
+| Item | Size | Notes |
+|---|---|---|
+| Sound engine + positional playback | L | `symphonia` for Ogg Vorbis decode. |
+| Block, step, break, place, mob and player sounds | M | |
+| Music and records | M | |
+| Volume sliders, subtitles optional | S | |
+
+### 8. Multiplayer and authentication
+
+| Item | Size | Notes |
+|---|---|---|
+| **Microsoft device-code OAuth → Xbox Live → Minecraft services** | **L** | The blocker for release. Read `pomme-auth` for flow, re-implement from Microsoft docs. |
+| Token storage + refresh | M | Encrypted at rest. |
+| Online-mode encryption handshake | M | AES + RSA; check whether our login path already does this. |
+| Server list screen (ping, MOTD, version, favourites, history) | M | |
+| Dimension change, respawn packets, portals | L | |
+| Resource packs (server-sent) | M | |
+| Full C→S action coverage (entity action, use entity, spectate, plugin channels) | M | |
+| Disconnect reasons, reconnects, login errors | S | |
+
+### 9. Singleplayer and world management
+
+| Item | Size | Notes |
+|---|---|---|
+| Region file **writing** (`.mca`), `level.dat`, player data, session lock | L | We can only read anvil today. |
+| World creation screen (seed, name, mode, world type) | M | |
+| World list, rename, delete, backup | M | |
+| Autosave, save-on-quit, dirty chunk tracking | M | |
+| Chunk loading/unloading while walking | M | |
+| Time of day, weather, lightning | M | |
+
+### 10. Distribution and product
+
+| Item | Size | Notes |
+|---|---|---|
+| Launcher v2: profiles, versions, news, update check | L | v0.1 exists. |
+| Signed auto-update | L | |
+| Crash reporter with opt-in upload | M | |
+| Telemetry opt-in only, and never on by default | S | |
+| Mod/plugin API for client modules | XL | Only if we want a third-party ecosystem. |
+| Terms, privacy policy, non-affiliation disclaimer | S | Required before public release. |
+| Branding, installer, packaging | M | |
+
+### 11. Testing and parity
+
+| Item | Size | Notes |
+|---|---|---|
+| Java oracle parity harness (`Nephele-private/oracle`) | exists | Extend per feature: terrain, blocks, biome overrides. |
+| Reference worlds for regression tests | exists | Seed 12345, structures off. |
+| Performance benchmark on low-end hardware | M | Define the bar: 60 fps, Intel HD 4000-class. |
+| Automated multiplayer smoke test against a real server | M | |
+
+---
+
+## Milestones
+
+**M0 — Foundations (done).** Protocol, rendering, movement, worldgen height
+field, launcher, CI.
+
+**M1 — A world worth walking in.** Mesa, caves, ores, trees and flora, smooth
+lighting, block shapes. *Exit:* singleplayer world looks like Minecraft from
+above and from underground.
+
+**M2 — Survival loop.** Fixed 20 Hz tick, inventory + containers, crafting,
+hunger/XP, drops, death/respawn. *Exit:* you can punch a tree and make a
+pickaxe.
+
+**M3 — Join a real server.** Microsoft auth, server list, online-mode
+handshake, dimension change. *Exit:* join a public 1.8.9 server and play.
+
+**M4 — PvP client.** HUD modules, toggle sprint, zoom, crosshair/hit indicators,
+chat, scoreboard, tab list. *Exit:* playable at a competitive level on an old
+laptop.
+
+**M5 — Product.** Launcher v2, auto-update, crash reporting, legal pages,
+installer. *Exit:* a stranger can download, install and play without help.
+
+**M6 — Depth.** Entities and mobs, block entities, particles, audio, singleplayer
+saving, structures.
+
+---
+
+## Backlog — small items worth writing down
+
+**Ticks and movement**
+- Fixed 20 Hz simulation with render interpolation
+- Sprint resets when hunger drops or you take damage
+- Sneak height change (`1.8` → `1.65`) and the camera drop
+- Block outline exactly matches vanilla's box for non-cube blocks
+- Correct `onGround` flag in position packets (servers use it for anti-cheat)
+- Bobbing/view bobbing toggle
+
+**Rendering**
+- Vsync on/off plus an fps cap that actually caps
+- FOV slider plus sprint/zoom modifiers
+- GUI scale 1/2/3/auto
+- Fullbright and brightness
+- Named colour codes (`§`) and Unicode font
+
+**UI**
+- Pause menu completeness
+- Connect screen remembers the last address
+- Toggle sprint keybind defaults matching vanilla conventions
+- Tooltips on hover for HUD elements
+
+**Network**
+- Keep-alive handling and timeout UI
+- Compression threshold handling
+- Chunk unload packets
+- Entity spawn/despawn bookkeeping (some is in `entities.rs`)
+
+**Misc**
+- Localisation via `.lang`
+- Screenshots (F2), fullscreen (F11), window icon
+- Crash handler and in-game log viewer
+
+---
+
+## Open decisions
+
+1. **Renderer backend.** wgpu (Vulkan/DX12) is modern and clean, but old Intel
+   iGPUs and stale drivers break on it. OpenGL is what every competitor uses and
+   what old laptops actually support. Options: keep wgpu and accept the
+   compatibility risk; keep wgpu and add a GL/GLES fallback; switch to GL
+   entirely. **Decide by benchmarking on the oldest hardware you care about.**
+   Preference order for the product: GL first, wgpu where available.
+2. **Auth scope.** Device-code flow only, or full browser flow too? Device code
+   is far simpler and works everywhere; browser flow is friendlier for children.
+3. **Client modules.** Built-in only, or a plugin API for third parties? A plugin
+   API is an XL investment that only pays off with an ecosystem.
+4. **Multi-version.** 1.8.9 only, or 1.7.10/1.12.2 later? Every extra version
+   doubles protocol and rendering-shape work.
+5. **Telemetry.** Ship at all? If yes, opt-in, anonymised, and documented.
