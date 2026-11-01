@@ -1529,6 +1529,8 @@ pub struct BiomeLayers {
     debug_base: SharedLayer,
     debug_chain: SharedLayer,
     debug_smoothed: SharedLayer,
+    debug_biome_edge: SharedLayer,
+    debug_hills_only: SharedLayer,
 }
 
 impl BiomeLayers {
@@ -1558,18 +1560,22 @@ impl BiomeLayers {
 
         let biome_source = Box::new(GenLayerBiome::new(200, base.boxed()));
         let zoomed_biomes = magnify(1000, biome_source, 2);
-        let biome_edge = Box::new(GenLayerBiomeEdge::new(1000, zoomed_biomes));
+        let biome_edge = SharedLayer::new(Box::new(GenLayerBiomeEdge::new(1000, zoomed_biomes)));
 
         let hill_noise = SharedLayer::new(magnify(1000, river_init.boxed(), 2));
-        let mut chain: Box<dyn Layer> =
-            Box::new(GenLayerHills::new(1000, biome_edge, hill_noise.boxed()));
+        let mut chain: Box<dyn Layer> = Box::new(GenLayerHills::new(
+            1000,
+            biome_edge.boxed(),
+            hill_noise.boxed(),
+        ));
 
         let mut river_chain = magnify(1000, river_init.boxed(), 2);
         river_chain = magnify(1000, river_chain, 4);
         let river = Box::new(GenLayerRiver::new(1, river_chain));
         let smoothed_river = Box::new(GenLayerSmooth::new(1000, river));
 
-        chain = Box::new(GenLayerRareBiome::new(1001, chain));
+        let hills_only = SharedLayer::new(chain);
+        chain = Box::new(GenLayerRareBiome::new(1001, hills_only.boxed()));
 
         for step in 0..4i64 {
             chain = Box::new(GenLayerZoom::new(1000 + step, chain));
@@ -1597,6 +1603,8 @@ impl BiomeLayers {
             debug_base: base,
             debug_chain: chain,
             debug_smoothed: smoothed,
+            debug_biome_edge: biome_edge,
+            debug_hills_only: hills_only,
         };
         layers.set_world_seed(seed);
         layers
@@ -1626,6 +1634,16 @@ impl BiomeLayers {
     /// The chain after `GenLayerSmooth`, before rivers are mixed in.
     pub fn debug_smoothed(&mut self, x: i32, z: i32, w: usize, h: usize) -> Vec<i32> {
         self.debug_smoothed.get_ints(x, z, w, h)
+    }
+
+    /// `GenLayerBiomeEdge`, the last layer before `GenLayerHills`.
+    pub fn debug_biome_edge(&mut self, x: i32, z: i32, w: usize, h: usize) -> Vec<i32> {
+        self.debug_biome_edge.get_ints(x, z, w, h)
+    }
+
+    /// `GenLayerHills` output, before `GenLayerRareBiome`.
+    pub fn debug_hills_only(&mut self, x: i32, z: i32, w: usize, h: usize) -> Vec<i32> {
+        self.debug_hills_only.get_ints(x, z, w, h)
     }
 
     /// Biome ids for a block-space rectangle, one per block.
@@ -1803,6 +1821,63 @@ mod tests {
     ///
     /// Needs a world at `Nephele-private/parity` (see the oracle's README); it
     /// skips when that world is not present.
+    #[ignore = "diagnostic: scans the whole reference region"]
+    #[test]
+    fn debug_first_mismatch() {
+        use nephele_anvil::{parse_chunk, RegionFile};
+        use std::path::PathBuf;
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Nephele-private/parity/server/world/region");
+        let mut layers = BiomeLayers::new(12345);
+        let mut total = 0usize;
+        let mut bad = 0usize;
+        let mut first = 0usize;
+        for (name, _base_x, _base_z) in [("r.-1.-1.mca", -32, -32), ("r.-1.0.mca", -32, 0)] {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let region = RegionFile::open(&path).expect("region opens");
+            for lz in 0..32 {
+                for lx in 0..32 {
+                    let Some(bytes) = region.chunk_nbt(lx, lz).ok().flatten() else {
+                        continue;
+                    };
+                    let Ok(stored) = parse_chunk(&bytes) else {
+                        continue;
+                    };
+                    let ours = layers.chunk_biomes(stored.x, stored.z);
+                    if ours.len() != stored.biomes.len() {
+                        continue;
+                    }
+                    for z in 0..16i32 {
+                        for x in 0..16i32 {
+                            let i = (z * 16 + x) as usize;
+                            total += 1;
+                            if ours[i] != stored.biomes[i] as i32 {
+                                bad += 1;
+                                if first == 0 {
+                                    first = 1;
+                                    println!(
+                                        "first mismatch: block=({},{}) chunk=({},{}) ours={} real={}",
+                                        stored.x * 16 + x,
+                                        stored.z * 16 + z,
+                                        stored.x,
+                                        stored.z,
+                                        ours[i],
+                                        stored.biomes[i]
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("mismatched {bad} of {total}");
+    }
+
     #[test]
     fn chunk_biomes_match_a_world_the_real_server_generated() {
         use nephele_anvil::{parse_chunk, RegionFile};
