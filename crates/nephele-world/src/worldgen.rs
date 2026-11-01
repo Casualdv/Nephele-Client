@@ -1,0 +1,228 @@
+//! The complete vanilla chunk pipeline: biome layers, then the density
+//! height field, then the per-biome surface pass.
+//!
+//! Generation is per chunk and independent of the order chunks are asked for,
+//! which is what a client needs — unlike vanilla, whose shared `Random` makes
+//! earlier chunks influence later ones. The only thing that diverges from
+//! vanilla as a result is the exact depth of the filler layer and the
+//! roughness of the bedrock, since those come from that stream.
+
+use crate::chunk::ChunkColumn;
+use crate::genlayer::BiomeLayers;
+use crate::noise::JavaRandom;
+use crate::surface::{self, SurfaceNoise};
+use crate::terrain::TerrainNoise;
+
+/// Generates vanilla 1.8.9 terrain for a world seed.
+pub struct VanillaGenerator {
+    seed: i64,
+    layers: BiomeLayers,
+    terrain: TerrainNoise,
+    surface: SurfaceNoise,
+}
+
+impl VanillaGenerator {
+    pub fn new(seed: i64) -> Self {
+        Self {
+            seed,
+            layers: BiomeLayers::new(seed),
+            terrain: TerrainNoise::new(seed),
+            surface: SurfaceNoise::new(),
+        }
+    }
+
+    /// A whole chunk, ready to be inserted into a [`crate::World`].
+    pub fn column(&mut self, chunk_x: i32, chunk_z: i32) -> ChunkColumn {
+        let mut column = self.terrain.primer(&mut self.layers, chunk_x, chunk_z);
+        let biomes = self.layers.chunk_biomes(chunk_x, chunk_z);
+        let stone_noise = self.terrain.stone_noise(chunk_x, chunk_z);
+        let mut rand = JavaRandom::new(chunk_seed(self.seed, chunk_x, chunk_z));
+        surface::apply(&mut column, &biomes, &stone_noise, &self.surface, &mut rand);
+        column
+    }
+
+    /// The y a player's feet rest at on this column.
+    pub fn height_at(&mut self, world_x: i32, world_z: i32) -> i32 {
+        let chunk_x = world_x.div_euclid(16);
+        let chunk_z = world_z.div_euclid(16);
+        let column = self.column(chunk_x, chunk_z);
+        let x = world_x.rem_euclid(16) as usize;
+        let z = world_z.rem_euclid(16) as usize;
+        for y in (0..256).rev() {
+            if !column.get_block(x, y, z).is_air() {
+                return y as i32 + 1;
+            }
+        }
+        0
+    }
+
+    /// The biome map for one chunk, as `Level.Biomes` stores it.
+    pub fn biomes(&mut self, chunk_x: i32, chunk_z: i32) -> Vec<i32> {
+        self.layers.chunk_biomes(chunk_x, chunk_z)
+    }
+}
+
+/// A stable per-chunk seed, so a chunk always looks the same whatever order it
+/// is generated in.
+///
+/// Plain XOR of two coordinates collides (1,3 against 3,1, for instance), so
+/// the pair is hashed with a 64-bit finaliser instead.
+fn chunk_seed(seed: i64, chunk_x: i32, chunk_z: i32) -> i64 {
+    let mut value = (seed as u64) ^ ((u64::from(chunk_x as u32)) << 32) ^ u64::from(chunk_z as u32);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (value ^ (value >> 31)) as i64
+}
+
+/// The highest non-air block of a column, or `None` for an empty one.
+pub fn highest_solid(column: &ChunkColumn, x: usize, z: usize) -> Option<i32> {
+    for y in (0..256).rev() {
+        if !column.get_block(x, y, z).is_air() {
+            return Some(y as i32);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::ids;
+
+    #[test]
+    fn the_same_chunk_is_generated_twice_identically() {
+        let mut generator = VanillaGenerator::new(12345);
+        let first = generator.column(-3, 7);
+        let second = generator.column(-3, 7);
+        for y in 0..256 {
+            for x in 0..16 {
+                for z in 0..16 {
+                    assert_eq!(
+                        first.get_block(x, y, z),
+                        second.get_block(x, y, z),
+                        "block {x},{y},{z}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn same_blocks(a: &ChunkColumn, b: &ChunkColumn) -> bool {
+        (0..16).all(|x| {
+            (0..256).all(|y| {
+                (0..16).all(|z| {
+                    a.get_block(x as usize, y, z as usize) == b.get_block(x as usize, y, z as usize)
+                })
+            })
+        })
+    }
+
+    #[test]
+    fn chunks_do_not_depend_on_generation_order() {
+        let mut forward = VanillaGenerator::new(99);
+        let a = forward.column(0, 0);
+        let mut backward = VanillaGenerator::new(99);
+        backward.column(5, 5);
+        backward.column(-2, 1);
+        let b = backward.column(0, 0);
+        assert!(same_blocks(&a, &b));
+    }
+
+    #[test]
+    fn the_world_has_a_bedrock_floor_a_water_layer_and_a_surface() {
+        let mut generator = VanillaGenerator::new(12345);
+        let column = generator.column(-28, 4);
+
+        for x in 0..16 {
+            for z in 0..16 {
+                assert_eq!(
+                    column.get_block(x, 0, z).id(),
+                    ids::BEDROCK,
+                    "the bottom block is bedrock"
+                );
+                let top = highest_solid(&column, x, z).expect("a column with blocks");
+                assert!(top > 1, "column {x},{z} is empty");
+            }
+        }
+
+        // Somewhere in the chunk there is water, since this area has ocean.
+        let mut water = 0;
+        for y in 0..64 {
+            for x in 0..16 {
+                for z in 0..16 {
+                    if column.get_block(x, y, z).id() == ids::WATER {
+                        water += 1;
+                    }
+                }
+            }
+        }
+        assert!(water > 0, "expected water below sea level");
+    }
+
+    #[test]
+    fn height_at_agrees_with_the_generated_column() {
+        let mut generator = VanillaGenerator::new(12345);
+        let column = generator.column(2, 2);
+        for (x, z) in [(0, 0), (7, 9), (15, 15)] {
+            let expected = highest_solid(&column, x, z).unwrap() + 1;
+            let actual = generator.height_at(2 * 16 + x as i32, 2 * 16 + z as i32);
+            assert_eq!(actual, expected, "column {x},{z}");
+        }
+    }
+
+    #[test]
+    fn the_surface_of_land_is_a_surface_block() {
+        let mut generator = VanillaGenerator::new(12345);
+        let column = generator.column(0, 0);
+        let mut seen_grass = false;
+        for x in 0..16 {
+            for z in 0..16 {
+                let Some(top) = highest_solid(&column, x, z) else {
+                    continue;
+                };
+                let id = column.get_block(x, top as usize, z).id();
+                if id == ids::GRASS {
+                    seen_grass = true;
+                }
+                assert!(
+                    matches!(
+                        id,
+                        ids::GRASS
+                            | ids::DIRT
+                            | ids::SAND
+                            | ids::GRAVEL
+                            | ids::STONE
+                            | ids::WATER
+                            | ids::SNOW_LAYER
+                            | ids::MYCELIUM
+                    ),
+                    "unexpected surface block {id} at {x},{top},{z}"
+                );
+            }
+        }
+        assert!(seen_grass, "expected some grass at the surface");
+    }
+
+    #[test]
+    fn different_seeds_produce_different_terrain() {
+        let mut a = VanillaGenerator::new(1);
+        let mut b = VanillaGenerator::new(2);
+        assert!(!same_blocks(&a.column(0, 0), &b.column(0, 0)));
+    }
+
+    #[test]
+    fn chunk_seeds_spread_out() {
+        let mut seen = std::collections::HashSet::new();
+        for cx in -4..4 {
+            for cz in -4..4 {
+                assert!(seen.insert(chunk_seed(7, cx, cz)), "collision at {cx},{cz}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_column_has_no_height() {
+        let column = ChunkColumn::empty(0, 0);
+        assert_eq!(highest_solid(&column, 3, 3), None);
+    }
+}

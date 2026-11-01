@@ -119,6 +119,9 @@ enum Command {
         /// Flight speed in blocks per second
         #[arg(long, default_value_t = 24.0)]
         speed: f32,
+        /// World seed
+        #[arg(long, default_value_t = 0)]
+        seed: i64,
     },
 }
 
@@ -171,12 +174,14 @@ fn main() -> ExitCode {
             radius,
             assets_dir,
             speed,
+            seed,
         } => {
             let assets_dir = assets_dir.unwrap_or_else(default_assets_dir);
             match viewer::run(viewer::ViewerOptions {
                 radius,
                 assets_dir,
                 speed,
+                seed,
             }) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {

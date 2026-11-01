@@ -26,6 +26,7 @@ pub mod raycast;
 pub mod surface;
 pub mod terrain;
 pub mod world;
+pub mod worldgen;
 
 pub use block::BlockState;
 pub use chunk::{section_index, ChunkColumn, Section, SECTION_COUNT, SECTION_DIM, SECTION_VOLUME};

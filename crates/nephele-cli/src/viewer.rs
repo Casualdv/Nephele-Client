@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nephele_assets::{TextureArray, UiAtlas};
-use nephele_mock::terrain;
 use nephele_render::{build_world_mesh, Camera, Renderer};
+use nephele_world::worldgen::VanillaGenerator;
 use nephele_world::World;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -22,6 +22,7 @@ pub struct ViewerOptions {
     pub radius: i32,
     pub assets_dir: PathBuf,
     pub speed: f32,
+    pub seed: i64,
 }
 
 pub fn run(options: ViewerOptions) -> Result<(), Box<dyn Error>> {
@@ -41,6 +42,7 @@ struct Viewer {
     renderer: Option<Renderer>,
     camera: Camera,
     world: World,
+    spawn: glam::Vec3,
     keys: HashSet<KeyCode>,
     mouse_captured: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
@@ -62,6 +64,7 @@ impl Viewer {
             renderer: None,
             camera,
             world: World::new(0),
+            spawn: glam::Vec3::ZERO,
             keys: HashSet::new(),
             mouse_captured: false,
             last_cursor: None,
@@ -112,9 +115,13 @@ impl Viewer {
             Err(err) => return self.fail(event_loop, err),
         };
 
+        let seed = self.options.seed;
+        let mut generator = VanillaGenerator::new(seed);
         self.world = World::new(0);
-        for column in terrain::generate_region(self.options.radius) {
-            self.world.insert(column);
+        for cx in -self.options.radius..=self.options.radius {
+            for cz in -self.options.radius..=self.options.radius {
+                self.world.insert(generator.column(cx, cz));
+            }
         }
         let mesh = build_world_mesh(&self.world, &textures);
         println!(
@@ -125,7 +132,8 @@ impl Viewer {
         );
         renderer.set_mesh(&mesh);
 
-        let spawn_height = terrain::height_at(8, 8) as f32;
+        let spawn_height = generator.height_at(8, 8) as f32;
+        self.spawn = glam::Vec3::new(8.5, spawn_height + 9.0, 8.5);
         self.camera.position = glam::Vec3::new(8.5, spawn_height + 9.0, 8.5);
         self.camera.set_aspect(size.width, size.height);
 
@@ -242,8 +250,7 @@ impl ApplicationHandler for Viewer {
                         }
                         (KeyCode::KeyR, ElementState::Pressed) => {
                             // Recentre the camera above spawn.
-                            self.camera.position =
-                                glam::Vec3::new(8.5, terrain::height_at(8, 8) as f32 + 9.0, 8.5);
+                            self.camera.position = self.spawn;
                         }
                         (_, ElementState::Pressed) => {
                             self.keys.insert(code);
