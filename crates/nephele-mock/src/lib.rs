@@ -324,7 +324,8 @@ const BOT_NAMES: [&str; 8] = [
     "Grumm",
 ];
 
-const BOT_COUNT: usize = 8;
+/// How many bots `MockConfig::bots` spawns. Reported by the CLI on startup.
+pub const BOT_COUNT: usize = 8;
 
 /// Bots ringed around the spawn point, so they are in view whichever way the
 /// player happens to be looking.

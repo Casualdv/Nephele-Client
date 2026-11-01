@@ -521,7 +521,10 @@ async fn run_mock_server(port: u16, radius: i32, no_compression: bool, bots: boo
     let server = MockServer::start_on(port, config).await?;
     println!("Nephele mock server listening on {}", server.address());
     if bots {
-        println!("Spawning 4 walking players around spawn.");
+        println!(
+            "Spawning {} walking players around spawn.",
+            nephele_mock::BOT_COUNT
+        );
     }
     println!(
         "World: {} chunk columns, compression {}",
