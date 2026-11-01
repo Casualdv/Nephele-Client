@@ -467,7 +467,12 @@ async fn net_loop(
 
                 if use_pressed {
                     if let Some(target) = aim {
-                        client.place(&target).await.map_err(|err| err.to_string())?;
+                        if !placement_hits_player(&target, [position.x, position.y, position.z]) {
+                            client
+                                .place(&target)
+                                .await
+                                .map_err(|err| err.to_string())?;
+                        }
                     }
                 }
 
@@ -1737,6 +1742,30 @@ fn mob_scale(kind: u8) -> f32 {
 }
 
 /// `1`..`9` selects hotbar slots 0..8, exactly like vanilla.
+/// Would placing the block at `aim`'s face put it inside the player?
+///
+/// Vanilla refuses such a placement outright (`World.checkNoEntityCollision`),
+/// which is why placing under your own feet does nothing instead of shoving you
+/// upward.
+fn placement_hits_player(aim: &Aim, feet: [f64; 3]) -> bool {
+    let normal = nephele_world::Face::from_protocol_id(aim.face)
+        .map(|face| face.normal())
+        .unwrap_or([0, 1, 0]);
+    let x = (aim.x + normal[0]) as f64;
+    let y = (aim.y + normal[1]) as f64;
+    let z = (aim.z + normal[2]) as f64;
+
+    let half = nephele_client::physics::WIDTH / 2.0;
+    let height = nephele_client::physics::HEIGHT;
+
+    x < feet[0] + half
+        && x + 1.0 > feet[0] - half
+        && y < feet[1] + height
+        && y + 1.0 > feet[1]
+        && z < feet[2] + half
+        && z + 1.0 > feet[2] - half
+}
+
 fn hotbar_digit(code: KeyCode) -> Option<i16> {
     let slot = match code {
         KeyCode::Digit1 => 0,
@@ -1762,6 +1791,73 @@ mod tests {
         assert_eq!(hotbar_digit(KeyCode::Digit1), Some(0));
         assert_eq!(hotbar_digit(KeyCode::Digit9), Some(8));
         assert_eq!(hotbar_digit(KeyCode::KeyW), None);
+    }
+
+    /// A player standing on the block at (0, 63, 0), so their feet are at y = 64.
+    fn standing_on_a_block() -> [f64; 3] {
+        [0.5, 64.0, 0.5]
+    }
+
+    fn hit(aim: Aim) -> bool {
+        placement_hits_player(&aim, standing_on_a_block())
+    }
+
+    #[test]
+    fn placing_on_the_block_below_your_feet_is_refused() {
+        // Top face of the block you are standing on: the new block would
+        // occupy the space your legs are in.
+        let aim = Aim {
+            x: 0,
+            y: 63,
+            z: 0,
+            face: 1,
+            cursor: [0.5, 1.0, 0.5],
+        };
+        assert!(hit(aim));
+    }
+
+    #[test]
+    fn placing_beside_or_above_you_is_allowed() {
+        // East face of a block far to the side.
+        let beside = Aim {
+            x: 4,
+            y: 63,
+            z: 0,
+            face: 5,
+            cursor: [1.0, 0.5, 0.5],
+        };
+        assert!(!hit(beside));
+
+        // Top face of a block two above the feet: clear of the head.
+        let above = Aim {
+            x: 0,
+            y: 65,
+            z: 0,
+            face: 1,
+            cursor: [0.5, 1.0, 0.5],
+        };
+        assert!(!hit(above));
+    }
+
+    #[test]
+    fn placing_into_your_own_head_space_is_refused() {
+        // The block at head height, reached from the side.
+        let aim = Aim {
+            x: 0,
+            y: 63,
+            z: 0,
+            face: 1,
+            cursor: [0.5, 1.0, 0.5],
+        };
+        assert!(hit(aim));
+
+        // One block up still overlaps the head, which reaches 65.8.
+        let head = Aim { y: 64, ..aim };
+        assert!(hit(head));
+
+        // One higher clears it.
+        let clear = Aim { y: 65, ..aim };
+        assert!(!hit(clear));
     }
 
     #[test]

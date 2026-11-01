@@ -1,20 +1,20 @@
 //! The block-breaking state machine, following vanilla `PlayerControllerMP`.
 //!
-//! Vanilla accumulates `curBlockDamageMP` every tick by
-//! `toolEfficiency / hardness / (canHarvest ? 30 : 100)` and destroys the block
-//! once it reaches 1.0, then ignores clicks for 5 ticks (`blockHitDelay`).
-//! Nephele has no tools yet, so efficiency is always the bare-hand 1.0.
+//! The server is the authority and treats the two modes differently
+//! (`ItemInWorldManager`), so the client has to follow suit:
 //!
-//! Breaking is instantaneous for now: clicking a block yields it on the same
-//! tick and there is no post-break cooldown, so holding the button clears
-//! blocks as fast as the crosshair moves. [`tick_damage`] still carries
-//! vanilla's hardness formula, ready for when tools make it meaningful again.
+//! - **Creative**: `onBlockClicked` harvests on `START_DESTROY_BLOCK`, so the
+//!   block is gone the moment it is clicked and the crosshair can move on to
+//!   the next one immediately.
+//! - **Survival**: the server only harvests once its own timer reaches the
+//!   block's hardness (`blockRemoving` checks `>= 0.7`, then `>= 1.0` of the
+//!   full time). Nothing a client sends can shorten that, so the client
+//!   accumulates exactly like vanilla and sends `STOP` when the block pops.
+//!
+//! Nephele has no tools yet, so efficiency is always the bare-hand 1.0.
 
 use nephele_world::block::{hardness, requires_tool, UNBREAKABLE};
 use nephele_world::{BlockState, World};
-
-/// Destroy a block on the tick it is first aimed at, with no cooldown.
-pub const INSTANT_MINING: bool = true;
 
 /// How long a destroyed block is remembered while waiting for the server's
 /// block update, in ticks. Without this, holding the button would re-send
@@ -132,28 +132,16 @@ impl Miner {
             self.current = Some(aim);
             self.progress = 0.0;
             events.push(MiningEvent::Start(aim));
-
-            if creative {
-                // Creative destroys on the first click; the server applies it
-                // itself, so this is just START followed by STOP.
-                events.push(MiningEvent::Stop(aim));
-                self.current = None;
-                self.hit_delay = HIT_DELAY_TICKS;
-                return events;
-            }
         }
 
-        self.progress += if INSTANT_MINING {
-            1.0
-        } else {
-            tick_damage(state)
-        };
+        self.progress += if creative { 1.0 } else { tick_damage(state) };
         if self.progress >= 1.0 {
             events.push(MiningEvent::Stop(aim));
             self.current = None;
             self.progress = 0.0;
-            self.hit_delay = if INSTANT_MINING { 0 } else { HIT_DELAY_TICKS };
-            if INSTANT_MINING {
+            // Creative has no cooldown: the whole point is chaining blocks.
+            self.hit_delay = if creative { 0 } else { HIT_DELAY_TICKS };
+            if creative {
                 self.pending = Some(aim.pos());
                 self.pending_ticks = PENDING_TICKS;
             }
@@ -215,9 +203,28 @@ mod tests {
         world
     }
 
+    fn two_blocks(block: BlockState) -> World {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(1, 10, 1, block);
+        column.set_block(2, 10, 1, block);
+        let mut world = World::new(0);
+        world.insert(column);
+        world
+    }
+
     fn aim() -> Aim {
         Aim {
             x: 1,
+            y: 10,
+            z: 1,
+            face: 1,
+            cursor: [0.5, 1.0, 0.5],
+        }
+    }
+
+    fn next_to_aim() -> Aim {
+        Aim {
+            x: 2,
             y: 10,
             z: 1,
             face: 1,
@@ -238,61 +245,56 @@ mod tests {
     }
 
     #[test]
-    fn mining_a_block_emits_start_then_stop() {
+    fn survival_starts_then_accumulates_until_the_block_pops() {
         let world = world_with(BlockState::new(ids::DIRT, 0));
         let mut miner = Miner::default();
-        let first = miner.tick(&world, Some(aim()), true, false);
+
         assert_eq!(
-            first,
-            vec![MiningEvent::Start(aim()), MiningEvent::Stop(aim())]
+            miner.tick(&world, Some(aim()), true, false),
+            vec![MiningEvent::Start(aim())]
         );
+        assert_eq!(miner.stage(), Some(0));
+
+        let mut ticks = 1;
+        loop {
+            ticks += 1;
+            let events = miner.tick(&world, Some(aim()), true, false);
+            if events
+                .iter()
+                .any(|event| matches!(event, MiningEvent::Stop(_)))
+            {
+                break;
+            }
+            assert!(ticks < 100, "never finished");
+        }
+
+        // Vanilla's 15 ticks for dirt: 1/15 of the block per tick.
+        assert_eq!(ticks, 15);
         assert!(miner.target().is_none());
     }
 
     #[test]
-    fn holding_the_button_waits_for_the_server_to_remove_the_block() {
-        let world = world_with(BlockState::new(ids::DIRT, 0));
-        let mut miner = Miner::default();
-        assert_eq!(miner.tick(&world, Some(aim()), true, false).len(), 2);
-        for _ in 0..5 {
-            assert!(
-                miner.tick(&world, Some(aim()), true, false).is_empty(),
-                "the same block must not be re-sent while it is still there"
-            );
-        }
-    }
-
-    #[test]
-    fn the_next_block_breaks_on_the_very_next_tick() {
-        let mut column = ChunkColumn::empty(0, 0);
-        column.set_block(1, 10, 1, BlockState::STONE);
-        column.set_block(2, 10, 1, BlockState::STONE);
-        let mut world = World::new(0);
-        world.insert(column);
-
-        let mut miner = Miner::default();
-        assert_eq!(miner.tick(&world, Some(aim()), true, false).len(), 2);
-
-        let other = Aim {
-            x: 2,
-            y: 10,
-            z: 1,
-            face: 1,
-            cursor: [0.5, 1.0, 0.5],
-        };
-        assert_eq!(
-            miner.tick(&world, Some(other), true, false),
-            vec![MiningEvent::Start(other), MiningEvent::Stop(other)]
-        );
-    }
-
-    #[test]
-    fn releasing_the_button_sends_nothing_further() {
+    fn survival_aborts_when_the_button_is_released() {
         let world = world_with(BlockState::STONE);
         let mut miner = Miner::default();
         miner.tick(&world, Some(aim()), true, false);
-        assert!(miner.tick(&world, Some(aim()), false, false).is_empty());
+        let events = miner.tick(&world, Some(aim()), false, false);
+        assert_eq!(events, vec![MiningEvent::Abort(aim())]);
         assert!(miner.target().is_none());
+    }
+
+    #[test]
+    fn survival_aborts_the_old_block_when_the_target_changes() {
+        let world = two_blocks(BlockState::STONE);
+        let mut miner = Miner::default();
+        miner.tick(&world, Some(aim()), true, false);
+
+        let events = miner.tick(&world, Some(next_to_aim()), true, false);
+        assert_eq!(
+            events,
+            vec![MiningEvent::Abort(aim()), MiningEvent::Start(next_to_aim())]
+        );
+        assert_eq!(miner.target(), Some((2, 10, 1)));
     }
 
     #[test]
@@ -304,12 +306,53 @@ mod tests {
             events,
             vec![MiningEvent::Start(aim()), MiningEvent::Stop(aim())]
         );
+        assert!(miner.target().is_none());
+    }
+
+    #[test]
+    fn creative_chains_straight_onto_the_next_block() {
+        let world = two_blocks(BlockState::STONE);
+        let mut miner = Miner::default();
+        assert_eq!(miner.tick(&world, Some(aim()), true, true).len(), 2);
+        assert_eq!(
+            miner.tick(&world, Some(next_to_aim()), true, true),
+            vec![
+                MiningEvent::Start(next_to_aim()),
+                MiningEvent::Stop(next_to_aim())
+            ]
+        );
+    }
+
+    #[test]
+    fn creative_does_not_repeat_a_block_the_server_has_not_removed() {
+        let world = world_with(BlockState::STONE);
+        let mut miner = Miner::default();
+        assert_eq!(miner.tick(&world, Some(aim()), true, true).len(), 2);
+        for _ in 0..5 {
+            assert!(miner.tick(&world, Some(aim()), true, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn creative_retries_after_the_pending_window() {
+        let world = world_with(BlockState::STONE);
+        let mut miner = Miner::default();
+        assert_eq!(miner.tick(&world, Some(aim()), true, true).len(), 2);
+        for _ in 0..PENDING_TICKS {
+            miner.tick(&world, Some(aim()), true, true);
+        }
+        assert_eq!(
+            miner.tick(&world, Some(aim()), true, true).len(),
+            2,
+            "a server that ignored the break should be asked again"
+        );
     }
 
     #[test]
     fn unbreakable_blocks_never_start() {
         let world = world_with(BlockState::BEDROCK);
         let mut miner = Miner::default();
+        assert!(miner.tick(&world, Some(aim()), true, true).is_empty());
         assert!(miner.tick(&world, Some(aim()), true, false).is_empty());
         assert!(miner.target().is_none());
     }
