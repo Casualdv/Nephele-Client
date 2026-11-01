@@ -1480,10 +1480,12 @@ impl Layer for GenLayerVoronoiZoom {
                     for dx in 0..4usize {
                         let dxf = dx as f64;
                         let dzf = dz as f64;
-                        let d0 = (dxf - top_left_z).powi(2) + (dzf - top_left_x).powi(2);
-                        let d1 = (dxf - top_right_z).powi(2) + (dzf - top_right_x).powi(2);
-                        let d2 = (dxf - bottom_left_z).powi(2) + (dzf - bottom_left_x).powi(2);
-                        let d3 = (dxf - bottom_right_z).powi(2) + (dzf - bottom_right_x).powi(2);
+                        // Vanilla pairs the first draw with the column and the
+                        // second with the row.
+                        let d0 = (dzf - top_left_z).powi(2) + (dxf - top_left_x).powi(2);
+                        let d1 = (dzf - top_right_z).powi(2) + (dxf - top_right_x).powi(2);
+                        let d2 = (dzf - bottom_left_z).powi(2) + (dxf - bottom_left_x).powi(2);
+                        let d3 = (dzf - bottom_right_z).powi(2) + (dxf - bottom_right_x).powi(2);
                         zoomed[row + dx] = if d0 < d1 && d0 < d2 && d0 < d3 {
                             top_left
                         } else if d1 < d0 && d1 < d2 && d1 < d3 {
@@ -1781,11 +1783,11 @@ mod tests {
         );
     }
 
-    /// Currently ignored: the assembled stack disagrees with the reference
-    /// world (biome ids come out one temperature band too cold), so this is the
-    /// target, not a passing check. Fix by diffing layer by layer against a
-    /// Java oracle built from the MCP sources.
-    #[ignore = "the port does not match the reference world yet"]
+    /// Every chunk the real 1.8.9 server generated must carry the same biome
+    /// ids we produce. This is what proves the chain is a faithful port.
+    ///
+    /// Needs a world at `Nephele-private/parity` (see the oracle's README); it
+    /// skips when that world is not present.
     #[test]
     fn chunk_biomes_match_a_world_the_real_server_generated() {
         use nephele_anvil::{parse_chunk, RegionFile};
