@@ -209,7 +209,7 @@ No audio exists yet.
 
 | Item | Size | Notes |
 |---|---|---|
-| **Microsoft device-code OAuth → Xbox Live → Minecraft services** | **M** | No longer unknown: port `azalea-auth` (MIT) and re-check the endpoints against Microsoft docs. |
+| **Microsoft device-code OAuth → Xbox Live → Minecraft services** | **M** | `nephele-auth` does the whole flow; `nephele auth` signs in and caches a session. Needs a client id. |
 | Token storage + refresh | M | `azalea-auth` has a cache; encrypt at rest. |
 | Online-mode encryption handshake | M | `azalea-crypto` (MIT) has AES/RSA + PKCS#1; mirror it. |
 | Server list screen (ping, MOTD, version, favourites, history) | M | |

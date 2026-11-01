@@ -108,6 +108,15 @@ enum Command {
         #[arg(long)]
         seed: Option<u64>,
     },
+    /// Sign in with a Microsoft account (device code) and cache the session.
+    Auth {
+        /// Azure application client id (or set NEPHELE_CLIENT_ID)
+        #[arg(long)]
+        client_id: Option<String>,
+        /// Where to write the cached session
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Render the synthetic world in a window (WASD + right-drag to look).
     View {
         /// Chunk radius to generate
@@ -190,6 +199,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Auth { client_id, out } => run_auth(client_id, out),
         command => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -206,9 +216,107 @@ fn main() -> ExitCode {
     }
 }
 
+/// A session is a credential, so it lives beside the prepared resources, not in
+/// the repository root, and it is gitignored with the rest of `.local`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CachedSession {
+    client_id: String,
+    access_token: String,
+    expires_at: u64,
+    id: String,
+    name: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+fn run_auth(client_id: Option<String>, out: Option<PathBuf>) -> ExitCode {
+    use std::io::Write;
+
+    let client_id = client_id
+        .or_else(|| std::env::var("NEPHELE_CLIENT_ID").ok())
+        .unwrap_or_default();
+
+    if client_id.trim().is_empty() {
+        eprintln!("error: no client id configured");
+        eprintln!(
+            "       register an Azure application (public client, device code flow enabled),"
+        );
+        eprintln!("       then run `nephele auth --client-id <id>` or set NEPHELE_CLIENT_ID");
+        return ExitCode::FAILURE;
+    }
+
+    let code = match nephele_auth::begin(&client_id) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!();
+    println!("  To sign in, open {}", code.verification_uri);
+    println!("  and enter the code:  {}", code.user_code);
+    println!();
+    print!("  waiting");
+    let _ = std::io::stdout().flush();
+
+    let token = match nephele_auth::wait_for_token(&client_id, &code, |_| {
+        print!(".");
+        let _ = std::io::stdout().flush();
+    }) {
+        Ok(token) => token,
+        Err(err) => {
+            println!();
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(" done");
+
+    let session = match nephele_auth::to_minecraft(&client_id, &token) {
+        Ok(session) => session,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "  signed in as {} ({})",
+        session.profile.name, session.profile.id
+    );
+
+    let path = out.unwrap_or_else(|| project_root().join(".local/auth.json"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let cached = CachedSession {
+        client_id: client_id.clone(),
+        access_token: session.access_token.clone(),
+        expires_at: session.expires_at,
+        id: session.profile.id.clone(),
+        name: session.profile.name.clone(),
+        refresh_token: session.refresh_token.clone(),
+    };
+
+    match serde_json::to_string_pretty(&cached)
+        .map_err(|err| err.to_string())
+        .and_then(|json| std::fs::write(&path, json).map_err(|err| err.to_string()))
+    {
+        Ok(()) => {
+            println!("  session saved to {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("error: could not save the session: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
 async fn run_command(command: Command) -> Result<()> {
     match command {
-        Command::View { .. } | Command::Play { .. } => {
+        Command::View { .. } | Command::Play { .. } | Command::Auth { .. } => {
             unreachable!("windowed commands are handled synchronously")
         }
         Command::Status {

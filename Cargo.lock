@@ -1321,11 +1321,13 @@ dependencies = [
  "glam",
  "image",
  "nephele-assets",
+ "nephele-auth",
  "nephele-client",
  "nephele-mock",
  "nephele-protocol",
  "nephele-render",
  "nephele-world",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -1350,6 +1352,16 @@ dependencies = [
  "nephele-world",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "nephele-auth"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "ureq",
 ]
 
 [[package]]

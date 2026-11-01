@@ -1,0 +1,13 @@
+[package]
+name = "nephele-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Microsoft account login for Nephele: device code, Xbox Live, Minecraft services"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ureq = { version = "2", default-features = false, features = ["tls"] }
