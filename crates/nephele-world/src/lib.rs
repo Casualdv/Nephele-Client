@@ -23,6 +23,7 @@ pub mod generation;
 pub mod genlayer;
 pub mod noise;
 pub mod raycast;
+pub mod terrain;
 pub mod world;
 
 pub use block::BlockState;

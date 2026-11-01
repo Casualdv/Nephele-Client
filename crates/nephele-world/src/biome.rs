@@ -65,7 +65,7 @@ const fn b(
     }
 }
 
-/// The registered biomes, ids 0..=39.
+/// The registered biomes, indexed by id.
 pub static BIOMES: [Biome; 40] = [
     b(0, "Ocean", BiomeClass::Ocean, 0.5, 0.5, false),
     b(1, "Plains", BiomeClass::Plains, 0.8, 0.4, false),
@@ -250,6 +250,49 @@ pub fn can_be_neighbors(a: i32, b: i32) -> bool {
 /// `GenLayerShore.func_151631_c`.
 pub fn shore_accepts(id: i32) -> bool {
     is_jungle_class(id) || matches!(id, 21 | 22 | 23 | 4 | 5) || is_oceanic(id)
+}
+
+/// `BiomeGenBase.Height` presets, as `(rootHeight, variation)`.
+const HEIGHT_DEFAULT: (f32, f32) = (0.1, 0.2);
+const HEIGHT_SHALLOW_WATERS: (f32, f32) = (-0.5, 0.0);
+const HEIGHT_OCEANS: (f32, f32) = (-1.0, 0.1);
+const HEIGHT_DEEP_OCEANS: (f32, f32) = (-1.8, 0.1);
+const HEIGHT_LOW_PLAINS: (f32, f32) = (0.125, 0.05);
+const HEIGHT_MID_PLAINS: (f32, f32) = (0.2, 0.2);
+const HEIGHT_LOW_HILLS: (f32, f32) = (0.45, 0.3);
+const HEIGHT_HIGH_PLATEAUS: (f32, f32) = (1.5, 0.025);
+const HEIGHT_MID_HILLS: (f32, f32) = (1.0, 0.5);
+const HEIGHT_SHORES: (f32, f32) = (0.0, 0.025);
+const HEIGHT_ROCKY_WATERS: (f32, f32) = (0.1, 0.8);
+const HEIGHT_LOW_ISLANDS: (f32, f32) = (0.2, 0.3);
+const HEIGHT_PARTIALLY_SUBMERGED: (f32, f32) = (-0.2, 0.1);
+
+/// The `(minHeight, maxHeight)` a biome contributes to the terrain height
+/// field. Mutated biomes are their base biome plus `(0.1, 0.2)`, exactly as
+/// `BiomeGenMutated` builds them.
+pub fn height_params(id: i32) -> (f32, f32) {
+    let (root, variation) = match if id >= 128 { id - 128 } else { id } {
+        0 | 10 => HEIGHT_OCEANS,
+        1 | 4 | 8 | 9 | 20 | 21 | 23 | 27 | 29 | 37 => HEIGHT_DEFAULT,
+        2 | 12 | 35 => HEIGHT_LOW_PLAINS,
+        3 | 34 => HEIGHT_MID_HILLS,
+        5 | 30 | 32 => HEIGHT_MID_PLAINS,
+        6 => HEIGHT_PARTIALLY_SUBMERGED,
+        7 | 11 => HEIGHT_SHALLOW_WATERS,
+        13 | 17 | 18 | 19 | 22 | 28 | 31 | 33 => HEIGHT_LOW_HILLS,
+        14 => HEIGHT_LOW_ISLANDS,
+        15 | 16 | 26 => HEIGHT_SHORES,
+        24 => HEIGHT_DEEP_OCEANS,
+        25 => HEIGHT_ROCKY_WATERS,
+        36 | 38 | 39 => HEIGHT_HIGH_PLATEAUS,
+        _ => HEIGHT_DEFAULT,
+    };
+
+    if id >= 128 {
+        (root + 0.1, variation + 0.2)
+    } else {
+        (root, variation)
+    }
 }
 
 pub fn name_of(id: i32) -> &'static str {

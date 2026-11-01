@@ -1655,6 +1655,16 @@ impl BiomeLayers {
     pub fn chunk_biomes(&mut self, chunk_x: i32, chunk_z: i32) -> Vec<i32> {
         self.biomes(chunk_x * 16, chunk_z * 16, 16, 16)
     }
+
+    /// The biome sample the terrain height field is built from.
+    ///
+    /// `GenLayer.initializeAllBiomeGenerators` returns `{rivermix, voronoi,
+    /// rivermix}`, and `WorldChunkManager.getBiomesForGeneration` reads the
+    /// first one: the coarse 1:64 river-mixed layer. Only the stored per-block
+    /// map comes from the voronoi layer, so terrain must not use [`biomes`].
+    pub fn terrain_biomes(&mut self, x: i32, z: i32, width: usize, height: usize) -> Vec<i32> {
+        self.debug_mixed.get_ints(x, z, width, height)
+    }
 }
 
 #[cfg(test)]
