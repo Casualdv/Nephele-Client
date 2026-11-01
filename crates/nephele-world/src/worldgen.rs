@@ -41,6 +41,7 @@ impl VanillaGenerator {
         // Vanilla order: caves and ravines carve the terrain, then veins are
         // placed into what is left.
         crate::caves::Caves::new(self.seed).carve(&mut column, &biomes);
+        crate::ravines::Ravines::new(self.seed).carve(&mut column, &biomes);
         crate::ores::decorate(&mut column);
         column
     }
@@ -144,7 +145,7 @@ mod tests {
         println!("cave air below y=56: ours {mine:.0}/chunk, reference {real:.0}/chunk");
         assert!(chunks > 100);
         assert!(
-            (mine - real).abs() < real * 0.5,
+            (mine - real).abs() < real * 0.15,
             "cave volume off: {mine:.0} vs {real:.0}"
         );
     }
@@ -210,10 +211,9 @@ mod tests {
             let real = theirs[index] as f64 / chunks as f64;
             println!("{name}: ours {mine:.1}/chunk, reference {real:.1}/chunk");
 
-            // Ours runs a little high because caves are not carved yet, and a
-            // vein that a cave would have eaten still lands. Once caves exist
-            // this should close up.
-            if (mine - real).abs() > real * 0.3 {
+            // Ours still runs slightly high: vanilla's decoration pass places
+            // a few veins the terrain pass never sees.
+            if (mine - real).abs() > real * 0.2 {
                 failures.push(format!("{name}: {mine:.1} vs {real:.1}"));
             }
         }
