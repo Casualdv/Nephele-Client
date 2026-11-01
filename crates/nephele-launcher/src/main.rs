@@ -455,36 +455,46 @@ impl ApplicationHandler for Launcher {
     }
 }
 
-/// The directory `nephele-prepare` writes into, and where the prepared
-/// resources live.
-///
-/// Found from the current directory first, then by walking up from the
-/// executable, so launching from Explorer (which sets the working directory to
-/// the binary's folder) resolves the same tree as `cargo run`.
-fn project_root() -> PathBuf {
-    fn looks_like_root(dir: &std::path::Path) -> bool {
-        if dir.join(".local/prepared").is_dir() {
-            return true;
-        }
-        std::fs::read_to_string(dir.join("Cargo.toml"))
-            .map(|manifest| manifest.contains("[workspace]"))
-            .unwrap_or(false)
-    }
-
+/// Every directory worth considering as the project root: the working
+/// directory, then each ancestor of the executable.
+fn candidate_roots() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
-        if looks_like_root(&cwd) {
-            return cwd;
-        }
+        dirs.push(cwd);
     }
-
     let mut candidate = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(PathBuf::from));
     while let Some(dir) = candidate {
-        if looks_like_root(&dir) {
-            return dir;
-        }
+        dirs.push(dir.clone());
         candidate = dir.parent().map(PathBuf::from);
+    }
+    dirs
+}
+
+/// The workspace root, where `.local/prepared` and `assets/vanilla` live, and
+/// where `nephele-prepare` should write.
+///
+/// A `[workspace]` manifest wins over a prepared tree, because a stray
+/// `.local/prepared` can exist inside `target` and would otherwise be picked
+/// just for being closer. The prepared tree is only a fallback, for an
+/// installed build that has no source tree beside it.
+fn project_root() -> PathBuf {
+    let dirs = candidate_roots();
+
+    let has_workspace = |dir: &PathBuf| {
+        std::fs::read_to_string(dir.join("Cargo.toml"))
+            .map(|manifest| manifest.contains("[workspace]"))
+            .unwrap_or(false)
+    };
+    if let Some(found) = dirs.iter().find(|dir| has_workspace(dir)) {
+        return found.clone();
+    }
+    if let Some(found) = dirs
+        .iter()
+        .find(|dir| dir.join(".local/prepared/1.8.9").is_dir())
+    {
+        return found.clone();
     }
 
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
