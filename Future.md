@@ -33,8 +33,13 @@ own 1.8.9 jar by `nephele-prepare`, verified against `research-lock.json`.
 | `Thinkofname/steven` | MIT / Apache-2.0 | The original 2015 Rust client | Copy with attribution. Superseded. |
 | `iceiix/stevenarella` | MIT / Apache-2.0 | Actively-kept fork of steven | **Copy with attribution** |
 | `Lea-fish/Leafish` | MIT / Apache-2.0 | Furthest-along fork: entities, inventory, screens, lighting | **Copy with attribution** |
-| `PommeMC/Client` | **GPL-3.0** | Most complete (265 files): auth, audio, singleplayer, renderer | **Read only.** Never copy. |
+| `azalea-rs/azalea` | **MIT** | Full Rust MC stack: auth, crypto, protocol, world, entity, inventory, brigadier | **Copy with attribution. Highest value.** |
+| `Oery/origami` | MIT | ~1.4k-line pure-Rust bot; very readable event/packet layer | Copy with attribution |
+| `cohaereo/minecrab` | **GPL-3.0** | Rust bot/automation | **Read only.** |
+| `Exopteron/opengl-classic-client` | none stated | Toy Rust/OpenGL Classic client | **Do not copy** — no licence |
+| `PommeMC/Client` | **GPL-3.0** | Most complete client (265 files): auth, audio, singleplayer | **Read only.** Never copy. |
 | Our own oracle (`Nephele-private`) | private | Decompiled 1.8.9 + Java harness | Never published |
+
 
 ### Licence rules
 
@@ -50,14 +55,22 @@ own 1.8.9 jar by `nephele-prepare`, verified against `research-lock.json`.
 
 ### What the references actually contain
 
-- **None of them generate terrain.** Leafish and stevenarella have a 119-line
-  biome colour table and nothing else. Our worldgen is already ahead.
-- **None of the MIT/Apache ones implement Microsoft auth.** `stevenarella`'s
-  `auth.rs` is 57 lines and offline only. `PommeMC` has device-code OAuth
-  (`pomme-auth`, ~500 lines) but is GPL — read it, re-implement it.
-- The useful, borrowable material is: Leafish `entity/` (19 files),
-  `inventory/` (24), `screen/` (12), `world/lighting.rs`, `entity/block_entity/`,
-  `particle/`.
+- **None of them generate 1.8.9 terrain.** Leafish and stevenarella have a
+  119-line biome colour table and nothing else. Our worldgen is already ahead.
+- **Azalea solves authentication.** `azalea-auth` (MIT) implements the full
+  Microsoft device-code flow, token refresh, ownership check, profile fetch and
+  session-server join; `azalea-crypto` has the AES/RSA online-mode handshake.
+  It targets modern versions, but auth and the join handshake are the parts that
+  did not change. This is a port, not a research project.
+- Azalea also carries `azalea-brigadier` (command parsing and suggestions),
+  `azalea-chat` (JSON chat components), `azalea-inventory`, `azalea-entity` and
+  `azalea-physics` — all MIT, all useful as structure even where 1.8.9 constants
+  differ.
+- The useful, borrowable material in the older clients is: Leafish `entity/`
+  (19 files), `inventory/` (24), `screen/` (12), `world/lighting.rs`,
+  `entity/block_entity/`, `particle/`.
+- `minecrab` and `PommeMC` are GPL-3.0: read for understanding, never copy.
+
 
 ---
 
@@ -169,7 +182,7 @@ This is what separates a PvP client from a compatible one.
 |---|---|---|
 | Hunger / XP / armour / air HUD | M | |
 | Hotbar selection highlight, item counts, durability | S | |
-| Chat overlay + input + command suggestions | M | Currently received and printed to console. |
+| Chat overlay + input + command suggestions | M | Received and printed to console today; `azalea-brigadier` and `azalea-chat` are MIT references. |
 | Scoreboard sidebar, tab player list, boss bar, titles | M | |
 | **Client modules:** FPS, CPS, keystrokes, coordinates, ping, armour status, potion timers, reach display | M | The Lunar/Badlion basics. |
 | **Toggle sprint, toggle sneak** | S | |
@@ -196,9 +209,9 @@ No audio exists yet.
 
 | Item | Size | Notes |
 |---|---|---|
-| **Microsoft device-code OAuth → Xbox Live → Minecraft services** | **L** | The blocker for release. Read `pomme-auth` for flow, re-implement from Microsoft docs. |
-| Token storage + refresh | M | Encrypted at rest. |
-| Online-mode encryption handshake | M | AES + RSA; check whether our login path already does this. |
+| **Microsoft device-code OAuth → Xbox Live → Minecraft services** | **M** | No longer unknown: port `azalea-auth` (MIT) and re-check the endpoints against Microsoft docs. |
+| Token storage + refresh | M | `azalea-auth` has a cache; encrypt at rest. |
+| Online-mode encryption handshake | M | `azalea-crypto` (MIT) has AES/RSA + PKCS#1; mirror it. |
 | Server list screen (ping, MOTD, version, favourites, history) | M | |
 | Dimension change, respawn packets, portals | L | |
 | Resource packs (server-sent) | M | |
