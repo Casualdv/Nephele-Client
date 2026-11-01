@@ -24,6 +24,10 @@ const SCOPE: &str = "XboxLive.signin offline_access";
 // `login.live.com` endpoints only accept legacy Live application ids, so an
 // app registered in Entra answers "the account does not exist in tenant
 // Microsoft Services" when pointed at them.
+const LEGACY_SCOPE: &str = "service::user.auth.xboxlive.com::MBI_SSL";
+const LEGACY_DEVICE_CODE_URL: &str = "https://login.live.com/oauth20_connect.srf";
+const LEGACY_TOKEN_URL: &str = "https://login.live.com/oauth20_token.srf";
+
 const DEVICE_CODE_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode";
 const TOKEN_URL: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
 const XBL_URL: &str = "https://user.auth.xboxlive.com/user/authenticate";
@@ -175,15 +179,26 @@ impl StoredSession {
 }
 /// Start a sign-in: ask Microsoft for a device code.
 pub fn begin(client_id: &str) -> Result<DeviceCode, AuthError> {
+    begin_with(client_id, false)
+}
+
+/// `legacy` targets `login.live.com`, which only accepts legacy Live
+/// application ids. Keep it for testing with an app registered before Entra.
+pub fn begin_with(client_id: &str, legacy: bool) -> Result<DeviceCode, AuthError> {
     if client_id.is_empty() {
         return Err(AuthError::NoClientId);
     }
-    let body = form(&[
-        ("scope", SCOPE),
-        ("client_id", client_id),
-        ("response_type", "device_code"),
-    ]);
-    let text = post(DEVICE_CODE_URL, &body)?;
+    let (url, _, scope) = endpoints(legacy);
+    let body = if legacy {
+        form(&[
+            ("scope", scope),
+            ("client_id", client_id),
+            ("response_type", "device_code"),
+        ])
+    } else {
+        form(&[("client_id", client_id), ("scope", scope)])
+    };
+    let text = post(url, &body)?;
     serde_json::from_str(&text).map_err(|err| AuthError::Unexpected(format!("{err}: {text}")))
 }
 
@@ -193,8 +208,18 @@ pub fn begin(client_id: &str) -> Result<DeviceCode, AuthError> {
 pub fn wait_for_token(
     client_id: &str,
     code: &DeviceCode,
+    on_wait: impl FnMut(Duration),
+) -> Result<String, AuthError> {
+    wait_for_token_with(client_id, code, false, on_wait)
+}
+
+pub fn wait_for_token_with(
+    client_id: &str,
+    code: &DeviceCode,
+    legacy: bool,
     mut on_wait: impl FnMut(Duration),
 ) -> Result<String, AuthError> {
+    let (_, token_url, _) = endpoints(legacy);
     let deadline = Instant::now() + Duration::from_secs(code.expires_in);
     let interval = Duration::from_secs(code.interval.max(1));
 
@@ -208,7 +233,7 @@ pub fn wait_for_token(
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ]);
 
-        match post(TOKEN_URL, &body) {
+        match post(token_url, &body) {
             Ok(text) => {
                 let token: TokenResponse = serde_json::from_str(&text)
                     .map_err(|err| AuthError::Unexpected(format!("{err}: {text}")))?;
@@ -346,6 +371,15 @@ pub fn login(client_id: &str, mut show: impl FnMut(&DeviceCode)) -> Result<Sessi
     let mut session = to_minecraft(client_id, &ms_token)?;
     session.refresh_token = None;
     Ok(session)
+}
+
+/// `(device code url, token url, scope)` for the selected sign-in endpoint.
+fn endpoints(legacy: bool) -> (&'static str, &'static str, &'static str) {
+    if legacy {
+        (LEGACY_DEVICE_CODE_URL, LEGACY_TOKEN_URL, LEGACY_SCOPE)
+    } else {
+        (DEVICE_CODE_URL, TOKEN_URL, SCOPE)
+    }
 }
 
 fn form(fields: &[(&str, &str)]) -> String {

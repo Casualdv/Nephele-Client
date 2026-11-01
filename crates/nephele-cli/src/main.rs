@@ -119,6 +119,9 @@ enum Command {
         /// Where to write the cached session
         #[arg(long)]
         out: Option<PathBuf>,
+        /// Use the legacy login.live.com endpoint (testing only; needs a legacy app id)
+        #[arg(long)]
+        legacy: bool,
     },
     /// Render the synthetic world in a window (WASD + right-drag to look).
     View {
@@ -205,7 +208,11 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::Auth { client_id, out } => run_auth(client_id, out),
+        Command::Auth {
+            client_id,
+            out,
+            legacy,
+        } => run_auth(client_id, out, legacy),
         command => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -235,7 +242,7 @@ fn explain_auth_failure(message: &str) {
         eprintln!("  App registration -> Authentication -> Allow public client flows -> Yes.");
     }
 }
-fn run_auth(client_id: Option<String>, out: Option<PathBuf>) -> ExitCode {
+fn run_auth(client_id: Option<String>, out: Option<PathBuf>, legacy: bool) -> ExitCode {
     use std::io::Write;
 
     let client_id = client_id
@@ -253,7 +260,7 @@ fn run_auth(client_id: Option<String>, out: Option<PathBuf>) -> ExitCode {
 
     println!("  client id: {client_id}");
 
-    let code = match nephele_auth::begin(&client_id) {
+    let code = match nephele_auth::begin_with(&client_id, legacy) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("error: {err}");
@@ -269,7 +276,7 @@ fn run_auth(client_id: Option<String>, out: Option<PathBuf>) -> ExitCode {
     print!("  waiting");
     let _ = std::io::stdout().flush();
 
-    let token = match nephele_auth::wait_for_token(&client_id, &code, |_| {
+    let token = match nephele_auth::wait_for_token_with(&client_id, &code, legacy, |_| {
         print!(".");
         let _ = std::io::stdout().flush();
     }) {
