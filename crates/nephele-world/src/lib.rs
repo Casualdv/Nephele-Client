@@ -29,6 +29,7 @@ pub mod noise;
 pub mod ores;
 pub mod ravines;
 pub mod raycast;
+pub mod shapes;
 pub mod surface;
 pub mod terrain;
 pub mod world;
