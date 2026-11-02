@@ -514,9 +514,10 @@ the planned M2 close-out.
 **M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
 block drops and pickup, survival inventory, container click protocol, and mock
 2x2/3x3 crafting are implemented. The crafting flow has packet-level mock coverage
-but still needs hand verification. **Still missing:** death screen/respawn, eating,
-armour equip and damage reduction, hunger effects, XP orbs, furnace/chest block
-entities, item-atlas rendering, and a singleplayer recipe evaluator.
+but still needs an interactive hand check. The death screen and respawn are
+implemented. **Still missing:** singleplayer recipe evaluation, eating, armour
+equip and damage reduction, hunger effects, XP orbs, furnace/chest block entities,
+and item-atlas rendering.
 
 ---
 
@@ -576,12 +577,12 @@ entities, item-atlas rendering, and a singleplayer recipe evaluator.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **114 tests** in `nephele-world`; **422 across the workspace** (1 ignored);
-  13 in the server list (9 list + 4 ping board), 9 `ui` tests for the multiplayer
-  screen, 8 for the command parser, 6 for the mock's container-click/crafting
-  logic, 3 for the paths module, and two real-socket integration tests in
-  `join_mock.rs` (the drop -> pickup -> hotbar chain, and crafting planks from a
-  log through `C0E`).
+- **436 test cases across the workspace** (435 passed, 1 ignored, including two
+  doctests). `nephele-render` has 43 passing tests, including seven shape-meshing
+  regressions; `nephele-world` has 119 passing tests and one ignored. The six
+  real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,
+  compression, chat, joining/loading the mock world, drop pickup, and crafting
+  planks through `C0E`.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
 
@@ -607,12 +608,13 @@ so the screen cannot bounce back before the server's own update lands.
    keeps the direct cube path. Neighbour culling only removes a whole face when
    both states are full cubes; cross-plants and `is_transparent` are unchanged.
    Tests cover the full-cube path, slab, stair, fence, pane, door and torch bounds.
-2. **Doors, next.** `shapes` has `DOOR`/`DOOR_REVERSED` (hinge via
-   `meta & 8`). Doors need: state bits (`meta & 4` = open, `meta & 8` = upper
-   half, `meta & 1` = hinge, `meta & 3` = facing), `use_block` on a door
-   toggling the open bit server-side (mock), and placement of two blocks (lower
-   at the hit face, upper above) with facing from yaw. `C08` already reaches the
-   mock; add the door branch next to the crafting-table branch.
+2. **Doors, next.** The shape table currently supplies only a thin panel box.
+   Resolve the split metadata (lower half: `meta & 4` open and `meta & 3` facing;
+   upper half: `meta & 8` upper bit and `meta & 1` hinge), then add `use_block` to
+   toggle the open bit on both halves and send `S23` for each in the mock. Place
+   the lower half at the hit face and upper half above it, derive facing from yaw,
+   and mirror the client prediction. `C08` already reaches the mock; add the door
+   branch next to the crafting-table branch.
 3. **Verify the crafting table by hand.** The 3x3 window and recipes work against
    the mock (see §11) at the packet level, but nobody has played it. Also:
    armour slots take stacks but nothing equips them (no armour logic, no HUD
