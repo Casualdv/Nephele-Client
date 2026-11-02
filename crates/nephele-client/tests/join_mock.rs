@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use nephele_client::{Aim, EntityKind, GameClient};
 use nephele_mock::{MockConfig, MockServer};
+use nephele_protocol::packets::play;
+use nephele_protocol::packets::play::ItemStack;
 use nephele_protocol::{ping, ServerAddress};
 
 fn address_of(server: &MockServer) -> ServerAddress {
@@ -210,6 +212,83 @@ async fn a_broken_block_drops_an_item_that_is_picked_up() {
             .iter()
             .any(|entity| matches!(entity.kind, EntityKind::Item { .. })),
         "the collected entity should have been removed"
+    );
+
+    client.disconnect().await;
+}
+
+/// The survival inventory loop over a real socket: a stack moves from the
+/// hotbar into the 2x2 grid through `C0E`, and the server reports planks in the
+/// output slot.
+#[tokio::test]
+async fn a_log_in_the_crafting_grid_shows_planks_in_the_output_slot() {
+    let server = MockServer::start(MockConfig {
+        radius: 0,
+        greeting: false,
+        ..MockConfig::default()
+    })
+    .await
+    .unwrap();
+    let address = address_of(&server);
+
+    let mut client = GameClient::join(&address, "Crafter").await.unwrap();
+    client
+        .pump(Duration::from_millis(600), Duration::from_millis(50))
+        .await
+        .unwrap();
+
+    let hotbar = play::HOTBAR_FIRST_SLOT;
+    let log = ItemStack::new(17, 3, 0);
+    client
+        .creative_set_slot(hotbar as i16, Some(log))
+        .await
+        .unwrap();
+    client
+        .pump(Duration::from_millis(300), Duration::from_millis(20))
+        .await
+        .unwrap();
+    assert_eq!(client.inventory[hotbar], Some(log), "setup stack");
+
+    // Pick the stack up, then drop it all into the top-left grid cell.
+    client
+        .click_slot(hotbar as i16, 0, play::click_mode::CLICK)
+        .await
+        .unwrap();
+    client
+        .pump(Duration::from_millis(300), Duration::from_millis(20))
+        .await
+        .unwrap();
+    assert_eq!(client.inventory[hotbar], None, "the stack left the hotbar");
+
+    client
+        .click_slot(1, 0, play::click_mode::CLICK)
+        .await
+        .unwrap();
+    client
+        .pump(Duration::from_millis(300), Duration::from_millis(20))
+        .await
+        .unwrap();
+    assert_eq!(client.inventory[1], Some(log));
+    assert_eq!(
+        client.inventory[0],
+        Some(ItemStack::new(5, 4, 0)),
+        "one log crafts four planks"
+    );
+
+    // Taking the result spends exactly one log.
+    client
+        .click_slot(0, 0, play::click_mode::CLICK)
+        .await
+        .unwrap();
+    client
+        .pump(Duration::from_millis(300), Duration::from_millis(20))
+        .await
+        .unwrap();
+    assert_eq!(client.inventory[1], Some(ItemStack::new(17, 2, 0)));
+    assert_eq!(
+        client.inventory[0],
+        Some(ItemStack::new(5, 4, 0)),
+        "the output preview is refreshed for the next craft"
     );
 
     client.disconnect().await;

@@ -741,6 +741,20 @@ impl GameClient {
     /// inventory guard.
     pub async fn click_slot(&mut self, slot: i16, button: i8, mode: i8) -> Result<i16> {
         let clicked = clicked_stack(&self.inventory, slot);
+        self.click_slot_with(slot, button, mode, clicked).await
+    }
+
+    /// [`GameClient::click_slot`] with the caller's predicted copy of the
+    /// clicked slot. The UI predicts clicks between server ticks, so it must
+    /// pass its own copy - sending `self.inventory` would report a stack the
+    /// server has already replaced and get the click rejected.
+    pub async fn click_slot_with(
+        &mut self,
+        slot: i16,
+        button: i8,
+        mode: i8,
+        clicked: Option<ItemStack>,
+    ) -> Result<i16> {
         let action = self.next_click_action(0);
         self.connection
             .write_packet(&play::click_window(

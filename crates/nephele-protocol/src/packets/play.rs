@@ -505,6 +505,13 @@ pub fn parse_confirm_transaction(packet: &Packet) -> Result<ConfirmTransaction> 
     })
 }
 
+/// `S32` written from the server side — answers one `C0E`.
+pub fn confirm_transaction(window_id: i8, action: i16, accepted: bool) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_i8(window_id).write_i16(action).write_bool(accepted);
+    Packet::new(clientbound::CONFIRM_TRANSACTION, w.into_bytes())
+}
+
 /// `S2F` written from the server side — the mock server uses it when a pickup
 /// lands in a slot.
 pub fn set_slot(window_id: i8, slot: i16, item: Option<&ItemStack>) -> Packet {
@@ -1178,6 +1185,21 @@ mod tests {
                 window_id: 0,
                 action: 7,
                 accepted: false,
+            }
+        );
+    }
+
+    #[test]
+    fn confirm_transaction_round_trips() {
+        let packet = confirm_transaction(2, 41, true);
+        assert_eq!(packet.id, clientbound::CONFIRM_TRANSACTION);
+        let parsed = parse_confirm_transaction(&packet).expect("confirm");
+        assert_eq!(
+            parsed,
+            ConfirmTransaction {
+                window_id: 2,
+                action: 41,
+                accepted: true,
             }
         );
     }

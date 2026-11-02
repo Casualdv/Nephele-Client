@@ -507,6 +507,8 @@ const PLAYER_ENTITY_ID: i32 = 1;
 const PLAY_CONTAINER_SLOTS: usize = play::PLAYER_CONTAINER_SLOTS;
 /// A dropped item is picked up this long after the block breaks.
 const PICKUP_DELAY: Duration = Duration::from_millis(1000);
+/// Stack size ceiling for merges, shared by pickups and container clicks.
+const MAX_STACK: i8 = 64;
 
 struct PendingPickup {
     due: tokio::time::Instant,
@@ -521,6 +523,389 @@ fn first_free_slot(inventory: &[Option<play::ItemStack>; PLAY_CONTAINER_SLOTS]) 
         .chain(9..PLAY_CONTAINER_SLOTS - play::HOTBAR_SLOTS)
         .chain(0..9)
         .find(|&slot| inventory[slot].is_none())
+}
+
+// ---- container clicks -------------------------------------------------------
+
+/// Player-container slot numbers used by the click handler (`C0E`).
+const CRAFT_RESULT_SLOT: usize = 0;
+const CRAFT_GRID_FIRST: usize = 1;
+const CRAFT_GRID_SLOTS: usize = 4;
+const STORAGE_FIRST_SLOT: usize = 9;
+const STORAGE_LAST_SLOT: usize = play::HOTBAR_FIRST_SLOT;
+
+const LOG_ITEM: i16 = 17;
+const PLANKS_ITEM: i16 = 5;
+const STICK_ITEM: i16 = 280;
+const CRAFTING_TABLE_ITEM: i16 = 58;
+
+/// What one click did. `changed` lists the slots whose contents moved so the
+/// caller can mirror them to the client with `S2F`.
+struct ClickResult {
+    accepted: bool,
+    changed: Vec<usize>,
+}
+
+fn same_item(a: &play::ItemStack, b: &play::ItemStack) -> bool {
+    a.id == b.id && a.damage == b.damage
+}
+
+fn mark(changed: &mut Vec<usize>, slot: usize) {
+    if !changed.contains(&slot) {
+        changed.push(slot);
+    }
+}
+
+/// The 2x2 craft the player container offers. Vanilla keys recipes off item
+/// ids and ignores stack sizes, so one cell holding three logs still yields
+/// planks (consuming one log per craft).
+fn craft_output(
+    inventory: &[Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+) -> Option<play::ItemStack> {
+    let cells: [Option<play::ItemStack>; CRAFT_GRID_SLOTS] =
+        std::array::from_fn(|index| inventory[CRAFT_GRID_FIRST + index]);
+    let items: Vec<play::ItemStack> = cells.iter().flatten().copied().collect();
+
+    // One log anywhere -> four planks of the matching wood type.
+    if items.len() == 1 && items[0].id == LOG_ITEM {
+        return Some(play::ItemStack::new(
+            PLANKS_ITEM,
+            4,
+            items[0].damage.clamp(0, 3),
+        ));
+    }
+
+    if items.is_empty() || items.iter().any(|item| item.id != PLANKS_ITEM) {
+        return None;
+    }
+    if items.iter().any(|item| item.damage != items[0].damage) {
+        return None;
+    }
+
+    // Four planks -> a crafting table (the 3x3 screen is a later slice).
+    if items.len() == 4 {
+        return Some(play::ItemStack::new(CRAFTING_TABLE_ITEM, 1, 0));
+    }
+
+    // Two planks in one column -> sticks.
+    let left_column = cells[0].is_some() && cells[2].is_some();
+    let right_column = cells[1].is_some() && cells[3].is_some();
+    if items.len() == 2 && (left_column || right_column) {
+        return Some(play::ItemStack::new(STICK_ITEM, 4, 0));
+    }
+
+    None
+}
+
+/// Spend one item from every occupied crafting cell.
+fn consume_craft_grid(
+    inventory: &mut [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+    changed: &mut Vec<usize>,
+) {
+    for (index, slot) in inventory
+        .iter_mut()
+        .enumerate()
+        .skip(CRAFT_GRID_FIRST)
+        .take(CRAFT_GRID_SLOTS)
+    {
+        if let Some(mut stack) = *slot {
+            stack.count -= 1;
+            *slot = if stack.count <= 0 { None } else { Some(stack) };
+            mark(changed, index);
+        }
+    }
+}
+
+/// Keep slot 0 showing what the grid would produce.
+fn refresh_craft_output(
+    inventory: &mut [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+    changed: &mut Vec<usize>,
+) {
+    let preview = craft_output(inventory);
+    if inventory[CRAFT_RESULT_SLOT] != preview {
+        inventory[CRAFT_RESULT_SLOT] = preview;
+        mark(changed, CRAFT_RESULT_SLOT);
+    }
+}
+
+/// Move a whole stack into the first slot in `targets` that has room, merging
+/// into matching stacks before using empty slots.
+fn quick_move(
+    inventory: &mut [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+    from: usize,
+    targets: std::ops::Range<usize>,
+    changed: &mut Vec<usize>,
+) -> bool {
+    let Some(mut stack) = inventory[from] else {
+        return false;
+    };
+    let original = stack.count;
+    for target in targets {
+        match inventory[target] {
+            None => {
+                inventory[target] = Some(stack);
+                inventory[from] = None;
+                mark(changed, from);
+                mark(changed, target);
+                return true;
+            }
+            Some(mut existing) if same_item(&existing, &stack) && existing.count < MAX_STACK => {
+                let take = stack.count.min(MAX_STACK - existing.count);
+                existing.count += take;
+                inventory[target] = Some(existing);
+                stack.count -= take;
+                mark(changed, target);
+                if stack.count == 0 {
+                    inventory[from] = None;
+                    mark(changed, from);
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    // Partially merged into one or more stacks: keep the remainder where it was.
+    if stack.count != original {
+        inventory[from] = Some(stack);
+        mark(changed, from);
+        return true;
+    }
+    false
+}
+
+/// Put `stack` somewhere in the player's storage, hotbar first.
+fn insert_into(
+    inventory: &mut [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+    stack: play::ItemStack,
+    changed: &mut Vec<usize>,
+) -> bool {
+    let targets = (play::HOTBAR_FIRST_SLOT..PLAY_CONTAINER_SLOTS)
+        .chain(STORAGE_FIRST_SLOT..STORAGE_LAST_SLOT);
+    for target in targets {
+        match inventory[target] {
+            None => {
+                inventory[target] = Some(stack);
+                mark(changed, target);
+                return true;
+            }
+            Some(mut existing)
+                if same_item(&existing, &stack) && existing.count + stack.count <= MAX_STACK =>
+            {
+                existing.count += stack.count;
+                inventory[target] = Some(existing);
+                mark(changed, target);
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Resolve one `C0E` against the server's own slots and cursor.
+///
+/// Supports normal left/right clicks, shift-click quick moves and number-key
+/// swaps; drag and double-click modes are refused, which the client reads as
+/// "do not trust the prediction".
+fn click_container(
+    inventory: &mut [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+    cursor: &mut Option<play::ItemStack>,
+    slot: i16,
+    button: i8,
+    mode: i8,
+) -> ClickResult {
+    let mut changed = Vec::new();
+
+    // Dropping the cursor outside the window: the mock voids the stack instead
+    // of spawning an item entity.
+    if slot == play::SLOT_OUTSIDE {
+        *cursor = None;
+        return ClickResult {
+            accepted: true,
+            changed,
+        };
+    }
+    let Ok(index) = usize::try_from(slot) else {
+        return ClickResult {
+            accepted: false,
+            changed,
+        };
+    };
+    if index >= PLAY_CONTAINER_SLOTS {
+        return ClickResult {
+            accepted: false,
+            changed,
+        };
+    }
+
+    match mode {
+        play::click_mode::CLICK => {
+            if index == CRAFT_RESULT_SLOT {
+                if let Some(result) = craft_output(inventory) {
+                    match cursor.as_mut() {
+                        None => {
+                            *cursor = Some(result);
+                            consume_craft_grid(inventory, &mut changed);
+                        }
+                        Some(held) if same_item(held, &result) => {
+                            if held.count + result.count <= MAX_STACK {
+                                held.count += result.count;
+                                consume_craft_grid(inventory, &mut changed);
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                }
+            } else if button == 0 {
+                match (*cursor, inventory[index]) {
+                    (None, Some(stack)) => {
+                        *cursor = Some(stack);
+                        inventory[index] = None;
+                        mark(&mut changed, index);
+                    }
+                    (Some(held), None) => {
+                        inventory[index] = Some(held);
+                        *cursor = None;
+                        mark(&mut changed, index);
+                    }
+                    (Some(held), Some(on_slot))
+                        if same_item(&held, &on_slot) && on_slot.count < MAX_STACK =>
+                    {
+                        let take = held.count.min(MAX_STACK - on_slot.count);
+                        let mut merged = on_slot;
+                        merged.count += take;
+                        inventory[index] = Some(merged);
+                        let left = held.count - take;
+                        *cursor = if left == 0 {
+                            None
+                        } else {
+                            Some(play::ItemStack::new(held.id, left, held.damage))
+                        };
+                        mark(&mut changed, index);
+                    }
+                    (Some(held), Some(on_slot)) => {
+                        inventory[index] = Some(held);
+                        *cursor = Some(on_slot);
+                        mark(&mut changed, index);
+                    }
+                    (None, None) => {}
+                }
+            } else {
+                // Right click: take half, or place one.
+                match (*cursor, inventory[index]) {
+                    (None, Some(stack)) if stack.count > 0 => {
+                        let take = (stack.count + 1) / 2;
+                        let mut moved = stack;
+                        moved.count = take;
+                        inventory[index] = if stack.count == take {
+                            None
+                        } else {
+                            Some(play::ItemStack::new(
+                                stack.id,
+                                stack.count - take,
+                                stack.damage,
+                            ))
+                        };
+                        *cursor = Some(moved);
+                        mark(&mut changed, index);
+                    }
+                    (Some(held), None) => {
+                        let mut placed = held;
+                        placed.count = 1;
+                        inventory[index] = Some(placed);
+                        *cursor = if held.count <= 1 {
+                            None
+                        } else {
+                            Some(play::ItemStack::new(held.id, held.count - 1, held.damage))
+                        };
+                        mark(&mut changed, index);
+                    }
+                    (Some(held), Some(on_slot))
+                        if same_item(&held, &on_slot) && on_slot.count < MAX_STACK =>
+                    {
+                        let mut merged = on_slot;
+                        merged.count += 1;
+                        inventory[index] = Some(merged);
+                        *cursor = if held.count <= 1 {
+                            None
+                        } else {
+                            Some(play::ItemStack::new(held.id, held.count - 1, held.damage))
+                        };
+                        mark(&mut changed, index);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        play::click_mode::SHIFT_CLICK => {
+            if index == CRAFT_RESULT_SLOT {
+                if let Some(result) = craft_output(inventory) {
+                    if insert_into(inventory, result, &mut changed) {
+                        consume_craft_grid(inventory, &mut changed);
+                    }
+                }
+            } else if (play::HOTBAR_FIRST_SLOT..PLAY_CONTAINER_SLOTS).contains(&index) {
+                quick_move(
+                    inventory,
+                    index,
+                    STORAGE_FIRST_SLOT..STORAGE_LAST_SLOT,
+                    &mut changed,
+                );
+            } else {
+                quick_move(
+                    inventory,
+                    index,
+                    play::HOTBAR_FIRST_SLOT..PLAY_CONTAINER_SLOTS,
+                    &mut changed,
+                );
+            }
+        }
+        play::click_mode::NUMBER_KEY if button >= 0 && (button as usize) < play::HOTBAR_SLOTS => {
+            let hotbar = play::HOTBAR_FIRST_SLOT + button as usize;
+            if index != hotbar {
+                match (inventory[index], inventory[hotbar]) {
+                    (Some(a), Some(b)) if same_item(&a, &b) && a.count + b.count <= MAX_STACK => {
+                        let mut merged = b;
+                        merged.count += a.count;
+                        inventory[hotbar] = Some(merged);
+                        inventory[index] = None;
+                        mark(&mut changed, index);
+                        mark(&mut changed, hotbar);
+                    }
+                    (Some(a), other) => {
+                        inventory[index] = other;
+                        inventory[hotbar] = Some(a);
+                        mark(&mut changed, index);
+                        mark(&mut changed, hotbar);
+                    }
+                    (None, Some(b)) => {
+                        inventory[index] = Some(b);
+                        inventory[hotbar] = None;
+                        mark(&mut changed, index);
+                        mark(&mut changed, hotbar);
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        _ => {
+            return ClickResult {
+                accepted: false,
+                changed,
+            };
+        }
+    }
+
+    if (CRAFT_GRID_FIRST..CRAFT_GRID_FIRST + CRAFT_GRID_SLOTS).contains(&index)
+        || index == CRAFT_RESULT_SLOT
+    {
+        refresh_craft_output(inventory, &mut changed);
+    }
+
+    ClickResult {
+        accepted: true,
+        changed,
+    }
 }
 
 /// Drop `block` as an item entity where it was broken, and schedule its pickup.
@@ -568,6 +953,9 @@ async fn play_loop(
     // hotbar). Pickups land here and are mirrored to the client as SET_SLOT.
     let mut inventory: [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS] =
         [None; PLAY_CONTAINER_SLOTS];
+    // The stack the server thinks is attached to the player's cursor. `C0E`
+    // does not carry it; the client only reports the slot it clicked.
+    let mut cursor: Option<play::ItemStack> = None;
     let mut next_drop_id: i32 = 1_000;
     let mut picks_up_at: std::collections::VecDeque<PendingPickup> =
         std::collections::VecDeque::new();
@@ -666,8 +1054,74 @@ async fn play_loop(
                                 }
                             }
                         }
+                        play::serverbound::CREATIVE_INVENTORY_ACTION => {
+                            let mut r = packet.reader();
+                            let slot = r.read_i16()?;
+                            let item = play::parse_slot(&mut r)?;
+                            if slot >= 0 && (slot as usize) < PLAY_CONTAINER_SLOTS {
+                                let index = slot as usize;
+                                inventory[index] = item;
+                                connection
+                                    .write_packet(&play::set_slot(0, slot, item.as_ref()))
+                                    .await?;
+                            }
+                        }
+                        play::serverbound::CLICK_WINDOW => {
+                            let mut r = packet.reader();
+                            let window_id = r.read_u8()?;
+                            let slot = r.read_i16()?;
+                            let button = r.read_i8()?;
+                            let action = r.read_i16()?;
+                            let mode = r.read_i8()?;
+                            let clicked = play::parse_slot(&mut r)?;
+
+                            // The client reports its copy of the clicked slot.
+                            // When ours differs the click is stale, so resend
+                            // that slot and refuse to apply it.
+                            let mut accepted = window_id == 0;
+                            if accepted {
+                                if let Ok(index) = usize::try_from(slot) {
+                                    if index < PLAY_CONTAINER_SLOTS
+                                        && inventory[index] != clicked
+                                    {
+                                        accepted = false;
+                                    }
+                                }
+                            }
+
+                            let mut changed = Vec::new();
+                            if accepted {
+                                let outcome =
+                                    click_container(&mut inventory, &mut cursor, slot, button, mode);
+                                accepted = outcome.accepted;
+                                changed = outcome.changed;
+                            }
+                            for index in changed {
+                                let item = inventory[index];
+                                connection
+                                    .write_packet(&play::set_slot(0, index as i16, item.as_ref()))
+                                    .await?;
+                            }
+                            if !accepted {
+                                if let Ok(index) = usize::try_from(slot) {
+                                    if index < PLAY_CONTAINER_SLOTS {
+                                        let item = inventory[index];
+                                        connection
+                                            .write_packet(&play::set_slot(
+                                                0,
+                                                slot,
+                                                item.as_ref(),
+                                            ))
+                                            .await?;
+                                    }
+                                }
+                            }
+                            connection
+                                .write_packet(&play::confirm_transaction(0, action, accepted))
+                                .await?;
+                        }
                         // Everything else (keep-alive echoes, settings,
-                        // movement, creative inventory) is intentionally ignored.
+                        // movement) is intentionally ignored.
                         _ => {}
                     },
                     Err(_) => return Ok(()),
@@ -770,5 +1224,191 @@ mod tests {
     #[test]
     fn chat_json_escapes_quotes() {
         assert_eq!(serde_json_escape(r#"say "hi""#), r#"say \"hi\""#);
+    }
+
+    fn empty_inventory() -> [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS] {
+        [None; PLAY_CONTAINER_SLOTS]
+    }
+
+    #[test]
+    fn one_log_crafts_four_planks() {
+        let mut inventory = empty_inventory();
+        inventory[1] = Some(play::ItemStack::new(LOG_ITEM, 3, 2));
+        assert_eq!(
+            craft_output(&inventory),
+            Some(play::ItemStack::new(PLANKS_ITEM, 4, 2)),
+            "stack size does not change the recipe, and birch stays birch"
+        );
+
+        inventory[1] = Some(play::ItemStack::new(LOG_ITEM, 1, 0));
+        inventory[4] = Some(play::ItemStack::new(LOG_ITEM, 1, 0));
+        assert_eq!(craft_output(&inventory), None, "two logs is not a recipe");
+    }
+
+    #[test]
+    fn two_planks_make_sticks_and_four_make_a_table() {
+        let mut inventory = empty_inventory();
+        inventory[1] = Some(play::ItemStack::new(PLANKS_ITEM, 1, 0));
+        inventory[3] = Some(play::ItemStack::new(PLANKS_ITEM, 1, 0));
+        assert_eq!(
+            craft_output(&inventory),
+            Some(play::ItemStack::new(STICK_ITEM, 4, 0))
+        );
+
+        // The same two planks played horizontally are not a recipe.
+        inventory[3] = None;
+        inventory[2] = Some(play::ItemStack::new(PLANKS_ITEM, 1, 0));
+        assert_eq!(craft_output(&inventory), None);
+
+        // Mixed wood types do not combine.
+        inventory[1] = Some(play::ItemStack::new(PLANKS_ITEM, 1, 0));
+        inventory[2] = Some(play::ItemStack::new(PLANKS_ITEM, 1, 1));
+        assert_eq!(craft_output(&inventory), None);
+
+        for slot in inventory
+            .iter_mut()
+            .take(CRAFT_GRID_FIRST + CRAFT_GRID_SLOTS)
+            .skip(1)
+        {
+            *slot = Some(play::ItemStack::new(PLANKS_ITEM, 1, 1));
+        }
+        assert_eq!(
+            craft_output(&inventory),
+            Some(play::ItemStack::new(CRAFTING_TABLE_ITEM, 1, 0))
+        );
+    }
+
+    #[test]
+    fn clicking_moves_stacks_between_the_cursor_and_a_slot() {
+        let mut inventory = empty_inventory();
+        let mut cursor = None;
+        inventory[36] = Some(play::ItemStack::new(LOG_ITEM, 5, 0));
+
+        // Take the stack.
+        let taken = click_container(&mut inventory, &mut cursor, 36, 0, play::click_mode::CLICK);
+        assert!(taken.accepted);
+        assert_eq!(cursor, Some(play::ItemStack::new(LOG_ITEM, 5, 0)));
+        assert_eq!(inventory[36], None);
+
+        // Put it in the crafting grid; the output slot updates.
+        let placed = click_container(&mut inventory, &mut cursor, 1, 0, play::click_mode::CLICK);
+        assert!(placed.accepted);
+        assert!(placed.changed.contains(&1));
+        assert!(placed.changed.contains(&CRAFT_RESULT_SLOT));
+        assert_eq!(cursor, None);
+        assert_eq!(inventory[1], Some(play::ItemStack::new(LOG_ITEM, 5, 0)));
+        assert_eq!(
+            inventory[CRAFT_RESULT_SLOT],
+            Some(play::ItemStack::new(PLANKS_ITEM, 4, 0))
+        );
+
+        // Taking the result spends one log and leaves four planks on the cursor.
+        click_container(
+            &mut inventory,
+            &mut cursor,
+            CRAFT_RESULT_SLOT as i16,
+            0,
+            play::click_mode::CLICK,
+        );
+        assert_eq!(cursor, Some(play::ItemStack::new(PLANKS_ITEM, 4, 0)));
+        assert_eq!(
+            inventory[1],
+            Some(play::ItemStack::new(LOG_ITEM, 4, 0)),
+            "the grid loses one item per craft"
+        );
+        assert_eq!(
+            inventory[CRAFT_RESULT_SLOT],
+            Some(play::ItemStack::new(PLANKS_ITEM, 4, 0)),
+            "the preview is recomputed for the next craft"
+        );
+    }
+
+    #[test]
+    fn right_click_takes_half_and_places_one() {
+        let mut inventory = empty_inventory();
+        let mut cursor = None;
+        inventory[36] = Some(play::ItemStack::new(STICK_ITEM, 5, 0));
+
+        click_container(&mut inventory, &mut cursor, 36, 1, play::click_mode::CLICK);
+        assert_eq!(cursor, Some(play::ItemStack::new(STICK_ITEM, 3, 0)));
+        assert_eq!(inventory[36], Some(play::ItemStack::new(STICK_ITEM, 2, 0)));
+
+        click_container(&mut inventory, &mut cursor, 9, 1, play::click_mode::CLICK);
+        assert_eq!(cursor, Some(play::ItemStack::new(STICK_ITEM, 2, 0)));
+        assert_eq!(inventory[9], Some(play::ItemStack::new(STICK_ITEM, 1, 0)));
+    }
+
+    #[test]
+    fn shift_click_moves_a_stack_to_the_other_region() {
+        let mut inventory = empty_inventory();
+        let mut cursor = None;
+        inventory[36] = Some(play::ItemStack::new(LOG_ITEM, 1, 0));
+
+        let moved = click_container(
+            &mut inventory,
+            &mut cursor,
+            36,
+            0,
+            play::click_mode::SHIFT_CLICK,
+        );
+        assert!(moved.accepted);
+        assert_eq!(inventory[36], None);
+        assert_eq!(inventory[9], Some(play::ItemStack::new(LOG_ITEM, 1, 0)));
+
+        // And back again, into the hotbar.
+        click_container(
+            &mut inventory,
+            &mut cursor,
+            9,
+            0,
+            play::click_mode::SHIFT_CLICK,
+        );
+        assert_eq!(inventory[9], None);
+        assert_eq!(
+            inventory[play::HOTBAR_FIRST_SLOT],
+            Some(play::ItemStack::new(LOG_ITEM, 1, 0))
+        );
+    }
+
+    #[test]
+    fn number_key_swaps_with_the_hotbar() {
+        let mut inventory = empty_inventory();
+        let mut cursor = None;
+        inventory[9] = Some(play::ItemStack::new(STICK_ITEM, 2, 0));
+        inventory[37] = Some(play::ItemStack::new(LOG_ITEM, 1, 0));
+
+        click_container(
+            &mut inventory,
+            &mut cursor,
+            9,
+            1,
+            play::click_mode::NUMBER_KEY,
+        );
+        assert_eq!(inventory[9], Some(play::ItemStack::new(LOG_ITEM, 1, 0)));
+        assert_eq!(inventory[37], Some(play::ItemStack::new(STICK_ITEM, 2, 0)));
+
+        // Same item merges instead of swapping.
+        inventory[9] = Some(play::ItemStack::new(STICK_ITEM, 1, 0));
+        inventory[37] = Some(play::ItemStack::new(STICK_ITEM, 2, 0));
+        click_container(
+            &mut inventory,
+            &mut cursor,
+            9,
+            1,
+            play::click_mode::NUMBER_KEY,
+        );
+        assert_eq!(inventory[9], None);
+        assert_eq!(inventory[37], Some(play::ItemStack::new(STICK_ITEM, 3, 0)));
+    }
+
+    #[test]
+    fn unsupported_click_modes_are_refused() {
+        let mut inventory = empty_inventory();
+        let mut cursor = None;
+        inventory[36] = Some(play::ItemStack::new(LOG_ITEM, 1, 0));
+        let result = click_container(&mut inventory, &mut cursor, 36, 0, play::click_mode::DRAG);
+        assert!(!result.accepted);
+        assert!(result.changed.is_empty());
+        assert_eq!(inventory[36], Some(play::ItemStack::new(LOG_ITEM, 1, 0)));
     }
 }

@@ -387,6 +387,23 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   clicked slot, not the cursor stack: 1.8's server compares it with its own copy
   and rejects the click when they differ. Click modes live in
   `play::click_mode`; `SLOT_OUTSIDE (-999)` is the dropped-outside slot.
+- **The mock implements the container** (`click_container`), so the whole
+  inventory loop is provable without Java: normal left/right clicks (take,
+  half, place all, place one, merge, swap), shift-click between hotbar and
+  storage, and number-key swaps. Drag/double-click/middle-click modes are
+  refused (`accepted = false`), which tells the client not to trust its
+  prediction. A stale click (our copy of the slot differs from the server's) is
+  also refused and the slot is resent.
+- The mock's 2x2 recipes are **one log -> 4 planks** (plank meta follows log
+  meta), **two planks in one column -> 4 sticks**, and **four planks -> a
+  crafting table**. Stack sizes in the grid do not matter, matching vanilla.
+  A pickaxe needs the **3x3** crafting-table window, which does not exist yet -
+  so "punch a tree and make a pickaxe" still ends at the crafting table.
+- The mock now honours `C10 Creative Inventory Action` by writing the slot and
+  echoing `S2F`, which is how tests (and `/give`) put a known stack in a slot.
+  The integration test `a_log_in_the_crafting_grid_shows_planks_in_the_output_slot`
+  covers the whole chain: C10 setup, two `C0E`s to move the log into the grid,
+  and a third to take the result.
 
 **Chat and client-side commands** (added 2026-11-01):
 
@@ -489,10 +506,12 @@ the protocol crate), a death screen, and eating.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **110 tests** in `nephele-world`; **391 across the workspace** (1 ignored);
+- **110 tests** in `nephele-world`; **404 across the workspace** (1 ignored);
   13 in the server list (9 list + 4 ping board), 9 `ui` tests for the multiplayer
-  screen, 8 for the command parser, 3 for the paths module, and one real-socket integration test for the
-  whole drop → pickup → hotbar chain (`join_mock.rs`).
+  screen, 8 for the command parser, 6 for the mock's container-click/crafting
+  logic, 3 for the paths module, and two real-socket integration tests in
+  `join_mock.rs` (the drop -> pickup -> hotbar chain, and crafting planks from a
+  log through `C0E`).
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
 
@@ -500,18 +519,15 @@ the protocol crate), a death screen, and eating.
 
 ## 15. Next move
 
-1. **M2: the survival inventory screen.** Vanilla layout (armour, 2×2 crafting,
-   27 storage, hotbar) with click / place / take, then recipe matching for
-   planks, sticks, the crafting table and a pickaxe — that is the milestone's own
-   exit criterion ("punch a tree and make a pickaxe"). The packets and the client
-   side exist now: `click_window(...)` / `parse_confirm_transaction` in
-   `packets/play.rs`, `GameClient::click_slot` (window 0, per-window action
-   counter, sends our own copy of the clicked slot) and
-   `Event::ConfirmTransaction`. What is left is the `Click Window` handler and a
-   2x2 recipe table in the mock, then the screen itself.
-   The data half is already in place (see §11), so this is UI + click protocol +
-   recipes. **Chat/commands landed first** (see §11) because they are what make
-   the inventory testable (`/give`, `/setblock`, `/gamemode`).
+1. **M2: the survival inventory screen — now the only missing piece.** Vanilla
+   layout (armour, 2x2 crafting, 27 storage, hotbar) with click / place / take.
+   Protocol, client and mock are all in place and tested: `click_window` /
+   `confirm_transaction` / `click_slot_with` (the UI must pass its *predicted*
+   cursor copy) and the mock's `click_container` with the 2x2 recipes. So this
+   slice is pure UI: `Screen::Inventory`, a cursor stack, slot rendering, and
+   wiring clicks to `Shared` -> `GameClient::click_slot_with`. **The pickaxe still
+   needs the 3x3 crafting-table window** (`Use` on a crafted table, window id 1),
+   which belongs in the same slice or right after it — the 2x2 cannot make one.
 2. **Death screen + eating.** Small, and the other half of the survival loop.
 3. **World creation screen** — smaller. `local_loop` already takes a seed and
    `play --seed` already parses one; v1 creates but does not save (region writing is
