@@ -262,13 +262,13 @@ field, launcher, CI.
 lighting, block shapes. *Exit:* singleplayer world looks like Minecraft from
 above and from underground.
 
-**M2 — Survival loop.** Fixed 20 Hz tick (*done*), hunger/XP data (*done, received
-from the server*), drops (*done: block drops, pickup, hotbar*), survival inventory,
-container clicks and mock 2x2/3x3 recipes (*implemented; crafting still needs an
-interactive hand check*). Remaining: death screen/respawn, eating, armour behavior,
-hunger effects, XP orbs, block entities, item-atlas rendering and singleplayer
-recipe evaluation. *Exit:* you can punch a tree and make a pickaxe in a survival
-session.
+**M2 - Survival loop.** Partly done: fixed 20 Hz tick, hunger/XP data from the
+server, block drops and pickup, survival inventory, container clicks, mock
+2x2/3x3 recipes, and the death screen with respawn. Remaining before the exit
+test can be played for real: singleplayer recipe evaluation (crafting exists
+only in the mock today), eating, armour and hunger effects, XP orbs, block
+entities and item-atlas rendering. *Exit:* punch a tree and make a pickaxe in a
+survival session.
 
 **M3 — Join a real server.** Microsoft auth (**done**, missing only a shippable
 Azure client id), server list (**done**), online-mode handshake (**done**),

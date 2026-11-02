@@ -589,11 +589,13 @@ entities, item-atlas rendering, and a singleplayer recipe evaluator.
 
 ## 15. Next move
 
-**M2 is closed.** Tick, hunger/XP, drops, inventory, 2x2 + 3x3 crafting, death
-screen and respawn all work against the mock, and the exit criterion (punch a tree,
-make a pickaxe) is pinned by `the_survival_chain_reaches_a_pickaxe` in
-`nephele-mock`. Tool durability, armour effects and tool tiers were left out on
-purpose and live in the backlog table instead.
+**M2 is not closed.** The tick, hunger/XP, drops, inventory, containers, mock
+2x2/3x3 recipes, death screen and respawn all work, and the exit chain (log to
+planks to sticks to table to pickaxe) is pinned by
+`the_survival_chain_reaches_a_pickaxe` in `nephele-mock`. What still blocks a real
+survival session: **singleplayer recipe evaluation** (crafting exists only in the
+mock), eating, armour and hunger effects, XP orbs, block entities, item-atlas
+rendering. Do not claim M2 done until the exit criterion has been played.
 
 Death screen: done. Health reaching 0 raises `Screen::Death` ("You Died!" plus a
 Respawn button). The button sets `Shared::pending_respawn`, which the network loop
