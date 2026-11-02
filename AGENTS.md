@@ -568,7 +568,7 @@ the protocol crate), a death screen, and eating.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **110 tests** in `nephele-world`; **418 across the workspace** (1 ignored);
+- **114 tests** in `nephele-world`; **422 across the workspace** (1 ignored);
   13 in the server list (9 list + 4 ping board), 9 `ui` tests for the multiplayer
   screen, 8 for the command parser, 6 for the mock's container-click/crafting
   logic, 3 for the paths module, and two real-socket integration tests in
@@ -581,15 +581,28 @@ the protocol crate), a death screen, and eating.
 
 ## 15. Next move
 
-1. **M2: verify the crafting table in a real match, then eating/death.** The 3x3
-   window and the survival recipe set now work against the mock (see 11), so
-   "punch a tree, make a table, make a pickaxe" is playable end to end. What is
-   left in this slice: relabel the armour slots and add the missing art, and
-   actually play through it once (it was tested at the packet/recipe level, not
-   by hand). **Armour items exist in the recipe table but nothing equips them**
-   - the armour slots take stacks but there is no armour logic or HUD hearts
-   change.
-2. **Death screen + eating.** Small, and the other half of the survival loop.
+1. **Mesher consumes `block_shape` (start here).** `nephele_world::shapes`
+   already returns boxes for slabs/stairs/fences/panes/doors/torches. In
+   `crates/nephele-render/src/mesh.rs`, `mesh_column` still emits one cube per
+   block. Change it to walk `block_shape(id, meta)`, build each box's corners as
+   `min + corner * (max - min)`, and only run the existing neighbour face cull
+   when both this block and the neighbour are `is_full_cube` (otherwise stairs
+   lose faces). Keep the cross-plant and `is_transparent` branches as they are;
+   `is_full_cube` keeps the cube fast path. Update the "six faces" tests and add
+   one per family (slab, stair, fence, pane, torch). This is also where panes
+   start connecting: today `PANE` is the default north-south slab, so pass
+   `meta`/neighbours once the basic loop works.
+2. **Doors, after the mesher.** `shapes` has `DOOR`/`DOOR_REVERSED` (hinge via
+   `meta & 8`). Doors need: state bits (`meta & 4` = open, `meta & 8` = upper
+   half, `meta & 1` = hinge, `meta & 3` = facing), `use_block` on a door
+   toggling the open bit server-side (mock), and placement of two blocks (lower
+   at the hit face, upper above) with facing from yaw. `C08` already reaches the
+   mock; add the door branch next to the crafting-table branch.
+3. **Verify the crafting table by hand.** The 3x3 window and recipes work against
+   the mock (see §11) at the packet level, but nobody has played it. Also:
+   armour slots take stacks but nothing equips them (no armour logic, no HUD
+   change), and tools/armour still draw `MISSING_TEXTURE`.
+4. **Death screen + eating.** Small, and the other half of the survival loop.
 3. **World creation screen** — smaller. `local_loop` already takes a seed and
    `play --seed` already parses one; v1 creates but does not save (region writing is
    M2).
