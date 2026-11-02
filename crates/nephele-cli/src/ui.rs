@@ -49,6 +49,8 @@ pub enum Screen {
     Creative,
     /// The survival player inventory (2x2 crafting, armour, storage, hotbar).
     Inventory,
+    /// Vanilla's "You Died!" screen, shown until the player respawns.
+    Death,
 }
 
 /// A clickable thing the UI drew this frame.
@@ -79,6 +81,8 @@ pub enum Action {
     SelectSlot(usize),
     /// A click on a player-container slot (0..=44).
     InventorySlot(usize),
+    /// Perform respawn from the death screen.
+    Respawn,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -406,6 +410,36 @@ fn draw_button_state(
 }
 
 /// The pause menu: title, "Back to Game", "Disconnect".
+/// Vanilla's death screen: a red wash over the frozen game.
+pub fn draw_death(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    pointer: Option<[f32; 2]>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Vec<Button> {
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.35, 0.02, 0.02, 0.75]);
+    let cx = width / 2.0;
+
+    fg.text_centered("You Died!", cx, height * 0.3, scale * 2.5, TEXT);
+
+    let w = 200.0 * scale;
+    let h = 20.0 * scale;
+    let respawn = Rect::new(cx - w / 2.0, height * 0.55, w, h);
+    draw_button(
+        bg,
+        fg,
+        respawn,
+        "Respawn",
+        scale,
+        hovered(pointer, &respawn),
+    );
+    vec![Button {
+        action: Action::Respawn,
+        rect: respawn,
+    }]
+}
 pub fn draw_pause(
     bg: &mut UiBatch,
     fg: &mut UiBatch,

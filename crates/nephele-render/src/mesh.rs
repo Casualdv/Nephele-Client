@@ -1,4 +1,5 @@
 use nephele_assets::{face_textures, is_transparent, TextureArray, MISSING_TEXTURE};
+use nephele_world::shapes::{block_shape, is_full_cube};
 use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World};
 
 #[repr(C)]
@@ -400,47 +401,101 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                 }
                 continue;
             }
-            for face in &FACES {
-                let neighbour = job.block(
-                    local_x + face.normal[0],
-                    y + face.normal[1],
-                    local_z + face.normal[2],
-                );
-                if !is_transparent(neighbour >> 4) {
-                    continue;
-                }
-                // Two of the same see-through block still hide their shared face.
-                if neighbour == raw && is_transparent(id) {
-                    continue;
-                }
+            let meta = (raw & 0x0f) as u8;
+            let shape = block_shape(id, meta);
+            let origin = [
+                (base_x + local_x) as f32,
+                y as f32,
+                (base_z + local_z) as f32,
+            ];
 
-                let layer = layers[face.slot];
-                let base = mesh.vertices.len() as u32;
-                let x = (base_x + local_x) as f32;
-                let yf = y as f32;
-                let z = (base_z + local_z) as f32;
+            if is_full_cube(shape) {
+                // Keep the common cube path on unit-cube coordinates. A whole
+                // face can be culled only when its neighbour also fills a cube.
+                for face in &FACES {
+                    if should_cull_full_cube_face(job, raw, id, local_x, y, local_z, face) {
+                        continue;
+                    }
 
-                for (corner, uv) in face.corners.iter().zip(face.uvs.iter()) {
-                    mesh.vertices.push(Vertex {
-                        position: [x + corner[0], yf + corner[1], z + corner[2]],
-                        uv: *uv,
-                        shade: face.shade,
-                        layer,
+                    let positions = std::array::from_fn(|index| {
+                        let corner = face.corners[index];
+                        [
+                            origin[0] + corner[0],
+                            origin[1] + corner[1],
+                            origin[2] + corner[2],
+                        ]
                     });
+                    append_quad(&mut mesh, face, layers[face.slot], positions);
                 }
-                mesh.indices.extend_from_slice(&[
-                    base,
-                    base + 1,
-                    base + 2,
-                    base,
-                    base + 2,
-                    base + 3,
-                ]);
+            } else {
+                // Shape boxes use 0..16 block pixels; convert them to block
+                // fractions, then scale each unit-cube face corner into the box.
+                for shape_box in shape {
+                    let min = shape_box.min.map(|value| value / 16.0);
+                    let max = shape_box.max.map(|value| value / 16.0);
+                    let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+
+                    for face in &FACES {
+                        let positions = std::array::from_fn(|index| {
+                            let corner = face.corners[index];
+                            [
+                                origin[0] + min[0] + corner[0] * size[0],
+                                origin[1] + min[1] + corner[1] * size[1],
+                                origin[2] + min[2] + corner[2] * size[2],
+                            ]
+                        });
+                        append_quad(&mut mesh, face, layers[face.slot], positions);
+                    }
+                }
             }
         }
     }
 
     mesh
+}
+
+/// Preserve the existing opacity rules, but only remove a complete shared face
+/// when both block states are full cubes. A partial shape may cover just part of
+/// the face, so treating it as a whole-face occluder would create holes.
+fn should_cull_full_cube_face(
+    job: &ColumnMeshJob,
+    raw: u16,
+    id: u16,
+    local_x: i32,
+    y: i32,
+    local_z: i32,
+    face: &FaceDef,
+) -> bool {
+    let neighbour = job.block(
+        local_x + face.normal[0],
+        y + face.normal[1],
+        local_z + face.normal[2],
+    );
+    let neighbour_id = neighbour >> 4;
+    let neighbour_meta = (neighbour & 0x0f) as u8;
+    if !is_full_cube(block_shape(neighbour_id, neighbour_meta)) {
+        return false;
+    }
+
+    if !is_transparent(neighbour_id) {
+        return true;
+    }
+    // Two of the same see-through block still hide their shared face.
+    neighbour == raw && is_transparent(id)
+}
+
+fn append_quad(mesh: &mut MeshData, face: &FaceDef, layer: u32, positions: [[f32; 3]; 4]) {
+    let base = mesh.vertices.len() as u32;
+    for (position, uv) in positions.into_iter().zip(face.uvs.iter().copied()) {
+        mesh.vertices.push(Vertex {
+            position,
+            uv,
+            shade: face.shade,
+            layer,
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 /// Blocks drawn as two crossed quads rather than a cube.
@@ -617,13 +672,107 @@ mod tests {
     }
 
     #[test]
-    fn single_block_emits_six_faces() {
+    fn full_cube_emits_six_faces() {
         let mut column = ChunkColumn::empty(0, 0);
         column.set_block(0, 40, 0, BlockState::STONE);
         let world = world_with(column.clone());
         let mesh = build_column_mesh(&column, &world, &atlas());
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(mesh.indices.len(), 36);
+    }
+
+    fn single_block_mesh(state: BlockState) -> MeshData {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(0, 40, 0, state);
+        let world = world_with(column.clone());
+        build_column_mesh(&column, &world, &atlas())
+    }
+
+    fn bounds(vertices: &[Vertex]) -> ([f32; 3], [f32; 3]) {
+        let mut min = [f32::INFINITY; 3];
+        let mut max = [f32::NEG_INFINITY; 3];
+        for vertex in vertices {
+            for (axis, value) in vertex.position.iter().enumerate() {
+                min[axis] = min[axis].min(*value);
+                max[axis] = max[axis].max(*value);
+            }
+        }
+        (min, max)
+    }
+
+    #[test]
+    fn slab_mesh_uses_bottom_or_top_half_height() {
+        let bottom = single_block_mesh(BlockState::new(44, 0));
+        assert_eq!(bottom.vertices.len(), 24);
+        assert_eq!(
+            bounds(&bottom.vertices),
+            ([0.0, 40.0, 0.0], [1.0, 40.5, 1.0])
+        );
+
+        let top = single_block_mesh(BlockState::new(44, 8));
+        assert_eq!(top.vertices.len(), 24);
+        assert_eq!(bounds(&top.vertices), ([0.0, 40.5, 0.0], [1.0, 41.0, 1.0]));
+    }
+
+    #[test]
+    fn stair_mesh_emits_the_base_and_oriented_step_boxes() {
+        let mesh = single_block_mesh(BlockState::new(53, 0));
+        assert_eq!(mesh.vertices.len(), 48);
+        assert_eq!(
+            bounds(&mesh.vertices[24..]),
+            ([0.5, 40.5, 0.0], [1.0, 41.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn fence_mesh_uses_the_narrow_post() {
+        let mesh = single_block_mesh(BlockState::new(85, 0));
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(
+            bounds(&mesh.vertices),
+            (
+                [6.0 / 16.0, 40.0, 6.0 / 16.0],
+                [10.0 / 16.0, 41.0, 10.0 / 16.0]
+            )
+        );
+    }
+
+    #[test]
+    fn pane_mesh_uses_its_thin_axis_aligned_box() {
+        let mesh = single_block_mesh(BlockState::new(101, 0));
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(
+            bounds(&mesh.vertices),
+            ([7.0 / 16.0, 40.0, 0.0], [9.0 / 16.0, 41.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn door_mesh_uses_the_metadata_selected_side() {
+        let reversed = single_block_mesh(BlockState::new(64, 0));
+        assert_eq!(
+            bounds(&reversed.vertices),
+            ([13.0 / 16.0, 40.0, 0.0], [1.0, 41.0, 1.0])
+        );
+
+        let normal = single_block_mesh(BlockState::new(64, 8));
+        assert_eq!(
+            bounds(&normal.vertices),
+            ([0.0, 40.0, 0.0], [3.0 / 16.0, 41.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn torch_mesh_uses_its_small_standing_box() {
+        let mesh = single_block_mesh(BlockState::new(50, 0));
+        assert_eq!(mesh.vertices.len(), 24);
+        assert_eq!(
+            bounds(&mesh.vertices),
+            (
+                [7.0 / 16.0, 40.0, 7.0 / 16.0],
+                [9.0 / 16.0, 40.625, 9.0 / 16.0]
+            )
+        );
     }
 
     /// One dropped stack is a single small spinning cube.

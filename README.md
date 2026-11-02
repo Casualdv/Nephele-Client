@@ -21,6 +21,7 @@ talks protocol 47, and joins offline-mode servers.
 - World: chunk decoding, block states, lighting, raycasting, terrain generation
 - Rendering: wgpu 30 with worker-threaded chunk meshing, vanilla block models
   and textures, the GUI atlas, the title-screen panorama and splashes
+- Block shapes: slabs, stairs, fence posts, panes, doors and torches render with shape-aware geometry
 - Movement and interaction: vanilla travel physics, sprinting, mining, block
   placement, creative item palette, chat
 - Players: entity tracking, skins and skin loading, humanoid rendering

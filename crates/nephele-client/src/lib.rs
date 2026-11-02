@@ -888,6 +888,12 @@ impl GameClient {
             .await
     }
 
+    /// Ask the server to respawn us. Vanilla calls this "perform respawn";
+    /// the death screen's button is the only caller.
+    pub async fn respawn(&mut self) -> Result<()> {
+        self.connection.write_packet(&play::client_status(0)).await
+    }
+
     pub async fn send_chat(&mut self, message: &str) -> Result<()> {
         self.connection.send_chat(message).await
     }

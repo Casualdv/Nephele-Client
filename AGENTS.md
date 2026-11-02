@@ -314,9 +314,18 @@ nothing writes there any more.
   6, 31, 32, 37, 38, 39, 40, 59, 83, 141, 142, 175, emitting two diagonals each drawn
   twice with opposite winding. Pinned by `plants_are_crossed_quads_not_cubes`.
 
-**Still cubes, still wrong:** slabs, stairs, fences, panes, torches, and every other
-non-full-cube shape. Fixing those needs a real per-state vertex-box model system —
-bigger than everything else in M1 combined.
+### Shape-aware meshing — first pass done (2026-11-02)
+
+`mesh_column` now consumes `nephele_world::shapes::block_shape(id, meta)`. Full
+cubes keep the direct unit-cube path; each non-full `ShapeBox` emits its six faces
+after converting its 0..16 pixel bounds to block fractions. Whole-face neighbour
+culling runs only when both states are full cubes, preserving the existing
+`is_transparent` rules without dropping the partially covered face beside a stair,
+pane or other small shape. Cross-plants stay on their separate crossed-quad path.
+
+The current table now renders slabs, stairs, fence posts, panes, door slabs and
+standing torches. Fence rails and pane connections are not modelled yet; shaped
+blocks currently emit their box faces without neighbour culling.
 
 ### Dropped items — done
 
@@ -497,18 +506,17 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
 M0 bootstrap → **M1 worldgen + renderer** → M2 survival loop → M3 multiplayer polish →
 M4 PvP features → M5 performance → M6 release. Details in `Future.md`.
 
-**M1 remaining:** block shapes (cross-plants done; slabs/stairs/fences panes/torches
-not) and smooth lighting. Then M1 is closed. **M1 has been deliberately parked** —
-M2 work goes ahead of it (2026-11-01 decision).
+**M1 status (2026-11-02):** the shape table is now visible through the mesher for
+slabs, stairs, fence posts, panes, doors and torches. Smooth lighting/AO, animated
+textures, plant edge cases and terrain polish remain; M1 is active again before
+the planned M2 close-out.
 
-**M2 in progress.** Already present before the first slice: the fixed 20 Hz tick
-with render interpolation, and the whole server-driven survival data path
-(`UPDATE_HEALTH` health/food/saturation, `EXPERIENCE`, `RESPAWN`, `SET_SLOT`,
-`WINDOW_ITEMS`). Done in the first slice: block drops → item entities → pickup →
-hotbar. **Still missing:** the survival inventory screen (only the creative
-palette exists), crafting and recipe matching, container windows
-(`OPEN_WINDOW`/`CLOSE_WINDOW`/`CLICK_WINDOW`/`CONFIRM_TRANSACTION` are not even in
-the protocol crate), a death screen, and eating.
+**M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
+block drops and pickup, survival inventory, container click protocol, and mock
+2x2/3x3 crafting are implemented. The crafting flow has packet-level mock coverage
+but still needs hand verification. **Still missing:** death screen/respawn, eating,
+armour equip and damage reduction, hunger effects, XP orbs, furnace/chest block
+entities, item-atlas rendering, and a singleplayer recipe evaluator.
 
 ---
 
@@ -581,18 +589,17 @@ the protocol crate), a death screen, and eating.
 
 ## 15. Next move
 
-1. **Mesher consumes `block_shape` (start here).** `nephele_world::shapes`
-   already returns boxes for slabs/stairs/fences/panes/doors/torches. In
-   `crates/nephele-render/src/mesh.rs`, `mesh_column` still emits one cube per
-   block. Change it to walk `block_shape(id, meta)`, build each box's corners as
-   `min + corner * (max - min)`, and only run the existing neighbour face cull
-   when both this block and the neighbour are `is_full_cube` (otherwise stairs
-   lose faces). Keep the cross-plant and `is_transparent` branches as they are;
-   `is_full_cube` keeps the cube fast path. Update the "six faces" tests and add
-   one per family (slab, stair, fence, pane, torch). This is also where panes
-   start connecting: today `PANE` is the default north-south slab, so pass
-   `meta`/neighbours once the basic loop works.
-2. **Doors, after the mesher.** `shapes` has `DOOR`/`DOOR_REVERSED` (hinge via
+**Death screen: done.** Health reaching 0 raises `Screen::Death` ("You Died!" plus a
+Respawn button). The button sets `Shared::pending_respawn`, which the network loop
+turns into `client_status(0)` (`GameClient::respawn`), and the stale zero is cleared
+so the screen cannot bounce back before the server's own update lands.
+
+1. **Mesher consumes `block_shape` — done 2026-11-02.** `mesh_column` walks
+   `block_shape(id, meta)`, scales 0..16 box corners into block coordinates and
+   keeps the direct cube path. Neighbour culling only removes a whole face when
+   both states are full cubes; cross-plants and `is_transparent` are unchanged.
+   Tests cover the full-cube path, slab, stair, fence, pane, door and torch bounds.
+2. **Doors, next.** `shapes` has `DOOR`/`DOOR_REVERSED` (hinge via
    `meta & 8`). Doors need: state bits (`meta & 4` = open, `meta & 8` = upper
    half, `meta & 1` = hinge, `meta & 3` = facing), `use_block` on a door
    toggling the open bit server-side (mock), and placement of two blocks (lower
@@ -601,14 +608,10 @@ the protocol crate), a death screen, and eating.
 3. **Verify the crafting table by hand.** The 3x3 window and recipes work against
    the mock (see §11) at the packet level, but nobody has played it. Also:
    armour slots take stacks but nothing equips them (no armour logic, no HUD
-   change), and tools/armour still draw `MISSING_TEXTURE`.
-4. **Death screen + eating.** Small, and the other half of the survival loop.
-3. **World creation screen** — smaller. `local_loop` already takes a seed and
-   `play --seed` already parses one; v1 creates but does not save (region writing is
-   M2).
-4. **M1 leftovers** (smooth lighting, block shapes) whenever rendering comes back
-   to the top of the queue; parked, not dropped. The server-list screen is done;
-   its remaining gaps (player counts, history, drag-to-reorder) are in Future.md §8.
+   change), and tools/armour still draw `MISSING_TEXTURE`. Test with an empty hand,
+   craft sticks and a pickaxe, and use `/gamemode survival`.
+4. **M1 then M2 close-out.** Follow the remaining renderer/gameplay order in
+   `Future.md`; do not count mock packet coverage as an interactive hand test.
 
 ---
 

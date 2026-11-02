@@ -81,7 +81,8 @@ wgpu renderer, worker-pooled meshing, player skins, bitmap font + UI atlas,
 title / pause / settings / connect / creative screens, HUD (hotbar, crosshair,
 health), physics (walk, sprint, sneak, fly, jump, sneak edge protection),
 mining + placement, creative inventory, anvil **reading**, biomes + density
-height field + surface pass, launcher, CI, verified-resource preparation.
+height field + surface pass, shape-aware block meshing (slabs, stairs, fence
+posts, panes, doors and torches), launcher, CI, verified-resource preparation.
 
 Measured parity against a world the real 1.8.9 server generated: **92.8%** of
 biome cells, **96%** of surface heights, **98.8%** of surface block types.
@@ -97,7 +98,7 @@ biome cells, **96%** of surface heights, **98.8%** of surface block types.
 | Decide the backend: wgpu vs OpenGL vs both | **XL** | See open decisions. Blocks almost everything else. |
 | GLES/Vulkan fallback path or a GL renderer | XL | Only if the above says "support old drivers". |
 | Smooth lighting + ambient occlusion | L | We decode light but do not apply it per vertex. Biggest visual win. |
-| Block shapes from vanilla models (stairs, slabs, fences, panes, cross plants) | L | Shape table done (`nephele_world::shapes`); **mesher still draws cubes**, so nothing is visible yet. |
+| Block shapes from vanilla models (stairs, slabs, fences, panes, cross plants) | L | The mesher now emits the `block_shape` boxes for slabs, stairs, fence posts, panes, doors and torches. Cross plants remain crossed quads. Fence rails and pane connections are still absent, and shaped boxes are not neighbour-culled yet. |
 | First-person hand + held block | M | Done: skin-textured arm, held block, swing. Occluded by walls (no depth-clear pass). |
 | Animated textures (`.mcmeta`, water/lava/fire/portal) | M | |
 | Sky: sun, moon, stars, clouds, day-night, fog per biome/dimension | L | |
@@ -261,10 +262,13 @@ field, launcher, CI.
 lighting, block shapes. *Exit:* singleplayer world looks like Minecraft from
 above and from underground.
 
-**M2 — Survival loop.** Fixed 20 Hz tick (*done*), hunger/XP (*done, received
-from the server*), drops (*done: block drops, pickup, hotbar*), inventory +
-containers (*in progress — no survival inventory screen yet*), crafting, death
-screen. *Exit:* you can punch a tree and make a pickaxe.
+**M2 — Survival loop.** Fixed 20 Hz tick (*done*), hunger/XP data (*done, received
+from the server*), drops (*done: block drops, pickup, hotbar*), survival inventory,
+container clicks and mock 2x2/3x3 recipes (*implemented; crafting still needs an
+interactive hand check*). Remaining: death screen/respawn, eating, armour behavior,
+hunger effects, XP orbs, block entities, item-atlas rendering and singleplayer
+recipe evaluation. *Exit:* you can punch a tree and make a pickaxe in a survival
+session.
 
 **M3 — Join a real server.** Microsoft auth (**done**, missing only a shippable
 Azure client id), server list (**done**), online-mode handshake (**done**),

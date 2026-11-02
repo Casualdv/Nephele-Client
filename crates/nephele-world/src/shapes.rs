@@ -1,8 +1,8 @@
 //! Non-full-cube block shapes, in 0..16 block pixels.
 //!
-//! The mesher still draws every block as a cube; this module is the table it
-//! will consume. Facing/meta variants are resolved here so the mesher never has
-//! to know about stair orientation.
+//! The chunk mesher consumes this table for non-full-cube geometry. Facing/meta
+//! variants are resolved here so the mesher never has to know about stair
+//! orientation.
 //!
 //! Boxes are axis-aligned and measured from the block's minimum corner. Door
 //! and pane orientation come straight from their metadata nibbles.

@@ -146,6 +146,8 @@ struct Shared {
     use_pressed: bool,
     /// Hotbar slot the player just selected.
     pending_slot: Option<i16>,
+    /// Set by the death screen, drained by the network loop.
+    pending_respawn: bool,
     /// Written by the network thread, read by the renderer.
     aim: Option<Aim>,
     break_stage: Option<u8>,
@@ -196,6 +198,7 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         attacking: false,
         use_pressed: false,
         pending_slot: None,
+        pending_respawn: false,
         aim: None,
         break_stage: None,
         held_slot: 0,
@@ -611,6 +614,9 @@ async fn net_loop(
                     .iter()
                     .map(EntitySnapshot::from_entity)
                     .collect();
+                if std::mem::take(&mut shared.lock().unwrap().pending_respawn) {
+                    client.respawn().await.map_err(|err| err.to_string())?;
+                }
                 let _ = tx.send(NetMsg::Entities(snapshot));
 
                 {
@@ -1581,6 +1587,17 @@ impl LiveApp {
                 width,
                 height,
             ),
+            Screen::Game if hud.health <= 0.0 => {
+                self.screen = Screen::Death;
+                ui::draw_death(
+                    &mut self.ui_bg,
+                    &mut self.ui_fg,
+                    hud.pointer,
+                    scale,
+                    width,
+                    height,
+                )
+            }
             Screen::Game => {
                 let Some(textures) = self.textures.as_ref() else {
                     return;
@@ -1596,6 +1613,14 @@ impl LiveApp {
                     height,
                 )
             }
+            Screen::Death => ui::draw_death(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                hud.pointer,
+                scale,
+                width,
+                height,
+            ),
             Screen::Pause => {
                 ui::draw_pause(&mut self.ui_bg, &mut self.ui_fg, &hud, scale, width, height)
             }
@@ -2148,6 +2173,15 @@ impl LiveApp {
                 }
             }
             Action::Disconnect => event_loop.exit(),
+            Action::Respawn => {
+                let mut shared = self.shared.lock().unwrap();
+                shared.pending_respawn = true;
+                // The server picks the real value; clearing the stale zero stops
+                // the death screen reappearing before the respawn packet lands.
+                shared.health = 20.0;
+                drop(shared);
+                self.screen = Screen::Game;
+            }
             Action::CreativePage(delta) => {
                 let pages = ui::creative_pages().max(1);
                 let next = self.creative_page as i32 + delta;
@@ -2292,7 +2326,7 @@ impl ApplicationHandler for LiveApp {
                             Screen::Settings => self.screen = self.settings_return,
                             Screen::Title => {}
                             Screen::Servers => self.screen = Screen::Title,
-                            Screen::Connect => self.screen = Screen::Title,
+                            Screen::Connect | Screen::Death => self.screen = Screen::Title,
                         },
                         (KeyCode::KeyT, ElementState::Pressed) if self.screen == Screen::Game => {
                             self.open_chat(false);
@@ -2315,7 +2349,8 @@ impl ApplicationHandler for LiveApp {
                             | Screen::Settings
                             | Screen::Title
                             | Screen::Servers
-                            | Screen::Connect => {}
+                            | Screen::Connect
+                            | Screen::Death => {}
                         },
                         (KeyCode::KeyF, ElementState::Pressed) if self.screen == Screen::Game => {
                             let mut state = self.shared.lock().unwrap();
