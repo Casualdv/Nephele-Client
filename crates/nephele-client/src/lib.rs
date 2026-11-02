@@ -22,6 +22,15 @@ pub use entities::{Entities, Entity, EntityKind};
 pub use mining::{Aim, Miner, MiningEvent};
 pub use skins::{SkinInfo, Skins};
 
+/// A container window the server opened (e.g. a crafting table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWindowState {
+    pub id: u8,
+    pub kind: String,
+    /// Slot contents as sent by `S30`; empty until the first resync.
+    pub slots: Vec<Option<ItemStack>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Vec3 {
     pub x: f64,
@@ -98,6 +107,13 @@ pub enum Event {
         action: i16,
         accepted: bool,
     },
+    /// A container window opened (`S2D`); its slot contents follow in `S30`.
+    WindowOpened {
+        window_id: u8,
+        kind: String,
+    },
+    /// A container window closed (`S2E`).
+    WindowClosed,
     /// Another player is breaking a block (`S25`). `stage` 255 = stopped.
     BreakAnimation {
         breaker: i32,
@@ -188,6 +204,8 @@ pub struct GameClient {
     /// Next `C0E` action number per open window. Vanilla keeps one counter per
     /// container and the server echoes the value in `S32`.
     click_actions: HashMap<i8, i16>,
+    /// The container the server has open, if any (window 0 is the player's own).
+    pub open_window: Option<OpenWindowState>,
     pub chat: Vec<String>,
     /// Every entity the server has told us about except ourselves.
     pub entities: Entities,
@@ -324,6 +342,7 @@ impl GameClient {
             inventory: vec![None; play::PLAYER_CONTAINER_SLOTS],
             held_slot: 0,
             click_actions: HashMap::new(),
+            open_window: None,
             chat: Vec::new(),
             entities: Entities::new(),
             skins: Skins::new(),
@@ -513,12 +532,38 @@ impl GameClient {
                 self.held_slot = slot.clamp(0, (play::HOTBAR_SLOTS - 1) as i16);
                 Ok(Event::HeldSlot(self.held_slot))
             }
+            play::clientbound::OPEN_WINDOW => {
+                let window = play::parse_open_window(&packet)?;
+                self.open_window = Some(OpenWindowState {
+                    id: window.window_id,
+                    kind: window.kind.clone(),
+                    slots: Vec::new(),
+                });
+                Ok(Event::WindowOpened {
+                    window_id: window.window_id,
+                    kind: window.kind,
+                })
+            }
+            play::clientbound::CLOSE_WINDOW => {
+                let id = play::parse_close_window(&packet)?;
+                if self.open_window.as_ref().is_some_and(|open| open.id == id) {
+                    self.open_window = None;
+                }
+                Ok(Event::WindowClosed)
+            }
             play::clientbound::SET_SLOT => {
                 let update = play::parse_set_slot(&packet)?;
                 if update.window_id == 0 && update.slot >= 0 {
                     let slot = update.slot as usize;
                     if slot < self.inventory.len() {
                         self.inventory[slot] = update.item;
+                    }
+                } else if let Some(open) = self.open_window.as_mut() {
+                    if update.window_id as u8 == open.id && update.slot >= 0 {
+                        let slot = update.slot as usize;
+                        if slot < open.slots.len() {
+                            open.slots[slot] = update.item;
+                        }
                     }
                 }
                 Ok(Event::Inventory)
@@ -534,6 +579,11 @@ impl GameClient {
                     }
                     for slot in update.items.len()..self.inventory.len() {
                         self.inventory[slot] = None;
+                    }
+                } else if let Some(open) = self.open_window.as_mut() {
+                    if update.window_id as u8 == open.id {
+                        open.slots.resize(update.items.len(), None);
+                        open.slots.clone_from(&update.items);
                     }
                 }
                 Ok(Event::Inventory)
@@ -732,6 +782,26 @@ impl GameClient {
         take_click_action(&mut self.click_actions, window)
     }
 
+    /// Window id clicks should target: the open container, else the player's.
+    fn active_window(&self) -> i8 {
+        self.open_window
+            .as_ref()
+            .map(|open| open.id as i8)
+            .unwrap_or(0)
+    }
+
+    /// Ask the server to close the open container (`C0D`).
+    pub async fn close_container(&mut self) -> Result<()> {
+        let Some(id) = self.open_window.as_ref().map(|open| open.id) else {
+            return Ok(());
+        };
+        self.connection
+            .write_packet(&play::close_window(id, true))
+            .await?;
+        self.open_window = None;
+        Ok(())
+    }
+
     /// Send a `C0E` click in the player container (window 0).
     ///
     /// Returns the action number, which comes back in `S32 Confirm Transaction`.
@@ -755,10 +825,11 @@ impl GameClient {
         mode: i8,
         clicked: Option<ItemStack>,
     ) -> Result<i16> {
-        let action = self.next_click_action(0);
+        let window = self.active_window();
+        let action = self.next_click_action(window);
         self.connection
             .write_packet(&play::click_window(
-                0,
+                window as u8,
                 slot,
                 button,
                 action,
@@ -767,6 +838,15 @@ impl GameClient {
             ))
             .await?;
         Ok(action)
+    }
+
+    /// Right-click without placing: `C08` with an empty held slot. Servers use
+    /// this to open crafting tables, furnaces and chests.
+    pub async fn use_block(&mut self, aim: &Aim) -> Result<()> {
+        let packet = play::block_placement(aim.x, aim.y, aim.z, aim.face, aim.cursor, None);
+        self.connection.write_packet(&packet).await?;
+        self.connection.write_packet(&play::swing_arm()).await?;
+        Ok(())
     }
 
     /// Put `item` into a player-container slot (creative only). `slot` uses

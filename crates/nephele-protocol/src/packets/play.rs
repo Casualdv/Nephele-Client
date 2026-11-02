@@ -36,6 +36,8 @@ pub mod clientbound {
     pub const BLOCK_BREAK_ANIMATION: i32 = 0x25;
     pub const MAP_CHUNK_BULK: i32 = 0x26;
     pub const SET_SLOT: i32 = 0x2F;
+    pub const OPEN_WINDOW: i32 = 0x2D;
+    pub const CLOSE_WINDOW: i32 = 0x2E;
     pub const WINDOW_ITEMS: i32 = 0x30;
     pub const CONFIRM_TRANSACTION: i32 = 0x32;
     pub const PLAYER_LIST_ITEM: i32 = 0x38;
@@ -57,6 +59,7 @@ pub mod serverbound {
     pub const PLAYER_BLOCK_PLACEMENT: i32 = 0x08;
     pub const HELD_ITEM_CHANGE: i32 = 0x09;
     pub const ANIMATION: i32 = 0x0A;
+    pub const CLOSE_WINDOW: i32 = 0x0D;
     pub const CLICK_WINDOW: i32 = 0x0E;
     pub const CREATIVE_INVENTORY_ACTION: i32 = 0x10;
     pub const CLIENT_SETTINGS: i32 = 0x15;
@@ -484,6 +487,52 @@ pub fn parse_set_slot(packet: &Packet) -> Result<SetSlot> {
         slot,
         item,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWindow {
+    pub window_id: u8,
+    /// Vanilla inventory type, e.g. `minecraft:crafting_table`.
+    pub kind: String,
+    /// Title as raw chat JSON; the UI draws its own labels.
+    pub title: String,
+    pub slots: u8,
+}
+
+pub fn parse_open_window(packet: &Packet) -> Result<OpenWindow> {
+    let mut r = packet.reader();
+    Ok(OpenWindow {
+        window_id: r.read_u8()?,
+        kind: r.read_string()?,
+        title: r.read_string()?,
+        slots: r.read_u8()?,
+    })
+}
+
+/// `S2D` written from the server side (the mock opens the crafting table GUI).
+pub fn open_window(window_id: u8, kind: &str, title: &str, slots: u8) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_u8(window_id)
+        .write_string(kind)
+        .write_string(title)
+        .write_u8(slots);
+    Packet::new(clientbound::OPEN_WINDOW, w.into_bytes())
+}
+
+/// `S2E`'s body and `C0D`'s body are both just the window id.
+pub fn close_window(window_id: u8, to_server: bool) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_u8(window_id);
+    let id = if to_server {
+        serverbound::CLOSE_WINDOW
+    } else {
+        clientbound::CLOSE_WINDOW
+    };
+    Packet::new(id, w.into_bytes())
+}
+
+pub fn parse_close_window(packet: &Packet) -> Result<u8> {
+    packet.reader().read_u8()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1202,6 +1251,33 @@ mod tests {
                 accepted: true,
             }
         );
+    }
+
+    #[test]
+    fn open_window_round_trips() {
+        let packet = open_window(1, "minecraft:crafting_table", "{\"text\":\"Crafting\"}", 46);
+        assert_eq!(packet.id, clientbound::OPEN_WINDOW);
+        let parsed = parse_open_window(&packet).expect("open window");
+        assert_eq!(
+            parsed,
+            OpenWindow {
+                window_id: 1,
+                kind: "minecraft:crafting_table".to_string(),
+                title: "{\"text\":\"Crafting\"}".to_string(),
+                slots: 46,
+            }
+        );
+    }
+
+    #[test]
+    fn close_window_uses_the_right_direction() {
+        let to_server = close_window(1, true);
+        assert_eq!(to_server.id, serverbound::CLOSE_WINDOW);
+        assert_eq!(parse_close_window(&to_server).unwrap(), 1);
+
+        let to_client = close_window(1, false);
+        assert_eq!(to_client.id, clientbound::CLOSE_WINDOW);
+        assert_eq!(parse_close_window(&to_client).unwrap(), 1);
     }
 
     #[test]

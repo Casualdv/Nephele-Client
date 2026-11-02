@@ -168,6 +168,11 @@ struct Shared {
     creative_override: Option<bool>,
     /// Container clicks from the inventory screen; the game thread sends them.
     inventory_clicks: Vec<(i16, i8, i8, Option<ItemStack>)>,
+    /// Slots of the server's open container (crafting table), and whether one is.
+    window_slots: Vec<Option<ItemStack>>,
+    window_open: bool,
+    /// Ask the game thread to send `C0D` for the open container.
+    close_window: bool,
     /// Single-player has no server to apply clicks, so the UI applies them.
     local: bool,
     /// Render distance, pushed to the server as a client-settings update.
@@ -206,6 +211,9 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         world_edits: Vec::new(),
         creative_override: None,
         inventory_clicks: Vec::new(),
+        window_slots: Vec::new(),
+        window_open: false,
+        close_window: false,
         local: false,
         view_distance: nephele_client::VIEW_DISTANCE,
         prev_position: [0.5, 80.0, 0.5],
@@ -487,6 +495,12 @@ async fn net_loop(
                         .await
                         .map_err(|err| err.to_string())?;
                 }
+                if std::mem::take(&mut shared.lock().unwrap().close_window) {
+                    client
+                        .close_container()
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
                 for line in chat {
                     client
                         .send_chat(&line)
@@ -565,10 +579,21 @@ async fn net_loop(
                 if use_pressed {
                     if let Some(target) = aim {
                         if !placement_hits_player(&target, [position.x, position.y, position.z]) {
-                            client
-                                .place(&target)
-                                .await
-                                .map_err(|err| err.to_string())?;
+                            let placeable = client
+                                .held_item()
+                                .and_then(|item| item.block_state())
+                                .is_some();
+                            if placeable {
+                                client
+                                    .place(&target)
+                                    .await
+                                    .map_err(|err| err.to_string())?;
+                            } else {
+                                client
+                                    .use_block(&target)
+                                    .await
+                                    .map_err(|err| err.to_string())?;
+                            }
                         }
                     }
                 }
@@ -603,6 +628,12 @@ async fn net_loop(
                     } else {
                         state.inventory.copy_from_slice(&client.inventory);
                     }
+                    state.window_open = client.open_window.is_some();
+                    state.window_slots = client
+                        .open_window
+                        .as_ref()
+                        .map(|open| open.slots.clone())
+                        .unwrap_or_default();
                 }
 
                 let mut batch = Vec::new();
@@ -691,6 +722,8 @@ struct FrameView {
     /// Left mouse held: drives both the miner and the first-person swing.
     attacking: bool,
     inventory: Vec<Option<ItemStack>>,
+    window_open: bool,
+    window_slots: Vec<Option<ItemStack>>,
     health: f32,
     food: i32,
     xp_bar: f32,
@@ -1285,6 +1318,8 @@ impl LiveApp {
                 creative: state.creative,
                 attacking: state.attacking,
                 inventory: state.inventory.clone(),
+                window_open: state.window_open,
+                window_slots: state.window_slots.clone(),
                 health: state.health,
                 food: state.food,
                 xp_bar: state.xp_bar,
@@ -1297,6 +1332,13 @@ impl LiveApp {
 
         if let Some(err) = &view.error {
             eprintln!("disconnected: {err}");
+        }
+
+        // Right-clicking a crafting table opens a server window; show it.
+        if view.window_open && self.screen == Screen::Game {
+            self.screen = Screen::Inventory;
+            self.inventory_cursor = None;
+            self.set_mouse_capture(false);
         }
 
         // Collect finished meshes and upload them. This is the only chunk work
@@ -1500,6 +1542,11 @@ impl LiveApp {
             pointer: self.pointer,
             captured: self.mouse_captured,
             chatting: self.chat_open,
+            window_slots: if view.window_open {
+                Some(view.window_slots.as_slice())
+            } else {
+                None
+            },
         };
 
         self.buttons = match self.screen {
@@ -1975,6 +2022,15 @@ impl LiveApp {
 
     /// Close the inventory, putting whatever is on the cursor back first.
     fn close_inventory(&mut self) {
+        let open = self.shared.lock().unwrap().window_open;
+        if open {
+            // The server returns the grid and cursor stacks when it closes; the
+            // local cursor just stops existing.
+            self.inventory_cursor = None;
+            self.shared.lock().unwrap().close_window = true;
+            self.enter_game();
+            return;
+        }
         if self.inventory_cursor.is_some() {
             let free = {
                 let state = self.shared.lock().unwrap();
@@ -1999,16 +2055,28 @@ impl LiveApp {
         let Ok(index) = usize::try_from(slot) else {
             return;
         };
-        if index >= state.inventory.len() {
+        // An open container replaces the player container: slot numbers are the
+        // window's (0 = output, 1..9 = grid, 10.. = storage/hotbar).
+        let open = state.window_open;
+        let count = if open {
+            state.window_slots.len()
+        } else {
+            state.inventory.len()
+        };
+        if index >= count {
             return;
         }
 
-        let clicked = state.inventory[index];
+        let clicked = if open {
+            state.window_slots.get(index).copied().flatten()
+        } else {
+            state.inventory[index]
+        };
 
         if shift {
             // Mode 1 is server-side when there is one; single-player moves it
             // locally so the item does not disappear.
-            if state.local {
+            if state.local && !open {
                 inventory::quick_move(&mut state.inventory, index);
             }
             state
@@ -2019,7 +2087,7 @@ impl LiveApp {
 
         let (cursor, new_slot) = inventory::click(self.inventory_cursor, clicked, button);
         self.inventory_cursor = cursor;
-        if state.local && new_slot != clicked {
+        if state.local && !open && new_slot != clicked {
             state.inventory[index] = new_slot;
         }
         state

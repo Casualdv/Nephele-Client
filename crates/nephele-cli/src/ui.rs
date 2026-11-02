@@ -105,6 +105,8 @@ pub struct HudState<'a> {
     pub captured: bool,
     /// The chat line is open, so the "click to look" hint would be wrong.
     pub chatting: bool,
+    /// Slots of the open container window (a crafting table), if any.
+    pub window_slots: Option<&'a [Option<ItemStack>]>,
 }
 
 /// Vanilla's automatic GUI scale: integers only so the pixel font stays crisp.
@@ -751,6 +753,41 @@ fn draw_stack(
     }
 }
 
+/// Top-left of a crafting-table window slot (46 slots: output, 9 grid cells,
+/// 27 storage, 9 hotbar) inside the same 176x166 panel.
+pub fn window_slot_origin(slot: usize) -> Option<[f32; 2]> {
+    Some(match slot {
+        0 => [124.0, 35.0],
+        1..=9 => {
+            let index = slot - 1;
+            [
+                30.0 + (index % 3) as f32 * 18.0,
+                17.0 + (index / 3) as f32 * 18.0,
+            ]
+        }
+        10..=36 => {
+            let index = slot - 10;
+            [
+                8.0 + (index % 9) as f32 * 18.0,
+                84.0 + (index / 9) as f32 * 18.0,
+            ]
+        }
+        37..=45 => [8.0 + (slot - 37) as f32 * 18.0, 142.0],
+        _ => return None,
+    })
+}
+
+pub fn window_slot_rect(slot: usize, scale: f32, width: f32, height: f32) -> Option<Rect> {
+    let [x, y] = window_slot_origin(slot)?;
+    let panel = inventory_panel(scale, width, height);
+    Some(Rect::new(
+        panel.x + x * scale,
+        panel.y + y * scale,
+        SLOT_SIZE * scale,
+        SLOT_SIZE * scale,
+    ))
+}
+
 /// The survival inventory: 2x2 crafting, armour, storage and the hotbar, with
 /// the stack under the cursor drawn last.
 #[allow(clippy::too_many_arguments)]
@@ -771,18 +808,39 @@ pub fn draw_inventory(
     let panel = inventory_panel(scale, width, height);
     bg.rect(panel, PANEL);
     bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
-    fg.text_centered("Inventory", width / 2.0, panel.y - s(13.0), scale, TEXT);
+
+    // A crafting table replaces the 2x2 half of the panel with its 3x3 grid;
+    // the storage and hotbar below are the same slots in both layouts.
+    let window = hud.window_slots;
+    let (slots, count, rect_of, title, subtitle) = match window {
+        Some(slots) => (
+            slots,
+            slots.len(),
+            window_slot_rect as fn(usize, f32, f32, f32) -> Option<Rect>,
+            "Crafting Table",
+            "Crafting",
+        ),
+        None => (
+            hud.inventory,
+            hud.inventory.len(),
+            inventory_slot_rect as fn(usize, f32, f32, f32) -> Option<Rect>,
+            "Inventory",
+            "Crafting",
+        ),
+    };
+
+    fg.text_centered(title, width / 2.0, panel.y - s(13.0), scale, TEXT);
     fg.text(
-        "Crafting",
-        panel.x + s(97.0),
+        subtitle,
+        panel.x + s(if window.is_some() { 30.0 } else { 97.0 }),
         panel.y + s(6.0),
         scale,
         TEXT_DIM,
     );
 
     let mut buttons = Vec::new();
-    for slot in 0..nephele_protocol::packets::play::PLAYER_CONTAINER_SLOTS {
-        let Some(rect) = inventory_slot_rect(slot, scale, width, height) else {
+    for slot in 0..count {
+        let Some(rect) = rect_of(slot, scale, width, height) else {
             continue;
         };
         bg.rect(
@@ -793,7 +851,7 @@ pub fn draw_inventory(
                 SLOT_BG
             },
         );
-        if let Some(item) = hud.inventory.get(slot).copied().flatten() {
+        if let Some(item) = slots.get(slot).copied().flatten() {
             let inner = Rect::new(rect.x + s(1.0), rect.y + s(1.0), s(16.0), s(16.0));
             draw_stack(fg, icons, inner, item, textures, scale);
         }
@@ -1374,6 +1432,7 @@ mod tests {
             pointer: None,
             captured: false,
             chatting: false,
+            window_slots: None,
         }
     }
 
@@ -1448,6 +1507,36 @@ mod tests {
                     && rect.y < other.y + other.h
                     && other.y < rect.y + rect.h;
                 assert!(!overlap, "slots overlap");
+            }
+            rects.push(rect);
+        }
+    }
+
+    #[test]
+    fn crafting_table_slots_cover_the_grid_and_the_player_half() {
+        assert_eq!(window_slot_origin(0), Some([124.0, 35.0]));
+        assert_eq!(window_slot_origin(1), Some([30.0, 17.0]));
+        assert_eq!(window_slot_origin(9), Some([66.0, 53.0]));
+        assert_eq!(window_slot_origin(10), Some([8.0, 84.0]));
+        assert_eq!(window_slot_origin(36), Some([152.0, 120.0]));
+        assert_eq!(window_slot_origin(37), Some([8.0, 142.0]));
+        assert_eq!(window_slot_origin(45), Some([152.0, 142.0]));
+        assert_eq!(window_slot_origin(46), None);
+
+        let (width, height, scale) = (1280.0, 720.0, 3.0);
+        let panel = inventory_panel(scale, width, height);
+        let mut rects: Vec<Rect> = Vec::new();
+        for slot in 0..46 {
+            let rect = window_slot_rect(slot, scale, width, height).expect("slot exists");
+            assert!(rect.x >= panel.x && rect.y >= panel.y);
+            assert!(rect.x + rect.w <= panel.x + panel.w);
+            assert!(rect.y + rect.h <= panel.y + panel.h);
+            for other in &rects {
+                let overlap = rect.x < other.x + other.w
+                    && other.x < rect.x + rect.w
+                    && rect.y < other.y + other.h
+                    && other.y < rect.y + rect.h;
+                assert!(!overlap, "crafting table slots overlap");
             }
             rects.push(rect);
         }

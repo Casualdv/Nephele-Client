@@ -452,6 +452,15 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
 - **Single-player cannot craft:** there is no recipe evaluator client-side and
   the output slot is only updated by the server (`S2F` slot 0). The 2x2 recipes
   exist only in the mock.
+- **Crafting-table window: protocol/client/UI groundwork only.** `S2D Open
+  Window` (0x2D, inventory type string + chat title + slot count), `S2E`/`C0D`
+  Close Window, `GameClient.open_window` (with its own 46-slot store that
+  `S2F`/`S30` route into by window id), `click_slot_with` targeting the open
+  window, `use_block` (a `C08` with an empty hand so the server can open a GUI),
+  `Event::WindowOpened/WindowClosed`, and `ui::draw_inventory` switching to the
+  3x3 layout when a window is open. **The mock still ignores the crafting table
+  and has no 3x3 recipes**, so nothing opens in-game yet - that is the next
+  slice, together with the recipe table.
 - Item icons: block items use their block texture; everything else (sticks,
   tools) draws `MISSING_TEXTURE`, because the item texture atlas is prepared but
   never uploaded.
@@ -557,7 +566,7 @@ the protocol crate), a death screen, and eating.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **110 tests** in `nephele-world`; **413 across the workspace** (1 ignored);
+- **110 tests** in `nephele-world`; **416 across the workspace** (1 ignored);
   13 in the server list (9 list + 4 ping board), 9 `ui` tests for the multiplayer
   screen, 8 for the command parser, 6 for the mock's container-click/crafting
   logic, 3 for the paths module, and two real-socket integration tests in
