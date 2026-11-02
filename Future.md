@@ -97,7 +97,8 @@ biome cells, **96%** of surface heights, **98.8%** of surface block types.
 | Decide the backend: wgpu vs OpenGL vs both | **XL** | See open decisions. Blocks almost everything else. |
 | GLES/Vulkan fallback path or a GL renderer | XL | Only if the above says "support old drivers". |
 | Smooth lighting + ambient occlusion | L | We decode light but do not apply it per vertex. Biggest visual win. |
-| Block shapes from vanilla models (stairs, slabs, fences, panes, cross plants) | L | Everything currently renders as a cube. |
+| Block shapes from vanilla models (stairs, slabs, fences, panes, cross plants) | L | Shape table done (`nephele_world::shapes`); **mesher still draws cubes**, so nothing is visible yet. |
+| First-person hand + held block | M | Done: skin-textured arm, held block, swing. Occluded by walls (no depth-clear pass). |
 | Animated textures (`.mcmeta`, water/lava/fire/portal) | M | |
 | Sky: sun, moon, stars, clouds, day-night, fog per biome/dimension | L | |
 | Frustum + occlusion culling | M | |
@@ -161,8 +162,8 @@ per render frame — it no longer does. Keep new simulation work inside
 
 | Item | Size | Notes |
 |---|---|---|
-| Survival inventory screen (2×2 crafting, armour slots) | L | |
-| Crafting table, furnace, chest, hopper, dispenser, brewing, enchanting, anvil, beacon | XL | Port the GUI model from Leafish `inventory/`. |
+| Survival inventory screen (2×2 crafting, armour slots) | L | Done: vanilla layout, cursor stack, left/right/shift clicks via `C0E`. |
+| Crafting table, furnace, chest, hopper, dispenser, brewing, enchanting, anvil, beacon | XL | **Crafting table done** (window id 1, 3×3 grid, recipes in the mock). The rest unstarted. |
 | Shift-click, drag-split, item dragging, hotbar swap keys | M | |
 | Item tooltips: name, rarity colour, enchantments | M | |
 | Durability bar, stack counts, item icons | M | |
