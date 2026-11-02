@@ -19,6 +19,7 @@ pub mod block;
 pub mod blocks;
 pub mod caves;
 pub mod chunk;
+pub mod crafting;
 pub mod decode;
 pub mod encode;
 pub mod features;
