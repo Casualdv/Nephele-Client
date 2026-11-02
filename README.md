@@ -25,6 +25,7 @@ talks protocol 47, and joins offline-mode servers.
   placement, creative item palette, chat
 - Players: entity tracking, skins and skin loading, humanoid rendering
 - Items: block drops spawn as spinning item entities and are collected into the hotbar
+- First person: a skin-textured arm holding the selected block, with a swing while mining
 - Chat: on-screen log and input, with client-side `/gamemode`, `/tp`, `/setblock`, `/give`
 - UI: title, multiplayer (live ping, MOTD and version), direct connect, pause, settings
   and creative screens; HUD, hotbar, hearts

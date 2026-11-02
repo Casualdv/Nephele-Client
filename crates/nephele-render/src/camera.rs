@@ -47,6 +47,11 @@ impl Camera {
         Vec3::new(cy, 0.0, sy)
     }
 
+    /// Camera up, perpendicular to [`Camera::forward`] and [`Camera::right`].
+    pub fn up(&self) -> Vec3 {
+        self.right().cross(self.forward()).normalize_or_zero()
+    }
+
     /// Right-handed look-at, built explicitly so it does not depend on the
     /// math crate's naming.
     pub fn view(&self) -> Mat4 {

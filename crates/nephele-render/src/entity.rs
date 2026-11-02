@@ -8,6 +8,7 @@
 //! only a few thousand vertices, and interpolation changes the positions every
 //! frame anyway.
 
+use glam::Vec3;
 use nephele_assets::SkinAtlas;
 
 #[repr(C)]
@@ -269,6 +270,95 @@ pub fn build_entities(draws: &[EntityDraw]) -> EntityMesh {
     mesh
 }
 
+/// The first-person arm.
+///
+/// `right`/`up`/`forward` are the camera's world-space basis. The arm is built
+/// in camera space and then placed in the world, so it shares the terrain
+/// pipeline's depth test without needing a second render pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandDraw {
+    /// Eye position in world space.
+    pub eye: [f32; 3],
+    pub right: [f32; 3],
+    pub up: [f32; 3],
+    pub forward: [f32; 3],
+    /// Skin atlas slot; slot 0 is the built-in stand-in skin.
+    pub skin_slot: u32,
+    /// 0 = resting, 1 = fully swung (mining or attacking).
+    pub swing: f32,
+}
+
+/// Where the arm ended up, so a held item can sit in the palm.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandPose {
+    pub palm: [f32; 3],
+    pub right: [f32; 3],
+    pub up: [f32; 3],
+    pub forward: [f32; 3],
+}
+
+/// Pixel size of the right-arm box in the vanilla skin layout.
+const HAND_ARM_UV: [f32; 2] = [40.0, 16.0];
+
+/// Append the first-person arm to `mesh` and return where the hand is.
+///
+/// The arm hangs from the bottom-right of the view and reaches forward-left.
+/// `swing` raises it, which is enough to read as a mining/attack animation.
+pub fn append_hand(mesh: &mut EntityMesh, hand: &HandDraw) -> HandPose {
+    let eye = Vec3::from(hand.eye);
+    let right = Vec3::from(hand.right);
+    let up = Vec3::from(hand.up);
+    let forward = Vec3::from(hand.forward);
+
+    let reach = (forward + up * (-0.30 + hand.swing * 0.55) + right * -0.18).normalize_or_zero();
+    let side = up.cross(reach).normalize_or_zero();
+    let normal = reach.cross(side).normalize_or_zero();
+
+    let shoulder = eye + right * 0.34 + up * -0.40 + forward * 0.30;
+    let length = 12.0 * PIXEL;
+    let width = 4.0 * PIXEL;
+    let centre = shoulder + reach * (length * 0.5);
+
+    let part = Part {
+        origin: [0.0; 3],
+        size: [4.0, 12.0, 4.0],
+        uv: HAND_ARM_UV,
+        follows_head: false,
+    };
+
+    for (face_index, face) in FACES.iter().enumerate() {
+        let rect = face_rect(&part, face);
+        let base = mesh.vertices.len() as u32;
+
+        for (corner_index, corner) in face.corners.iter().enumerate() {
+            // Box-local axes: x = side, y = normal (palm facing), z = reach.
+            let local = side * ((corner[0] - 0.5) * width)
+                + normal * ((corner[1] - 0.5) * width)
+                + reach * ((corner[2] - 0.5) * length);
+            let uv_in_rect = CORNER_UV[face_index][corner_index];
+            let u = rect[0] + uv_in_rect[0] * rect[2];
+            let v = rect[1] + uv_in_rect[1] * rect[3];
+
+            mesh.vertices.push(EntityVertex {
+                position: (centre + local).to_array(),
+                uv: SkinAtlas::uv(hand.skin_slot, u, v),
+                shade: face.shade,
+                color: [1.0; 4],
+            });
+        }
+
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    HandPose {
+        palm: (shoulder + reach * (length * 1.05)).to_array(),
+        right: side.to_array(),
+        up: normal.to_array(),
+        forward: reach.to_array(),
+    }
+}
+
 fn append_humanoid(mesh: &mut EntityMesh, draw: &EntityDraw) {
     let body_yaw = draw.yaw.to_radians();
     let head_yaw = draw.head_yaw.to_radians();
@@ -368,6 +458,56 @@ fn face_rect(part: &Part, face: &FaceSpec) -> [f32; 4] {
 mod tests {
     use super::*;
     use nephele_assets::SKIN_SIZE;
+
+    #[test]
+    fn the_hand_is_one_skin_textured_box() {
+        let mut mesh = EntityMesh::default();
+        let pose = append_hand(
+            &mut mesh,
+            &HandDraw {
+                eye: [0.0, 0.0, 0.0],
+                right: [1.0, 0.0, 0.0],
+                up: [0.0, 1.0, 0.0],
+                forward: [0.0, 0.0, -1.0],
+                skin_slot: 0,
+                swing: 0.0,
+            },
+        );
+        assert_eq!(mesh.vertices.len(), 24, "one box is six faces of four");
+        assert_eq!(mesh.indices.len(), 36);
+
+        let [u0, v0] = SkinAtlas::uv(0, 0.0, 0.0);
+        let [u1, v1] = SkinAtlas::uv(0, SKIN_SIZE as f32, SKIN_SIZE as f32);
+        for vertex in &mesh.vertices {
+            assert!(vertex.uv[0] >= u0 - 1e-6 && vertex.uv[0] <= u1 + 1e-6);
+            assert!(vertex.uv[1] >= v0 - 1e-6 && vertex.uv[1] <= v1 + 1e-6);
+        }
+
+        // Forward is -Z: the palm sits in front, below the eye and to the right.
+        assert!(pose.palm[2] < -0.2, "hand should be in front: {pose:?}");
+        assert!(pose.palm[1] < 0.0, "hand should sit low: {pose:?}");
+        assert!(pose.palm[0] > 0.0, "hand should sit right: {pose:?}");
+    }
+
+    #[test]
+    fn swinging_lifts_the_hand() {
+        let hand = |swing| {
+            let mut mesh = EntityMesh::default();
+            append_hand(
+                &mut mesh,
+                &HandDraw {
+                    eye: [0.0; 3],
+                    right: [1.0, 0.0, 0.0],
+                    up: [0.0, 1.0, 0.0],
+                    forward: [0.0, 0.0, -1.0],
+                    skin_slot: 0,
+                    swing,
+                },
+            )
+            .palm
+        };
+        assert!(hand(1.0)[1] - hand(0.0)[1] > 0.1, "swing raises the palm");
+    }
 
     #[test]
     fn one_humanoid_is_six_boxes() {

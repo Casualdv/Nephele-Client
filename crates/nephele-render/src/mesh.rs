@@ -543,6 +543,59 @@ pub fn build_item_mesh(items: &[ItemDraw], atlas: &TextureArray, time: f32) -> M
     mesh
 }
 
+/// A block held in the first-person hand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HandItem {
+    /// Item id; block items use that block's textures.
+    pub item: i16,
+    pub meta: i16,
+    /// World-space centre of the cube.
+    pub centre: [f32; 3],
+    /// World-space axes; `right x up` must equal `forward`.
+    pub right: [f32; 3],
+    pub up: [f32; 3],
+    pub forward: [f32; 3],
+    /// Edge length in blocks.
+    pub size: f32,
+}
+
+/// Build one held block cube oriented along the hand's axes.
+pub fn build_hand_item(item: &HandItem, atlas: &TextureArray) -> MeshData {
+    let mut mesh = MeshData::default();
+    let state = BlockState::new(item.item.max(0) as u16, item.meta.clamp(0, 15) as u8);
+    let layers = match face_textures(state) {
+        Some(faces) => [
+            atlas.layer_or_missing(faces.top),
+            atlas.layer_or_missing(faces.bottom),
+            atlas.layer_or_missing(faces.side),
+        ],
+        None => [atlas.layer_or_missing(MISSING_TEXTURE); 3],
+    };
+
+    let right = glam::Vec3::from(item.right);
+    let up = glam::Vec3::from(item.up);
+    let forward = glam::Vec3::from(item.forward);
+    let centre = glam::Vec3::from(item.centre);
+
+    for face in &FACES {
+        let base = mesh.vertices.len() as u32;
+        for (corner, uv) in face.corners.iter().zip(face.uvs.iter()) {
+            let local = right * ((corner[0] - 0.5) * item.size)
+                + up * ((corner[1] - 0.5) * item.size)
+                + forward * ((corner[2] - 0.5) * item.size);
+            mesh.vertices.push(Vertex {
+                position: (centre + local).to_array(),
+                uv: *uv,
+                shade: face.shade,
+                layer: layers[face.slot],
+            });
+        }
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    mesh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

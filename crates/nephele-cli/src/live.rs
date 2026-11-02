@@ -24,8 +24,9 @@ use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
 use nephele_render::{
-    block_outline, break_overlay_texture, build_break_overlay, build_entities, build_item_mesh,
-    Camera, ColumnMeshJob, EntityDraw, ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
+    append_hand, block_outline, break_overlay_texture, build_break_overlay, build_entities,
+    build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw, HandDraw, HandItem,
+    ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
 };
 use nephele_world::{raycast, ChunkColumn, ChunkCoord, World};
 use winit::application::ApplicationHandler;
@@ -673,6 +674,8 @@ struct FrameView {
     stage: Option<u8>,
     held_slot: i16,
     creative: bool,
+    /// Left mouse held: drives both the miner and the first-person swing.
+    attacking: bool,
     inventory: Vec<Option<ItemStack>>,
     health: f32,
     food: i32,
@@ -1020,13 +1023,14 @@ impl LiveApp {
     ///
     /// Positions come from the 20 Hz network tick and are blended by `alpha`, so
     /// other players move as smoothly as the local camera does.
-    fn draw_entities(&mut self, alpha: f64) {
+    fn draw_entities(&mut self, view: &FrameView) {
         let Some(textures) = self.textures.as_ref() else {
             return;
         };
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+        let alpha = view.alpha;
         let mut draws = Vec::with_capacity(self.entities.len());
         let mut items = Vec::new();
         for entity in &self.entities {
@@ -1064,8 +1068,52 @@ impl LiveApp {
             }
             draws.push(draw);
         }
-        renderer.set_entities(&build_entities(&draws));
-        renderer.set_items(&build_item_mesh(&items, textures, self.time));
+        let mut entity_mesh = build_entities(&draws);
+        let mut item_mesh = build_item_mesh(&items, textures, self.time);
+        if self.screen == Screen::Game {
+            // The first-person arm is built in camera space and placed in the
+            // world, so it lands in the same depth-tested pass as everything else.
+            let camera = &view.camera;
+            let swing = if view.attacking {
+                (self.time * 11.0).sin() * 0.5 + 0.5
+            } else {
+                0.0
+            };
+            let pose = append_hand(
+                &mut entity_mesh,
+                &HandDraw {
+                    eye: camera.position.to_array(),
+                    right: camera.right().to_array(),
+                    up: camera.up().to_array(),
+                    forward: camera.forward().to_array(),
+                    skin_slot: SkinAtlas::DEFAULT_SLOT,
+                    swing,
+                },
+            );
+
+            let held = view
+                .inventory
+                .get(play::HOTBAR_FIRST_SLOT + view.held_slot.max(0) as usize)
+                .copied()
+                .flatten();
+            if let Some(state) = held.and_then(|item| item.block_state()) {
+                let state = nephele_world::BlockState::from_raw(state);
+                item_mesh.append(build_hand_item(
+                    &HandItem {
+                        item: state.id() as i16,
+                        meta: state.meta() as i16,
+                        centre: pose.palm,
+                        right: pose.right,
+                        up: pose.up,
+                        forward: pose.forward,
+                        size: 0.36,
+                    },
+                    textures,
+                ));
+            }
+        }
+        renderer.set_entities(&entity_mesh);
+        renderer.set_items(&item_mesh);
     }
 
     fn drain_network(&mut self) {
@@ -1215,6 +1263,7 @@ impl LiveApp {
                 stage: state.break_stage,
                 held_slot: state.held_slot,
                 creative: state.creative,
+                attacking: state.attacking,
                 inventory: state.inventory.clone(),
                 health: state.health,
                 food: state.food,
@@ -1291,7 +1340,7 @@ impl LiveApp {
         self.prof_mesh += mesh_start.elapsed().as_secs_f32() * 1000.0;
 
         self.update_skins();
-        self.draw_entities(view.alpha);
+        self.draw_entities(&view);
 
         self.time += delta;
         let ui_start = Instant::now();

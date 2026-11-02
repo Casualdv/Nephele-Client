@@ -12,11 +12,14 @@ pub mod mesh;
 pub mod ui;
 
 pub use camera::Camera;
-pub use entity::{build_entities, EntityDraw, EntityMesh, EntityVertex};
+pub use entity::{
+    append_hand, build_entities, EntityDraw, EntityMesh, EntityVertex, HandDraw, HandPose,
+};
 pub use gpu::{DrawOutcome, Renderer, RendererError};
 pub use lines::{block_outline, LineMesh, LineVertex};
 pub use mesh::{
-    break_overlay_texture, build_break_overlay, build_column_mesh, build_item_mesh,
-    build_world_mesh, mesh_column, ColumnMeshJob, ItemDraw, MeshData, Vertex,
+    break_overlay_texture, build_break_overlay, build_column_mesh, build_hand_item,
+    build_item_mesh, build_world_mesh, mesh_column, ColumnMeshJob, HandItem, ItemDraw, MeshData,
+    Vertex,
 };
 pub use ui::{Rect, UiBatch, UiVertex};

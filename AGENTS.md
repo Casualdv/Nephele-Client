@@ -333,6 +333,30 @@ the entity pipeline, which is bound to the skin atlas — via
 - `ItemDraw.position` is the **feet** (block-bottom) position; the mesh adds
   `ITEM_HOVER = 0.1` and centres the cube on the block centre.
 
+### First-person hand + held block — done (2026-11-02)
+
+- `entity::append_hand(&mut EntityMesh, &HandDraw) -> HandPose` appends **one
+  skin-textured arm box** (the right arm's `(40,16)` unwrap) to the entity mesh
+  and returns where the palm ended up. `HandDraw` takes the camera's world-space
+  basis, so the arm is built in camera space and placed in the world; it then
+  renders in the normal depth-tested pass with the skin pipeline. No second
+  render pass, so **the hand is occluded by walls** instead of drawing over them
+  (vanilla clears depth for the hand) - acceptable for a placeholder, worth a
+  separate pass later.
+- `mesh::build_hand_item(&HandItem, &TextureArray)` builds the held **block**
+  cube along the hand's axes; `live.rs` appends it to the same item mesh as the
+  drops, at `HandPose::palm`, 0.36 blocks wide.
+- `HandDraw.skin_slot` is `SkinAtlas::DEFAULT_SLOT` today: the built-in grey
+  stand-in. Using the player's own skin needs the local player's atlas slot,
+  which the render side does not track yet.
+- The arm rests at the bottom-right and reaches forward-left; while the left
+  mouse button is held (`FrameView.attacking`) the reach lifts and falls with a
+  `sin`, which is the whole "swing" animation. `Camera::up()` was added for the
+  basis.
+- `draw_entities` now takes the whole `FrameView` (it needs `attacking`,
+  `held_slot` and the inventory) and only attaches the hand on `Screen::Game`.
+
+
 ### Smooth lighting — planned, not started
 
 Light **is** decoded: `Section` stores `block_light: Vec<u8>` and
@@ -506,7 +530,7 @@ the protocol crate), a death screen, and eating.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **110 tests** in `nephele-world`; **404 across the workspace** (1 ignored);
+- **110 tests** in `nephele-world`; **407 across the workspace** (1 ignored);
   13 in the server list (9 list + 4 ping board), 9 `ui` tests for the multiplayer
   screen, 8 for the command parser, 6 for the mock's container-click/crafting
   logic, 3 for the paths module, and two real-socket integration tests in
