@@ -959,80 +959,17 @@ fn add_to_inventory(
 /// Rows are trimmed of empty edges before comparing, so a shape can sit
 /// anywhere in the grid like vanilla.
 fn table_recipe(grid: &[Option<play::ItemStack>]) -> Option<play::ItemStack> {
-    let ids: Vec<Vec<i16>> = (0..3)
-        .map(|row| {
-            (0..3)
-                .map(|col| grid[row * 3 + col].map_or(0, |item| item.id))
-                .collect()
-        })
-        .collect();
-
-    // One log anywhere -> four planks; everything else ignores stack size.
-    let filled: Vec<play::ItemStack> = grid.iter().flatten().copied().collect();
-    if filled.len() == 1 && filled[0].id == LOG_ITEM {
-        let meta = filled[0].damage.clamp(0, 3);
-        return Some(play::ItemStack::new(PLANKS_ITEM, 4, meta));
-    }
-
-    // Trim empty rows and columns.
-    let rows_used: Vec<usize> = (0..3)
-        .filter(|&r| ids[r].iter().any(|&id| id != 0))
-        .collect();
-    let cols_used: Vec<usize> = (0..3).filter(|&c| (0..3).any(|r| ids[r][c] != 0)).collect();
-    if rows_used.is_empty() {
-        return None;
-    }
-    let shape: Vec<Vec<i16>> = rows_used
-        .iter()
-        .map(|&r| cols_used.iter().map(|&c| ids[r][c]).collect())
-        .collect();
-
-    const P: i16 = PLANKS_ITEM;
-    const C: i16 = 4; // cobblestone
-    const I: i16 = 265; // iron ingot
-    const S: i16 = STICK_ITEM;
-    const T: i16 = CRAFTING_TABLE_ITEM;
-
-    let recipes: &[(i16, i8, &[&[i16]])] = &[
-        (S, 4, &[&[P], &[P]]),
-        (T, 1, &[&[P, P], &[P, P]]),
-        (50, 4, &[&[263], &[S]]), // torch: coal over a stick
-        (61, 1, &[&[C, C, C], &[C, 0, C], &[C, C, C]]),
-        (54, 1, &[&[P, P, P], &[P, 0, P], &[P, P, P]]),
-        // Pickaxes.
-        (270, 1, &[&[P, P, P], &[0, S, 0], &[0, S, 0]]),
-        (274, 1, &[&[C, C, C], &[0, S, 0], &[0, S, 0]]),
-        (257, 1, &[&[I, I, I], &[0, S, 0], &[0, S, 0]]),
-        // Axes.
-        (271, 1, &[&[P, P], &[P, S], &[0, S]]),
-        (275, 1, &[&[C, C], &[C, S], &[0, S]]),
-        (258, 1, &[&[I, I], &[I, S], &[0, S]]),
-        // Shovels.
-        (269, 1, &[&[P], &[S], &[S]]),
-        (273, 1, &[&[C], &[S], &[S]]),
-        (256, 1, &[&[I], &[S], &[S]]),
-        // Swords.
-        (268, 1, &[&[P], &[P], &[S]]),
-        (272, 1, &[&[C], &[C], &[S]]),
-        (267, 1, &[&[I], &[I], &[S]]),
-        // Iron armour.
-        (306, 1, &[&[I, I, I], &[I, 0, I]]),
-        (307, 1, &[&[I, 0, I], &[I, I, I], &[I, I, I]]),
-        (308, 1, &[&[I, I, I], &[I, 0, I], &[I, 0, I]]),
-        (309, 1, &[&[I, 0, I], &[I, 0, I]]),
-    ];
-
-    for (id, count, pattern) in recipes {
-        if pattern.len() == shape.len()
-            && pattern
-                .iter()
-                .zip(shape.iter())
-                .all(|(a, b)| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y))
-        {
-            return Some(play::ItemStack::new(*id, *count, 0));
+    // The table itself lives in nephele-world so singleplayer and the mock
+    // cannot drift apart; this only adapts the protocol's stack type to it.
+    let mut cells: [Option<(u16, u16)>; 9] = [None; 9];
+    for (slot, cell) in grid.iter().take(9).enumerate() {
+        if let Some(item) = cell {
+            cells[slot] = Some((item.id.max(0) as u16, item.damage.max(0) as u16));
         }
     }
-    None
+    nephele_world::crafting::craft(&cells).map(|recipe| {
+        play::ItemStack::new(recipe.id as i16, recipe.count as i8, recipe.damage as i16)
+    })
 }
 
 /// Spend one item from every occupied grid cell (slots 1..=9 of a window).
