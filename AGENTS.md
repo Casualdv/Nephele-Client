@@ -452,18 +452,20 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
 - **Single-player cannot craft:** there is no recipe evaluator client-side and
   the output slot is only updated by the server (`S2F` slot 0). The 2x2 recipes
   exist only in the mock.
-- **Crafting-table window: protocol/client/UI groundwork only.** `S2D Open
-  Window` (0x2D, inventory type string + chat title + slot count), `S2E`/`C0D`
-  Close Window, `GameClient.open_window` (with its own 46-slot store that
-  `S2F`/`S30` route into by window id), `click_slot_with` targeting the open
-  window, `use_block` (a `C08` with an empty hand so the server can open a GUI),
-  `Event::WindowOpened/WindowClosed`, and `ui::draw_inventory` switching to the
-  3x3 layout when a window is open. **The mock still ignores the crafting table
-  and has no 3x3 recipes**, so nothing opens in-game yet - that is the next
-  slice, together with the recipe table.
+- **Crafting-table window works end to end (2026-11-02).** Right-clicking a
+  placed crafting table with a non-block/empty hand sends `C08` with an empty
+  held slot; the mock answers `S2D` (window id 1, `minecraft:crafting_table`,
+  46 slots) + `S30`, and `C0D` closes it, returning the grid and the cursor
+  stack to the player. The window's storage/hotbar half (slots 10..=45) mirrors
+  the player inventory, so the panel is the same one with a 3x3 grid on top.
+  The mock's 3x3 recipes: planks, sticks, crafting table, torch, furnace, chest,
+  pickaxe/axe/shovel/sword in wood/stone/iron, and iron armour. Patterns are
+  matched after trimming empty rows/columns, so a shape can sit anywhere in the
+  grid; stack sizes in the grid do not matter. **Only the mock crafts** - a real
+  server computes its own output, which is the whole point of the protocol.
 - Item icons: block items use their block texture; everything else (sticks,
-  tools) draws `MISSING_TEXTURE`, because the item texture atlas is prepared but
-  never uploaded.
+  tools, armour) draws `MISSING_TEXTURE`, because the item texture atlas is
+  prepared but never uploaded.
 
 **Chat and client-side commands** (added 2026-11-01):
 
@@ -566,7 +568,7 @@ the protocol crate), a death screen, and eating.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **110 tests** in `nephele-world`; **416 across the workspace** (1 ignored);
+- **110 tests** in `nephele-world`; **418 across the workspace** (1 ignored);
   13 in the server list (9 list + 4 ping board), 9 `ui` tests for the multiplayer
   screen, 8 for the command parser, 6 for the mock's container-click/crafting
   logic, 3 for the paths module, and two real-socket integration tests in
@@ -579,14 +581,14 @@ the protocol crate), a death screen, and eating.
 
 ## 15. Next move
 
-1. **M2: the 3x3 crafting table, then the recipe set.** The player inventory
-   screen shipped (see §11): `Screen::Inventory`, the vanilla slot layout, a
-   cursor stack, left/right/shift clicks through `C0E`, and the mock's 2x2
-   recipes. What is missing for "punch a tree and make a pickaxe" is the **3x3
-   crafting-table window**: `Use` on a placed table must open window id 1
-   (`S2D Open Window`) with a 3x3 grid + result, the mock must serve that window
-   (tools, torch, furnace, chest, armour from planks/sticks/cobble), and the UI
-   needs the second panel. The 2x2 cannot make a pickaxe.
+1. **M2: verify the crafting table in a real match, then eating/death.** The 3x3
+   window and the survival recipe set now work against the mock (see 11), so
+   "punch a tree, make a table, make a pickaxe" is playable end to end. What is
+   left in this slice: relabel the armour slots and add the missing art, and
+   actually play through it once (it was tested at the packet/recipe level, not
+   by hand). **Armour items exist in the recipe table but nothing equips them**
+   - the armour slots take stacks but there is no armour logic or HUD hearts
+   change.
 2. **Death screen + eating.** Small, and the other half of the survival loop.
 3. **World creation screen** — smaller. `local_loop` already takes a seed and
    `play --seed` already parses one; v1 creates but does not save (region writing is

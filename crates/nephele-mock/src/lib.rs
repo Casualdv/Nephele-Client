@@ -908,6 +908,330 @@ fn click_container(
     }
 }
 
+// ---- crafting table ---------------------------------------------------------
+
+/// Slots in a crafting-table window: result, 3x3 grid, 27 storage, 9 hotbar.
+const TABLE_SLOTS: usize = 46;
+
+fn table_window(
+    inventory: &[Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+) -> Vec<Option<play::ItemStack>> {
+    let mut slots = vec![None; TABLE_SLOTS];
+    slots[10..37].copy_from_slice(&inventory[9..36]);
+    slots[37..46].copy_from_slice(&inventory[36..45]);
+    slots
+}
+
+fn table_to_inventory(
+    table: &[Option<play::ItemStack>],
+    inventory: &mut [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+) {
+    inventory[9..36].copy_from_slice(&table[10..37]);
+    inventory[36..45].copy_from_slice(&table[37..46]);
+}
+
+/// Put `stack` back somewhere in the player's storage, merging first.
+fn add_to_inventory(
+    inventory: &mut [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+    stack: play::ItemStack,
+) {
+    for slot in
+        (play::HOTBAR_FIRST_SLOT..PLAY_CONTAINER_SLOTS).chain(STORAGE_FIRST_SLOT..STORAGE_LAST_SLOT)
+    {
+        match inventory[slot] {
+            None => {
+                inventory[slot] = Some(stack);
+                return;
+            }
+            Some(mut existing)
+                if same_item(&existing, &stack) && existing.count + stack.count <= MAX_STACK =>
+            {
+                existing.count += stack.count;
+                inventory[slot] = Some(existing);
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recipes the mock knows how to make in a 3x3 grid. `0` is an empty cell.
+/// Rows are trimmed of empty edges before comparing, so a shape can sit
+/// anywhere in the grid like vanilla.
+fn table_recipe(grid: &[Option<play::ItemStack>]) -> Option<play::ItemStack> {
+    let ids: Vec<Vec<i16>> = (0..3)
+        .map(|row| {
+            (0..3)
+                .map(|col| grid[row * 3 + col].map_or(0, |item| item.id))
+                .collect()
+        })
+        .collect();
+
+    // One log anywhere -> four planks; everything else ignores stack size.
+    let filled: Vec<play::ItemStack> = grid.iter().flatten().copied().collect();
+    if filled.len() == 1 && filled[0].id == LOG_ITEM {
+        let meta = filled[0].damage.clamp(0, 3);
+        return Some(play::ItemStack::new(PLANKS_ITEM, 4, meta));
+    }
+
+    // Trim empty rows and columns.
+    let rows_used: Vec<usize> = (0..3)
+        .filter(|&r| ids[r].iter().any(|&id| id != 0))
+        .collect();
+    let cols_used: Vec<usize> = (0..3).filter(|&c| (0..3).any(|r| ids[r][c] != 0)).collect();
+    if rows_used.is_empty() {
+        return None;
+    }
+    let shape: Vec<Vec<i16>> = rows_used
+        .iter()
+        .map(|&r| cols_used.iter().map(|&c| ids[r][c]).collect())
+        .collect();
+
+    const P: i16 = PLANKS_ITEM;
+    const C: i16 = 4; // cobblestone
+    const I: i16 = 265; // iron ingot
+    const S: i16 = STICK_ITEM;
+    const T: i16 = CRAFTING_TABLE_ITEM;
+
+    let recipes: &[(i16, i8, &[&[i16]])] = &[
+        (S, 4, &[&[P], &[P]]),
+        (T, 1, &[&[P, P], &[P, P]]),
+        (50, 4, &[&[263], &[S]]), // torch: coal over a stick
+        (61, 1, &[&[C, C, C], &[C, 0, C], &[C, C, C]]),
+        (54, 1, &[&[P, P, P], &[P, 0, P], &[P, P, P]]),
+        // Pickaxes.
+        (270, 1, &[&[P, P, P], &[0, S, 0], &[0, S, 0]]),
+        (274, 1, &[&[C, C, C], &[0, S, 0], &[0, S, 0]]),
+        (257, 1, &[&[I, I, I], &[0, S, 0], &[0, S, 0]]),
+        // Axes.
+        (271, 1, &[&[P, P], &[P, S], &[0, S]]),
+        (275, 1, &[&[C, C], &[C, S], &[0, S]]),
+        (258, 1, &[&[I, I], &[I, S], &[0, S]]),
+        // Shovels.
+        (269, 1, &[&[P], &[S], &[S]]),
+        (273, 1, &[&[C], &[S], &[S]]),
+        (256, 1, &[&[I], &[S], &[S]]),
+        // Swords.
+        (268, 1, &[&[P], &[P], &[S]]),
+        (272, 1, &[&[C], &[C], &[S]]),
+        (267, 1, &[&[I], &[I], &[S]]),
+        // Iron armour.
+        (306, 1, &[&[I, I, I], &[I, 0, I]]),
+        (307, 1, &[&[I, 0, I], &[I, I, I], &[I, I, I]]),
+        (308, 1, &[&[I, I, I], &[I, 0, I], &[I, 0, I]]),
+        (309, 1, &[&[I, 0, I], &[I, 0, I]]),
+    ];
+
+    for (id, count, pattern) in recipes {
+        if pattern.len() == shape.len()
+            && pattern
+                .iter()
+                .zip(shape.iter())
+                .all(|(a, b)| a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y))
+        {
+            return Some(play::ItemStack::new(*id, *count, 0));
+        }
+    }
+    None
+}
+
+/// Spend one item from every occupied grid cell (slots 1..=9 of a window).
+fn spend_grid(table: &mut [Option<play::ItemStack>], changed: &mut Vec<usize>) {
+    for (index, cell) in table.iter_mut().enumerate().skip(1).take(9) {
+        if let Some(mut stack) = *cell {
+            stack.count -= 1;
+            *cell = (stack.count > 0).then_some(stack);
+            mark(changed, index);
+        }
+    }
+}
+
+/// One click in the crafting-table window.
+fn click_table(
+    table: &mut [Option<play::ItemStack>],
+    cursor: &mut Option<play::ItemStack>,
+    slot: i16,
+    button: i8,
+    mode: i8,
+) -> ClickResult {
+    let mut changed = Vec::new();
+    let Ok(index) = usize::try_from(slot) else {
+        return ClickResult {
+            accepted: false,
+            changed,
+        };
+    };
+    if index >= TABLE_SLOTS {
+        return ClickResult {
+            accepted: false,
+            changed,
+        };
+    }
+    let grid: Vec<Option<play::ItemStack>> = table[1..10].to_vec();
+
+    if mode == play::click_mode::CLICK && index == 0 {
+        if let Some(result) = table_recipe(&grid) {
+            match cursor.as_mut() {
+                None => {
+                    *cursor = Some(result);
+                    spend_grid(table, &mut changed);
+                }
+                Some(held) if same_item(held, &result) => {
+                    if held.count + result.count <= MAX_STACK {
+                        held.count += result.count;
+                        spend_grid(table, &mut changed);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    } else if mode == play::click_mode::SHIFT_CLICK {
+        // Quick move: output crafts into the player half; storage <-> hotbar.
+        if index == 0 {
+            if let Some(result) = table_recipe(&grid) {
+                if insert_into_window(table, result, &mut changed) {
+                    spend_grid(table, &mut changed);
+                }
+            }
+        } else if (10..37).contains(&index) {
+            quick_move_table(table, index, 37..46, &mut changed);
+        } else {
+            quick_move_table(table, index, 10..37, &mut changed);
+        }
+    } else {
+        let (new_cursor, new_slot) = click_pair(*cursor, table[index], button);
+        *cursor = new_cursor;
+        if new_slot != table[index] {
+            table[index] = new_slot;
+            mark(&mut changed, index);
+        }
+    }
+
+    // Keep the result preview in step with the grid.
+    let preview = table_recipe(&table[1..10]);
+    if table[0] != preview {
+        table[0] = preview;
+        mark(&mut changed, 0);
+    }
+    ClickResult {
+        accepted: true,
+        changed,
+    }
+}
+
+fn insert_into_window(
+    table: &mut [Option<play::ItemStack>],
+    stack: play::ItemStack,
+    changed: &mut Vec<usize>,
+) -> bool {
+    for target in (37..46).chain(10..37) {
+        match table[target] {
+            None => {
+                table[target] = Some(stack);
+                mark(changed, target);
+                return true;
+            }
+            Some(mut existing)
+                if same_item(&existing, &stack) && existing.count + stack.count <= MAX_STACK =>
+            {
+                existing.count += stack.count;
+                table[target] = Some(existing);
+                mark(changed, target);
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn quick_move_table(
+    table: &mut [Option<play::ItemStack>],
+    from: usize,
+    targets: std::ops::Range<usize>,
+    changed: &mut Vec<usize>,
+) {
+    let Some(mut stack) = table[from] else {
+        return;
+    };
+    let original = stack.count;
+    for target in targets {
+        match table[target] {
+            None => {
+                table[target] = Some(stack);
+                table[from] = None;
+                mark(changed, from);
+                mark(changed, target);
+                return;
+            }
+            Some(mut existing) if same_item(&existing, &stack) && existing.count < MAX_STACK => {
+                let take = stack.count.min(MAX_STACK - existing.count);
+                existing.count += take;
+                table[target] = Some(existing);
+                stack.count -= take;
+                mark(changed, target);
+                if stack.count == 0 {
+                    table[from] = None;
+                    mark(changed, from);
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+    if stack.count != original {
+        table[from] = Some(stack);
+        mark(changed, from);
+    }
+}
+
+/// The cursor half of a normal click, shared by the player window and the table.
+fn click_pair(
+    cursor: Option<play::ItemStack>,
+    slot: Option<play::ItemStack>,
+    button: i8,
+) -> (Option<play::ItemStack>, Option<play::ItemStack>) {
+    match (cursor, slot, button) {
+        (None, Some(on_slot), 0) => (Some(on_slot), None),
+        (Some(held), None, 0) => (None, Some(held)),
+        (Some(held), Some(on_slot), 0)
+            if same_item(&held, &on_slot) && on_slot.count < MAX_STACK =>
+        {
+            let take = held.count.min(MAX_STACK - on_slot.count);
+            let mut merged = on_slot;
+            merged.count += take;
+            let left = held.count - take;
+            let cursor = (left > 0).then_some(play::ItemStack::new(held.id, left, held.damage));
+            (cursor, Some(merged))
+        }
+        (Some(held), Some(on_slot), 0) => (Some(on_slot), Some(held)),
+        // Right click: take half or place one.
+        (None, Some(on_slot), _) if on_slot.count > 0 => {
+            let take = (on_slot.count + 1) / 2;
+            let left = on_slot.count - take;
+            let moved = play::ItemStack::new(on_slot.id, take, on_slot.damage);
+            let slot = (left > 0).then_some(play::ItemStack::new(on_slot.id, left, on_slot.damage));
+            (Some(moved), slot)
+        }
+        (Some(held), _, _) if held.count > 0 => {
+            let left = held.count - 1;
+            let cursor = (left > 0).then_some(play::ItemStack::new(held.id, left, held.damage));
+            let placed = play::ItemStack::new(held.id, 1, held.damage);
+            let slot = match slot {
+                Some(on_slot) if same_item(&held, &on_slot) && on_slot.count < MAX_STACK => {
+                    let mut merged = on_slot;
+                    merged.count += 1;
+                    Some(merged)
+                }
+                None => Some(placed),
+                other => other,
+            };
+            (cursor, slot)
+        }
+        (cursor, slot, _) => (cursor, slot),
+    }
+}
+
 /// Drop `block` as an item entity where it was broken, and schedule its pickup.
 ///
 /// Real servers pop the drop out with a little velocity and let gravity settle
@@ -956,6 +1280,8 @@ async fn play_loop(
     // The stack the server thinks is attached to the player's cursor. `C0E`
     // does not carry it; the client only reports the slot it clicked.
     let mut cursor: Option<play::ItemStack> = None;
+    // The open crafting-table window (id 1), if any.
+    let mut table: Option<Vec<Option<play::ItemStack>>> = None;
     let mut next_drop_id: i32 = 1_000;
     let mut picks_up_at: std::collections::VecDeque<PendingPickup> =
         std::collections::VecDeque::new();
@@ -1039,6 +1365,25 @@ async fn play_loop(
                             let face = r.read_u8()?;
                             let held = play::parse_slot(&mut r)?;
                             let _cursor = [r.read_u8()?, r.read_u8()?, r.read_u8()?];
+                            // Right-clicking a crafting table opens the 3x3 GUI.
+                            if world.get_block(x, y, z).id() as i16 == CRAFTING_TABLE_ITEM
+                                && held.and_then(|item| item.block_state()).is_none()
+                            {
+                                let slots = table_window(&inventory);
+                                connection
+                                    .write_packet(&play::open_window(
+                                        1,
+                                        "minecraft:crafting_table",
+                                        "{\"text\":\"Crafting\"}",
+                                        TABLE_SLOTS as u8,
+                                    ))
+                                    .await?;
+                                connection
+                                    .write_packet(&play::window_items(1, &slots))
+                                    .await?;
+                                table = Some(slots);
+                                continue;
+                            }
                             if let Some(item) = held {
                                 if let Some(state) = item.block_state() {
                                     let normal = Face::from_protocol_id(face)
@@ -1074,6 +1419,49 @@ async fn play_loop(
                             let action = r.read_i16()?;
                             let mode = r.read_i8()?;
                             let clicked = play::parse_slot(&mut r)?;
+
+                            if window_id == 1 {
+                                let Some(slots) = table.as_mut() else {
+                                    continue;
+                                };
+                                let stale = usize::try_from(slot)
+                                    .ok()
+                                    .filter(|&index| index < TABLE_SLOTS)
+                                    .is_some_and(|index| slots[index] != clicked);
+                                let mut accepted = !stale;
+                                let mut changed = Vec::new();
+                                if accepted {
+                                    let outcome =
+                                        click_table(slots, &mut cursor, slot, button, mode);
+                                    accepted = outcome.accepted;
+                                    changed = outcome.changed;
+                                }
+                                table_to_inventory(slots, &mut inventory);
+                                for index in changed {
+                                    let item = slots[index];
+                                    connection
+                                        .write_packet(&play::set_slot(1, index as i16, item.as_ref()))
+                                        .await?;
+                                }
+                                if !accepted {
+                                    if let Ok(index) = usize::try_from(slot) {
+                                        if index < TABLE_SLOTS {
+                                            let item = slots[index];
+                                            connection
+                                                .write_packet(&play::set_slot(
+                                                    1,
+                                                    slot,
+                                                    item.as_ref(),
+                                                ))
+                                                .await?;
+                                        }
+                                    }
+                                }
+                                connection
+                                    .write_packet(&play::confirm_transaction(1, action, accepted))
+                                    .await?;
+                                continue;
+                            }
 
                             // The client reports its copy of the clicked slot.
                             // When ours differs the click is stale, so resend
@@ -1119,6 +1507,28 @@ async fn play_loop(
                             connection
                                 .write_packet(&play::confirm_transaction(0, action, accepted))
                                 .await?;
+                        }
+                        play::serverbound::CLOSE_WINDOW => {
+                            let id = packet.reader().read_u8()?;
+                            if id == 1 {
+                                if let Some(mut slots) = table.take() {
+                                    // Return the grid and the cursor to the player.
+                                    for cell in slots.iter_mut().skip(1).take(9) {
+                                        if let Some(item) = cell.take() {
+                                            add_to_inventory(&mut inventory, item);
+                                        }
+                                    }
+                                    if let Some(item) = cursor.take() {
+                                        add_to_inventory(&mut inventory, item);
+                                    }
+                                    connection
+                                        .write_packet(&play::window_items(0, &inventory))
+                                        .await?;
+                                    connection
+                                        .write_packet(&play::close_window(1, false))
+                                        .await?;
+                                }
+                            }
                         }
                         // Everything else (keep-alive echoes, settings,
                         // movement) is intentionally ignored.
@@ -1219,6 +1629,71 @@ mod tests {
             *slot = Some(play::ItemStack::new(1, 1, 0));
         }
         assert_eq!(first_free_slot(&inventory), None);
+    }
+
+    #[test]
+    fn the_3x3_table_knows_the_survival_recipes() {
+        let cell = |id: i16| Some(play::ItemStack::new(id, 1, 0));
+        // Pickaxe: three planks over two sticks.
+        let mut grid = vec![None; 9];
+        grid[0] = cell(PLANKS_ITEM);
+        grid[1] = cell(PLANKS_ITEM);
+        grid[2] = cell(PLANKS_ITEM);
+        grid[4] = cell(STICK_ITEM);
+        grid[7] = cell(STICK_ITEM);
+        assert_eq!(table_recipe(&grid), Some(play::ItemStack::new(270, 1, 0)));
+
+        // Two planks in one column, shifted right, still make sticks.
+        let mut shifted = vec![None; 9];
+        shifted[1] = cell(PLANKS_ITEM);
+        shifted[4] = cell(PLANKS_ITEM);
+        assert_eq!(
+            table_recipe(&shifted),
+            Some(play::ItemStack::new(280, 4, 0))
+        );
+
+        // Torch, furnace and chest.
+        let mut torch = vec![None; 9];
+        torch[1] = cell(263);
+        torch[4] = cell(STICK_ITEM);
+        assert_eq!(table_recipe(&torch), Some(play::ItemStack::new(50, 4, 0)));
+
+        let cobble: Vec<Option<play::ItemStack>> = (0..9)
+            .map(|i| if i == 4 { None } else { cell(4) })
+            .collect();
+        assert_eq!(table_recipe(&cobble), Some(play::ItemStack::new(61, 1, 0)));
+
+        // Malformed shapes do not craft.
+        let mut wrong = vec![None; 9];
+        wrong[0] = cell(STICK_ITEM);
+        wrong[1] = cell(STICK_ITEM);
+        assert_eq!(table_recipe(&wrong), None);
+    }
+
+    #[test]
+    fn clicking_the_result_crafts_and_spends_the_grid() {
+        let mut table = vec![None; TABLE_SLOTS];
+        for cell in [1, 2, 3] {
+            table[cell] = Some(play::ItemStack::new(PLANKS_ITEM, 2, 0));
+        }
+        table[5] = Some(play::ItemStack::new(STICK_ITEM, 2, 0));
+        table[8] = Some(play::ItemStack::new(STICK_ITEM, 2, 0));
+        let mut cursor = None;
+
+        let result = click_table(&mut table, &mut cursor, 0, 0, play::click_mode::CLICK);
+        assert!(result.accepted);
+        assert_eq!(cursor, Some(play::ItemStack::new(270, 1, 0)));
+        assert_eq!(table[1], Some(play::ItemStack::new(PLANKS_ITEM, 1, 0)));
+        assert_eq!(
+            table[5],
+            Some(play::ItemStack::new(STICK_ITEM, 1, 0)),
+            "one stick per craft is spent"
+        );
+        assert_eq!(
+            table[0],
+            Some(play::ItemStack::new(270, 1, 0)),
+            "the preview is recomputed"
+        );
     }
 
     #[test]

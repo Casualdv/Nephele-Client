@@ -27,6 +27,7 @@ talks protocol 47, and joins offline-mode servers.
 - Items: block drops spawn as spinning item entities and are collected into the hotbar
 - First person: a skin-textured arm holding the selected block, with a swing while mining
 - Inventory: survival panel with 2x2 crafting, armour, storage and hotbar; click to move stacks
+- Crafting: right-click a crafting table for the 3x3 grid (tools, torch, furnace, chest, armour)
 - Chat: on-screen log and input, with client-side `/gamemode`, `/tp`, `/setblock`, `/give`
 - UI: title, multiplayer (live ping, MOTD and version), direct connect, pause, settings
   and creative screens; HUD, hotbar, hearts

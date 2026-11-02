@@ -477,6 +477,16 @@ pub struct SetSlot {
     pub item: Option<ItemStack>,
 }
 
+/// `S30` written from the server side, e.g. when a container window opens.
+pub fn window_items(window_id: u8, items: &[Option<ItemStack>]) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_u8(window_id).write_i16(items.len() as i16);
+    for item in items {
+        write_slot(&mut w, item.as_ref());
+    }
+    Packet::new(clientbound::WINDOW_ITEMS, w.into_bytes())
+}
+
 pub fn parse_set_slot(packet: &Packet) -> Result<SetSlot> {
     let mut r = packet.reader();
     let window_id = r.read_i8()?;
