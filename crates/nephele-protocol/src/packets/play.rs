@@ -37,6 +37,7 @@ pub mod clientbound {
     pub const MAP_CHUNK_BULK: i32 = 0x26;
     pub const SET_SLOT: i32 = 0x2F;
     pub const WINDOW_ITEMS: i32 = 0x30;
+    pub const CONFIRM_TRANSACTION: i32 = 0x32;
     pub const PLAYER_LIST_ITEM: i32 = 0x38;
     pub const PLAYER_ABILITIES: i32 = 0x39;
     pub const DISCONNECT: i32 = 0x40;
@@ -56,6 +57,7 @@ pub mod serverbound {
     pub const PLAYER_BLOCK_PLACEMENT: i32 = 0x08;
     pub const HELD_ITEM_CHANGE: i32 = 0x09;
     pub const ANIMATION: i32 = 0x0A;
+    pub const CLICK_WINDOW: i32 = 0x0E;
     pub const CREATIVE_INVENTORY_ACTION: i32 = 0x10;
     pub const CLIENT_SETTINGS: i32 = 0x15;
     pub const CLIENT_STATUS: i32 = 0x16;
@@ -80,6 +82,20 @@ pub mod digging {
 pub const PLAYER_CONTAINER_SLOTS: usize = 45;
 pub const HOTBAR_SLOTS: usize = 9;
 pub const HOTBAR_FIRST_SLOT: usize = 36;
+
+/// Click modes for `C0E Packet Click Window` (`mode` on the wire).
+pub mod click_mode {
+    pub const CLICK: i8 = 0;
+    pub const SHIFT_CLICK: i8 = 1;
+    pub const NUMBER_KEY: i8 = 2;
+    pub const MIDDLE_CLICK: i8 = 3;
+    pub const DROP_KEY: i8 = 4;
+    pub const DRAG: i8 = 5;
+    pub const DOUBLE_CLICK: i8 = 6;
+}
+
+/// The slot number vanilla sends when the cursor leaves the window.
+pub const SLOT_OUTSIDE: i16 = -999;
 
 /// An item stack, as it appears in a slot on the wire.
 ///
@@ -341,7 +357,30 @@ pub fn creative_set_slot(slot: i16, item: Option<&ItemStack>) -> Packet {
     Packet::new(serverbound::CREATIVE_INVENTORY_ACTION, w.into_bytes())
 }
 
-/// A single block change, either from `S23` or one entry of `S22`.
+/// `C0E Click Window` — a single click in an open container.
+///
+/// `action` is the client's running counter for this window; the server echoes
+/// it back in `S32 Confirm Transaction` so the client can tell which prediction
+/// it is confirming. `clicked` is the stack *under the cursor* before the click,
+/// which the server re-validates against its own copy.
+pub fn click_window(
+    window_id: u8,
+    slot: i16,
+    button: i8,
+    action: i16,
+    mode: i8,
+    clicked: Option<&ItemStack>,
+) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_u8(window_id);
+    w.write_i16(slot);
+    w.write_i8(button);
+    w.write_i16(action);
+    w.write_i8(mode);
+    write_slot(&mut w, clicked);
+    Packet::new(serverbound::CLICK_WINDOW, w.into_bytes())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockChange {
     pub x: i32,
@@ -444,6 +483,25 @@ pub fn parse_set_slot(packet: &Packet) -> Result<SetSlot> {
         window_id,
         slot,
         item,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfirmTransaction {
+    pub window_id: i8,
+    /// The `action` number of the `C0E` this answers.
+    pub action: i16,
+    /// `false` means the server rejected the click and the client should
+    /// resync the window (`S30 Window Items`) rather than trust its prediction.
+    pub accepted: bool,
+}
+
+pub fn parse_confirm_transaction(packet: &Packet) -> Result<ConfirmTransaction> {
+    let mut r = packet.reader();
+    Ok(ConfirmTransaction {
+        window_id: r.read_i8()?,
+        action: r.read_i16()?,
+        accepted: r.read_bool()?,
     })
 }
 
@@ -1076,6 +1134,52 @@ mod tests {
         assert_eq!(r.read_u8().unwrap(), 4);
         assert_eq!(r.read_u8().unwrap(), 8);
         assert_eq!(r.read_u8().unwrap(), 12);
+    }
+
+    #[test]
+    fn click_window_carries_the_cursor_stack() {
+        let held = ItemStack::new(3, 12, 0);
+        let packet = click_window(0, 36, 0, 7, click_mode::CLICK, Some(&held));
+        assert_eq!(packet.id, serverbound::CLICK_WINDOW);
+        let mut r = packet.reader();
+        assert_eq!(r.read_u8().unwrap(), 0, "window id");
+        assert_eq!(r.read_i16().unwrap(), 36, "slot");
+        assert_eq!(r.read_i8().unwrap(), 0, "button");
+        assert_eq!(r.read_i16().unwrap(), 7, "action");
+        assert_eq!(r.read_i8().unwrap(), click_mode::CLICK, "mode");
+        assert_eq!(parse_slot(&mut r).unwrap(), Some(held));
+        assert_eq!(r.read_u8().ok(), None, "no trailing bytes");
+    }
+
+    #[test]
+    fn click_window_encodes_an_empty_cursor_as_air() {
+        let packet = click_window(0, SLOT_OUTSIDE, 1, -3, click_mode::CLICK, None);
+        let mut r = packet.reader();
+        r.read_u8().unwrap();
+        assert_eq!(r.read_i16().unwrap(), SLOT_OUTSIDE);
+        assert_eq!(r.read_i8().unwrap(), 1, "right button");
+        assert_eq!(r.read_i16().unwrap(), -3);
+        assert_eq!(r.read_i8().unwrap(), click_mode::CLICK);
+        assert_eq!(parse_slot(&mut r).unwrap(), None);
+    }
+
+    #[test]
+    fn parses_confirm_transaction() {
+        let mut w = PacketWriter::new();
+        w.write_i8(0).write_i16(7).write_bool(false);
+        let confirm = parse_confirm_transaction(&Packet::new(
+            clientbound::CONFIRM_TRANSACTION,
+            w.into_bytes(),
+        ))
+        .expect("confirm");
+        assert_eq!(
+            confirm,
+            ConfirmTransaction {
+                window_id: 0,
+                action: 7,
+                accepted: false,
+            }
+        );
     }
 
     #[test]

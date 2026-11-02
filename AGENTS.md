@@ -380,6 +380,10 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   `a_broken_block_drops_an_item_that_is_picked_up` in
   `crates/nephele-client/tests/join_mock.rs`. `--survival` also joins as
   game mode 0 so the survival mining path (not the creative one-click path) runs.
+- Container clicks use `C0E Click Window` (`click_window`) with the client's own
+  per-window action counter; `S32 Confirm Transaction` answers each click and
+  `accepted = false` means resync from `S30`. Click modes live in
+  `play::click_mode`; `SLOT_OUTSIDE (-999)` is the dropped-outside slot.
 
 **Chat and client-side commands** (added 2026-11-01):
 
@@ -496,9 +500,11 @@ the protocol crate), a death screen, and eating.
 1. **M2: the survival inventory screen.** Vanilla layout (armour, 2×2 crafting,
    27 storage, hotbar) with click / place / take, then recipe matching for
    planks, sticks, the crafting table and a pickaxe — that is the milestone's own
-   exit criterion ("punch a tree and make a pickaxe"). Needs two packets that do
-   not exist yet: `C0E Click Window` and `S32 Confirm Transaction`, plus a
-   `Click Window` handler and a 2×2 recipe table in the mock so it works offline.
+   exit criterion ("punch a tree and make a pickaxe"). The two packets exist now
+   (`click_window(...)` writer and `parse_confirm_transaction`, plus
+   `click_mode`/`SLOT_OUTSIDE` in `packets/play.rs`); what is left is
+   `GameClient::click_slot` with the action counter, a `Click Window` handler and
+   a 2x2 recipe table in the mock so it works offline.
    The data half is already in place (see §11), so this is UI + click protocol +
    recipes. **Chat/commands landed first** (see §11) because they are what make
    the inventory testable (`/give`, `/setblock`, `/gamemode`).
