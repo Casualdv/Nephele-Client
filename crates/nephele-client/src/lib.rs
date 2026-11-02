@@ -9,6 +9,7 @@ pub mod mining;
 pub mod physics;
 pub mod skins;
 
+use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -90,6 +91,13 @@ pub enum Event {
     HeldSlot(i16),
     /// The player inventory changed (contents, not a specific slot).
     Inventory,
+    /// The server answered a container click (`S32`). `accepted = false` means
+    /// the click was rejected and the slot will be resent; the UI should drop
+    /// any prediction it made for it.
+    ConfirmTransaction {
+        action: i16,
+        accepted: bool,
+    },
     /// Another player is breaking a block (`S25`). `stage` 255 = stopped.
     BreakAnimation {
         breaker: i32,
@@ -177,6 +185,9 @@ pub struct GameClient {
     /// Player container contents (`S30` / `S2F`), 45 slots; 36..=44 is the hotbar.
     pub inventory: Vec<Option<ItemStack>>,
     pub held_slot: i16,
+    /// Next `C0E` action number per open window. Vanilla keeps one counter per
+    /// container and the server echoes the value in `S32`.
+    click_actions: HashMap<i8, i16>,
     pub chat: Vec<String>,
     /// Every entity the server has told us about except ourselves.
     pub entities: Entities,
@@ -312,6 +323,7 @@ impl GameClient {
             spawn_position: None,
             inventory: vec![None; play::PLAYER_CONTAINER_SLOTS],
             held_slot: 0,
+            click_actions: HashMap::new(),
             chat: Vec::new(),
             entities: Entities::new(),
             skins: Skins::new(),
@@ -526,6 +538,13 @@ impl GameClient {
                 }
                 Ok(Event::Inventory)
             }
+            play::clientbound::CONFIRM_TRANSACTION => {
+                let confirm = play::parse_confirm_transaction(&packet)?;
+                Ok(Event::ConfirmTransaction {
+                    action: confirm.action,
+                    accepted: confirm.accepted,
+                })
+            }
             play::clientbound::SPAWN_PLAYER => {
                 let spawn = play::parse_spawn_player(&packet)?;
                 if spawn.entity_id == self.info.entity_id {
@@ -708,6 +727,34 @@ impl GameClient {
         Ok(Some(target))
     }
 
+    /// Take the next `C0E` action number and bump the counter.
+    fn next_click_action(&mut self, window: i8) -> i16 {
+        take_click_action(&mut self.click_actions, window)
+    }
+
+    /// Send a `C0E` click in the player container (window 0).
+    ///
+    /// Returns the action number, which comes back in `S32 Confirm Transaction`.
+    /// The packet carries *our* copy of the clicked slot, not the stack under
+    /// the cursor: 1.8's server compares it against its own and rejects the
+    /// click when they differ (then resends the slot), which is the stale
+    /// inventory guard.
+    pub async fn click_slot(&mut self, slot: i16, button: i8, mode: i8) -> Result<i16> {
+        let clicked = clicked_stack(&self.inventory, slot);
+        let action = self.next_click_action(0);
+        self.connection
+            .write_packet(&play::click_window(
+                0,
+                slot,
+                button,
+                action,
+                mode,
+                clicked.as_ref(),
+            ))
+            .await?;
+        Ok(action)
+    }
+
     /// Put `item` into a player-container slot (creative only). `slot` uses
     /// container numbering, so the hotbar is 36..=44.
     pub async fn creative_set_slot(&mut self, slot: i16, item: Option<ItemStack>) -> Result<()> {
@@ -801,6 +848,24 @@ impl fmt::Debug for GameClient {
     }
 }
 
+/// Take the next action number for `window`, bumping that window's counter.
+/// Counters start at zero and wrap rather than overflow.
+fn take_click_action(actions: &mut HashMap<i8, i16>, window: i8) -> i16 {
+    let next = actions.entry(window).or_insert(0);
+    let action = *next;
+    *next = action.wrapping_add(1);
+    action
+}
+
+/// The stack a click reports for `slot`, taken from our own container copy.
+/// Negative slots (outside the window) and out-of-range slots report air.
+fn clicked_stack(inventory: &[Option<ItemStack>], slot: i16) -> Option<ItemStack> {
+    if slot < 0 {
+        return None;
+    }
+    inventory.get(slot as usize).copied().flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +893,32 @@ mod tests {
             let back = yaw_to_mc(yaw_from_mc(degrees));
             assert!((back - degrees).abs() < 1e-3, "{degrees} -> {back}");
         }
+    }
+
+    #[test]
+    fn click_actions_count_per_window_and_wrap() {
+        let mut actions = HashMap::new();
+        assert_eq!(take_click_action(&mut actions, 0), 0);
+        assert_eq!(take_click_action(&mut actions, 0), 1);
+        assert_eq!(take_click_action(&mut actions, 1), 0, "separate window");
+        assert_eq!(take_click_action(&mut actions, 0), 2);
+
+        actions.insert(0, i16::MAX);
+        assert_eq!(take_click_action(&mut actions, 0), i16::MAX);
+        assert_eq!(take_click_action(&mut actions, 0), i16::MIN, "wraps");
+    }
+
+    #[test]
+    fn clicked_stack_reads_our_own_slot_copy() {
+        let mut inventory = vec![None; play::PLAYER_CONTAINER_SLOTS];
+        inventory[36] = Some(ItemStack::new(4, 64, 0));
+        assert_eq!(
+            clicked_stack(&inventory, 36),
+            Some(ItemStack::new(4, 64, 0))
+        );
+        assert_eq!(clicked_stack(&inventory, 37), None, "empty slot");
+        assert_eq!(clicked_stack(&inventory, play::SLOT_OUTSIDE), None);
+        assert_eq!(clicked_stack(&inventory, 999), None, "out of range");
     }
 
     #[test]
