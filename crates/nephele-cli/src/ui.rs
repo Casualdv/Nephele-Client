@@ -47,6 +47,8 @@ pub enum Screen {
     Pause,
     Settings,
     Creative,
+    /// The survival player inventory (2x2 crafting, armour, storage, hotbar).
+    Inventory,
 }
 
 /// A clickable thing the UI drew this frame.
@@ -75,6 +77,8 @@ pub enum Action {
     CreativePage(i32),
     CreativeItem(usize),
     SelectSlot(usize),
+    /// A click on a player-container slot (0..=44).
+    InventorySlot(usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -658,6 +662,160 @@ pub fn draw_creative(
             rect: next,
         });
     }
+    buttons
+}
+
+/// Vanilla player-inventory panel size, in GUI pixels.
+pub const INVENTORY_PANEL_W: f32 = 176.0;
+pub const INVENTORY_PANEL_H: f32 = 166.0;
+const SLOT_SIZE: f32 = 18.0;
+
+fn inventory_panel(scale: f32, width: f32, height: f32) -> Rect {
+    Rect::new(
+        width / 2.0 - INVENTORY_PANEL_W * scale / 2.0,
+        height / 2.0 - INVENTORY_PANEL_H * scale / 2.0,
+        INVENTORY_PANEL_W * scale,
+        INVENTORY_PANEL_H * scale,
+    )
+}
+
+/// Top-left of a player-container slot inside the panel, in GUI pixels.
+///
+/// Vanilla 1.8 layout: output at (144,36), 2x2 grid at (98/116, 18/36), armour
+/// down the left, three storage rows from y=84 and the hotbar at y=142.
+pub fn inventory_slot_origin(slot: usize) -> Option<[f32; 2]> {
+    Some(match slot {
+        0 => [144.0, 36.0],
+        1 => [98.0, 18.0],
+        2 => [116.0, 18.0],
+        3 => [98.0, 36.0],
+        4 => [116.0, 36.0],
+        5..=8 => [8.0, 8.0 + (slot - 5) as f32 * 18.0],
+        9..=35 => {
+            let index = slot - 9;
+            [
+                8.0 + (index % 9) as f32 * 18.0,
+                84.0 + (index / 9) as f32 * 18.0,
+            ]
+        }
+        36..=44 => [8.0 + (slot - 36) as f32 * 18.0, 142.0],
+        _ => return None,
+    })
+}
+
+/// Screen-space rectangle of a container slot, for hit-testing and drawing.
+pub fn inventory_slot_rect(slot: usize, scale: f32, width: f32, height: f32) -> Option<Rect> {
+    let [x, y] = inventory_slot_origin(slot)?;
+    let panel = inventory_panel(scale, width, height);
+    Some(Rect::new(
+        panel.x + x * scale,
+        panel.y + y * scale,
+        SLOT_SIZE * scale,
+        SLOT_SIZE * scale,
+    ))
+}
+
+/// One stack: block icon (or the missing-texture tile) plus a count.
+fn draw_stack(
+    fg: &mut UiBatch,
+    icons: &mut UiBatch,
+    inner: Rect,
+    item: ItemStack,
+    textures: &TextureArray,
+    scale: f32,
+) {
+    let s = |v: f32| v * scale;
+    match item.block_state() {
+        Some(state) => {
+            if let Some((top, side)) = icon_layers(BlockState::from_raw(state), textures) {
+                icons.block_icon(inner.x, inner.y, inner.w, top, side, 1.0);
+            }
+        }
+        None => {
+            // Tools, sticks and food have no uploaded item texture yet; the
+            // missing tile is the project's convention for "no art".
+            let layer = textures.layer_or_missing(MISSING_TEXTURE);
+            icons.block_icon(inner.x, inner.y, inner.w, layer, layer, 1.0);
+        }
+    }
+    if item.count > 1 {
+        let label = item.count.to_string();
+        let text_w = UiBatch::text_width(&label, scale);
+        fg.text(
+            &label,
+            inner.x + inner.w + s(1.0) - text_w,
+            inner.y + inner.h - s(7.0),
+            scale,
+            TEXT,
+        );
+    }
+}
+
+/// The survival inventory: 2x2 crafting, armour, storage and the hotbar, with
+/// the stack under the cursor drawn last.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_inventory(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    icons: &mut UiBatch,
+    hud: &HudState<'_>,
+    cursor: Option<ItemStack>,
+    textures: &TextureArray,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Vec<Button> {
+    let s = |v: f32| v * scale;
+    bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
+
+    let panel = inventory_panel(scale, width, height);
+    bg.rect(panel, PANEL);
+    bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
+    fg.text_centered("Inventory", width / 2.0, panel.y - s(13.0), scale, TEXT);
+    fg.text(
+        "Crafting",
+        panel.x + s(97.0),
+        panel.y + s(6.0),
+        scale,
+        TEXT_DIM,
+    );
+
+    let mut buttons = Vec::new();
+    for slot in 0..nephele_protocol::packets::play::PLAYER_CONTAINER_SLOTS {
+        let Some(rect) = inventory_slot_rect(slot, scale, width, height) else {
+            continue;
+        };
+        bg.rect(
+            rect,
+            if hovered(hud.pointer, &rect) {
+                SLOT_HOVER
+            } else {
+                SLOT_BG
+            },
+        );
+        if let Some(item) = hud.inventory.get(slot).copied().flatten() {
+            let inner = Rect::new(rect.x + s(1.0), rect.y + s(1.0), s(16.0), s(16.0));
+            draw_stack(fg, icons, inner, item, textures, scale);
+        }
+        buttons.push(Button {
+            action: Action::InventorySlot(slot),
+            rect,
+        });
+    }
+
+    if let (Some(item), Some([x, y])) = (cursor, hud.pointer) {
+        let rect = Rect::new(x - s(8.0), y - s(8.0), s(16.0), s(16.0));
+        draw_stack(fg, icons, rect, item, textures, scale);
+    }
+
+    fg.text_centered(
+        "Click to move stacks  -  E / Esc to close",
+        width / 2.0,
+        panel.y + panel.h + s(6.0),
+        scale,
+        TEXT_DIM,
+    );
+
     buttons
 }
 
@@ -1258,6 +1416,41 @@ mod tests {
         // The three buttons must not overlap.
         assert!(buttons[0].rect.y + buttons[0].rect.h <= buttons[1].rect.y);
         assert!(buttons[1].rect.y + buttons[1].rect.h <= buttons[2].rect.y);
+    }
+
+    #[test]
+    fn inventory_slots_sit_where_vanilla_puts_them() {
+        assert_eq!(inventory_slot_origin(0), Some([144.0, 36.0]));
+        assert_eq!(inventory_slot_origin(1), Some([98.0, 18.0]));
+        assert_eq!(inventory_slot_origin(4), Some([116.0, 36.0]));
+        assert_eq!(inventory_slot_origin(5), Some([8.0, 8.0]));
+        assert_eq!(inventory_slot_origin(8), Some([8.0, 62.0]));
+        assert_eq!(inventory_slot_origin(9), Some([8.0, 84.0]));
+        assert_eq!(inventory_slot_origin(35), Some([152.0, 120.0]));
+        assert_eq!(inventory_slot_origin(36), Some([8.0, 142.0]));
+        assert_eq!(inventory_slot_origin(44), Some([152.0, 142.0]));
+        assert_eq!(inventory_slot_origin(45), None);
+    }
+
+    #[test]
+    fn inventory_slot_rects_are_inside_the_panel_and_do_not_overlap() {
+        let (width, height, scale) = (1280.0, 720.0, 3.0);
+        let panel = inventory_panel(scale, width, height);
+        let mut rects: Vec<Rect> = Vec::new();
+        for slot in 0..45 {
+            let rect = inventory_slot_rect(slot, scale, width, height).expect("slot exists");
+            assert!(rect.x >= panel.x && rect.y >= panel.y);
+            assert!(rect.x + rect.w <= panel.x + panel.w);
+            assert!(rect.y + rect.h <= panel.y + panel.h);
+            for other in &rects {
+                let overlap = rect.x < other.x + other.w
+                    && other.x < rect.x + rect.w
+                    && rect.y < other.y + other.h
+                    && other.y < rect.y + rect.h;
+                assert!(!overlap, "slots overlap");
+            }
+            rects.push(rect);
+        }
     }
 
     #[test]

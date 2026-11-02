@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::commands;
+use crate::inventory;
 use crate::mesher::MeshPool;
 use crate::servers::{Ping, PingBoard, ServerEntry, ServerList, Status};
 use crate::settings::Settings;
@@ -165,6 +166,10 @@ struct Shared {
     world_edits: Vec<(i32, i32, i32, u16)>,
     /// `/gamemode` requests; `true` is creative.
     creative_override: Option<bool>,
+    /// Container clicks from the inventory screen; the game thread sends them.
+    inventory_clicks: Vec<(i16, i8, i8, Option<ItemStack>)>,
+    /// Single-player has no server to apply clicks, so the UI applies them.
+    local: bool,
     /// Render distance, pushed to the server as a client-settings update.
     view_distance: u8,
     /// Position at the start of the current tick, and when that tick began, so
@@ -200,6 +205,8 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         chat_out: Vec::new(),
         world_edits: Vec::new(),
         creative_override: None,
+        inventory_clicks: Vec::new(),
+        local: false,
         view_distance: nephele_client::VIEW_DISTANCE,
         prev_position: [0.5, 80.0, 0.5],
         tick_at: Instant::now(),
@@ -461,7 +468,7 @@ async fn net_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 let (position, yaw, pitch, on_ground) = step_player(&shared, &client.world);
-                let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode) = {
+                let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode, clicks) = {
                     let mut state = shared.lock().unwrap();
                     (
                         state.attacking,
@@ -471,8 +478,15 @@ async fn net_loop(
                         std::mem::take(&mut state.chat_out),
                         std::mem::take(&mut state.world_edits),
                         state.creative_override.take(),
+                        std::mem::take(&mut state.inventory_clicks),
                     )
                 };
+                for (slot, button, mode, clicked) in clicks {
+                    client
+                        .click_slot_with(slot, button, mode, clicked)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
                 for line in chat {
                     client
                         .send_chat(&line)
@@ -759,6 +773,10 @@ struct LiveApp {
     settings: Settings,
     pointer: Option<[f32; 2]>,
     creative_page: usize,
+    /// Stack held on the cursor in the inventory screen (client-side only).
+    inventory_cursor: Option<ItemStack>,
+    /// Shift held down, for inventory quick-move clicks.
+    shift: bool,
     last_fps: f32,
     error: Option<Box<dyn Error>>,
 }
@@ -843,6 +861,8 @@ impl LiveApp {
             settings: initial_settings(),
             pointer: None,
             creative_page: 0,
+            inventory_cursor: None,
+            shift: false,
             last_fps: 0.0,
             error: None,
         };
@@ -1556,6 +1576,22 @@ impl LiveApp {
                     height,
                 )
             }
+            Screen::Inventory => {
+                let Some(textures) = self.textures.as_ref() else {
+                    return;
+                };
+                ui::draw_inventory(
+                    &mut self.ui_bg,
+                    &mut self.ui_fg,
+                    &mut self.ui_icons,
+                    &hud,
+                    self.inventory_cursor,
+                    textures,
+                    scale,
+                    width,
+                    height,
+                )
+            }
         };
 
         if self.screen == Screen::Game {
@@ -1618,6 +1654,7 @@ impl LiveApp {
         // Singleplayer starts in creative, like the offline demo always has;
         // `/gamemode survival` switches it for testing.
         self.shared.lock().unwrap().creative = true;
+        self.shared.lock().unwrap().local = true;
         let shared = Arc::clone(&self.shared);
         let tx = self.tx.clone();
         let seed = self.options.seed.unwrap_or_else(|| {
@@ -1930,6 +1967,66 @@ impl LiveApp {
         self.creative_page = 0;
     }
 
+    fn open_inventory(&mut self) {
+        self.screen = Screen::Inventory;
+        self.set_mouse_capture(false);
+        self.inventory_cursor = None;
+    }
+
+    /// Close the inventory, putting whatever is on the cursor back first.
+    fn close_inventory(&mut self) {
+        if self.inventory_cursor.is_some() {
+            let free = {
+                let state = self.shared.lock().unwrap();
+                (play::HOTBAR_FIRST_SLOT..state.inventory.len())
+                    .chain(9..play::HOTBAR_FIRST_SLOT)
+                    .find(|&slot| state.inventory[slot].is_none())
+            };
+            if let Some(slot) = free {
+                self.inventory_click(slot as i16, 0, false);
+            }
+        }
+        self.enter_game();
+    }
+
+    /// Resolve one click in the inventory screen.
+    ///
+    /// The cursor lives here, the slots live on the server (single-player keeps
+    /// them locally). `clicked` is our copy of the slot *before* the click, which
+    /// the server checks for staleness.
+    fn inventory_click(&mut self, slot: i16, button: i8, shift: bool) {
+        let mut state = self.shared.lock().unwrap();
+        let Ok(index) = usize::try_from(slot) else {
+            return;
+        };
+        if index >= state.inventory.len() {
+            return;
+        }
+
+        let clicked = state.inventory[index];
+
+        if shift {
+            // Mode 1 is server-side when there is one; single-player moves it
+            // locally so the item does not disappear.
+            if state.local {
+                inventory::quick_move(&mut state.inventory, index);
+            }
+            state
+                .inventory_clicks
+                .push((slot, 0, play::click_mode::SHIFT_CLICK, clicked));
+            return;
+        }
+
+        let (cursor, new_slot) = inventory::click(self.inventory_cursor, clicked, button);
+        self.inventory_cursor = cursor;
+        if state.local && new_slot != clicked {
+            state.inventory[index] = new_slot;
+        }
+        state
+            .inventory_clicks
+            .push((slot, button, play::click_mode::CLICK, clicked));
+    }
+
     fn enter_game(&mut self) {
         self.screen = Screen::Game;
         self.set_mouse_capture(true);
@@ -2001,6 +2098,9 @@ impl LiveApp {
                 let mut shared = self.shared.lock().unwrap();
                 shared.pending_slot = Some(slot as i16);
             }
+            // Container clicks need the mouse button, so the inventory screen
+            // handles them directly instead of going through this action list.
+            Action::InventorySlot(_) => {}
         }
     }
 }
@@ -2032,6 +2132,9 @@ impl ApplicationHandler for LiveApp {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.shift = modifiers.state().shift_key();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
@@ -2117,6 +2220,7 @@ impl ApplicationHandler for LiveApp {
                         (KeyCode::Escape, ElementState::Pressed) => match self.screen {
                             Screen::Game => self.open_pause(),
                             Screen::Pause | Screen::Creative => self.enter_game(),
+                            Screen::Inventory => self.close_inventory(),
                             Screen::Settings => self.screen = self.settings_return,
                             Screen::Title => {}
                             Screen::Servers => self.screen = Screen::Title,
@@ -2133,9 +2237,12 @@ impl ApplicationHandler for LiveApp {
                                 let creative = self.shared.lock().unwrap().creative;
                                 if creative {
                                     self.open_creative();
+                                } else {
+                                    self.open_inventory();
                                 }
                             }
                             Screen::Creative => self.enter_game(),
+                            Screen::Inventory => self.close_inventory(),
                             Screen::Pause
                             | Screen::Settings
                             | Screen::Title
@@ -2165,6 +2272,19 @@ impl ApplicationHandler for LiveApp {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 // Menus use the free cursor; the game uses the captured one.
+                if self.screen == Screen::Inventory {
+                    if state == ElementState::Pressed {
+                        if let Some([x, y]) = self.pointer {
+                            if let Some(ui::Action::InventorySlot(slot)) =
+                                ui::hit_test(&self.buttons, [x, y])
+                            {
+                                let button = if button == MouseButton::Right { 1 } else { 0 };
+                                self.inventory_click(slot as i16, button, self.shift);
+                            }
+                        }
+                    }
+                    return;
+                }
                 if self.screen != Screen::Game {
                     if button == MouseButton::Left && state == ElementState::Pressed {
                         if let Some([x, y]) = self.pointer {

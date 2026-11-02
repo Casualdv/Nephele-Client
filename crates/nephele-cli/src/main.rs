@@ -1,4 +1,5 @@
 mod commands;
+mod inventory;
 mod live;
 mod mesher;
 mod paths;

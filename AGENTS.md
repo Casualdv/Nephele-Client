@@ -429,6 +429,33 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   covers the whole chain: C10 setup, two `C0E`s to move the log into the grid,
   and a third to take the result.
 
+**Survival inventory screen** (added 2026-11-02):
+
+- `E` in `Screen::Game` opens it when *not* creative; in creative the same key
+  still opens the creative panel. `E`/`Esc` close it.
+- Vanilla 1.8 layout in `ui::inventory_slot_origin` (panel 176x166, output at
+  (144,36), 2x2 grid at (98/116, 18/36), armour down the left from y=8, three
+  storage rows from y=84, hotbar at y=142). `inventory_slot_rect` turns any
+  container slot into a screen rect, and the tests pin the positions plus
+  "inside the panel, never overlapping".
+- Left click takes all / places all / merges up to 64 / swaps; right click takes
+  half / places one. Shift-click quick-moves between hotbar and storage. The
+  rules live in `crates/nephele-cli/src/inventory.rs` (client half) and are
+  mirrored by the mock's `click_container` (server half).
+- **Prediction split:** the cursor stack is pure client state; slots stay
+  server-authoritative. In single-player (`Shared.local`) the same helpers also
+  write the slots, since there is no server. Against a server the click is queued
+  into `Shared.inventory_clicks` and sent as `C0E` with `clicked` = our copy of
+  the slot before the click.
+- Closing while holding a stack puts it back in the first free hotbar/storage
+  slot (a click) instead of vanilla's drop-on-the-ground.
+- **Single-player cannot craft:** there is no recipe evaluator client-side and
+  the output slot is only updated by the server (`S2F` slot 0). The 2x2 recipes
+  exist only in the mock.
+- Item icons: block items use their block texture; everything else (sticks,
+  tools) draws `MISSING_TEXTURE`, because the item texture atlas is prepared but
+  never uploaded.
+
 **Chat and client-side commands** (added 2026-11-01):
 
 - `T` opens the chat line, `/` opens it with a slash prefilled, `Enter` sends,
@@ -530,7 +557,7 @@ the protocol crate), a death screen, and eating.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **110 tests** in `nephele-world`; **407 across the workspace** (1 ignored);
+- **110 tests** in `nephele-world`; **413 across the workspace** (1 ignored);
   13 in the server list (9 list + 4 ping board), 9 `ui` tests for the multiplayer
   screen, 8 for the command parser, 6 for the mock's container-click/crafting
   logic, 3 for the paths module, and two real-socket integration tests in
@@ -543,15 +570,14 @@ the protocol crate), a death screen, and eating.
 
 ## 15. Next move
 
-1. **M2: the survival inventory screen — now the only missing piece.** Vanilla
-   layout (armour, 2x2 crafting, 27 storage, hotbar) with click / place / take.
-   Protocol, client and mock are all in place and tested: `click_window` /
-   `confirm_transaction` / `click_slot_with` (the UI must pass its *predicted*
-   cursor copy) and the mock's `click_container` with the 2x2 recipes. So this
-   slice is pure UI: `Screen::Inventory`, a cursor stack, slot rendering, and
-   wiring clicks to `Shared` -> `GameClient::click_slot_with`. **The pickaxe still
-   needs the 3x3 crafting-table window** (`Use` on a crafted table, window id 1),
-   which belongs in the same slice or right after it — the 2x2 cannot make one.
+1. **M2: the 3x3 crafting table, then the recipe set.** The player inventory
+   screen shipped (see §11): `Screen::Inventory`, the vanilla slot layout, a
+   cursor stack, left/right/shift clicks through `C0E`, and the mock's 2x2
+   recipes. What is missing for "punch a tree and make a pickaxe" is the **3x3
+   crafting-table window**: `Use` on a placed table must open window id 1
+   (`S2D Open Window`) with a 3x3 grid + result, the mock must serve that window
+   (tools, torch, furnace, chest, armour from planks/sticks/cobble), and the UI
+   needs the second panel. The 2x2 cannot make a pickaxe.
 2. **Death screen + eating.** Small, and the other half of the survival loop.
 3. **World creation screen** — smaller. `local_loop` already takes a seed and
    `play --seed` already parses one; v1 creates but does not save (region writing is
