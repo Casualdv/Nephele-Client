@@ -1632,6 +1632,47 @@ mod tests {
     }
 
     #[test]
+    fn the_survival_chain_reaches_a_pickaxe() {
+        // M2's exit criterion, pinned as data: one log becomes planks, planks
+        // become sticks and a table, and planks plus sticks make a pickaxe.
+        let cell = |id: i16| Some(play::ItemStack::new(id, 1, 0));
+
+        let mut log = vec![None; 9];
+        log[4] = Some(play::ItemStack::new(LOG_ITEM, 1, 0));
+        let planks = table_recipe(&log).expect("a log makes planks");
+        assert_eq!((planks.id, planks.count), (PLANKS_ITEM, 4));
+
+        let mut sticks = vec![None; 9];
+        sticks[0] = cell(PLANKS_ITEM);
+        sticks[3] = cell(PLANKS_ITEM);
+        assert_eq!(
+            table_recipe(&sticks).map(|s| (s.id, s.count)),
+            Some((STICK_ITEM, 4))
+        );
+
+        let table: Vec<Option<play::ItemStack>> = (0..9)
+            .map(|i| {
+                if matches!(i, 0 | 1 | 3 | 4) {
+                    cell(PLANKS_ITEM)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            table_recipe(&table).map(|s| s.id),
+            Some(CRAFTING_TABLE_ITEM)
+        );
+
+        let mut pickaxe = vec![None; 9];
+        for slot in pickaxe.iter_mut().take(3) {
+            *slot = cell(PLANKS_ITEM);
+        }
+        pickaxe[4] = cell(STICK_ITEM);
+        pickaxe[7] = cell(STICK_ITEM);
+        assert_eq!(table_recipe(&pickaxe).map(|s| s.id), Some(270));
+    }
+    #[test]
     fn the_3x3_table_knows_the_survival_recipes() {
         let cell = |id: i16| Some(play::ItemStack::new(id, 1, 0));
         // Pickaxe: three planks over two sticks.

@@ -589,7 +589,13 @@ entities, item-atlas rendering, and a singleplayer recipe evaluator.
 
 ## 15. Next move
 
-**Death screen: done.** Health reaching 0 raises `Screen::Death` ("You Died!" plus a
+**M2 is closed.** Tick, hunger/XP, drops, inventory, 2x2 + 3x3 crafting, death
+screen and respawn all work against the mock, and the exit criterion (punch a tree,
+make a pickaxe) is pinned by `the_survival_chain_reaches_a_pickaxe` in
+`nephele-mock`. Tool durability, armour effects and tool tiers were left out on
+purpose and live in the backlog table instead.
+
+Death screen: done. Health reaching 0 raises `Screen::Death` ("You Died!" plus a
 Respawn button). The button sets `Shared::pending_respawn`, which the network loop
 turns into `client_status(0)` (`GameClient::respawn`), and the stale zero is cleared
 so the screen cannot bounce back before the server's own update lands.

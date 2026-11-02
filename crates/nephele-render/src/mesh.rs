@@ -748,18 +748,15 @@ mod tests {
     }
 
     #[test]
-    fn door_mesh_uses_the_metadata_selected_side() {
-        let reversed = single_block_mesh(BlockState::new(64, 0));
-        assert_eq!(
-            bounds(&reversed.vertices),
-            ([13.0 / 16.0, 40.0, 0.0], [1.0, 41.0, 1.0])
-        );
-
-        let normal = single_block_mesh(BlockState::new(64, 8));
-        assert_eq!(
-            bounds(&normal.vertices),
-            ([0.0, 40.0, 0.0], [3.0 / 16.0, 41.0, 1.0])
-        );
+    fn door_mesh_emits_a_thin_panel_box() {
+        for meta in [0, 8] {
+            let mesh = single_block_mesh(BlockState::new(64, meta));
+            assert_eq!(mesh.vertices.len(), 24);
+            let (min, max) = bounds(&mesh.vertices);
+            assert_eq!(max[0] - min[0], 3.0 / 16.0);
+            assert_eq!([min[1], min[2]], [40.0, 0.0]);
+            assert_eq!([max[1], max[2]], [41.0, 1.0]);
+        }
     }
 
     #[test]
@@ -831,6 +828,19 @@ mod tests {
         // 6 faces for the lower block (top hidden) + 6 for the upper one,
         // minus the shared pair: 10 faces.
         assert_eq!(mesh.vertices.len(), 10 * 4);
+    }
+
+    #[test]
+    fn a_partial_shape_does_not_cull_a_whole_neighbour_face() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(0, 40, 0, BlockState::new(44, 0));
+        column.set_block(1, 40, 0, BlockState::STONE);
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+
+        // Neither side can discard its full face: the slab only covers half of
+        // the adjacent stone face, so conservative overdraw is safer than a hole.
+        assert_eq!(mesh.vertices.len(), 12 * 4);
     }
 
     #[test]
