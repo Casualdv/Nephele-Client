@@ -308,6 +308,8 @@ fn shift_craft_local_outputs(state: &mut Shared) {
 }
 
 pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
+    perf::start();
+    let settings = initial_settings();
     let shared = Arc::new(Mutex::new(Shared {
         player: PlayerState::default(),
         yaw: 0.0,
@@ -342,7 +344,7 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         local_container: LocalContainer::default(),
         close_window: false,
         local: false,
-        view_distance: nephele_client::VIEW_DISTANCE,
+        view_distance: configured_view_distance(&settings),
         prev_position: [0.5, 80.0, 0.5],
         tick_at: Instant::now(),
     }));
@@ -351,7 +353,7 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
 
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = LiveApp::new(options, shared, rx, tx);
+    let mut app = LiveApp::new(options, shared, rx, tx, settings);
     event_loop.run_app(&mut app)?;
     match app.error.take() {
         Some(err) => Err(err),
@@ -426,7 +428,7 @@ fn local_loop(
 
     loop {
         let (position, yaw, pitch, _on_ground) = step_player(&shared, &world);
-        radius = view_radius(shared.lock().unwrap().view_distance);
+        radius = local_stream_radius(&shared.lock().unwrap());
 
         // Stream generated columns around the player.
         let centre = (
@@ -1033,6 +1035,7 @@ impl LiveApp {
         shared: Arc<Mutex<Shared>>,
         rx: Receiver<NetMsg>,
         tx: Sender<NetMsg>,
+        settings: Settings,
     ) -> Self {
         let env_screen = match std::env::var("NEPHELE_SCREEN").as_deref() {
             Ok("creative") => Some(Screen::Creative),
@@ -1111,7 +1114,7 @@ impl LiveApp {
             last_server_click: None,
             settings_return: Screen::Pause,
             focus_gained: None,
-            settings: initial_settings(),
+            settings,
             saves_dir,
             worlds: Vec::new(),
             worlds_scroll: 0,
@@ -1154,6 +1157,7 @@ impl LiveApp {
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) {
+        let window_start = Instant::now();
         let attributes = Window::default_attributes()
             .with_title("Nephele")
             .with_inner_size(LogicalSize::new(1280.0, 720.0));
@@ -1161,11 +1165,14 @@ impl LiveApp {
             Ok(window) => Arc::new(window),
             Err(err) => return self.fail(event_loop, err),
         };
+        perf::record_stage_span("window_init", window_start, Instant::now());
 
+        let texture_decode_start = Instant::now();
         let textures = match TextureArray::load_from_dir(&self.options.assets_dir) {
             Ok(textures) => textures,
             Err(err) => return self.fail(event_loop, err),
         };
+        perf::record_stage_span("texture_atlas_decode", texture_decode_start, Instant::now());
         // The UI sheets live one level up: `textures/font`, `textures/gui`.
         let ui_root = self
             .options
@@ -1173,12 +1180,14 @@ impl LiveApp {
             .parent()
             .map(|path| path.to_path_buf())
             .unwrap_or_else(|| self.options.assets_dir.clone());
+        let ui_decode_start = Instant::now();
         let ui_atlas = match UiAtlas::load(&ui_root) {
             Ok(atlas) => atlas,
             Err(err) => {
                 return self.fail(event_loop, format!("could not build the UI atlas: {err}"));
             }
         };
+        perf::record_stage_span("ui_atlas_decode", ui_decode_start, Instant::now());
 
         // Title screen art: the panorama cube and the splash line.
         let panorama = Panorama::load(&ui_root).ok();
@@ -1193,6 +1202,7 @@ impl LiveApp {
         }
 
         let size = window.inner_size();
+        let renderer_start = Instant::now();
         let mut renderer = match Renderer::new(
             window.clone(),
             size.width,
@@ -1204,6 +1214,12 @@ impl LiveApp {
             Ok(renderer) => renderer,
             Err(err) => return self.fail(event_loop, err),
         };
+        perf::record_stage_span("renderer_init", renderer_start, Instant::now());
+        for sample in renderer.startup_timings().samples() {
+            let started = renderer_start + sample.start;
+            let ended = started + sample.duration;
+            perf::record_stage_span(sample.stage.name(), started, ended);
+        }
 
         {
             let mut state = self.shared.lock().unwrap();
@@ -1220,16 +1236,15 @@ impl LiveApp {
         }
         self.mesh_pool = Some(pool);
         self.textures = Some(textures);
-        self.renderer = Some(renderer);
         self.window = Some(window);
-        self.last_frame = Instant::now();
 
         // Upload the stand-in skin immediately; otherwise the entity atlas is
         // still all-transparent (and every humanoid is discarded) until the
         // first real skin downloads.
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer.set_skins(&self.skin_atlas);
-        }
+        let skin_upload_start = Instant::now();
+        renderer.set_skins(&self.skin_atlas);
+        perf::record_stage_span("texture_atlas_upload", skin_upload_start, Instant::now());
+        self.renderer = Some(renderer);
     }
 
     fn set_mouse_capture(&mut self, captured: bool) {
@@ -1284,9 +1299,10 @@ impl LiveApp {
         let min = [key.0 as f32 * 16.0, 0.0, key.1 as f32 * 16.0];
         let max = [min[0] + 16.0, 256.0, min[2] + 16.0];
         if let Some(renderer) = self.renderer.as_mut() {
+            let upload_start = Instant::now();
             renderer.set_chunk(key, mesh, min, max);
             if !mesh.is_empty() {
-                perf::record_chunk_upload();
+                perf::record_chunk_upload(upload_start, upload_start.elapsed());
             }
         }
     }
@@ -1670,6 +1686,7 @@ impl LiveApp {
         }
 
         let mut presented = false;
+        let first_frame = self.prof_frames == 0;
         let draw_start = Instant::now();
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_panorama(title);
@@ -1679,6 +1696,9 @@ impl LiveApp {
                 // burning CPU, and don't count those as frames.
                 _ => std::thread::sleep(Duration::from_millis(8)),
             }
+        }
+        if first_frame {
+            perf::record_stage_span("first_frame_pipeline_creation", draw_start, Instant::now());
         }
         self.prof_draw += draw_start.elapsed().as_secs_f32() * 1000.0;
 
@@ -3008,13 +3028,29 @@ impl ApplicationHandler for LiveApp {
 /// Settings for this run. `NEPHELE_VIEW_DISTANCE` overrides the render
 /// distance so the far view can be exercised without clicking through Options.
 fn initial_settings() -> Settings {
-    let mut settings = Settings::default();
-    if let Ok(value) = std::env::var("NEPHELE_VIEW_DISTANCE") {
+    settings_with_view_distance_override(
+        Settings::default(),
+        std::env::var("NEPHELE_VIEW_DISTANCE").ok().as_deref(),
+    )
+}
+
+fn settings_with_view_distance_override(mut settings: Settings, value: Option<&str>) -> Settings {
+    if let Some(value) = value {
         if let Ok(distance) = value.trim().parse::<u8>() {
             settings.view_distance = distance.clamp(2, 16);
         }
     }
     settings
+}
+
+/// The configured render distance before the first local world starts.
+fn configured_view_distance(settings: &Settings) -> u8 {
+    settings.view_distance
+}
+
+/// The chunk radius the local streaming loop uses for the shared state.
+fn local_stream_radius(state: &Shared) -> i32 {
+    view_radius(state.view_distance)
 }
 
 /// Chunk radius to generate around the player for a given render distance.
@@ -3223,6 +3259,19 @@ mod tests {
         assert_eq!(state.inventory[36], Some(ItemStack::new(5, 8, 0)));
         assert_eq!(state.local_container.grid()[0], None);
         assert_eq!(state.window_slots[0], None);
+    }
+
+    #[test]
+    fn nephele_view_distance_override_reaches_the_local_streaming_radius() {
+        let settings = settings_with_view_distance_override(Settings::default(), Some("6"));
+        let mut state = local_state_for_test();
+        state.view_distance = configured_view_distance(&settings);
+
+        assert_eq!(local_stream_radius(&state), 6);
+
+        let settings = settings_with_view_distance_override(Settings::default(), Some("11"));
+        state.view_distance = configured_view_distance(&settings);
+        assert_eq!(local_stream_radius(&state), 11);
     }
 
     #[test]

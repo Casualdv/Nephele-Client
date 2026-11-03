@@ -15,7 +15,7 @@ pub use camera::Camera;
 pub use entity::{
     append_hand, build_entities, EntityDraw, EntityMesh, EntityVertex, HandDraw, HandPose,
 };
-pub use gpu::{DrawOutcome, Renderer, RendererError};
+pub use gpu::{DrawOutcome, Renderer, RendererError, StartupSample, StartupStage, StartupTimings};
 pub use lines::{block_outline, LineMesh, LineVertex};
 pub use mesh::{
     break_overlay_texture, build_break_overlay, build_column_mesh, build_hand_item,
