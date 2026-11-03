@@ -1826,6 +1826,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn biome_results_do_not_depend_on_query_rectangle_size() {
+        let (area_x, area_z) = (-160, -64);
+        let (width, height) = (16usize, 16usize);
+        let mut rectangle = BiomeLayers::new(12345);
+        let expected = rectangle.biomes(area_x, area_z, width, height);
+
+        let mut points = BiomeLayers::new(12345);
+        let mut actual = Vec::with_capacity(width * height);
+        for z in 0..height {
+            for x in 0..width {
+                actual.extend(points.biomes(area_x + x as i32, area_z + z as i32, 1, 1));
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
     /// Every chunk the real 1.8.9 server generated must carry the same biome
     /// ids we produce. This is what proves the chain is a faithful port.
     ///
@@ -1869,14 +1886,30 @@ mod tests {
                                 bad += 1;
                                 if first == 0 {
                                     first = 1;
+                                    let block_x = stored.x * 16 + x;
+                                    let block_z = stored.z * 16 + z;
+                                    let parent_x = (block_x - 2) >> 2;
+                                    let parent_z = (block_z - 2) >> 2;
+                                    let hills_x = parent_x >> 4;
+                                    let hills_z = parent_z >> 4;
                                     println!(
                                         "first mismatch: block=({},{}) chunk=({},{}) ours={} real={}",
-                                        stored.x * 16 + x,
-                                        stored.z * 16 + z,
+                                        block_x,
+                                        block_z,
                                         stored.x,
                                         stored.z,
                                         ours[i],
                                         stored.biomes[i]
+                                    );
+                                    println!(
+                                        "1:4 parents at ({parent_x},{parent_z}): chain={:?} smooth={:?} mixed={:?}",
+                                        layers.debug_chain(parent_x - 1, parent_z - 1, 4, 4),
+                                        layers.debug_smoothed(parent_x - 1, parent_z - 1, 4, 4),
+                                        layers.debug_mixed(parent_x - 1, parent_z - 1, 4, 4),
+                                    );
+                                    println!(
+                                        "hills near ({hills_x},{hills_z})={:?}",
+                                        layers.debug_hills_only(hills_x - 2, hills_z - 2, 6, 6),
                                     );
                                 }
                             }

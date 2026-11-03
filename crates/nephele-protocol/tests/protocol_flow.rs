@@ -292,6 +292,31 @@ async fn a_play_packet_can_arrive_across_many_tcp_writes() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn play_disconnect_returns_the_server_reason() {
+    let (listener, port) = accept_one().await;
+
+    let server = tokio::spawn(async move {
+        let mut server = accept(listener).await;
+        let mut w = PacketWriter::new();
+        w.write_string(r#"{"text":"Kicked: ","extra":[{"text":"not allowed"}]}"#);
+        server
+            .write_packet(&Packet::new(play::clientbound::DISCONNECT, w.into_bytes()))
+            .await
+            .unwrap();
+    });
+
+    let mut client = connect(port).await;
+    client.set_state(State::Play);
+    let error = client.next_play_packet().await.unwrap_err();
+    assert!(matches!(
+        error,
+        nephele_protocol::Error::Disconnected(reason) if reason == "Kicked: not allowed"
+    ));
+
+    server.await.unwrap();
+}
+
 /// Sanity check that `Connection::from_stream` handles a socket produced by
 /// `TcpStream::connect` too (keeps the test helper honest).
 #[allow(dead_code)]

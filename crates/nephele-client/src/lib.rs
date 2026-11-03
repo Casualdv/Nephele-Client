@@ -1252,6 +1252,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn login_finish_advertises_the_nephele_brand() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = listener.local_addr().unwrap();
+        let (client_stream, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(socket), listener.accept());
+        let client_stream = client_stream.unwrap();
+        let (server_stream, _) = accepted.unwrap();
+        let mut server = Connection::from_stream(server_stream, nephele_protocol::State::Play);
+        let server_task = tokio::spawn(async move {
+            let mut join = nephele_protocol::PacketWriter::new();
+            join.write_i32(1)
+                .write_u8(0)
+                .write_i8(0)
+                .write_u8(1)
+                .write_u8(20)
+                .write_string("default")
+                .write_bool(false);
+            server
+                .write_packet(&Packet::new(
+                    play::clientbound::JOIN_GAME,
+                    join.into_bytes(),
+                ))
+                .await
+                .unwrap();
+
+            let settings = server.read_packet().await.unwrap();
+            assert_eq!(settings.id, play::serverbound::CLIENT_SETTINGS);
+            let brand = server.read_packet().await.unwrap();
+            let brand = play::parse_plugin_message(&brand).unwrap();
+            assert_eq!(brand.channel, "MC|Brand");
+            assert_eq!(play::parse_plugin_brand(&brand.data).unwrap(), "Nephele");
+            let status = server.read_packet().await.unwrap();
+            assert_eq!(status.id, play::serverbound::CLIENT_STATUS);
+            assert_eq!(status.reader().read_varint().unwrap(), 0);
+        });
+
+        let address = ServerAddress::parse("127.0.0.1").unwrap();
+        let client = GameClient::finish(
+            Connection::from_stream(client_stream, nephele_protocol::State::Play),
+            &address,
+            "00000000000000000000000000000001".into(),
+            "Tester".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(client.info.username, "Tester");
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_brand_and_block_entity_packets_are_retained() {
+        let (mut client, _peer) = test_game_client().await;
+
+        let mut brand_data = nephele_protocol::PacketWriter::new();
+        brand_data.write_string("Paper");
+        let mut plugin = nephele_protocol::PacketWriter::new();
+        plugin
+            .write_string("MC|Brand")
+            .write_bytes(brand_data.as_slice());
+        let event = client
+            .handle(Packet::new(
+                play::clientbound::PLUGIN_MESSAGE,
+                plugin.into_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(event, Event::ServerBrand("Paper".into()));
+        assert_eq!(client.server_brand.as_deref(), Some("Paper"));
+
+        let mut block_entity = nephele_protocol::PacketWriter::new();
+        play::write_position(&mut block_entity, -1, 70, 16);
+        block_entity
+            .write_u8(6)
+            .write_u8(10)
+            .write_string("")
+            .write_u8(0);
+        let event = client
+            .handle(Packet::new(
+                play::clientbound::BLOCK_ENTITY_DATA,
+                block_entity.into_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            event,
+            Event::BlockEntityUpdated {
+                x: -1,
+                y: 70,
+                z: 16,
+                action: 6,
+            }
+        );
+        assert_eq!(client.block_entities[&(-1, 70, 16)].action, 6);
+    }
+
+    #[tokio::test]
     async fn partial_chunk_sections_merge_when_they_arrive_out_of_order() {
         let (mut client, _peer) = test_game_client().await;
         let mut upper = ChunkColumn::empty(-2, 3);

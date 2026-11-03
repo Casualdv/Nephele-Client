@@ -15,6 +15,8 @@ pub struct StoredSection {
     pub blocks: [u8; SECTION_VOLUME],
     pub add: Option<[u8; SECTION_VOLUME / 2]>,
     pub data: Option<[u8; SECTION_VOLUME / 2]>,
+    pub block_light: Option<[u8; SECTION_VOLUME / 2]>,
+    pub sky_light: Option<[u8; SECTION_VOLUME / 2]>,
 }
 
 impl StoredSection {
@@ -94,12 +96,16 @@ impl StoredChunk {
 
                 let add = read_nibbles(entry.get("Add"));
                 let data = read_nibbles(entry.get("Data"));
+                let block_light = read_nibbles(entry.get("BlockLight"));
+                let sky_light = read_nibbles(entry.get("SkyLight"));
 
                 sections.push(StoredSection {
                     y: y as i8,
                     blocks: packed,
                     add,
                     data,
+                    block_light,
+                    sky_light,
                 });
             }
         }
@@ -150,6 +156,93 @@ impl StoredChunk {
     }
 }
 
+/// Encodes one stored chunk as the named NBT root used by a 1.8 Anvil region.
+pub fn encode_chunk_nbt(chunk: &StoredChunk) -> Result<Vec<u8>, ChunkError> {
+    if chunk.biomes.len() != 256 {
+        return Err(ChunkError::BadBiomeLength {
+            length: chunk.biomes.len(),
+        });
+    }
+
+    let mut sections = chunk.sections.clone();
+    sections.sort_by_key(|section| section.y);
+    for (index, section) in sections.iter().enumerate() {
+        if !(0..16).contains(&section.y) {
+            return Err(ChunkError::BadSectionY(section.y));
+        }
+        if index > 0 && sections[index - 1].y == section.y {
+            return Err(ChunkError::DuplicateSectionY(section.y));
+        }
+    }
+
+    let section_tags = sections
+        .iter()
+        .map(|section| {
+            let mut fields = std::collections::HashMap::new();
+            fields.insert("Y".to_string(), Tag::Byte(section.y));
+            fields.insert(
+                "Blocks".to_string(),
+                Tag::ByteArray(section.blocks.to_vec()),
+            );
+            if let Some(add) = section.add {
+                fields.insert("Add".to_string(), Tag::ByteArray(add.to_vec()));
+            }
+            fields.insert(
+                "Data".to_string(),
+                Tag::ByteArray(section.data.unwrap_or([0; SECTION_VOLUME / 2]).to_vec()),
+            );
+            fields.insert(
+                "BlockLight".to_string(),
+                Tag::ByteArray(
+                    section
+                        .block_light
+                        .unwrap_or([0; SECTION_VOLUME / 2])
+                        .to_vec(),
+                ),
+            );
+            fields.insert(
+                "SkyLight".to_string(),
+                Tag::ByteArray(
+                    section
+                        .sky_light
+                        .unwrap_or([0; SECTION_VOLUME / 2])
+                        .to_vec(),
+                ),
+            );
+            Tag::Compound(fields)
+        })
+        .collect();
+
+    let height_map = (0..16)
+        .flat_map(|z| {
+            (0..16).map(move |x| {
+                chunk
+                    .height(x, z)
+                    .map(|height| height as i32 + 1)
+                    .unwrap_or(0)
+            })
+        })
+        .collect();
+
+    let mut level = std::collections::HashMap::new();
+    level.insert("xPos".to_string(), Tag::Int(chunk.x));
+    level.insert("zPos".to_string(), Tag::Int(chunk.z));
+    level.insert("LastUpdate".to_string(), Tag::Long(0));
+    level.insert("InhabitedTime".to_string(), Tag::Long(0));
+    level.insert("TerrainPopulated".to_string(), Tag::Byte(1));
+    level.insert("LightPopulated".to_string(), Tag::Byte(1));
+    level.insert("Sections".to_string(), Tag::List(section_tags));
+    level.insert("Biomes".to_string(), Tag::ByteArray(chunk.biomes.clone()));
+    level.insert("HeightMap".to_string(), Tag::IntArray(height_map));
+    level.insert("Entities".to_string(), Tag::List(Vec::new()));
+    level.insert("TileEntities".to_string(), Tag::List(Vec::new()));
+    level.insert("TileTicks".to_string(), Tag::List(Vec::new()));
+
+    let mut root = std::collections::HashMap::new();
+    root.insert("Level".to_string(), Tag::Compound(level));
+    Ok(nbt::encode("", &Tag::Compound(root))?)
+}
+
 fn read_nibbles(tag: Option<&Tag>) -> Option<[u8; SECTION_VOLUME / 2]> {
     let bytes = tag.and_then(Tag::as_byte_array)?;
     if bytes.len() != SECTION_VOLUME / 2 {
@@ -168,6 +261,12 @@ pub enum ChunkError {
     MissingPosition,
     #[error("section Y={y} has {length} blocks, expected {SECTION_VOLUME}")]
     BadSectionLength { y: i8, length: usize },
+    #[error("chunk has {length} biome bytes, expected 256")]
+    BadBiomeLength { length: usize },
+    #[error("cannot encode section with Y={0}; expected 0..16")]
+    BadSectionY(i8),
+    #[error("chunk contains duplicate section Y={0}")]
+    DuplicateSectionY(i8),
     #[error(transparent)]
     Nbt(#[from] NbtError),
 }
@@ -238,6 +337,8 @@ mod tests {
             blocks: [0; SECTION_VOLUME],
             add: None,
             data: None,
+            block_light: None,
+            sky_light: None,
         };
         // Index = (y*16 + z)*16 + x
         section.blocks[(3 * 16 + 5) * 16 + 7] = 42;
@@ -252,6 +353,8 @@ mod tests {
             blocks: [0; SECTION_VOLUME],
             add: Some([0; SECTION_VOLUME / 2]),
             data: Some([0; SECTION_VOLUME / 2]),
+            block_light: None,
+            sky_light: None,
         };
         // (x, y, z) = (1, 0, 0) is index ((y * 16) + z) * 16 + x = 1.
         let index = 1;
@@ -262,5 +365,42 @@ mod tests {
         assert_eq!(section.block(1, 0, 0), 0x103);
         assert_eq!(section.metadata(1, 0, 0), 5);
         assert_eq!(section.state(1, 0, 0), (0x103 << 4) | 5);
+    }
+
+    #[test]
+    fn encoded_chunk_nbt_roundtrips_states_and_biomes() {
+        let mut section = StoredSection {
+            y: 4,
+            blocks: [0; SECTION_VOLUME],
+            add: Some([0; SECTION_VOLUME / 2]),
+            data: Some([0; SECTION_VOLUME / 2]),
+            block_light: Some([0xAB; SECTION_VOLUME / 2]),
+            sky_light: Some([0xFF; SECTION_VOLUME / 2]),
+        };
+        let index = (2 * 16 + 3) * 16 + 1;
+        section.blocks[index] = 3;
+        section.add.as_mut().unwrap()[index / 2] = 0x10;
+        section.data.as_mut().unwrap()[index / 2] = 0x50;
+        let original = StoredChunk {
+            x: -7,
+            z: 12,
+            sections: vec![section],
+            biomes: vec![6; 256],
+        };
+
+        let bytes = encode_chunk_nbt(&original).unwrap();
+        let decoded = parse_chunk(&bytes).unwrap();
+
+        assert_eq!((decoded.x, decoded.z), (-7, 12));
+        assert_eq!(decoded.state(1, 4 * 16 + 2, 3), (0x103 << 4) | 5);
+        assert_eq!(decoded.biome(15, 15), Some(6));
+        assert_eq!(
+            decoded.sections[0].block_light,
+            original.sections[0].block_light
+        );
+        assert_eq!(
+            decoded.sections[0].sky_light,
+            original.sections[0].sky_light
+        );
     }
 }

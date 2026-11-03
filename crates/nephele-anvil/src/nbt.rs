@@ -82,6 +82,16 @@ pub enum NbtError {
     Utf8(#[from] std::str::Utf8Error),
     #[error("NBT nesting exceeded {0} levels")]
     TooDeep(usize),
+    #[error("NBT string is {0} bytes, longer than the 16-bit length limit")]
+    StringTooLong(usize),
+    #[error("NBT payload length {0} exceeds the 32-bit length limit")]
+    LengthTooLarge(usize),
+    #[error("NBT list contains different tag types")]
+    HeterogeneousList,
+    #[error("TAG_End cannot be used as a compound value")]
+    EndTagValue,
+    #[error("TAG_End cannot be an NBT root")]
+    EndRoot,
 }
 
 const MAX_DEPTH: usize = 512;
@@ -210,6 +220,112 @@ pub fn parse(data: &[u8]) -> Result<(String, Tag), NbtError> {
     Ok((name, tag))
 }
 
+/// Writes a named NBT root tag.
+pub fn encode(name: &str, tag: &Tag) -> Result<Vec<u8>, NbtError> {
+    let kind = tag_id(tag);
+    if kind == 0 {
+        return Err(NbtError::EndRoot);
+    }
+
+    let mut out = Vec::new();
+    out.push(kind);
+    write_string(&mut out, name)?;
+    write_payload(&mut out, tag, 0)?;
+    Ok(out)
+}
+
+fn tag_id(tag: &Tag) -> u8 {
+    match tag {
+        Tag::End => 0,
+        Tag::Byte(_) => 1,
+        Tag::Short(_) => 2,
+        Tag::Int(_) => 3,
+        Tag::Long(_) => 4,
+        Tag::Float(_) => 5,
+        Tag::Double(_) => 6,
+        Tag::ByteArray(_) => 7,
+        Tag::String(_) => 8,
+        Tag::List(_) => 9,
+        Tag::Compound(_) => 10,
+        Tag::IntArray(_) => 11,
+        Tag::LongArray(_) => 12,
+    }
+}
+
+fn write_string(out: &mut Vec<u8>, value: &str) -> Result<(), NbtError> {
+    let bytes = value.as_bytes();
+    let length = u16::try_from(bytes.len()).map_err(|_| NbtError::StringTooLong(bytes.len()))?;
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn write_length(out: &mut Vec<u8>, length: usize) -> Result<(), NbtError> {
+    let length = i32::try_from(length).map_err(|_| NbtError::LengthTooLarge(length))?;
+    out.extend_from_slice(&length.to_be_bytes());
+    Ok(())
+}
+
+fn write_payload(out: &mut Vec<u8>, tag: &Tag, depth: usize) -> Result<(), NbtError> {
+    if depth > MAX_DEPTH {
+        return Err(NbtError::TooDeep(MAX_DEPTH));
+    }
+
+    match tag {
+        Tag::End => {}
+        Tag::Byte(value) => out.push(*value as u8),
+        Tag::Short(value) => out.extend_from_slice(&value.to_be_bytes()),
+        Tag::Int(value) => out.extend_from_slice(&value.to_be_bytes()),
+        Tag::Long(value) => out.extend_from_slice(&value.to_be_bytes()),
+        Tag::Float(value) => out.extend_from_slice(&value.to_be_bytes()),
+        Tag::Double(value) => out.extend_from_slice(&value.to_be_bytes()),
+        Tag::ByteArray(values) => {
+            write_length(out, values.len())?;
+            out.extend_from_slice(values);
+        }
+        Tag::String(value) => write_string(out, value)?,
+        Tag::List(values) => {
+            let element_id = values.first().map(tag_id).unwrap_or(0);
+            if element_id == 0 && !values.is_empty() {
+                return Err(NbtError::EndTagValue);
+            }
+            if values.iter().any(|value| tag_id(value) != element_id) {
+                return Err(NbtError::HeterogeneousList);
+            }
+            out.push(element_id);
+            write_length(out, values.len())?;
+            for value in values {
+                write_payload(out, value, depth + 1)?;
+            }
+        }
+        Tag::Compound(values) => {
+            for (name, value) in values {
+                let kind = tag_id(value);
+                if kind == 0 {
+                    return Err(NbtError::EndTagValue);
+                }
+                out.push(kind);
+                write_string(out, name)?;
+                write_payload(out, value, depth + 1)?;
+            }
+            out.push(0);
+        }
+        Tag::IntArray(values) => {
+            write_length(out, values.len())?;
+            for value in values {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        Tag::LongArray(values) => {
+            write_length(out, values.len())?;
+            for value in values {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +372,39 @@ mod tests {
         bytes.extend_from_slice(&16i32.to_be_bytes());
         bytes.extend_from_slice(&[1, 2, 3]);
         assert!(matches!(parse(&bytes), Err(NbtError::Eof(_))));
+    }
+
+    #[test]
+    fn named_nbt_values_encode_and_parse_without_loss() {
+        let mut nested = HashMap::new();
+        nested.insert("byte".to_string(), Tag::Byte(-3));
+        nested.insert("short".to_string(), Tag::Short(1234));
+        nested.insert("long".to_string(), Tag::Long(9_876_543_210));
+        nested.insert("float".to_string(), Tag::Float(1.25));
+        nested.insert("double".to_string(), Tag::Double(-2.5));
+        nested.insert("bytes".to_string(), Tag::ByteArray(vec![0, 1, 255]));
+        nested.insert("text".to_string(), Tag::String("Nephele".to_string()));
+        nested.insert(
+            "list".to_string(),
+            Tag::List(vec![Tag::Int(5), Tag::Int(-8)]),
+        );
+        nested.insert("ints".to_string(), Tag::IntArray(vec![1, -2]));
+        nested.insert("longs".to_string(), Tag::LongArray(vec![3, -4]));
+        let root = Tag::Compound(nested);
+
+        let bytes = encode("root", &root).unwrap();
+        let (name, decoded) = parse(&bytes).unwrap();
+
+        assert_eq!(name, "root");
+        assert_eq!(decoded, root);
+    }
+
+    #[test]
+    fn rejects_mixed_type_lists() {
+        let tag = Tag::List(vec![Tag::Int(1), Tag::String("two".to_string())]);
+        assert!(matches!(
+            encode("root", &tag),
+            Err(NbtError::HeterogeneousList)
+        ));
     }
 }

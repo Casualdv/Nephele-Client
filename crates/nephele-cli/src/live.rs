@@ -13,23 +13,25 @@ use std::time::{Duration, Instant};
 use crate::commands;
 use crate::inventory;
 use crate::mesher::MeshPool;
+use crate::perf;
 use crate::servers::{Ping, PingBoard, ServerEntry, ServerList, Status};
 use crate::settings::Settings;
 use crate::skins::SkinLoader;
 use crate::ui::{self, Action, HudState, Screen};
 use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
 use nephele_client::mining::{Aim, Miner, MiningEvent};
-use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
+use nephele_client::physics::{EYE_HEIGHT, Input, PlayerState};
 use nephele_client::{Event, GameClient, LocalContainer, Vec3};
-use nephele_protocol::packets::play;
-use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
+use nephele_protocol::packets::play;
+use nephele_protocol::packets::play::{ItemStack, digging};
 use nephele_render::{
-    append_hand, block_outline, break_overlay_texture, build_break_overlay, build_entities,
-    build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw, HandDraw, HandItem,
-    ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
+    Camera, ColumnMeshJob, EntityDraw, HandDraw, HandItem, ItemDraw, LineMesh, MeshData, Renderer,
+    UiBatch, append_hand, block_outline, break_overlay_texture, build_break_overlay,
+    build_entities, build_hand_item, build_item_mesh,
 };
-use nephele_world::{raycast, BlockState, ChunkColumn, ChunkCoord, World};
+use nephele_world::save::{self, WorldMetadata, WorldMode, WorldSave};
+use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World, raycast};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{
@@ -376,12 +378,26 @@ fn step_player(shared: &Arc<Mutex<Shared>>, world: &World) -> (Vec3, f32, f32, b
     )
 }
 
+fn fresh_world_seed() -> u64 {
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(1);
+    time ^ (u64::from(std::process::id()) << 32)
+}
+
 /// Single-player: generate terrain around the player, simulate, and let them
 /// mine and place without a server.
-fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Result<(), String> {
+fn local_loop(
+    mut save: WorldSave,
+    shared: Arc<Mutex<Shared>>,
+    tx: Sender<NetMsg>,
+) -> Result<(), String> {
     use nephele_protocol::packets::play::HOTBAR_FIRST_SLOT;
     use nephele_world::{BlockState, ChunkCoord, TerrainGenerator};
 
+    let seed = save.metadata().seed;
+    let mode = save.metadata().mode;
     let generator = TerrainGenerator::new(seed);
     let mut world = World::new(0);
     // Honour the render-distance setting; `radius` is re-read every tick so
@@ -393,12 +409,14 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
         let spawn_y = generator.spawn_height() as f64;
         state.player.teleport(0.5, spawn_y, 0.5);
         state.spawned = true;
-        state.creative = true;
-        state.status = format!("Singleplayer (seed {seed})");
+        state.creative = mode.is_creative();
+        state.status = format!("{} (seed {seed})", save.metadata().name);
         state.inventory.fill(None);
-        for (index, block) in nephele_client::STARTER_HOTBAR.iter().enumerate() {
-            state.inventory[HOTBAR_FIRST_SLOT + index] =
-                Some(ItemStack::new(block.id() as i16, 64, block.meta() as i16));
+        if mode.is_creative() {
+            for (index, block) in nephele_client::STARTER_HOTBAR.iter().enumerate() {
+                state.inventory[HOTBAR_FIRST_SLOT + index] =
+                    Some(ItemStack::new(block.id() as i16, 64, block.meta() as i16));
+            }
         }
         refresh_local_crafting_preview(&mut state);
     }
@@ -422,7 +440,11 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
                 if !sent.insert(coord) {
                     continue;
                 }
-                let column = generator.column(coord.0, coord.1);
+                let column = match save.load_chunk(coord.0, coord.1) {
+                    Ok(Some(column)) => column,
+                    Ok(None) => generator.column(coord.0, coord.1),
+                    Err(error) => return Err(error.to_string()),
+                };
                 world.insert(column.clone());
                 columns.push(column);
             }
@@ -484,6 +506,12 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
         }
         if let Some(creative) = gamemode {
             shared.lock().unwrap().creative = creative;
+            let mode = if creative {
+                WorldMode::Creative
+            } else {
+                WorldMode::Survival
+            };
+            save.set_mode(mode).map_err(|error| error.to_string())?;
         }
         for line in chat {
             // Singleplayer has no chat server; echo it like one would.
@@ -510,9 +538,12 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
         }
         if use_pressed {
             if let Some(aim) = aim {
-                if world.get_block(aim.x, aim.y, aim.z).id()
-                    == nephele_world::crafting::CRAFTING_TABLE
-                {
+                let targeted = world.get_block(aim.x, aim.y, aim.z);
+                if nephele_world::shapes::is_door(targeted.id()) {
+                    if nephele_world::shapes::toggle_door_open(&mut world, aim.x, aim.y, aim.z) {
+                        dirty.insert((aim.x.div_euclid(16), aim.z.div_euclid(16)));
+                    }
+                } else if targeted.id() == nephele_world::crafting::CRAFTING_TABLE {
                     let mut state = shared.lock().unwrap();
                     if state.window_id.is_none() {
                         open_local_crafting_table(&mut state);
@@ -529,10 +560,32 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
                             .unwrap_or([0, 1, 0]);
                         let (bx, by, bz) =
                             (aim.x + normal[0], aim.y + normal[1], aim.z + normal[2]);
-                        if world.get_block(bx, by, bz).is_air()
-                            && !placement_hits_player(&aim, [position.x, position.y, position.z])
+                        let player_feet = [position.x, position.y, position.z];
+                        let block = BlockState::from_raw(state_block);
+                        if nephele_world::shapes::is_door(block.id()) {
+                            if !door_placement_hits_player(bx, by, bz, player_feet)
+                                && nephele_world::shapes::place_door(
+                                    &mut world,
+                                    bx,
+                                    by,
+                                    bz,
+                                    block.id(),
+                                    yaw,
+                                )
+                            {
+                                dirty.insert((bx.div_euclid(16), bz.div_euclid(16)));
+                                if !creative {
+                                    consume_held_block(
+                                        &mut shared.lock().unwrap(),
+                                        held_slot,
+                                        state_block,
+                                    );
+                                }
+                            }
+                        } else if world.get_block(bx, by, bz).is_air()
+                            && !placement_hits_player(&aim, player_feet)
                         {
-                            world.set_block(bx, by, bz, BlockState::from_raw(state_block));
+                            world.set_block(bx, by, bz, block);
                             dirty.insert((bx.div_euclid(16), bz.div_euclid(16)));
                             if !creative {
                                 consume_held_block(
@@ -548,6 +601,7 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
         }
         for (cx, cz) in dirty {
             if let Some(column) = world.get(ChunkCoord::new(cx, cz)) {
+                save.save_chunk(column).map_err(|error| error.to_string())?;
                 let _ = tx.send(NetMsg::Chunks(vec![column.clone()]));
             }
         }
@@ -954,6 +1008,15 @@ struct LiveApp {
     /// When the window last gained focus; clicks right after it are ignored.
     focus_gained: Option<Instant>,
     settings: Settings,
+    saves_dir: std::path::PathBuf,
+    worlds: Vec<WorldMetadata>,
+    worlds_scroll: usize,
+    world_error: Option<String>,
+    world_name_input: String,
+    world_seed_input: String,
+    world_create_mode: WorldMode,
+    world_name_focused: bool,
+    world_seed_focused: bool,
     pointer: Option<[f32; 2]>,
     creative_page: usize,
     /// Stack held on the cursor in the inventory screen (client-side only).
@@ -977,11 +1040,18 @@ impl LiveApp {
             Ok("settings") => Some(Screen::Settings),
             Ok("connect") => Some(Screen::Connect),
             Ok("servers") => Some(Screen::Servers),
+            Ok("worlds") => Some(Screen::Worlds),
+            Ok("world_create") => Some(Screen::WorldCreate),
             Ok("game") => Some(Screen::Game),
             Ok("title") => Some(Screen::Title),
             _ => None,
         };
 
+        let saves_dir = crate::paths::user_data_dir().join("saves");
+        let world_seed_input = options
+            .seed
+            .map(|seed| seed.to_string())
+            .unwrap_or_default();
         let servers = ServerList::load(&options.servers_path);
         let (ping_tx, ping_rx) = mpsc::channel();
 
@@ -1042,6 +1112,15 @@ impl LiveApp {
             settings_return: Screen::Pause,
             focus_gained: None,
             settings: initial_settings(),
+            saves_dir,
+            worlds: Vec::new(),
+            worlds_scroll: 0,
+            world_error: None,
+            world_name_input: String::new(),
+            world_seed_input,
+            world_create_mode: WorldMode::Creative,
+            world_name_focused: true,
+            world_seed_focused: false,
             pointer: None,
             creative_page: 0,
             inventory_cursor: None,
@@ -1055,6 +1134,9 @@ impl LiveApp {
         }
         if app.screen == Screen::Servers {
             app.refresh_server_list();
+        }
+        if app.screen == Screen::Worlds {
+            app.refresh_worlds();
         }
         if std::env::var("NEPHELE_SCREEN").as_deref() == Ok("local") {
             app.start_local();
@@ -1094,7 +1176,7 @@ impl LiveApp {
         let ui_atlas = match UiAtlas::load(&ui_root) {
             Ok(atlas) => atlas,
             Err(err) => {
-                return self.fail(event_loop, format!("could not build the UI atlas: {err}"))
+                return self.fail(event_loop, format!("could not build the UI atlas: {err}"));
             }
         };
 
@@ -1203,6 +1285,9 @@ impl LiveApp {
         let max = [min[0] + 16.0, 256.0, min[2] + 16.0];
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_chunk(key, mesh, min, max);
+            if !mesh.is_empty() {
+                perf::record_chunk_upload();
+            }
         }
     }
 
@@ -1428,8 +1513,10 @@ impl LiveApp {
         };
 
         let now = Instant::now();
-        let delta = (now - self.last_frame).as_secs_f32().min(0.1);
+        let frame_interval = now.saturating_duration_since(self.last_frame);
         self.last_frame = now;
+        perf::record_frame_interval(frame_interval);
+        let delta = frame_interval.as_secs_f32().min(0.1);
 
         self.drain_network();
         self.drain_pings();
@@ -1715,6 +1802,31 @@ impl LiveApp {
                 width,
                 height,
             ),
+            Screen::Worlds => ui::draw_worlds(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &self.worlds,
+                self.worlds_scroll,
+                self.world_error.as_deref(),
+                self.pointer,
+                scale,
+                width,
+                height,
+            ),
+            Screen::WorldCreate => ui::draw_world_create(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &self.world_name_input,
+                &self.world_seed_input,
+                self.world_create_mode,
+                self.world_name_focused,
+                self.world_seed_focused,
+                self.world_error.as_deref(),
+                self.pointer,
+                scale,
+                width,
+                height,
+            ),
             Screen::Servers => ui::draw_servers(
                 &mut self.ui_bg,
                 &mut self.ui_fg,
@@ -1868,26 +1980,126 @@ impl LiveApp {
             });
     }
 
-    /// Start a generated single-player world on a background thread.
+    fn refresh_worlds(&mut self) {
+        match save::list_worlds(&self.saves_dir) {
+            Ok(worlds) => {
+                self.worlds = worlds;
+                self.worlds_scroll = self.worlds_scroll.min(self.worlds_max_scroll());
+                self.world_error = None;
+            }
+            Err(error) => {
+                self.worlds.clear();
+                self.world_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn worlds_max_scroll(&self) -> usize {
+        self.worlds.len().saturating_sub(ui::WORLD_ROWS)
+    }
+
+    fn scroll_worlds(&mut self, steps: i32) {
+        let next = self.worlds_scroll as i32 - steps;
+        self.worlds_scroll = next.clamp(0, self.worlds_max_scroll() as i32) as usize;
+    }
+
+    fn open_worlds(&mut self) {
+        self.set_mouse_capture(false);
+        self.world_error = None;
+        self.worlds_scroll = 0;
+        self.screen = Screen::Worlds;
+        self.refresh_worlds();
+    }
+
+    fn open_world_create(&mut self) {
+        self.world_name_input.clear();
+        self.world_seed_input = self
+            .options
+            .seed
+            .map(|seed| seed.to_string())
+            .unwrap_or_default();
+        self.world_create_mode = WorldMode::Creative;
+        self.world_name_focused = true;
+        self.world_seed_focused = false;
+        self.world_error = None;
+        self.screen = Screen::WorldCreate;
+    }
+
+    fn create_local_world(&mut self) {
+        let seed = if self.world_seed_input.trim().is_empty() {
+            fresh_world_seed()
+        } else {
+            match self.world_seed_input.trim().parse::<u64>() {
+                Ok(seed) => seed,
+                Err(_) => {
+                    self.world_error = Some("Seed must be an unsigned integer".to_string());
+                    return;
+                }
+            }
+        };
+        match WorldSave::create(
+            &self.saves_dir,
+            &self.world_name_input,
+            seed,
+            self.world_create_mode,
+        ) {
+            Ok(save) => {
+                self.world_error = None;
+                self.refresh_worlds();
+                self.start_local_save(save);
+            }
+            Err(error) => self.world_error = Some(error.to_string()),
+        }
+    }
+
+    fn open_saved_world(&mut self, index: usize) {
+        let Some(world) = self.worlds.get(index) else {
+            return;
+        };
+        match WorldSave::open(&self.saves_dir, &world.directory) {
+            Ok(save) => self.start_local_save(save),
+            Err(error) => {
+                let message = error.to_string();
+                self.refresh_worlds();
+                self.world_error = Some(message);
+            }
+        }
+    }
+
+    /// Development shortcut: open (or create) the default persistent world.
     fn start_local(&mut self) {
+        let seed = self.options.seed.unwrap_or_else(fresh_world_seed);
+        let existing = save::list_worlds(&self.saves_dir)
+            .ok()
+            .and_then(|worlds| worlds.into_iter().find(|world| world.directory == "World"));
+        let world = match existing {
+            Some(world) => WorldSave::open(&self.saves_dir, &world.directory),
+            None => WorldSave::create(&self.saves_dir, "World", seed, WorldMode::Creative),
+        };
+        match world {
+            Ok(save) => self.start_local_save(save),
+            Err(error) => {
+                self.world_error = Some(error.to_string());
+                self.screen = Screen::Title;
+            }
+        }
+    }
+
+    fn start_local_save(&mut self, save: WorldSave) {
+        let mode = save.metadata().mode;
         self.screen = Screen::Game;
         self.set_mouse_capture(false);
-        // Singleplayer starts in creative, like the offline demo always has;
-        // `/gamemode survival` switches it for testing.
-        self.shared.lock().unwrap().creative = true;
-        self.shared.lock().unwrap().local = true;
+        {
+            let mut state = self.shared.lock().unwrap();
+            state.creative = mode.is_creative();
+            state.local = true;
+        }
         let shared = Arc::clone(&self.shared);
         let tx = self.tx.clone();
-        let seed = self.options.seed.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or(1)
-        });
         let _ = std::thread::Builder::new()
             .name("nephele-local".into())
             .spawn(move || {
-                if let Err(err) = local_loop(seed, shared, tx.clone()) {
+                if let Err(err) = local_loop(save, shared, tx.clone()) {
                     let _ = tx.send(NetMsg::Error(err));
                 }
             });
@@ -2372,8 +2584,36 @@ impl LiveApp {
 
     fn handle_action(&mut self, action: Action, event_loop: &ActiveEventLoop) {
         match action {
-            Action::Singleplayer => self.start_local(),
+            Action::Singleplayer => self.open_worlds(),
             Action::Multiplayer => self.open_servers(),
+            Action::WorldOpen(index) => self.open_saved_world(index),
+            Action::WorldNew => self.open_world_create(),
+            Action::WorldsBack => {
+                self.world_error = None;
+                self.screen = Screen::Title;
+            }
+            Action::WorldNameFocus => {
+                self.world_name_focused = true;
+                self.world_seed_focused = false;
+                self.world_error = None;
+            }
+            Action::WorldSeedFocus => {
+                self.world_name_focused = false;
+                self.world_seed_focused = true;
+                self.world_error = None;
+            }
+            Action::WorldModeToggle => {
+                self.world_create_mode = match self.world_create_mode {
+                    WorldMode::Creative => WorldMode::Survival,
+                    WorldMode::Survival => WorldMode::Creative,
+                };
+                self.world_error = None;
+            }
+            Action::WorldCreateSubmit => self.create_local_world(),
+            Action::WorldCreateCancel => {
+                self.world_error = None;
+                self.screen = Screen::Worlds;
+            }
             Action::ServersJoin => self.join_selected_server(),
             Action::ServersDirectConnect => {
                 self.address_input.clear();
@@ -2527,6 +2767,45 @@ impl ApplicationHandler for LiveApp {
                     }
                     return;
                 }
+                if self.screen == Screen::WorldCreate && event.state == ElementState::Pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Enter) => {
+                            self.create_local_world();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            self.screen = Screen::Worlds;
+                            self.world_error = None;
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Backspace) => {
+                            if self.world_name_focused {
+                                self.world_name_input.pop();
+                            } else if self.world_seed_focused {
+                                self.world_seed_input.pop();
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                    if let Some(text) = event.text.as_ref() {
+                        for ch in text.chars() {
+                            if ch.is_control() {
+                                continue;
+                            }
+                            if self.world_name_focused && self.world_name_input.chars().count() < 64
+                            {
+                                self.world_name_input.push(ch);
+                            } else if self.world_seed_focused
+                                && ch.is_ascii_digit()
+                                && self.world_seed_input.len() < 20
+                            {
+                                self.world_seed_input.push(ch);
+                            }
+                        }
+                    }
+                    return;
+                }
                 // The direct-connect screen is a text field.
                 if self.screen == Screen::Connect && event.state == ElementState::Pressed {
                     match event.physical_key {
@@ -2570,7 +2849,11 @@ impl ApplicationHandler for LiveApp {
                             Screen::Inventory => self.close_inventory(),
                             Screen::Settings => self.screen = self.settings_return,
                             Screen::Title => {}
-                            Screen::Servers => self.screen = Screen::Title,
+                            Screen::Worlds | Screen::Servers => self.screen = Screen::Title,
+                            Screen::WorldCreate => {
+                                self.screen = Screen::Worlds;
+                                self.world_error = None;
+                            }
                             Screen::Connect | Screen::Death => self.screen = Screen::Title,
                         },
                         (KeyCode::KeyT, ElementState::Pressed) if self.screen == Screen::Game => {
@@ -2593,6 +2876,8 @@ impl ApplicationHandler for LiveApp {
                             Screen::Pause
                             | Screen::Settings
                             | Screen::Title
+                            | Screen::Worlds
+                            | Screen::WorldCreate
                             | Screen::Servers
                             | Screen::Connect
                             | Screen::Death => {}
@@ -2672,6 +2957,15 @@ impl ApplicationHandler for LiveApp {
                 };
                 if steps != 0 {
                     self.scroll_servers(steps);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.screen == Screen::Worlds => {
+                let steps = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                    MouseScrollDelta::PixelDelta(position) => (position.y / 40.0).round() as i32,
+                };
+                if steps != 0 {
+                    self.scroll_worlds(steps);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } if self.screen == Screen::Game => {
@@ -2789,19 +3083,11 @@ fn mob_scale(kind: u8) -> f32 {
 }
 
 /// `1`..`9` selects hotbar slots 0..8, exactly like vanilla.
-/// Would placing the block at `aim`'s face put it inside the player?
-///
-/// Vanilla refuses such a placement outright (`World.checkNoEntityCollision`),
-/// which is why placing under your own feet does nothing instead of shoving you
-/// upward.
-fn placement_hits_player(aim: &Aim, feet: [f64; 3]) -> bool {
-    let normal = nephele_world::Face::from_protocol_id(aim.face)
-        .map(|face| face.normal())
-        .unwrap_or([0, 1, 0]);
-    let x = (aim.x + normal[0]) as f64;
-    let y = (aim.y + normal[1]) as f64;
-    let z = (aim.z + normal[2]) as f64;
-
+/// Would a full block at these coordinates overlap the player's bounding box?
+fn block_hits_player(x: i32, y: i32, z: i32, feet: [f64; 3]) -> bool {
+    let x = x as f64;
+    let y = y as f64;
+    let z = z as f64;
     let half = nephele_client::physics::WIDTH / 2.0;
     let height = nephele_client::physics::HEIGHT;
 
@@ -2811,6 +3097,28 @@ fn placement_hits_player(aim: &Aim, feet: [f64; 3]) -> bool {
         && y + 1.0 > feet[1]
         && z < feet[2] + half
         && z + 1.0 > feet[2] - half
+}
+
+/// Door placement must keep both its lower and upper cells clear of the player.
+fn door_placement_hits_player(x: i32, y: i32, z: i32, feet: [f64; 3]) -> bool {
+    block_hits_player(x, y, z, feet) || block_hits_player(x, y + 1, z, feet)
+}
+
+/// Would placing the block at `aim`'s face put it inside the player?
+///
+/// Vanilla refuses such a placement outright (`World.checkNoEntityCollision`),
+/// which is why placing under your own feet does nothing instead of shoving you
+/// upward.
+fn placement_hits_player(aim: &Aim, feet: [f64; 3]) -> bool {
+    let normal = nephele_world::Face::from_protocol_id(aim.face)
+        .map(|face| face.normal())
+        .unwrap_or([0, 1, 0]);
+    block_hits_player(
+        aim.x + normal[0],
+        aim.y + normal[1],
+        aim.z + normal[2],
+        feet,
+    )
 }
 
 fn hotbar_digit(code: KeyCode) -> Option<i16> {
@@ -2968,6 +3276,14 @@ mod tests {
             cursor: [0.5, 1.0, 0.5],
         };
         assert!(!hit(above));
+    }
+
+    #[test]
+    fn door_placement_checks_the_upper_half_against_the_player() {
+        let feet = standing_on_a_block();
+        assert!(!block_hits_player(0, 63, 0, feet));
+        assert!(door_placement_hits_player(0, 63, 0, feet));
+        assert!(!door_placement_hits_player(0, 66, 0, feet));
     }
 
     #[test]
