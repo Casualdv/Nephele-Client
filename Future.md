@@ -260,13 +260,7 @@ field, launcher, CI.
 
 **M1 - A world worth walking in.** *Rendering done:* mesa, caves, ores, flora, shape-aware meshing (slabs, stairs, fences, panes that connect, doors, torches) and smooth lighting with ambient occlusion. *Still open:* biome-map parity, currently 92.8175% against the reference world - the world is right at scale and wrong in patches. *Exit:* singleplayer world looks like Minecraft from above and from underground.
 
-**M2 - Survival loop.** Partly done: fixed 20 Hz tick, hunger/XP data from the
-server, network block drops and pickup, survival inventory, container clicks,
-mock recipes, local 2x2/3x3 recipe evaluation and crafting-table use, mapped item
-icons, and the death screen with respawn. Remaining: interactive verification
-of the local tree-to-pickaxe chain, eating, armour and hunger effects, XP orbs,
-furnace/chest block entities and broader item-icon coverage. *Exit:* punch a
-tree and make a pickaxe in a survival session.
+**M2 - Survival loop.** *Exit criterion met offline.* A recorded play-through punched logs, made planks, sticks and a crafting table through the 2x2 grid, placed the table, opened the 3x3 window and crafted a wooden pickaxe - correct counts, no item loss. Remaining polish, none of it blocking the exit: eating, armour effects, XP orbs, block entities and item-atlas wiring.
 
 **M3 — Join a real server.** Microsoft auth (**done**, missing only a shippable
 Azure client id), server list (**done**), online-mode handshake (**done**),

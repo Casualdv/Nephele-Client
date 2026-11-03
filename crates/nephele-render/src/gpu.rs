@@ -1127,6 +1127,10 @@ impl Renderer {
 
             if self.overlay_index_count > 0 {
                 pass.set_pipeline(&self.overlay_pipeline);
+                // The overlay inherits whatever bind group the last draw left
+                // bound, which after entities is the 2D one. Binding the block
+                // group here is what keeps the scanline target valid.
+                pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.overlay_vertex_buffer.slice(..));
                 pass.set_index_buffer(
                     self.overlay_index_buffer.slice(..),

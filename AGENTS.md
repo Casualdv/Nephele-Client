@@ -622,9 +622,8 @@ are opt-in behind `NEPHELE_PERF=1`, with a reproducible run via
    `RiverMix` made it worse. That points at the 1:64 Hills output feeding the
    1:4 zooms rather than at the zooms themselves. Measure against the reference
    world, never stage-to-stage.
-2. **M2 - offline survival.** Local crafting works; still open: eating, armour
-   effects, XP orbs, block entities, item-atlas wiring, and an end-to-end check
-   of the punch-a-tree exit criterion that has never actually been played.
+2. **M2 - offline survival.** The exit criterion was played end to end offline: logs, planks, sticks, crafting table, then a wooden pickaxe with correct counts and no item loss. Remaining polish only: eating, armour effects, XP orbs, block entities, item-atlas wiring.
+
 3. **M3 - join a real server.** Dimension change, keepalive, tab list, and a
    shippable Azure app id.
 4. **M6 follow-up.** Attribute the startup frame spikes by stage, and report
