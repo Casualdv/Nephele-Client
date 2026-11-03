@@ -1860,6 +1860,18 @@ mod tests {
         let mut total = 0usize;
         let mut bad = 0usize;
         let mut first = 0usize;
+        let offsets = [
+            (0, 0),
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (1, -1),
+            (-1, 1),
+            (1, 1),
+        ];
+        let mut offset_mismatches = [0usize; 9];
         for (name, _base_x, _base_z) in [("r.-1.-1.mca", -32, -32), ("r.-1.0.mca", -32, 0)] {
             let path = dir.join(name);
             if !path.is_file() {
@@ -1874,15 +1886,26 @@ mod tests {
                     let Ok(stored) = parse_chunk(&bytes) else {
                         continue;
                     };
-                    let ours = layers.chunk_biomes(stored.x, stored.z);
-                    if ours.len() != stored.biomes.len() {
+                    let maps: Vec<_> = offsets
+                        .iter()
+                        .map(|(dx, dz)| {
+                            layers.biomes(stored.x * 16 + dx, stored.z * 16 + dz, 16, 16)
+                        })
+                        .collect();
+                    if maps[0].len() != stored.biomes.len() {
                         continue;
                     }
                     for z in 0..16i32 {
                         for x in 0..16i32 {
                             let i = (z * 16 + x) as usize;
                             total += 1;
-                            if ours[i] != stored.biomes[i] as i32 {
+                            let expected = stored.biomes[i] as i32;
+                            for (offset, map) in maps.iter().enumerate() {
+                                if map[i] != expected {
+                                    offset_mismatches[offset] += 1;
+                                }
+                            }
+                            if maps[0][i] != expected {
                                 bad += 1;
                                 if first == 0 {
                                     first = 1;
@@ -1898,7 +1921,7 @@ mod tests {
                                         block_z,
                                         stored.x,
                                         stored.z,
-                                        ours[i],
+                                        maps[0][i],
                                         stored.biomes[i]
                                     );
                                     println!(
@@ -1919,6 +1942,9 @@ mod tests {
             }
         }
         println!("mismatched {bad} of {total}");
+        for (offset, mismatches) in offsets.iter().zip(offset_mismatches) {
+            println!("offset {offset:?}: mismatched {mismatches} of {total}");
+        }
     }
 
     #[test]

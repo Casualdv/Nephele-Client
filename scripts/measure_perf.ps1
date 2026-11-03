@@ -7,16 +7,15 @@
     flat-color placeholder texture (no game assets). The client requests a
     low-power adapter and logs its actual adapter name/type. The run must report
     frame and mesh p50/p99 values plus non-zero mesh/upload counts before it can
-    be treated as a valid measurement.
+    be treated as a valid measurement. The workload uses the client default render
+    distance of 8 chunks (a 17x17 column area around spawn).
 
-    Frame-time reports are cumulative and emitted every 30 seconds. Run for at
-    least 65 seconds to get a report with a meaningful p99 sample count.
+    Frame-time histograms reset every 30 seconds. Run for at least 75 seconds to
+    collect a startup window and a separate steady-state window; the script checks
+    the final window. Mesh-build percentiles and chunk-upload counts are cumulative.
 
 .PARAMETER DurationSeconds
-    Wall-clock measurement duration. Defaults to 75 seconds; minimum is 65.
-
-.PARAMETER ViewDistance
-    Local-world render distance for the controlled workload (2..16 chunks).
+    Wall-clock measurement duration. Defaults to 75 seconds; minimum is 75.
 
 .PARAMETER IntegratedAdapterPattern
     Regex required in the selected adapter line in addition to the IntegratedGpu
@@ -29,15 +28,12 @@
     .\scripts\measure_perf.ps1
 
 .EXAMPLE
-    .\scripts\measure_perf.ps1 -DurationSeconds 120 -ViewDistance 8
+    .\scripts\measure_perf.ps1 -DurationSeconds 120
 #>
 [CmdletBinding()]
 param(
-    [ValidateRange(65, 3600)]
+    [ValidateRange(75, 3600)]
     [int]$DurationSeconds = 75,
-
-    [ValidateRange(2, 16)]
-    [int]$ViewDistance = 6,
 
     [string]$IntegratedAdapterPattern = 'Radeon|Iris|UHD|Vega|Arc',
 
@@ -115,7 +111,7 @@ try {
     $env:NEPHELE_PERF = '1'
     $env:NEPHELE_GPU = 'integrated'
     $env:NEPHELE_SCREEN = 'local'
-    $env:NEPHELE_VIEW_DISTANCE = [string]$ViewDistance
+    Remove-Item Env:NEPHELE_VIEW_DISTANCE -ErrorAction SilentlyContinue
     $env:NEPHELE_DATA_DIR = $dataDir
     Remove-Item Env:NEPHELE_PROFILE -ErrorAction SilentlyContinue
 
@@ -177,8 +173,15 @@ public static class NephelePerfWindow {
     if ($reportLines.Count -eq 0) {
         throw "No 30-second perf report was logged. Client stderr:`n$stderr"
     }
+    if ($reportLines.Count -lt 2) {
+        throw "Only one 30-second frame window was logged; run long enough to include warm-up and steady state."
+    }
 
     $reportLine = $reportLines[-1]
+    $elapsedMatch = [regex]::Match($reportLine, 'elapsed_s=([0-9.]+)')
+    if (-not $elapsedMatch.Success -or [double]$elapsedMatch.Groups[1].Value -lt 55) {
+        throw "The final perf report is not a full post-warmup measurement window: $reportLine"
+    }
     $frameSamplesMatch = [regex]::Match($reportLine, 'frame_samples=(\d+)')
     if (-not $frameSamplesMatch.Success -or [int64]$frameSamplesMatch.Groups[1].Value -lt 1000) {
         throw "Perf report has too few frame samples for a defensible p99: $reportLine"
@@ -192,7 +195,7 @@ public static class NephelePerfWindow {
         throw "Perf report contains no chunk uploads: $reportLine"
     }
 
-    Write-Output ("Workload: local generated world, seed 12345, 1280x720, view distance {0}, {1}s" -f $ViewDistance, $DurationSeconds)
+    Write-Output ("Workload: local generated world, seed 12345, 1280x720, view distance 8 (17x17 columns), {0}s" -f $DurationSeconds)
     Write-Output "Adapter: $adapterLine"
     Write-Output "Measurement: $reportLine"
 

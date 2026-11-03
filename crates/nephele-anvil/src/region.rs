@@ -6,9 +6,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use flate2::Compression;
 use flate2::read::{GzDecoder, ZlibDecoder};
 use flate2::write::ZlibEncoder;
+use flate2::Compression;
 
 const SECTOR: usize = 4096;
 const HEADER_SECTORS: usize = 2;

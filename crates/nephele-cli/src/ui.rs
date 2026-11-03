@@ -12,12 +12,12 @@ use std::sync::OnceLock;
 use crate::servers::{Ping, PingBoard, ServerList};
 use crate::settings::{SettingId, Settings};
 use nephele_assets::{
-    MISSING_TEXTURE, TextureArray, face_textures, font, item_texture_name, sprites,
+    face_textures, font, item_texture_name, sprites, TextureArray, MISSING_TEXTURE,
 };
-use nephele_protocol::packets::play::{HOTBAR_FIRST_SLOT, HOTBAR_SLOTS, ItemStack};
+use nephele_protocol::packets::play::{ItemStack, HOTBAR_FIRST_SLOT, HOTBAR_SLOTS};
 use nephele_render::{Rect, UiBatch};
-use nephele_world::BlockState;
 use nephele_world::save::{WorldMetadata, WorldMode};
+use nephele_world::BlockState;
 
 const TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const TEXT_DIM: [f32; 4] = [0.6, 0.6, 0.6, 1.0];
@@ -1715,21 +1715,15 @@ mod tests {
         let mut bg = UiBatch::default();
         let mut fg = UiBatch::default();
         let first = draw_worlds(&mut bg, &mut fg, &worlds, 0, None, None, 2.0, 1280.0, 720.0);
-        assert!(
-            first
-                .iter()
-                .any(|button| button.action == Action::WorldOpen(0))
-        );
-        assert!(
-            first
-                .iter()
-                .any(|button| button.action == Action::WorldOpen(WORLD_ROWS - 1))
-        );
-        assert!(
-            !first
-                .iter()
-                .any(|button| button.action == Action::WorldOpen(WORLD_ROWS))
-        );
+        assert!(first
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(0)));
+        assert!(first
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(WORLD_ROWS - 1)));
+        assert!(!first
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(WORLD_ROWS)));
         let first_row = rect_of(&first, Action::WorldOpen(0));
         assert_eq!(
             hit_test(
@@ -1743,20 +1737,16 @@ mod tests {
         );
 
         let last = draw_worlds(&mut bg, &mut fg, &worlds, 2, None, None, 2.0, 1280.0, 720.0);
-        assert!(
-            last.iter()
-                .any(|button| button.action == Action::WorldOpen(WORLD_ROWS + 1))
-        );
-        assert!(
-            !last
-                .iter()
-                .any(|button| button.action == Action::WorldOpen(1))
-        );
+        assert!(last
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(WORLD_ROWS + 1)));
+        assert!(!last
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(1)));
         assert!(last.iter().any(|button| button.action == Action::WorldNew));
-        assert!(
-            last.iter()
-                .any(|button| button.action == Action::WorldsBack)
-        );
+        assert!(last
+            .iter()
+            .any(|button| button.action == Action::WorldsBack));
     }
 
     #[test]
@@ -2081,11 +2071,9 @@ mod tests {
             .map(|index| rect_of(&first, Action::ServerSelect(index)))
             .collect();
         assert_eq!(rows.len(), SERVER_ROWS);
-        assert!(
-            !first
-                .iter()
-                .any(|b| b.action == Action::ServerSelect(SERVER_ROWS))
-        );
+        assert!(!first
+            .iter()
+            .any(|b| b.action == Action::ServerSelect(SERVER_ROWS)));
 
         let last = server_screen(&list, &PingBoard::default(), None, 2);
         rect_of(&last, Action::ServerSelect(SERVER_ROWS + 1));

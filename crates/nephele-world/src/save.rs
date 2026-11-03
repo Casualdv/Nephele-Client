@@ -8,11 +8,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use nephele_anvil::{
-    RegionFile, StoredChunk, StoredSection, Tag, encode_chunk_nbt, encode_nbt, parse_chunk,
-    parse_nbt,
+    encode_chunk_nbt, encode_nbt, parse_chunk, parse_nbt, RegionFile, StoredChunk, StoredSection,
+    Tag,
 };
 
-use crate::chunk::{ChunkColumn, SECTION_COUNT, SECTION_VOLUME, Section};
+use crate::chunk::{ChunkColumn, Section, SECTION_COUNT, SECTION_VOLUME};
 
 const METADATA_FILE: &str = "nephele.dat";
 const REGION_DIR: &str = "region";

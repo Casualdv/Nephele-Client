@@ -264,6 +264,54 @@ async fn login_rejected_in_online_mode() {
 }
 
 #[tokio::test]
+async fn encryption_response_sends_both_ciphertexts_before_aes_starts() {
+    let (listener, port) = accept_one().await;
+    let shared_secret = [0x5Au8; 16];
+    let encrypted_shared_secret = vec![0xA5; 128];
+    let encrypted_verify_token = vec![0x3C; 128];
+    let server_encrypted_shared_secret = encrypted_shared_secret.clone();
+    let server_encrypted_verify_token = encrypted_verify_token.clone();
+
+    let server = tokio::spawn(async move {
+        let mut server = accept(listener).await;
+        let response = server.read_packet().await.unwrap();
+        assert_eq!(response.id, login::SERVERBOUND_ENCRYPTION_RESPONSE);
+        let mut reader = response.reader();
+        assert_eq!(
+            reader.read_byte_array().unwrap(),
+            server_encrypted_shared_secret
+        );
+        assert_eq!(
+            reader.read_byte_array().unwrap(),
+            server_encrypted_verify_token
+        );
+        assert!(reader.is_empty());
+
+        server.enable_encryption(&shared_secret, &shared_secret);
+        let next = server.read_packet().await.unwrap();
+        assert_eq!(next.id, login::SERVERBOUND_LOGIN_START);
+        assert_eq!(next.reader().read_string().unwrap(), "after-encryption");
+    });
+
+    let mut client = connect(port).await;
+    client.set_state(State::Login);
+    client
+        .send_encryption_response(
+            &shared_secret,
+            &encrypted_shared_secret,
+            &encrypted_verify_token,
+        )
+        .await
+        .unwrap();
+    client
+        .write_packet(&login::login_start("after-encryption"))
+        .await
+        .unwrap();
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn a_play_packet_can_arrive_across_many_tcp_writes() {
     let (listener, port) = accept_one().await;
 

@@ -277,10 +277,19 @@ impl GameClient {
         address: &ServerAddress,
         session: &nephele_auth::Session,
     ) -> Result<Self> {
-        let mut connection = Connection::connect(address).await?;
-        connection.handshake(address, NextState::Login).await?;
+        let mut connection = Connection::connect(address)
+            .await
+            .map_err(|err| Error::Protocol(format!("connecting to {address}: {err}")))?;
+        connection
+            .handshake(address, NextState::Login)
+            .await
+            .map_err(|err| Error::Protocol(format!("sending login handshake: {err}")))?;
 
-        let (uuid, name) = match connection.login_start(&session.profile.name).await? {
+        let login = connection
+            .login_start(&session.profile.name)
+            .await
+            .map_err(|err| Error::Protocol(format!("reading Login Start response: {err}")))?;
+        let (uuid, name) = match login {
             LoginOutcome::Success(success) => (success.uuid, success.username),
             LoginOutcome::Disconnect(reason) => return Err(Error::Disconnected(reason)),
             LoginOutcome::EncryptionRequest(request) => {
@@ -304,16 +313,25 @@ impl GameClient {
                 .map_err(|err| Error::Disconnected(format!("join task failed: {err}")))?;
                 joined.map_err(Error::Disconnected)?;
 
-                let encrypted = nephele_protocol::crypto::rsa_encrypt(
+                let encrypted_secret =
+                    nephele_protocol::crypto::rsa_encrypt(&request.public_key, &secret)
+                        .map_err(Error::Disconnected)?;
+                let encrypted_verify_token = nephele_protocol::crypto::rsa_encrypt(
                     &request.public_key,
                     &request.verify_token,
                 )
                 .map_err(Error::Disconnected)?;
                 connection
-                    .send_encryption_response(&secret, &encrypted)
-                    .await?;
+                    .send_encryption_response(&secret, &encrypted_secret, &encrypted_verify_token)
+                    .await
+                    .map_err(|err| {
+                        Error::Protocol(format!("sending Encryption Response: {err}"))
+                    })?;
 
-                match connection.read_login_outcome().await? {
+                let outcome = connection.read_login_outcome().await.map_err(|err| {
+                    Error::Protocol(format!("reading Login Success after encryption: {err}"))
+                })?;
+                match outcome {
                     LoginOutcome::Success(success) => (success.uuid, success.username),
                     LoginOutcome::Disconnect(reason) => return Err(Error::Disconnected(reason)),
                     LoginOutcome::EncryptionRequest(_) => return Err(Error::EncryptionUnsupported),
@@ -1326,7 +1344,7 @@ mod tests {
         block_entity
             .write_u8(6)
             .write_u8(10)
-            .write_string("")
+            .write_u16(0)
             .write_u8(0);
         let event = client
             .handle(Packet::new(
@@ -1478,5 +1496,59 @@ mod tests {
 
         client.apply_player_list_update(play::PlayerListUpdate::Remove(vec![uuid]));
         assert!(!client.player_list.contains_key(&uuid));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual online acceptance; needs a cached Microsoft session and public network"]
+    async fn joins_a_public_protocol_47_server_with_the_cached_session() {
+        let app_data = std::env::var_os("APPDATA").expect("APPDATA is set on Windows");
+        let session_path = std::path::PathBuf::from(app_data)
+            .join("Nephele")
+            .join("auth.json");
+        let stored = nephele_auth::StoredSession::load(&session_path).expect("cached session");
+        let address = ServerAddress::parse("mc.hypixel.net").unwrap();
+        let mut client = GameClient::join_online(&address, &stored.session())
+            .await
+            .expect("online join");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut got_position = false;
+        while tokio::time::Instant::now() < deadline {
+            let packet = match tokio::time::timeout(
+                Duration::from_secs(2),
+                client.connection.next_play_packet(),
+            )
+            .await
+            {
+                Err(_) => continue,
+                Ok(Err(err)) => panic!("reading play packet: {err}"),
+                Ok(Ok(packet)) => packet,
+            };
+            client.packets_received += 1;
+            let packet_id = packet.id;
+            let event = client
+                .handle(packet)
+                .await
+                .unwrap_or_else(|err| panic!("handling play packet 0x{packet_id:02X}: {err}"));
+            if let Event::Position { .. } = event {
+                got_position = true;
+            }
+            if got_position && client.world.loaded_chunks() > 0 {
+                break;
+            }
+        }
+
+        assert!(got_position, "server did not send a spawn position");
+        assert!(client.world.loaded_chunks() > 0, "server sent no chunks");
+        let walked = Vec3::new(
+            client.position.x + 0.1,
+            client.position.y,
+            client.position.z,
+        );
+        client
+            .send_move(walked, client.yaw, client.pitch, true)
+            .await
+            .expect("movement update");
+        client.disconnect().await;
     }
 }

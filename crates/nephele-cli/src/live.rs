@@ -20,18 +20,18 @@ use crate::skins::SkinLoader;
 use crate::ui::{self, Action, HudState, Screen};
 use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
 use nephele_client::mining::{Aim, Miner, MiningEvent};
-use nephele_client::physics::{EYE_HEIGHT, Input, PlayerState};
+use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
 use nephele_client::{Event, GameClient, LocalContainer, Vec3};
-use nephele_protocol::ServerAddress;
 use nephele_protocol::packets::play;
-use nephele_protocol::packets::play::{ItemStack, digging};
+use nephele_protocol::packets::play::{digging, ItemStack};
+use nephele_protocol::ServerAddress;
 use nephele_render::{
-    Camera, ColumnMeshJob, EntityDraw, HandDraw, HandItem, ItemDraw, LineMesh, MeshData, Renderer,
-    UiBatch, append_hand, block_outline, break_overlay_texture, build_break_overlay,
-    build_entities, build_hand_item, build_item_mesh,
+    append_hand, block_outline, break_overlay_texture, build_break_overlay, build_entities,
+    build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw, HandDraw, HandItem,
+    ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
 };
 use nephele_world::save::{self, WorldMetadata, WorldMode, WorldSave};
-use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World, raycast};
+use nephele_world::{raycast, BlockState, ChunkColumn, ChunkCoord, World};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{

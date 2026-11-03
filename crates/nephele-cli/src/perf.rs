@@ -2,8 +2,9 @@
 //!
 //! Set `NEPHELE_PERF=1` to collect metrics. Frame intervals and mesh build
 //! durations are recorded into fixed 10-microsecond histograms (up to 100 ms);
-//! reported percentile values are conservative upper bucket bounds. Reports
-//! are cumulative and emitted every 30 seconds so p99 has a useful sample size.
+//! reported percentile values are conservative upper bucket bounds. Frame
+//! percentiles cover each 30-second window; mesh percentiles and upload counts
+//! are cumulative for the process.
 
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -40,7 +41,9 @@ pub fn record_frame_interval(interval: Duration) {
             while recorder.next_report_at <= now {
                 recorder.next_report_at += REPORT_INTERVAL;
             }
-            Some(recorder.snapshot(now))
+            let report = recorder.snapshot(now);
+            recorder.clear_frame_window();
+            Some(report)
         } else {
             None
         }
@@ -106,6 +109,11 @@ impl Recorder {
         }
     }
 
+    fn clear_frame_window(&mut self) {
+        self.frame_intervals.clear();
+        self.frame_over_budget = 0;
+    }
+
     fn snapshot(&self, now: Instant) -> PerfReport {
         let frame_samples = self.frame_intervals.samples;
         let p99_rank = percentile_rank(frame_samples, 99);
@@ -153,6 +161,11 @@ impl Histogram {
 
         self.buckets[bucket] = self.buckets[bucket].saturating_add(1);
         self.samples = self.samples.saturating_add(1);
+    }
+
+    fn clear(&mut self) {
+        self.buckets.fill(0);
+        self.samples = 0;
     }
 
     /// Nearest-rank percentile, rounded to the upper edge of its 10 μs bucket.
@@ -288,5 +301,20 @@ mod tests {
 
         assert_eq!(histogram.over_max_count(), 1);
         assert_eq!(histogram.percentile_upper_ns(99), Some(HISTOGRAM_MAX_NS));
+    }
+
+    #[test]
+    fn clearing_a_frame_window_keeps_cumulative_mesh_and_upload_metrics() {
+        let mut recorder = Recorder::new();
+        recorder.record_frame_interval(Duration::from_millis(10));
+        recorder.mesh_builds.record(Duration::from_millis(2));
+        recorder.chunk_uploads = 1;
+
+        recorder.clear_frame_window();
+        let report = recorder.snapshot(Instant::now());
+
+        assert_eq!(report.frame_samples, 0);
+        assert_eq!(report.mesh_build_samples, 1);
+        assert_eq!(report.chunk_uploads, 1);
     }
 }

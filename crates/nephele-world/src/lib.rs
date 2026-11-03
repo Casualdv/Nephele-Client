@@ -38,10 +38,10 @@ pub mod world;
 pub mod worldgen;
 
 pub use block::BlockState;
-pub use chunk::{ChunkColumn, SECTION_COUNT, SECTION_DIM, SECTION_VOLUME, Section, section_index};
-pub use decode::{ChunkUpdate, decode_chunk_bulk, decode_chunk_data};
+pub use chunk::{section_index, ChunkColumn, Section, SECTION_COUNT, SECTION_DIM, SECTION_VOLUME};
+pub use decode::{decode_chunk_bulk, decode_chunk_data, ChunkUpdate};
 pub use encode::{encode_chunk_bulk, encode_chunk_data};
-pub use generation::{SEA_LEVEL, SNOW_LINE, TerrainGenerator};
+pub use generation::{TerrainGenerator, SEA_LEVEL, SNOW_LINE};
 pub use noise::{JavaRandom, NoiseImproved, NoiseOctaves};
-pub use raycast::{Face, RayHit, raycast, raycast_to};
+pub use raycast::{raycast, raycast_to, Face, RayHit};
 pub use world::{ChunkCoord, World};
