@@ -258,9 +258,7 @@ No audio exists yet.
 **M0 — Foundations (done).** Protocol, rendering, movement, worldgen height
 field, launcher, CI.
 
-**M1 — A world worth walking in.** Mesa, caves, ores, trees and flora, smooth
-lighting, block shapes. *Exit:* singleplayer world looks like Minecraft from
-above and from underground.
+**M1 - A world worth walking in.** *Rendering done:* mesa, caves, ores, flora, shape-aware meshing (slabs, stairs, fences, panes that connect, doors, torches) and smooth lighting with ambient occlusion. *Still open:* biome-map parity, currently 92.8175% against the reference world - the world is right at scale and wrong in patches. *Exit:* singleplayer world looks like Minecraft from above and from underground.
 
 **M2 - Survival loop.** Partly done: fixed 20 Hz tick, hunger/XP data from the
 server, network block drops and pickup, survival inventory, container clicks,

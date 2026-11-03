@@ -606,38 +606,29 @@ item icons for unmapped item ids.
 
 ## 15. Next move
 
-**M2 is not closed.** The shared recipe matcher now drives local 2x2 and 3x3
-crafting; placed crafting tables open locally, and survival mining/placement
-updates the inventory. The exit chain (log to planks to sticks to table to
-pickaxe) is pinned by `the_survival_chain_reaches_a_pickaxe` in `nephele-mock`,
-but still needs to be played in a local survival session. Remaining features:
-eating, armour equip/reduction, hunger effects, XP orbs, furnace/chest block
-entities, and broader item-icon coverage. Do not claim M2 done until the exit
-criterion has been played.
+**Landed:** M1's rendering half, M5's world saves, M6's instrumentation.
+`block_shape` now drives the mesher - slabs, stairs, fences, panes that connect
+across chunk borders, doors with paired metadata and yaw placement, torches -
+and vertices carry sky/block light with ambient occlusion. Singleplayer creates,
+loads and saves dirty chunks under `%APPDATA%\Nephele\saves`. Performance metrics
+are opt-in behind `NEPHELE_PERF=1`, with a reproducible run via
+`scripts/measure_perf.ps1`.
 
-Death screen: done. Health reaching 0 raises `Screen::Death` ("You Died!" plus a
-Respawn button). The button sets `Shared::pending_respawn`, which the network loop
-turns into `client_status(0)` (`GameClient::respawn`), and the stale zero is cleared
-so the screen cannot bounce back before the server's own update lands.
+**Open:**
 
-1. **Mesher consumes `block_shape` — done 2026-11-02.** `mesh_column` walks
-   `block_shape(id, meta)`, scales 0..16 box corners into block coordinates and
-   keeps the direct cube path. Neighbour culling only removes a whole face when
-   both states are full cubes; cross-plants and `is_transparent` are unchanged.
-   Tests cover the full-cube path, slab, stair, fence, pane, door and torch bounds.
-2. **Verify the local survival chain by hand.** Use `/gamemode survival`, mine a
-   log, craft planks/sticks/a table in the inventory, place and right-click the
-   table, then craft a pickaxe. Check ingredient counts, placement consumption,
-   and that closing the table returns its grid. Mock packet tests are not this
-   interactive check.
-3. **M2 close-out.** Implement eating, armour/hunger effects, XP orbs,
-   furnace/chest block entities, remaining item icons and held-tool sprites. Do
-   not claim the milestone done until the local survival chain has been played.
-4. **M1 close-out.** Address smooth lighting/AO, the biome-parity gap, animated
-   textures, plant edge cases and connected shapes; finish door metadata,
-   placement and interaction. See `Future.md` for the full backlog.
-
----
+1. **M1b - biome parity, 92.8175%** (11,492 mismatches in 160,000 cells).
+   Negative results worth keeping: a +-1-block shift made it worse; bypassing
+   `RareBiome`, `AddIsland` or `Shore` changed nothing; bypassing `Smooth` or
+   `RiverMix` made it worse. That points at the 1:64 Hills output feeding the
+   1:4 zooms rather than at the zooms themselves. Measure against the reference
+   world, never stage-to-stage.
+2. **M2 - offline survival.** Local crafting works; still open: eating, armour
+   effects, XP orbs, block entities, item-atlas wiring, and an end-to-end check
+   of the punch-a-tree exit criterion that has never actually been played.
+3. **M3 - join a real server.** Dimension change, keepalive, tab list, and a
+   shippable Azure app id.
+4. **M6 follow-up.** Attribute the startup frame spikes by stage, and report
+   every measurement window instead of the best one.
 
 ## 16. Working agreement
 
