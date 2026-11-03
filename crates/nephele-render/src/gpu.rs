@@ -1,19 +1,15 @@
-use nephele_assets::{Panorama, SkinAtlas, TextureArray, UiAtlas};
+use nephele_assets::{Panorama, SkinAtlas, TextureAnimation, TextureArray, UiAtlas};
 use wgpu::util::DeviceExt;
 
 use crate::camera::Camera;
 use crate::entity::{EntityMesh, EntityVertex};
+use crate::environment::Environment;
 use crate::lines::{LineMesh, LineVertex};
 use crate::mesh::{MeshData, Vertex};
 use crate::ui::{UiBatch, UiVertex};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const SKY_COLOR: wgpu::Color = wgpu::Color {
-    r: 0.42,
-    g: 0.62,
-    b: 0.96,
-    a: 1.0,
-};
+const MAX_ANIMATIONS: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RendererError {
@@ -39,6 +35,15 @@ pub enum DrawOutcome {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+    inv_view_proj: [[f32; 4]; 4],
+    camera: [f32; 4],
+    fog_color: [f32; 4],
+    /// time_of_day, fog_start, fog_end, fog_scale.
+    environment: [f32; 4],
+    /// Independent texture-animation clock, in game ticks.
+    animation: [f32; 4],
+    /// Two vec4 per animation: (origin, frame_size), (step, frames, frametime, 0).
+    animations: [[f32; 4]; MAX_ANIMATIONS * 2],
 }
 
 #[repr(C)]
@@ -65,6 +70,13 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
     uniform_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    /// Kept alive for the lifetime of the animation-atlas view.
+    _animation_texture: wgpu::Texture,
+    block_animations: Vec<TextureAnimation>,
+    animation_started: std::time::Instant,
+    environment: Environment,
+    sky_pipeline: wgpu::RenderPipeline,
+    sky_bind_group: wgpu::BindGroup,
     chunks: std::collections::HashMap<(i32, i32), ChunkBuffers>,
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_vertex_buffer: wgpu::Buffer,
@@ -99,8 +111,11 @@ pub struct Renderer {
     item_index_count: u32,
     panorama: Option<PanoramaGpu>,
     show_panorama: bool,
-    /// Chunks that survived frustum culling in the last [`Renderer::draw`].
+    /// Chunks that survived culling in the last [`Renderer::draw`].
     drawn_chunks: usize,
+    occluded_chunks: usize,
+    occlusion: OcclusionBuffer,
+    occlusion_enabled: bool,
 }
 
 impl Renderer {
@@ -191,7 +206,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -215,19 +230,34 @@ impl Renderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
         let block_textures = create_block_texture_array(&device, &queue, textures);
         let texture_view = block_textures.create_view(&wgpu::TextureViewDescriptor::default());
+        let (animation_texture, animation_view) =
+            create_animation_texture(&device, &queue, textures);
+        // Vanilla uses nearest magnification and linear mip transitions.
+        // Mip levels are generated in `nephele-assets` so custom resource packs
+        // get the same filtering as the stock textures.
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("block sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -246,6 +276,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&animation_view),
                 },
             ],
         });
@@ -336,6 +370,77 @@ impl Renderer {
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sky_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("sky bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sky bind group"),
+            layout: &sky_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sky shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("sky.wgsl").into()),
+        });
+        let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky pipeline layout"),
+            bind_group_layouts: &[Some(&sky_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky pipeline"),
+            layout: Some(&sky_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sky_shader,
+                entry_point: Some("vs_sky"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &sky_shader,
+                entry_point: Some("fs_sky"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -529,7 +634,7 @@ impl Renderer {
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -686,6 +791,7 @@ impl Renderer {
                 &bind_group_layout,
                 &uniform_buffer,
                 &sampler,
+                &animation_view,
                 &shader,
                 &pipeline_layout,
                 format,
@@ -701,6 +807,12 @@ impl Renderer {
             depth_view,
             uniform_buffer,
             bind_group,
+            _animation_texture: animation_texture,
+            block_animations: textures.animations().to_vec(),
+            animation_started: std::time::Instant::now(),
+            environment: Environment::default(),
+            sky_pipeline,
+            sky_bind_group,
             chunks: std::collections::HashMap::new(),
             overlay_pipeline,
             overlay_vertex_buffer,
@@ -734,6 +846,11 @@ impl Renderer {
             panorama,
             show_panorama: false,
             drawn_chunks: 0,
+            occluded_chunks: 0,
+            occlusion: OcclusionBuffer::new(),
+            occlusion_enabled: std::env::var("NEPHELE_OCCLUSION")
+                .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
+                .unwrap_or(true),
         })
     }
 
@@ -803,9 +920,55 @@ impl Renderer {
         }
         queue.write_buffer(&chunk.indices, 0, bytemuck::cast_slice(&mesh.indices));
 
+        let mut cull_min = [f32::INFINITY; 3];
+        let mut cull_max = [f32::NEG_INFINITY; 3];
+        let mut block_heights = [0.0f32; 256];
+        for vertex in &mesh.vertices {
+            for axis in 0..3 {
+                cull_min[axis] = cull_min[axis].min(vertex.position[axis]);
+                cull_max[axis] = cull_max[axis].max(vertex.position[axis]);
+            }
+            let x = (vertex.position[0] - min[0]).floor().clamp(0.0, 15.0) as usize;
+            let z = (vertex.position[2] - min[2]).floor().clamp(0.0, 15.0) as usize;
+            let cell = z * 16 + x;
+            block_heights[cell] = block_heights[cell].max(vertex.position[1]);
+        }
+        if mesh.vertices.is_empty() {
+            cull_min = min;
+            cull_max = max;
+        }
+
+        // Minimum top height across each 4×4 cell. Taking the minimum keeps
+        // the test conservative: a tree or a single spire must not hide a
+        // whole neighbouring column.
+        let mut occluder = [0.0f32; 16];
+        for cz in 0..4 {
+            for cx in 0..4 {
+                let mut lowest = f32::INFINITY;
+                let mut complete = true;
+                for z in 0..4 {
+                    for x in 0..4 {
+                        let height = block_heights[(cz * 4 + z) * 16 + cx * 4 + x];
+                        if height <= 0.0 {
+                            complete = false;
+                            break;
+                        }
+                        lowest = lowest.min(height);
+                    }
+                    if !complete {
+                        break;
+                    }
+                }
+                if complete && lowest.is_finite() {
+                    occluder[cz * 4 + cx] = lowest;
+                }
+            }
+        }
+
         chunk.index_count = mesh.indices.len() as u32;
-        chunk.min = min;
-        chunk.max = max;
+        chunk.min = cull_min;
+        chunk.max = cull_max;
+        chunk.occluder = occluder;
     }
 
     pub fn remove_chunk(&mut self, key: (i32, i32)) {
@@ -992,6 +1155,11 @@ impl Renderer {
         self.show_panorama = visible;
     }
 
+    /// Update sky time and the fog colour sampled from the player's biome.
+    pub fn set_environment(&mut self, environment: Environment) {
+        self.environment = environment;
+    }
+
     pub fn set_ui(&mut self, back: &UiBatch, icons: &UiBatch, front: &UiBatch) {
         let (device, queue) = (&self.device, &self.queue);
         upload_ui(device, queue, &mut self.ui_back, back);
@@ -1000,9 +1168,50 @@ impl Renderer {
     }
 
     pub fn draw(&mut self, camera: &Camera) -> DrawOutcome {
-        let uniforms = Uniforms {
-            view_proj: camera.view_projection().to_cols_array_2d(),
+        let view_proj = camera.view_projection();
+        let mut uniforms = Uniforms {
+            view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+            camera: [camera.position.x, camera.position.y, camera.position.z, 1.0],
+            fog_color: [
+                self.environment.fog_color[0],
+                self.environment.fog_color[1],
+                self.environment.fog_color[2],
+                1.0,
+            ],
+            environment: [
+                self.environment.time_of_day,
+                self.environment.fog_start,
+                self.environment.fog_end,
+                self.environment.fog_scale,
+            ],
+            animation: [
+                self.animation_started.elapsed().as_secs_f32() * 20.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            animations: [[0.0; 4]; MAX_ANIMATIONS * 2],
         };
+        for (index, animation) in self
+            .block_animations
+            .iter()
+            .take(MAX_ANIMATIONS)
+            .enumerate()
+        {
+            uniforms.animations[index * 2] = [
+                animation.origin[0],
+                animation.origin[1],
+                animation.frame_size[0],
+                animation.frame_size[1],
+            ];
+            uniforms.animations[index * 2 + 1] = [
+                animation.step,
+                animation.frames as f32,
+                animation.frametime,
+                0.0,
+            ];
+        }
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
         let ui_uniforms = UiUniforms {
@@ -1043,7 +1252,12 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(SKY_COLOR),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: self.environment.fog_color[0] as f64,
+                            g: self.environment.fog_color[1] as f64,
+                            b: self.environment.fog_color[2] as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1060,6 +1274,14 @@ impl Renderer {
                 multiview_mask: None,
             });
 
+            // The sky is a cheap full-screen ray shader. It writes no depth,
+            // so terrain drawn afterwards still works normally.
+            if !self.show_panorama {
+                pass.set_pipeline(&self.sky_pipeline);
+                pass.set_bind_group(0, &self.sky_bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
             // Title screen: a six-faced panorama cube instead of the world.
             if self.show_panorama {
                 if let Some(panorama) = &self.panorama {
@@ -1074,16 +1296,42 @@ impl Renderer {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             self.drawn_chunks = 0;
+            self.occluded_chunks = 0;
             if !self.chunks.is_empty() {
-                let frustum = Frustum::from_view_projection(&camera.view_projection());
+                let view_proj = camera.view_projection();
+                let frustum = Frustum::from_view_projection(&view_proj);
+                // A coarse height-field depth buffer catches chunks behind
+                // hills. It is only used above the surface: inside a cave the
+                // height field would describe the roof, not what is visible.
+                let use_occlusion =
+                    self.occlusion_enabled && camera.position.y > 72.0 && self.chunks.len() > 16;
+                if use_occlusion {
+                    self.occlusion
+                        .rasterize(&self.chunks, &view_proj, camera.position);
+                }
+                let camera_key = (
+                    camera.position.x.floor() as i32 >> 4,
+                    camera.position.z.floor() as i32 >> 4,
+                );
                 // Nearest first: the depth buffer rejects the rest of the
                 // terrain early instead of shading it and discarding it.
                 let eye = camera.position;
+                let mut occluded = 0;
                 let mut visible: Vec<((i32, i32), f32)> = self
                     .chunks
                     .iter()
-                    .filter(|(_, chunk)| {
-                        chunk.index_count > 0 && frustum.intersects(chunk.min, chunk.max)
+                    .filter(|(&key, chunk)| {
+                        if chunk.index_count == 0 || !frustum.intersects(chunk.min, chunk.max) {
+                            return false;
+                        }
+                        if use_occlusion
+                            && key != camera_key
+                            && self.occlusion.occludes(chunk, &view_proj)
+                        {
+                            occluded += 1;
+                            return false;
+                        }
+                        true
                     })
                     .map(|(&key, chunk)| {
                         let cx = (chunk.min[0] + chunk.max[0]) * 0.5 - eye.x;
@@ -1092,6 +1340,7 @@ impl Renderer {
                         (key, cx * cx + cy * cy + cz * cz)
                     })
                     .collect();
+                self.occluded_chunks = occluded;
                 visible.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
 
                 for (key, _) in &visible {
@@ -1397,6 +1646,7 @@ fn create_block_texture_array(
             requested - layers
         );
     }
+    let mip_level_count = textures.mip_levels();
     let size = wgpu::Extent3d {
         width: tile,
         height: tile,
@@ -1405,6 +1655,52 @@ fn create_block_texture_array(
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("block texture array"),
         size,
+        mip_level_count,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    for level in 0..mip_level_count {
+        let level_size = textures.mip_size(level);
+        let layer_bytes = (level_size * level_size * 4) as usize;
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: level,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &textures.mip_pixels(level)[..layer_bytes * layers as usize],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * level_size),
+                rows_per_image: Some(level_size),
+            },
+            wgpu::Extent3d {
+                width: level_size,
+                height: level_size,
+                depth_or_array_layers: layers,
+            },
+        );
+    }
+    texture
+}
+
+fn create_animation_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    textures: &TextureArray,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let (pixels, width, height) = textures.animation_atlas();
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("block animation atlas"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -1419,15 +1715,20 @@ fn create_block_texture_array(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &textures.pixels()[..textures.bytes_per_layer() * layers as usize],
+        pixels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(4 * tile),
-            rows_per_image: Some(tile),
+            bytes_per_row: Some(4 * width),
+            rows_per_image: Some(height),
         },
-        size,
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
     );
-    texture
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 /// GPU resources for the title screen's panoramic cube.
@@ -1447,6 +1748,7 @@ fn create_panorama(
     layout: &wgpu::BindGroupLayout,
     uniform_buffer: &wgpu::Buffer,
     sampler: &wgpu::Sampler,
+    animation_view: &wgpu::TextureView,
     shader: &wgpu::ShaderModule,
     pipeline_layout: &wgpu::PipelineLayout,
     format: wgpu::TextureFormat,
@@ -1503,6 +1805,10 @@ fn create_panorama(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(animation_view),
             },
         ],
     });
@@ -1593,6 +1899,7 @@ fn panorama_mesh() -> (Vec<Vertex>, Vec<u32>) {
                 uv: *uv,
                 shade: 1.0,
                 layer: layer as u32,
+                anim: crate::mesh::NO_ANIMATION,
                 light: 1.0,
             });
         }
@@ -1610,6 +1917,8 @@ struct ChunkBuffers {
     index_count: u32,
     min: [f32; 3],
     max: [f32; 3],
+    /// Maximum solid height in each 4×4 block cell of the column.
+    occluder: [f32; 16],
 }
 
 impl ChunkBuffers {
@@ -1632,6 +1941,7 @@ impl ChunkBuffers {
             index_count: 0,
             min: [0.0; 3],
             max: [0.0; 3],
+            occluder: [0.0; 16],
         }
     }
 }
@@ -1675,4 +1985,212 @@ impl Frustum {
         }
         true
     }
+}
+
+const OCCLUSION_WIDTH: usize = 80;
+const OCCLUSION_HEIGHT: usize = 45;
+const OCCLUSION_BIAS: f32 = 0.0025;
+
+#[derive(Debug, Clone, Copy)]
+struct Projected {
+    x: f32,
+    y: f32,
+    z: f32,
+    inv_w: f32,
+}
+
+/// Coarse software depth buffer built from each column's 4×4 height field.
+///
+/// It is deliberately conservative: a chunk is only dropped when all nine
+/// sample points (eight AABB corners plus the centre) are behind a nearer
+/// height-field surface. Caves disable the pass, because the height field only
+/// describes the surface and would otherwise hide everything under it.
+struct OcclusionBuffer {
+    depth: Vec<f32>,
+}
+
+impl OcclusionBuffer {
+    fn new() -> Self {
+        Self {
+            depth: vec![1.0; OCCLUSION_WIDTH * OCCLUSION_HEIGHT],
+        }
+    }
+
+    fn rasterize(
+        &mut self,
+        chunks: &std::collections::HashMap<(i32, i32), ChunkBuffers>,
+        view_proj: &glam::Mat4,
+        eye: glam::Vec3,
+    ) {
+        self.depth.fill(1.0);
+        for (&key, chunk) in chunks {
+            if chunk.index_count == 0 || key.0 == i32::MIN {
+                continue;
+            }
+            // Only near columns can usefully hide anything; rasterizing the
+            // whole view distance is pure CPU work and was a p99 spike.
+            let cx = key.0 as f32 * 16.0 + 8.0 - eye.x;
+            let cz = key.1 as f32 * 16.0 + 8.0 - eye.z;
+            if cx * cx + cz * cz > 72.0 * 72.0 {
+                continue;
+            }
+            for cell in 0..16 {
+                let height = chunk.occluder[cell];
+                if height <= 0.0 {
+                    continue;
+                }
+                let x0 = key.0 as f32 * 16.0 + (cell % 4) as f32 * 4.0;
+                let z0 = key.1 as f32 * 16.0 + (cell / 4) as f32 * 4.0;
+                let y = height + 0.08;
+                let corners = [
+                    [x0, y, z0],
+                    [x0 + 4.0, y, z0],
+                    [x0 + 4.0, y, z0 + 4.0],
+                    [x0, y, z0 + 4.0],
+                ];
+                let mut projected = [Projected {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 1.0,
+                    inv_w: 0.0,
+                }; 4];
+                let mut valid = true;
+                for (index, corner) in corners.iter().enumerate() {
+                    match project_point(view_proj, *corner) {
+                        Some(point) => projected[index] = point,
+                        None => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid {
+                    continue;
+                }
+                self.raster_triangle(projected[0], projected[1], projected[2]);
+                self.raster_triangle(projected[0], projected[2], projected[3]);
+            }
+        }
+    }
+
+    fn raster_triangle(&mut self, a: Projected, b: Projected, c: Projected) {
+        let area = edge(a, b, c);
+        if area.abs() < 1.0e-6 {
+            return;
+        }
+        let min_x =
+            a.x.min(b.x)
+                .min(c.x)
+                .floor()
+                .clamp(0.0, OCCLUSION_WIDTH as f32 - 1.0);
+        let max_x =
+            a.x.max(b.x)
+                .max(c.x)
+                .ceil()
+                .clamp(0.0, OCCLUSION_WIDTH as f32 - 1.0);
+        let min_y =
+            a.y.min(b.y)
+                .min(c.y)
+                .floor()
+                .clamp(0.0, OCCLUSION_HEIGHT as f32 - 1.0);
+        let max_y =
+            a.y.max(b.y)
+                .max(c.y)
+                .ceil()
+                .clamp(0.0, OCCLUSION_HEIGHT as f32 - 1.0);
+
+        for y in min_y as usize..=max_y as usize {
+            for x in min_x as usize..=max_x as usize {
+                let p = Projected {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                    z: 1.0,
+                    inv_w: 0.0,
+                };
+                let w0 = edge(b, c, p);
+                let w1 = edge(c, a, p);
+                let w2 = edge(a, b, p);
+                let inside =
+                    (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+                if !inside {
+                    continue;
+                }
+                let l0 = w0 / area;
+                let l1 = w1 / area;
+                let l2 = w2 / area;
+                let inv_w = l0 * a.inv_w + l1 * b.inv_w + l2 * c.inv_w;
+                if inv_w <= 0.0 {
+                    continue;
+                }
+                let z = (l0 * a.z * a.inv_w + l1 * b.z * b.inv_w + l2 * c.z * c.inv_w) / inv_w;
+                if !(0.0..=1.0).contains(&z) {
+                    continue;
+                }
+                let index = y * OCCLUSION_WIDTH + x;
+                if z < self.depth[index] {
+                    self.depth[index] = z;
+                }
+            }
+        }
+    }
+
+    fn occludes(&self, chunk: &ChunkBuffers, view_proj: &glam::Mat4) -> bool {
+        let min = chunk.min;
+        let max = chunk.max;
+        let centre = [
+            (min[0] + max[0]) * 0.5,
+            (min[1] + max[1]) * 0.5,
+            (min[2] + max[2]) * 0.5,
+        ];
+        let samples = [
+            [min[0], min[1], min[2]],
+            [max[0], min[1], min[2]],
+            [min[0], max[1], min[2]],
+            [max[0], max[1], min[2]],
+            [min[0], min[1], max[2]],
+            [max[0], min[1], max[2]],
+            [min[0], max[1], max[2]],
+            [max[0], max[1], max[2]],
+            centre,
+        ];
+        for sample in samples {
+            let Some(point) = project_point(view_proj, sample) else {
+                return false;
+            };
+            if point.x < 0.0
+                || point.y < 0.0
+                || point.x >= OCCLUSION_WIDTH as f32
+                || point.y >= OCCLUSION_HEIGHT as f32
+            {
+                return false;
+            }
+            let index = point.y as usize * OCCLUSION_WIDTH + point.x as usize;
+            if point.z <= self.depth[index] + OCCLUSION_BIAS {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn edge(a: Projected, b: Projected, c: Projected) -> f32 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+fn project_point(view_proj: &glam::Mat4, point: [f32; 3]) -> Option<Projected> {
+    let clip = *view_proj * glam::Vec4::new(point[0], point[1], point[2], 1.0);
+    if clip.w <= 0.0001 {
+        return None;
+    }
+    let inv_w = 1.0 / clip.w;
+    let ndc = clip.truncate() * inv_w;
+    if !ndc.is_finite() {
+        return None;
+    }
+    Some(Projected {
+        x: (ndc.x * 0.5 + 0.5) * OCCLUSION_WIDTH as f32,
+        y: (0.5 - ndc.y * 0.5) * OCCLUSION_HEIGHT as f32,
+        z: ndc.z,
+        inv_w,
+    })
 }

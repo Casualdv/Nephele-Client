@@ -25,10 +25,25 @@ pub enum AssetError {
     EmptyArray,
 }
 
+/// One animation strip packed into the separate 2D animation atlas.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TextureAnimation {
+    /// Top-left corner of the strip in the animation atlas, in UV space.
+    pub origin: [f32; 2],
+    /// Size of one frame in UV space.
+    pub frame_size: [f32; 2],
+    /// Horizontal distance between two frames in UV space.
+    pub step: f32,
+    pub frames: u32,
+    pub frametime: f32,
+}
+
 /// One GPU texture-array layer per referenced block or supported item texture.
 ///
 /// Every block face samples its own layer, so unlike an atlas there is no
-/// bleeding between neighbouring textures and mipmapping stays safe.
+/// bleeding between neighbouring textures and mipmapping stays safe. Animated
+/// textures keep their first frame in the array (for UI/fallback use) and are
+/// sampled from [`TextureArray::animation_atlas`] at runtime.
 #[derive(Debug, Clone)]
 pub struct TextureArray {
     tile_size: u32,
@@ -36,6 +51,13 @@ pub struct TextureArray {
     pixels: Vec<u8>,
     index: HashMap<&'static str, u32>,
     missing: u32,
+    mip_levels: u32,
+    mips: Vec<Vec<u8>>,
+    animations: Vec<TextureAnimation>,
+    animation_index: HashMap<&'static str, u32>,
+    animation_width: u32,
+    animation_height: u32,
+    animation_pixels: Vec<u8>,
 }
 
 impl TextureArray {
@@ -51,13 +73,47 @@ impl TextureArray {
         (self.tile_size * self.tile_size * 4) as usize
     }
 
-    /// RGBA8 data for every layer, laid out layer by layer.
+    pub fn mip_levels(&self) -> u32 {
+        self.mip_levels
+    }
+
+    pub fn mip_size(&self, level: u32) -> u32 {
+        (self.tile_size >> level.min(self.mip_levels.saturating_sub(1))).max(1)
+    }
+
+    /// RGBA8 data for one mip level, laid out layer by layer.
+    pub fn mip_pixels(&self, level: u32) -> &[u8] {
+        if level == 0 {
+            &self.pixels
+        } else {
+            &self.mips[(level - 1) as usize]
+        }
+    }
+
+    /// RGBA8 data for level 0, laid out layer by layer.
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
 
     pub fn layer(&self, name: &str) -> Option<u32> {
         self.index.get(name).copied()
+    }
+
+    pub fn animation(&self, name: &str) -> Option<u32> {
+        self.animation_index.get(name).copied()
+    }
+
+    pub fn animations(&self) -> &[TextureAnimation] {
+        &self.animations
+    }
+
+    /// Packed 2D animation strip atlas and its dimensions.
+    pub fn animation_atlas(&self) -> (&[u8], u32, u32) {
+        (
+            &self.animation_pixels,
+            self.animation_width,
+            self.animation_height,
+        )
     }
 
     /// Layer for `name`, falling back to the generated "missing" texture.
@@ -82,6 +138,7 @@ impl TextureArray {
         }
 
         let mut tiles: Vec<(&'static str, RgbaImage)> = Vec::new();
+        let mut animation_strips: Vec<(&'static str, Vec<RgbaImage>, u32)> = Vec::new();
         for name in all_texture_names() {
             let path = blocks_dir.join(format!("{name}.png"));
             if !path.is_file() {
@@ -91,7 +148,14 @@ impl TextureArray {
                 path: path.display().to_string(),
                 source,
             })?;
-            let mut tile = to_tile(&image.to_rgba8());
+            let rgba = image.to_rgba8();
+            let mut tile = to_tile(&rgba);
+            if let Some((indices, frametime)) = read_mcmeta(&path) {
+                let frames = animation_frames(&rgba, &indices);
+                if frames.len() > 1 {
+                    animation_strips.push((name, frames, frametime));
+                }
+            }
 
             // 1.8 stores grass and foliage as grayscale and tints them at
             // runtime with the biome colour. Bake the plains colour in.
@@ -132,12 +196,19 @@ impl TextureArray {
                 tiles.push((layer, to_tile(&image.to_rgba8())));
             }
         }
-        Ok(Self::from_tiles(tiles))
+        Ok(Self::from_tiles_and_animations(tiles, animation_strips))
     }
 
     /// Build the array from already-decoded 16×16 RGBA tiles. A generated
     /// "missing" tile is appended if the caller didn't provide one.
-    pub fn from_tiles(mut tiles: Vec<(&'static str, RgbaImage)>) -> Self {
+    pub fn from_tiles(tiles: Vec<(&'static str, RgbaImage)>) -> Self {
+        Self::from_tiles_and_animations(tiles, Vec::new())
+    }
+
+    fn from_tiles_and_animations(
+        mut tiles: Vec<(&'static str, RgbaImage)>,
+        animation_strips: Vec<(&'static str, Vec<RgbaImage>, u32)>,
+    ) -> Self {
         if !tiles.iter().any(|(name, _)| *name == MISSING_TEXTURE) {
             tiles.push((MISSING_TEXTURE, missing_texture()));
         }
@@ -166,14 +237,166 @@ impl TextureArray {
             }
         }
 
+        let mips = generate_mips(&pixels, TILE_SIZE, layer_count);
+        let animation_width = animation_strips
+            .iter()
+            .map(|(_, frames, _)| frames.len() as u32 * TILE_SIZE)
+            .max()
+            .unwrap_or(TILE_SIZE)
+            .max(TILE_SIZE);
+        let animation_height = (animation_strips.len() as u32 * TILE_SIZE).max(TILE_SIZE);
+        let mut animation_pixels = vec![0u8; (animation_width * animation_height * 4) as usize];
+        let mut animation_index = HashMap::with_capacity(animation_strips.len());
+        let mut animations = Vec::with_capacity(animation_strips.len());
+
+        for (row, (name, frames, frametime)) in animation_strips.into_iter().enumerate() {
+            let animation = animations.len() as u32;
+            animation_index.insert(name, animation);
+            for (frame_index, frame) in frames.iter().enumerate() {
+                let x0 = frame_index as u32 * TILE_SIZE;
+                let y0 = row as u32 * TILE_SIZE;
+                for y in 0..TILE_SIZE {
+                    for x in 0..TILE_SIZE {
+                        let pixel =
+                            *frame.get_pixel(x.min(frame.width() - 1), y.min(frame.height() - 1));
+                        let offset = (((y0 + y) * animation_width + x0 + x) * 4) as usize;
+                        animation_pixels[offset..offset + 4].copy_from_slice(&pixel.0);
+                    }
+                }
+            }
+            animations.push(TextureAnimation {
+                origin: [0.0, row as f32 * TILE_SIZE as f32 / animation_height as f32],
+                frame_size: [
+                    TILE_SIZE as f32 / animation_width as f32,
+                    TILE_SIZE as f32 / animation_height as f32,
+                ],
+                step: TILE_SIZE as f32 / animation_width as f32,
+                frames: frames.len() as u32,
+                frametime: frametime.max(1) as f32,
+            });
+        }
+
         Self {
             tile_size: TILE_SIZE,
             layer_count,
             pixels,
             index,
             missing,
+            mip_levels: TILE_SIZE.trailing_zeros() + 1,
+            mips,
+            animations,
+            animation_index,
+            animation_width,
+            animation_height,
+            animation_pixels,
         }
     }
+}
+
+/// Read `.png.mcmeta` animation metadata. Returns frame indices (empty means
+/// "all frames in order") and the default frame time in game ticks.
+fn read_mcmeta(png_path: &Path) -> Option<(Vec<u32>, u32)> {
+    let text = std::fs::read_to_string(png_path.with_extension("png.mcmeta")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let animation = json.get("animation")?;
+    let frametime = animation
+        .get("frametime")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1) as u32;
+    let indices = animation
+        .get("frames")
+        .and_then(serde_json::Value::as_array)
+        .map(|frames| {
+            frames
+                .iter()
+                .filter_map(|frame| {
+                    frame
+                        .as_u64()
+                        .or_else(|| frame.get("index").and_then(serde_json::Value::as_u64))
+                })
+                .map(|index| index as u32)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((indices, frametime))
+}
+
+fn animation_frames(image: &RgbaImage, indices: &[u32]) -> Vec<RgbaImage> {
+    let size = image.width().min(image.height());
+    if size == 0 {
+        return Vec::new();
+    }
+    let available = image.height() / size;
+    let mut indices = if indices.is_empty() {
+        (0..available).collect::<Vec<_>>()
+    } else {
+        indices.to_vec()
+    };
+    indices.retain(|index| *index < available);
+    if indices.is_empty() {
+        indices.push(0);
+    }
+    indices
+        .into_iter()
+        .map(|index| {
+            let cropped = image::imageops::crop_imm(image, 0, index * size, size, size).to_image();
+            if size == TILE_SIZE {
+                cropped
+            } else {
+                image::imageops::resize(
+                    &cropped,
+                    TILE_SIZE,
+                    TILE_SIZE,
+                    image::imageops::FilterType::Nearest,
+                )
+            }
+        })
+        .collect()
+}
+
+fn generate_mips(pixels: &[u8], tile: u32, layers: u32) -> Vec<Vec<u8>> {
+    let levels = tile.trailing_zeros();
+    let mut mips = Vec::with_capacity(levels as usize);
+    let mut previous = pixels.to_vec();
+    let mut previous_size = tile;
+    for _ in 0..levels {
+        let next_size = (previous_size / 2).max(1);
+        let mut next = vec![0u8; (layers * next_size * next_size * 4) as usize];
+        for layer in 0..layers {
+            for y in 0..next_size {
+                for x in 0..next_size {
+                    let mut rgb = [0.0f32; 3];
+                    let mut alpha = 0.0;
+                    let mut count = 0.0;
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let sx = (x * 2 + dx).min(previous_size - 1);
+                            let sy = (y * 2 + dy).min(previous_size - 1);
+                            let offset =
+                                ((layer * previous_size * previous_size + sy * previous_size + sx)
+                                    * 4) as usize;
+                            let a = previous[offset + 3] as f32 / 255.0;
+                            rgb[0] += previous[offset] as f32 * a;
+                            rgb[1] += previous[offset + 1] as f32 * a;
+                            rgb[2] += previous[offset + 2] as f32 * a;
+                            alpha += a;
+                            count += 1.0;
+                        }
+                    }
+                    let divisor = if alpha > 0.0 { alpha } else { count };
+                    let offset = ((layer * next_size * next_size + y * next_size + x) * 4) as usize;
+                    next[offset] = (rgb[0] / divisor).round().clamp(0.0, 255.0) as u8;
+                    next[offset + 1] = (rgb[1] / divisor).round().clamp(0.0, 255.0) as u8;
+                    next[offset + 2] = (rgb[2] / divisor).round().clamp(0.0, 255.0) as u8;
+                    next[offset + 3] = (alpha / count * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        mips.push(next.clone());
+        previous = next;
+        previous_size = next_size;
+    }
+    mips
 }
 
 /// Plains-biome grass colour (vanilla `0x79C05A`).
@@ -327,6 +550,44 @@ mod tests {
                 "missing prepared layer {layer}"
             );
         }
+    }
+
+    #[test]
+    fn prepared_animated_textures_expose_all_mcmeta_frames() {
+        let Some(minecraft) = crate::test_support::minecraft() else {
+            eprintln!("skipping animation check: run `nephele-prepare` first");
+            return;
+        };
+        let atlas = TextureArray::load_from_dir(&minecraft.join("textures/blocks"))
+            .expect("prepared block textures load");
+        let water = atlas.animation("water_still").expect("water animation");
+        assert_eq!(atlas.animations()[water as usize].frames, 32);
+        assert_eq!(atlas.animations()[water as usize].frametime, 2.0);
+        let lava = atlas.animation("lava_still").expect("lava animation");
+        assert_eq!(atlas.animations()[lava as usize].frames, 38);
+        let (pixels, width, height) = atlas.animation_atlas();
+        assert_eq!(pixels.len(), (width * height * 4) as usize);
+        assert!(width >= 608);
+    }
+
+    #[test]
+    fn mip_chain_halves_every_layer() {
+        let array = TextureArray::from_tiles(vec![(
+            "a",
+            RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, Rgba([64, 128, 192, 255])),
+        )]);
+        assert_eq!(array.mip_levels(), 5);
+        assert_eq!(array.mip_size(0), 16);
+        assert_eq!(array.mip_size(1), 8);
+        assert_eq!(array.mip_size(4), 1);
+        for level in 1..array.mip_levels() {
+            let size = array.mip_size(level);
+            assert_eq!(
+                array.mip_pixels(level).len(),
+                (size * size * 4 * array.layer_count()) as usize
+            );
+        }
+        assert_eq!(&array.mip_pixels(1)[..4], &[64, 128, 192, 255]);
     }
 
     #[test]

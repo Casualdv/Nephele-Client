@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nephele_assets::{TextureArray, UiAtlas};
-use nephele_render::{build_world_mesh, Camera, Renderer};
+use nephele_render::{build_world_mesh, Camera, Environment, Renderer};
 use nephele_world::worldgen::VanillaGenerator;
 use nephele_world::World;
 use winit::application::ApplicationHandler;
@@ -114,6 +114,24 @@ impl Viewer {
             Ok(renderer) => renderer,
             Err(err) => return self.fail(event_loop, err),
         };
+
+        let mut environment = Environment::default();
+        if let Ok(value) = std::env::var("NEPHELE_TIME") {
+            if let Ok(ticks) = value.parse::<f32>() {
+                environment.time_of_day = ticks.rem_euclid(24000.0);
+            }
+        }
+        renderer.set_environment(environment);
+        if let Ok(value) = std::env::var("NEPHELE_PITCH") {
+            if let Ok(degrees) = value.parse::<f32>() {
+                self.camera.pitch = degrees.to_radians().clamp(-1.55, 1.55);
+            }
+        }
+        if let Ok(value) = std::env::var("NEPHELE_YAW") {
+            if let Ok(degrees) = value.parse::<f32>() {
+                self.camera.yaw = degrees.to_radians();
+            }
+        }
 
         let seed = self.options.seed;
         let mut generator = VanillaGenerator::new(seed);

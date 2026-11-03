@@ -366,17 +366,55 @@ the entity pipeline, which is bound to the skin atlas — via
   `held_slot` and the inventory) and only attaches the hand on `Screen::Game`.
 
 
-### Smooth lighting — planned, not started
+### Low-end renderer polish — done (2026-11-03)
 
-Light **is** decoded: `Section` stores `block_light: Vec<u8>` and
-`sky_light: Option<Vec<u8>>`, nibble-packed (`SECTION_LIGHT_BYTES`), with accessors.
-What's missing:
+Pillar 1's presentation/performance pass is in. It deliberately touched only
+`nephele-assets`, `nephele-render`, the CLI render loops and UI — **no worldgen
+or protocol changes**.
 
-1. `ColumnMeshJob` exposes only `block(x,y,z)` — it needs a `light(x,y,z)` reading the
-   nibbles out of the section.
-2. `Vertex` has no light field; bytemuck layout and `shader.wgsl` both change.
-3. The sampling — 4 corners per vertex plus ambient occlusion, which is what makes
-   caves dark and corners shaded. Per-face light first, AO second.
+- **Animated textures.** `TextureArray` now reads each texture's sibling
+  `.png.mcmeta`, honours `frametime` and the `frames` order, and packs every
+  animation into one 2D strip atlas. The block shader uses the tick clock to
+  choose a frame; water is 32 frames / 2 ticks, lava 38 frames (the mcmeta's
+  palindrome), fire and portal are picked up from the same metadata. Covers are
+  mapped in `block_textures`: water, lava (ids 10/11), fire (51) and portal (90).
+- **Mipmaps.** The block array has the full 16 → 1 chain. Mips are generated in
+  `nephele-assets` with an alpha-weighted box filter, so cutout edges do not
+  darken. Sampling is nearest magnification with linear minification/mip
+  transitions, matching vanilla's look.
+- **Sky.** `sky.wgsl` is one full-screen ray pass: day/night gradient, square
+  sun and moon, stable hashed stars, and two-octave procedural clouds at y=192.
+  Time comes from the server's `TIME_UPDATE` in multiplayer and advances one
+  tick per tick locally. `NEPHELE_TIME`, `NEPHELE_PITCH` and `NEPHELE_YAW` are
+  viewer-only diagnostics for capturing a particular sky.
+- **Fog.** `Environment` carries time, fog colour and start/end distance.
+  `biome_fog_color` tints the horizon by the biome under the camera; being in
+  water overrides it with short-range blue fog. Terrain and entities both apply
+  distance fog in their fragment shaders.
+- **Culling and streaming.** Frustum culling is unchanged. A conservative
+  software occlusion pass rasterises each near column's 4×4 height field into
+  an 80×45 depth buffer and only drops a chunk when all nine AABB samples are
+  behind a nearer surface. It is disabled underwater/cave-level and can be
+  turned off with `NEPHELE_OCCLUSION=0`. Finished column meshes now go through
+  a **2 MiB / 12-column per-frame upload budget** instead of all uploading in
+  the frame they complete.
+- **Damage feedback.** `ui::draw_damage_vignette` draws a red edge gradient for
+  ~0.55 s whenever health drops.
+- **Measured.** `scripts/measure_perf.ps1` on the integrated AMD Radeon
+  (Ryzen 5 7535HS), 1280×720, view distance 8, vsync off:
+  frame p50 `6.960 ms`, p99 `7.410 ms`, 0 frames over the 16.667 ms budget,
+  ~143 fps. A separate real-asset 30 s local-world run measured p99 `12.880 ms`.
+  The normal-world screenshot checked during this pass is
+  `C:\Users\dariu\AppData\Local\Temp\opencode\p1-final-world.png`.
+
+### Smooth lighting + AO — done (2026-11-02)
+
+`Section` decodes `block_light` and `sky_light` nibbles, `ColumnMeshJob` exposes
+light lookups, and `Vertex` carries a per-vertex `light` value. `vertex_light`
+samples the four tangent corners and applies the ambient-occlusion table; the
+`vertex_lighting_averages_four_samples_then_applies_ambient_occlusion` test pins
+it. Caves are dark, corners shade, and the shader multiplies the sampled texel
+by `shade * light`.
 
 ---
 
@@ -519,10 +557,12 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
 M0 bootstrap → **M1 worldgen + renderer** → M2 survival loop → M3 multiplayer polish →
 M4 PvP features → M5 performance → M6 release. Details in `Future.md`.
 
-**M1 status (2026-11-02):** the shape table is now visible through the mesher for
-slabs, stairs, fence posts, panes, doors and torches. Smooth lighting/AO, animated
-textures, plant edge cases and terrain polish remain; M1 is active again before
-the planned M2 close-out.
+**M1 status (2026-11-03):** the shape table is visible through the mesher for
+slabs, stairs, fence posts, panes, doors and torches. Animated `.mcmeta`
+textures, mipmapped filtering, procedural sky/clouds/stars, per-biome fog,
+frustum + height-field occlusion culling, the per-frame upload budget and the
+damage vignette are in. Remaining M1 work is the 92.8% biome map and broader
+plant/terrain edge cases.
 
 **M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
 network block drops and pickup, survival inventory, container click protocol,
@@ -613,6 +653,12 @@ and vertices carry sky/block light with ambient occlusion. Singleplayer creates,
 loads and saves dirty chunks under `%APPDATA%\Nephele\saves`. Performance metrics
 are opt-in behind `NEPHELE_PERF=1`, with a reproducible run via
 `scripts/measure_perf.ps1`.
+
+**Pillar 1 renderer polish landed 2026-11-03** (branch `p1-render`): animated
+`.mcmeta` textures, mipmapped block filtering, procedural sky (sun/moon/stars/
+clouds), per-biome fog, conservative height-field occlusion culling, the
+per-frame chunk upload budget and the damage vignette. Measured p99 on the
+integrated Radeon is 7.41 ms at 1280×720 / view distance 8 with vsync off.
 
 **Open:**
 

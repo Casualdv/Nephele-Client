@@ -26,9 +26,9 @@ use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
 use nephele_render::{
-    append_hand, block_outline, break_overlay_texture, build_break_overlay, build_entities,
-    build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw, HandDraw, HandItem,
-    ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
+    append_hand, biome_fog_color, block_outline, break_overlay_texture, build_break_overlay,
+    build_entities, build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw,
+    Environment, HandDraw, HandItem, ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
 };
 use nephele_world::save::{self, WorldMetadata, WorldMode, WorldSave};
 use nephele_world::{raycast, BlockState, ChunkColumn, ChunkCoord, World};
@@ -52,6 +52,10 @@ const OUTLINE_COLOR: [f32; 3] = [0.0, 0.0, 0.0];
 const PING_TIMEOUT: Duration = Duration::from_secs(1);
 /// Two clicks on the same server within this window join it (`double-click`).
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+/// Smooth streaming: meshes are uploaded over several frames instead of all in
+/// the frame they finish. This bounds the driver-side copy at ~2 MiB/frame.
+const CHUNK_UPLOAD_BUDGET_BYTES: usize = 2 * 1024 * 1024;
+const CHUNK_UPLOAD_BUDGET_COUNT: usize = 12;
 
 pub struct PlayOptions {
     /// None opens the title screen instead of connecting straight away.
@@ -161,6 +165,8 @@ struct Shared {
     food: i32,
     xp_bar: f32,
     xp_level: i32,
+    /// World time in ticks (0..24000), used by the sky.
+    time_of_day: f32,
     chunks: usize,
     /// Requested by the creative inventory, applied by the network thread.
     give_item: Option<(i16, ItemStack)>,
@@ -330,6 +336,7 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         food: 20,
         xp_bar: 0.0,
         xp_level: 0,
+        time_of_day: 6000.0,
         chunks: 0,
         give_item: None,
         chat_out: Vec::new(),
@@ -611,10 +618,25 @@ fn local_loop(
             state.aim = aim;
             state.break_stage = miner.stage();
             state.chunks = world.loaded_chunks();
+            // Singleplayer does not have a server sending TIME_UPDATE, so run
+            // the same 20-minute day the protocol would produce.
+            state.time_of_day = (state.time_of_day + 1.0) % 24000.0;
         }
 
         std::thread::sleep(TICK);
     }
+}
+
+/// Biome id at a world column, falling back to plains when it is not loaded.
+fn biome_at(world: &World, x: i32, z: i32) -> i32 {
+    let column = world.get(ChunkCoord::new(x.div_euclid(16), z.div_euclid(16)));
+    column
+        .and_then(ChunkColumn::biomes)
+        .map(|biomes| {
+            let index = z.rem_euclid(16) as usize * 16 + x.rem_euclid(16) as usize;
+            biomes.get(index).copied().unwrap_or(1) as i32
+        })
+        .unwrap_or(1)
 }
 
 /// Camera-relative look vector, matching [`Camera::forward`].
@@ -823,6 +845,7 @@ async fn net_loop(
                     state.food = client.food;
                     state.xp_bar = client.xp_bar;
                     state.xp_level = client.xp_level;
+                    state.time_of_day = (client.time_of_day.rem_euclid(24000) as f32).max(0.0);
                     state.chunks = client.world.loaded_chunks();
                     if state.inventory.len() != client.inventory.len() {
                         state.inventory = client.inventory.clone();
@@ -932,6 +955,7 @@ struct FrameView {
     food: i32,
     xp_bar: f32,
     xp_level: i32,
+    time_of_day: f32,
     chunks: usize,
     feet: [f64; 3],
     /// Fraction of the way through the current 20 Hz tick.
@@ -954,6 +978,8 @@ struct LiveApp {
     /// Columns edited while a worker was already meshing them; their result is
     /// out of date and gets rebuilt once it comes back.
     stale: HashSet<(i32, i32)>,
+    /// Finished meshes waiting for the per-frame upload budget.
+    pending_uploads: Vec<((i32, i32), MeshData)>,
     mesh_pool: Option<MeshPool>,
     /// Remote entities, replaced on every network tick.
     entities: Vec<EntitySnapshot>,
@@ -1024,6 +1050,9 @@ struct LiveApp {
     /// Shift held down, for inventory quick-move clicks.
     shift: bool,
     last_fps: f32,
+    /// Previous health value, so a drop can flash the damage vignette.
+    last_health: f32,
+    hurt_flash: f32,
     error: Option<Box<dyn Error>>,
 }
 
@@ -1067,6 +1096,7 @@ impl LiveApp {
             dirty_chunks: Vec::new(),
             queued: HashSet::new(),
             stale: HashSet::new(),
+            pending_uploads: Vec::new(),
             mesh_pool: None,
             entities: Vec::new(),
             skin_atlas: SkinAtlas::new(),
@@ -1126,6 +1156,8 @@ impl LiveApp {
             inventory_cursor: None,
             shift: false,
             last_fps: 0.0,
+            last_health: 20.0,
+            hurt_flash: 0.0,
             error: None,
         };
 
@@ -1421,6 +1453,7 @@ impl LiveApp {
                     self.world.remove(ChunkCoord::new(x, z));
                     self.queued.remove(&(x, z));
                     self.stale.remove(&(x, z));
+                    self.pending_uploads.retain(|(key, _)| *key != (x, z));
                     if let Some(renderer) = self.renderer.as_mut() {
                         renderer.remove_chunk((x, z));
                     }
@@ -1566,6 +1599,7 @@ impl LiveApp {
                 food: state.food,
                 xp_bar: state.xp_bar,
                 xp_level: state.xp_level,
+                time_of_day: state.time_of_day,
                 chunks: state.chunks,
                 feet,
                 alpha,
@@ -1575,6 +1609,11 @@ impl LiveApp {
         if let Some(err) = &view.error {
             eprintln!("disconnected: {err}");
         }
+        if view.health + 0.01 < self.last_health {
+            self.hurt_flash = 0.55;
+        }
+        self.last_health = view.health;
+        self.hurt_flash = (self.hurt_flash - delta * 1.8).max(0.0);
 
         // Right-clicking a crafting table opens a server window; show it.
         if view.window_open && self.screen == Screen::Game {
@@ -1601,7 +1640,47 @@ impl LiveApp {
                 }
                 continue;
             }
-            self.upload_chunk(key, &mesh);
+            if let Some(existing) = self
+                .pending_uploads
+                .iter_mut()
+                .find(|(pending, _)| *pending == key)
+            {
+                existing.1 = mesh;
+            } else {
+                self.pending_uploads.push((key, mesh));
+            }
+        }
+
+        // Upload only a slice of the pending meshes this frame. A burst of
+        // chunk loads (flying, teleporting, joining) used to copy every mesh
+        // to the GPU in one frame and caused multi-frame hitches.
+        if !self.pending_uploads.is_empty() {
+            let eye = view.camera.position;
+            self.pending_uploads.sort_unstable_by(|(a, _), (b, _)| {
+                let distance = |key: (i32, i32)| {
+                    let dx = key.0 as f32 * 16.0 + 8.0 - eye.x;
+                    let dz = key.1 as f32 * 16.0 + 8.0 - eye.z;
+                    dx * dx + dz * dz
+                };
+                distance(*a).total_cmp(&distance(*b))
+            });
+            let mut uploaded = 0;
+            let mut bytes = 0;
+            let index = 0;
+            while index < self.pending_uploads.len() {
+                let size = self.pending_uploads[index].1.vertices.len()
+                    * std::mem::size_of::<nephele_render::Vertex>()
+                    + self.pending_uploads[index].1.indices.len() * std::mem::size_of::<u32>();
+                if uploaded >= CHUNK_UPLOAD_BUDGET_COUNT
+                    || (uploaded > 0 && bytes + size > CHUNK_UPLOAD_BUDGET_BYTES)
+                {
+                    break;
+                }
+                let (key, mesh) = self.pending_uploads.remove(index);
+                bytes += size;
+                uploaded += 1;
+                self.upload_chunk(key, &mesh);
+            }
         }
 
         // Then hand the nearest pending columns to the workers.
@@ -1669,9 +1748,40 @@ impl LiveApp {
             };
         }
 
+        let eye_block = self.world.get_block(
+            view.camera.position.x.floor() as i32,
+            view.camera.position.y.floor() as i32,
+            view.camera.position.z.floor() as i32,
+        );
+        let underwater = matches!(eye_block.id(), 8 | 9);
+        let biome = biome_at(
+            &self.world,
+            view.camera.position.x.floor() as i32,
+            view.camera.position.z.floor() as i32,
+        );
+        let view_distance = self.settings.view_distance as f32 * 16.0;
+        let environment = if underwater {
+            Environment {
+                time_of_day: view.time_of_day,
+                fog_color: [0.02, 0.04, 0.20],
+                fog_start: 0.0,
+                fog_end: 10.0,
+                fog_scale: 1.0,
+            }
+        } else {
+            Environment {
+                time_of_day: view.time_of_day,
+                fog_color: biome_fog_color(biome),
+                fog_start: (view_distance * 0.58).max(24.0),
+                fog_end: (view_distance - 4.0).max(32.0),
+                fog_scale: 1.0,
+            }
+        };
+
         let mut presented = false;
         let draw_start = Instant::now();
         if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_environment(environment);
             renderer.set_panorama(title);
             match renderer.draw(&camera) {
                 nephele_render::DrawOutcome::Presented => presented = true,
@@ -1928,6 +2038,7 @@ impl LiveApp {
         };
 
         if self.screen == Screen::Game {
+            ui::draw_damage_vignette(&mut self.ui_bg, width, height, self.hurt_flash);
             self.draw_chat(scale, width, height);
         }
 
@@ -3014,6 +3125,9 @@ fn initial_settings() -> Settings {
             settings.view_distance = distance.clamp(2, 16);
         }
     }
+    if let Ok(value) = std::env::var("NEPHELE_VSYNC") {
+        settings.vsync = !matches!(value.trim(), "0" | "false" | "off");
+    }
     settings
 }
 
@@ -3164,6 +3278,7 @@ mod tests {
             food: 20,
             xp_bar: 0.0,
             xp_level: 0,
+            time_of_day: 6000.0,
             chunks: 0,
             give_item: None,
             chat_out: Vec::new(),

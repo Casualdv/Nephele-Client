@@ -66,6 +66,7 @@ pub fn face_textures(state: BlockState) -> Option<FaceTextures> {
         ids::PLANKS => same(planks(meta)),
         ids::BEDROCK => same("bedrock"),
         ids::WATER => same("water_still"),
+        10 | 11 => same("lava_still"),
         ids::SAND => same("sand"),
         ids::GRAVEL => same("gravel"),
         14 => same("gold_ore"),
@@ -86,6 +87,7 @@ pub fn face_textures(state: BlockState) -> Option<FaceTextures> {
         47 => split("planks_oak", "planks_oak", "bookshelf"),
         48 => same("cobblestone_mossy"),
         49 => same("obsidian"),
+        51 => same("fire_layer_0"),
         56 => same("diamond_ore"),
         57 => same("diamond_block"),
         58 => split("crafting_table_top", "planks_oak", "crafting_table_side"),
@@ -99,6 +101,7 @@ pub fn face_textures(state: BlockState) -> Option<FaceTextures> {
         87 => same("netherrack"),
         88 => same("soul_sand"),
         89 => same("glowstone"),
+        90 => same("portal"),
         91 => split("pumpkin_top", "pumpkin_top", "pumpkin_side"),
         95 => same(STAINED_GLASS[meta.min(15) as usize]),
         98 => match meta {

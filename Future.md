@@ -82,7 +82,11 @@ title / pause / settings / connect / creative screens, HUD (hotbar, crosshair,
 health), physics (walk, sprint, sneak, fly, jump, sneak edge protection),
 mining + placement, creative inventory, anvil **reading**, biomes + density
 height field + surface pass, shape-aware block meshing (slabs, stairs, fence
-posts, panes, doors and torches), launcher, CI, verified-resource preparation.
+posts, panes, doors and torches), animated textures, mipmapped filtering,
+procedural sky and per-biome fog, frustum + height-field occlusion culling,
+a per-frame upload budget, damage vignette, launcher, CI, verified-resource
+preparation. Performance bar: 143 fps / p99 7.41 ms on the integrated AMD
+Radeon at 1280×720, view distance 8, vsync off (`NEPHELE_PERF=1`).
 
 Measured parity against a world the real 1.8.9 server generated: **92.8%** of
 biome cells, **96%** of surface heights, **98.8%** of surface block types.
@@ -100,13 +104,13 @@ biome cells, **96%** of surface heights, **98.8%** of surface block types.
 | Smooth lighting + ambient occlusion | L | We decode light but do not apply it per vertex. Biggest visual win. |
 | Block shapes from vanilla models (stairs, slabs, fences, panes, cross plants) | L | The mesher now emits the `block_shape` boxes for slabs, stairs, fence posts, panes, doors and torches. Cross plants remain crossed quads. Fence rails and pane connections are still absent, and shaped boxes are not neighbour-culled yet. |
 | First-person hand + held block | M | Done: skin-textured arm, held block, swing. Occluded by walls (no depth-clear pass). |
-| Animated textures (`.mcmeta`, water/lava/fire/portal) | M | |
-| Sky: sun, moon, stars, clouds, day-night, fog per biome/dimension | L | |
-| Frustum + occlusion culling | M | |
-| Chunk upload budget per frame; async mesh results already exist | M | Avoid hitches when flying fast. |
-| Mipmapping / texture filtering parity with vanilla | S | |
+| Animated textures (`.mcmeta`, water/lava/fire/portal) | M | **Done 2026-11-03:** frame strips in a 2D atlas, tick clock in the block shader. |
+| Sky: sun, moon, stars, clouds, day-night, fog per biome/dimension | L | **Done 2026-11-03:** full-screen ray sky, server TIME_UPDATE, per-biome and underwater fog. |
+| Frustum + occlusion culling | M | **Done 2026-11-03:** frustum plus a conservative 4×4 height-field depth buffer; `NEPHELE_OCCLUSION=0` disables it. |
+| Chunk upload budget per frame; async mesh results already exist | M | **Done 2026-11-03:** 2 MiB / 12 columns per frame. |
+| Mipmapping / texture filtering parity with vanilla | S | **Done 2026-11-03:** full 16→1 chain, alpha-weighted, nearest mag + linear mips. |
 | Held item in first person + swing animation | M | PvP clients care about this. |
-| Damage overlay, hurt flash, vignette | S | |
+| Damage overlay, hurt flash, vignette | S | **Done 2026-11-03:** red edge vignette on health loss. |
 
 ### 2. World generation
 
@@ -258,7 +262,7 @@ No audio exists yet.
 **M0 — Foundations (done).** Protocol, rendering, movement, worldgen height
 field, launcher, CI.
 
-**M1 - A world worth walking in.** *Rendering done:* mesa, caves, ores, flora, shape-aware meshing (slabs, stairs, fences, panes that connect, doors, torches) and smooth lighting with ambient occlusion. *Still open:* biome-map parity, currently 92.8175% against the reference world - the world is right at scale and wrong in patches. *Exit:* singleplayer world looks like Minecraft from above and from underground.
+**M1 - A world worth walking in.** *Rendering done:* mesa, caves, ores, flora, shape-aware meshing (slabs, stairs, fences, panes that connect, doors, torches), smooth lighting with ambient occlusion, animated textures, mipmapped filtering, procedural sky with sun/moon/stars/clouds and per-biome fog, frustum + height-field occlusion culling, a per-frame upload budget and damage vignette. *Still open:* biome-map parity, currently 92.8175% against the reference world - the world is right at scale and wrong in patches. *Exit:* singleplayer world looks like Minecraft from above and from underground.
 
 **M2 - Survival loop.** *Exit criterion met offline.* A recorded play-through punched logs, made planks, sticks and a crafting table through the 2x2 grid, placed the table, opened the 3x3 window and crafted a wooden pickaxe - correct counts, no item loss. Remaining polish, none of it blocking the exit: eating, armour effects, XP orbs, block entities and item-atlas wiring.
 

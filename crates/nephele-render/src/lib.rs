@@ -6,6 +6,7 @@
 
 pub mod camera;
 pub mod entity;
+pub mod environment;
 pub mod gpu;
 pub mod lines;
 pub mod mesh;
@@ -15,6 +16,7 @@ pub use camera::Camera;
 pub use entity::{
     append_hand, build_entities, EntityDraw, EntityMesh, EntityVertex, HandDraw, HandPose,
 };
+pub use environment::{biome_fog_color, Environment};
 pub use gpu::{DrawOutcome, Renderer, RendererError};
 pub use lines::{block_outline, LineMesh, LineVertex};
 pub use mesh::{

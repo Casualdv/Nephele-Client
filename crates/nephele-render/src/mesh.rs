@@ -14,17 +14,23 @@ pub struct Vertex {
     pub shade: f32,
     /// Texture-array layer for this face.
     pub layer: u32,
+    /// Optional index into the renderer's `.mcmeta` animation table.
+    pub anim: u32,
     /// Combined block/sky illumination with ambient occlusion, in 0..=1.
     pub light: f32,
 }
 
+/// Sentinel for vertices that use a static texture-array layer.
+pub const NO_ANIMATION: u32 = u32::MAX;
+
 impl Vertex {
-    pub const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x2,
         2 => Float32,
         3 => Uint32,
-        4 => Float32
+        4 => Uint32,
+        5 => Float32
     ];
 
     pub const fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -173,6 +179,7 @@ pub fn build_break_overlay(x: i32, y: i32, z: i32, layer: u32) -> MeshData {
                 // Vanilla renders the crack overlay unshaded.
                 shade: 1.0,
                 layer,
+                anim: NO_ANIMATION,
                 light: 1.0,
             });
         }
@@ -512,7 +519,8 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
     let mut mesh = MeshData::default();
     // Block states repeat heavily, so resolve the texture layers once per
     // distinct state instead of three hash lookups per block.
-    let mut resolved: std::collections::HashMap<u16, Option<[u32; 3]>> =
+    type ResolvedTextures = ([u32; 3], [u32; 3]);
+    let mut resolved: std::collections::HashMap<u16, Option<ResolvedTextures>> =
         std::collections::HashMap::with_capacity(64);
 
     let base_x = job.key.0 * 16;
@@ -532,16 +540,22 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let textures = face_textures(BlockState::from_raw(raw)).map(|textures| {
-                        [
+                        let layers = [
                             atlas.layer_or_missing(textures.top),
                             atlas.layer_or_missing(textures.bottom),
                             atlas.layer_or_missing(textures.side),
-                        ]
+                        ];
+                        let anims = [
+                            atlas.animation(textures.top).unwrap_or(NO_ANIMATION),
+                            atlas.animation(textures.bottom).unwrap_or(NO_ANIMATION),
+                            atlas.animation(textures.side).unwrap_or(NO_ANIMATION),
+                        ];
+                        (layers, anims)
                     });
                     *entry.insert(textures)
                 }
             };
-            let Some(layers) = layers else {
+            let Some((layers, anims)) = layers else {
                 continue;
             };
 
@@ -555,6 +569,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             // cubes is what makes flowers and grass look like solid boxes.
             if is_cross_plant(id) {
                 let layer = layers[2];
+                let anim = anims[2];
                 let bx = (base_x + local_x) as f32;
                 let by = y as f32;
                 let bz = (base_z + local_z) as f32;
@@ -587,6 +602,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                                 uv: uvs[index],
                                 shade: 1.0,
                                 layer,
+                                anim,
                                 light,
                             });
                         }
@@ -634,7 +650,14 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                         ]
                     });
                     let lights = face_vertex_lights(job, local_x, y, local_z, face);
-                    append_quad(&mut mesh, face, layers[face.slot], positions, lights);
+                    append_quad(
+                        &mut mesh,
+                        face,
+                        layers[face.slot],
+                        anims[face.slot],
+                        positions,
+                        lights,
+                    );
                 }
             } else {
                 // Shape boxes use 0..16 block pixels; convert them to block
@@ -654,7 +677,14 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                             ]
                         });
                         let lights = face_vertex_lights(job, local_x, y, local_z, face);
-                        append_quad(&mut mesh, face, layers[face.slot], positions, lights);
+                        append_quad(
+                            &mut mesh,
+                            face,
+                            layers[face.slot],
+                            anims[face.slot],
+                            positions,
+                            lights,
+                        );
                     }
                 }
             }
@@ -827,6 +857,7 @@ fn append_quad(
     mesh: &mut MeshData,
     face: &FaceDef,
     layer: u32,
+    anim: u32,
     positions: [[f32; 3]; 4],
     lights: [f32; 4],
 ) {
@@ -841,6 +872,7 @@ fn append_quad(
             uv,
             shade: face.shade,
             layer,
+            anim,
             light,
         });
     }
@@ -941,6 +973,7 @@ pub fn build_item_mesh(items: &[ItemDraw], atlas: &TextureArray, time: f32) -> M
                     uv: *uv,
                     shade: face.shade,
                     layer: layers[face.slot],
+                    anim: NO_ANIMATION,
                     light: 1.0,
                 });
             }
@@ -996,6 +1029,7 @@ pub fn build_hand_item(item: &HandItem, atlas: &TextureArray) -> MeshData {
                 uv: *uv,
                 shade: face.shade,
                 layer: layers[face.slot],
+                anim: NO_ANIMATION,
                 light: 1.0,
             });
         }

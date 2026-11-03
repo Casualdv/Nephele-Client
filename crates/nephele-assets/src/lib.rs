@@ -18,7 +18,7 @@ pub mod skin_atlas;
 pub mod title;
 pub mod ui_atlas;
 
-pub use atlas::{AssetError, TextureArray, TILE_SIZE};
+pub use atlas::{AssetError, TextureAnimation, TextureArray, TILE_SIZE};
 pub use block_models::{BlockModel, BlockModels, Element, FaceSpec, ModelFace};
 pub use block_textures::{face_textures, is_transparent, FaceTextures, MISSING_TEXTURE};
 pub use item_textures::{all_item_texture_layers, item_texture_name};

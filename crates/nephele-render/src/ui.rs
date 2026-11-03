@@ -70,6 +70,17 @@ impl UiBatch {
     }
 
     pub fn quad(&mut self, corners: [[f32; 2]; 4], uv: [f32; 4], color: [f32; 4], layer: u32) {
+        self.quad_colors(corners, uv, [color; 4], layer);
+    }
+
+    /// Quad with one colour per corner, for gradients such as the hurt vignette.
+    pub fn quad_colors(
+        &mut self,
+        corners: [[f32; 2]; 4],
+        uv: [f32; 4],
+        colors: [[f32; 4]; 4],
+        layer: u32,
+    ) {
         let base = self.vertices.len() as u32;
         let uvs = [
             [uv[0], uv[1]],
@@ -77,11 +88,11 @@ impl UiBatch {
             [uv[2], uv[3]],
             [uv[0], uv[3]],
         ];
-        for (corner, uv) in corners.iter().zip(uvs.iter()) {
+        for ((corner, uv), color) in corners.iter().zip(uvs.iter()).zip(colors.iter()) {
             self.vertices.push(UiVertex {
                 position: *corner,
                 uv: *uv,
-                color,
+                color: *color,
                 layer,
             });
         }

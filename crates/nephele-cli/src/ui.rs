@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use crate::servers::{Ping, PingBoard, ServerList};
 use crate::settings::{SettingId, Settings};
 use nephele_assets::{
-    face_textures, font, item_texture_name, sprites, TextureArray, MISSING_TEXTURE,
+    face_textures, font, item_texture_name, sprites, TextureArray, UiAtlas, MISSING_TEXTURE,
 };
 use nephele_protocol::packets::play::{ItemStack, HOTBAR_FIRST_SLOT, HOTBAR_SLOTS};
 use nephele_render::{Rect, UiBatch};
@@ -335,6 +335,54 @@ pub fn draw_hud(
     }
 
     buttons
+}
+
+/// Red edge vignette shown briefly after the player takes damage.
+pub fn draw_damage_vignette(bg: &mut UiBatch, width: f32, height: f32, strength: f32) {
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.0 {
+        return;
+    }
+    let uv = UiAtlas::white_uv();
+    let red = [0.62, 0.02, 0.02, 0.48 * strength];
+    let clear = [0.62, 0.02, 0.02, 0.0];
+    let side = width * 0.16;
+    let band = height * 0.20;
+
+    bg.quad_colors(
+        [[0.0, 0.0], [width, 0.0], [width, band], [0.0, band]],
+        uv,
+        [red, red, clear, clear],
+        0,
+    );
+    bg.quad_colors(
+        [
+            [0.0, height - band],
+            [width, height - band],
+            [width, height],
+            [0.0, height],
+        ],
+        uv,
+        [clear, clear, red, red],
+        0,
+    );
+    bg.quad_colors(
+        [[0.0, 0.0], [side, 0.0], [side, height], [0.0, height]],
+        uv,
+        [red, clear, clear, red],
+        0,
+    );
+    bg.quad_colors(
+        [
+            [width - side, 0.0],
+            [width, 0.0],
+            [width, height],
+            [width - side, height],
+        ],
+        uv,
+        [clear, red, red, clear],
+        0,
+    );
 }
 
 /// Recent chat in the bottom-left, and the input line while it is open.
@@ -1689,6 +1737,19 @@ pub fn hit_test(buttons: &[Button], pointer: [f32; 2]) -> Option<Action> {
 mod tests {
     use super::*;
     use crate::servers::ServerEntry;
+
+    #[test]
+    fn damage_vignette_is_four_fading_edge_quads() {
+        let mut batch = UiBatch::default();
+        draw_damage_vignette(&mut batch, 100.0, 80.0, 0.0);
+        assert!(batch.is_empty());
+
+        draw_damage_vignette(&mut batch, 100.0, 80.0, 1.0);
+        assert_eq!(batch.vertices.len(), 16);
+        assert_eq!(batch.indices.len(), 24);
+        assert!(batch.vertices.iter().any(|vertex| vertex.color[3] > 0.0));
+        assert!(batch.vertices.iter().any(|vertex| vertex.color[3] == 0.0));
+    }
 
     #[test]
     fn gui_scale_is_integral_and_bounded() {

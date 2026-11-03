@@ -5,10 +5,11 @@
 .DESCRIPTION
     Builds the release CLI, then runs a deterministic local world with a generated
     flat-color placeholder texture (no game assets). The client requests a
-    low-power adapter and logs its actual adapter name/type. The run must report
-    frame and mesh p50/p99 values plus non-zero mesh/upload counts before it can
-    be treated as a valid measurement. The workload uses the client default render
-    distance of 8 chunks (a 17x17 column area around spawn).
+    low-power adapter and logs its actual adapter name/type. VSync is disabled so
+    the percentiles measure render headroom rather than the display refresh. The
+    run must report frame and mesh p50/p99 values plus non-zero mesh/upload counts
+    before it can be treated as a valid measurement. The workload uses the client
+    default render distance of 8 chunks (a 17x17 column area around spawn).
 
     Frame-time histograms reset every 30 seconds. Run for at least 75 seconds to
     collect a startup window and a separate steady-state window; the script checks
@@ -79,7 +80,9 @@ $processEnvNames = @(
     'NEPHELE_SCREEN',
     'NEPHELE_VIEW_DISTANCE',
     'NEPHELE_DATA_DIR',
-    'NEPHELE_PROFILE'
+    'NEPHELE_PROFILE',
+    'NEPHELE_VSYNC',
+    'NEPHELE_OCCLUSION'
 )
 $previousEnv = @{}
 foreach ($name in $processEnvNames) {
@@ -111,6 +114,8 @@ try {
     $env:NEPHELE_PERF = '1'
     $env:NEPHELE_GPU = 'integrated'
     $env:NEPHELE_SCREEN = 'local'
+    $env:NEPHELE_VSYNC = '0'
+    $env:NEPHELE_OCCLUSION = '1'
     Remove-Item Env:NEPHELE_VIEW_DISTANCE -ErrorAction SilentlyContinue
     $env:NEPHELE_DATA_DIR = $dataDir
     Remove-Item Env:NEPHELE_PROFILE -ErrorAction SilentlyContinue
