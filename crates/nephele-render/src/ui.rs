@@ -12,7 +12,7 @@ pub struct UiVertex {
     pub position: [f32; 2],
     pub uv: [f32; 2],
     pub color: [f32; 4],
-    /// Texture-array layer used by block and item icons.
+    /// Packed texture slot used by block and item icons.
     pub layer: u32,
 }
 

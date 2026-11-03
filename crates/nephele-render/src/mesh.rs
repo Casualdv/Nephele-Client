@@ -12,7 +12,7 @@ pub struct Vertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
     pub shade: f32,
-    /// Texture-array layer for this face.
+    /// Packed texture slot: `layer = slot / 16`, tile = `slot % 16`.
     pub layer: u32,
     /// Optional index into the renderer's `.mcmeta` animation table.
     pub anim: u32,
@@ -541,9 +541,9 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     let textures = face_textures(BlockState::from_raw(raw)).map(|textures| {
                         let layers = [
-                            atlas.layer_or_missing(textures.top),
-                            atlas.layer_or_missing(textures.bottom),
-                            atlas.layer_or_missing(textures.side),
+                            atlas.slot_or_missing(textures.top),
+                            atlas.slot_or_missing(textures.bottom),
+                            atlas.slot_or_missing(textures.side),
                         ];
                         let anims = [
                             atlas.animation(textures.top).unwrap_or(NO_ANIMATION),
@@ -932,16 +932,16 @@ pub fn build_item_mesh(items: &[ItemDraw], atlas: &TextureArray, time: f32) -> M
     let mut mesh = MeshData::default();
     for item in items {
         let layers = if let Some(texture) = item_texture_name(item.item, item.meta) {
-            [atlas.layer_or_missing(texture); 3]
+            [atlas.slot_or_missing(texture); 3]
         } else {
             let state = BlockState::new(item.item.max(0) as u16, item.meta.clamp(0, 15) as u8);
             match face_textures(state) {
                 Some(faces) => [
-                    atlas.layer_or_missing(faces.top),
-                    atlas.layer_or_missing(faces.bottom),
-                    atlas.layer_or_missing(faces.side),
+                    atlas.slot_or_missing(faces.top),
+                    atlas.slot_or_missing(faces.bottom),
+                    atlas.slot_or_missing(faces.side),
                 ],
-                None => [atlas.layer_or_missing(MISSING_TEXTURE); 3],
+                None => [atlas.slot_or_missing(MISSING_TEXTURE); 3],
             }
         };
 
@@ -1006,11 +1006,11 @@ pub fn build_hand_item(item: &HandItem, atlas: &TextureArray) -> MeshData {
     let state = BlockState::new(item.item.max(0) as u16, item.meta.clamp(0, 15) as u8);
     let layers = match face_textures(state) {
         Some(faces) => [
-            atlas.layer_or_missing(faces.top),
-            atlas.layer_or_missing(faces.bottom),
-            atlas.layer_or_missing(faces.side),
+            atlas.slot_or_missing(faces.top),
+            atlas.slot_or_missing(faces.bottom),
+            atlas.slot_or_missing(faces.side),
         ],
-        None => [atlas.layer_or_missing(MISSING_TEXTURE); 3],
+        None => [atlas.slot_or_missing(MISSING_TEXTURE); 3],
     };
 
     let right = glam::Vec3::from(item.right);
@@ -1049,11 +1049,11 @@ mod tests {
     fn atlas() -> TextureArray {
         TextureArray::from_tiles(vec![
             (
-                "stone",
+                "stone".to_string(),
                 RgbaImage::from_pixel(16, 16, image::Rgba([128, 128, 128, 255])),
             ),
             (
-                "item:stick",
+                "item:stick".to_string(),
                 RgbaImage::from_pixel(16, 16, image::Rgba([200, 150, 100, 255])),
             ),
         ])
@@ -1286,7 +1286,7 @@ mod tests {
         let textures = atlas();
         let mesh = build_item_mesh(&items, &textures, 0.0);
         assert_eq!(mesh.vertices.len(), 24);
-        let stick_layer = textures.layer("item:stick").unwrap();
+        let stick_layer = textures.slot("item:stick").unwrap();
         assert!(mesh
             .vertices
             .iter()

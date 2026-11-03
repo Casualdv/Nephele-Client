@@ -1198,6 +1198,17 @@ impl LiveApp {
             Ok(textures) => textures,
             Err(err) => return self.fail(event_loop, err),
         };
+        let missing = textures.unresolved_names();
+        tracing::info!(
+            tiles = textures.tile_count(),
+            layers = textures.layer_count(),
+            layer_size = textures.layer_size(),
+            missing = missing.len(),
+            "block textures loaded"
+        );
+        for name in missing {
+            tracing::warn!(texture = name, "unresolved block texture");
+        }
         // The UI sheets live one level up: `textures/font`, `textures/gui`.
         let ui_root = self
             .options
@@ -1526,7 +1537,7 @@ impl LiveApp {
             self.drawn_stage = stage;
             let overlay = match (aim, stage, self.textures.as_ref()) {
                 (Some(aim), Some(stage), Some(textures)) => {
-                    let layer = textures.layer_or_missing(break_overlay_texture(stage));
+                    let layer = textures.slot_or_missing(break_overlay_texture(stage));
                     build_break_overlay(aim.x, aim.y, aim.z, layer)
                 }
                 _ => MeshData::default(),
