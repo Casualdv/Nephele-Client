@@ -12,12 +12,12 @@ use std::sync::OnceLock;
 use crate::servers::{Ping, PingBoard, ServerList};
 use crate::settings::{SettingId, Settings};
 use nephele_assets::{
-    MISSING_TEXTURE, TextureArray, face_textures, font, item_texture_name, sprites,
+    face_textures, font, item_texture_name, sprites, TextureArray, MISSING_TEXTURE,
 };
-use nephele_protocol::packets::play::{HOTBAR_FIRST_SLOT, HOTBAR_SLOTS, ItemStack};
+use nephele_protocol::packets::play::{ItemStack, HOTBAR_FIRST_SLOT, HOTBAR_SLOTS};
 use nephele_render::{Rect, UiBatch};
-use nephele_world::BlockState;
 use nephele_world::save::{WorldMetadata, WorldMode};
+use nephele_world::BlockState;
 
 const TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 const TEXT_DIM: [f32; 4] = [0.6, 0.6, 0.6, 1.0];
@@ -47,6 +47,10 @@ pub enum Screen {
     Worlds,
     /// World name, seed and game-mode form.
     WorldCreate,
+    /// Rename the selected single-player world.
+    WorldRename,
+    /// Explicit confirmation before deleting a single-player world.
+    WorldDeleteConfirm,
     /// The saved-server list and its address field.
     Servers,
     Connect,
@@ -65,14 +69,22 @@ pub enum Screen {
 pub enum Action {
     Singleplayer,
     Multiplayer,
-    WorldOpen(usize),
+    WorldSelect(usize),
+    WorldOpenSelected,
     WorldNew,
+    WorldRenameSelected,
+    WorldDeleteSelected,
     WorldsBack,
     WorldNameFocus,
     WorldSeedFocus,
     WorldModeToggle,
     WorldCreateSubmit,
     WorldCreateCancel,
+    WorldRenameFocus,
+    WorldRenameSubmit,
+    WorldRenameCancel,
+    WorldDeleteConfirm,
+    WorldDeleteCancel,
     TitleOptions,
     Quit,
     /// Join whichever saved entry is selected.
@@ -1016,6 +1028,7 @@ pub fn draw_worlds(
     bg: &mut UiBatch,
     fg: &mut UiBatch,
     worlds: &[WorldMetadata],
+    selected_directory: Option<&str>,
     scroll: usize,
     error: Option<&str>,
     pointer: Option<[f32; 2]>,
@@ -1027,9 +1040,9 @@ pub fn draw_worlds(
     let cx = width / 2.0;
     bg.rect(Rect::new(0.0, 0.0, width, height), [0.08, 0.08, 0.08, 1.0]);
 
-    let row_h = s(22.0);
+    let row_h = s(20.0);
     let list_h = s(4.0) + row_h * WORLD_ROWS as f32 + s(4.0);
-    let block_h = s(12.0) + s(8.0) + list_h + s(12.0) + s(20.0) + s(8.0) + s(8.0);
+    let block_h = s(12.0) + s(8.0) + list_h + s(8.0) + s(20.0) + s(4.0) + s(20.0) + s(8.0) + s(8.0);
     let top = ((height - block_h) / 2.0).max(s(2.0));
     let panel_w = s(360.0).min(width - s(8.0));
     let panel_x = cx - panel_w / 2.0;
@@ -1060,9 +1073,12 @@ pub fn draw_worlds(
             panel_w - s(4.0),
             row_h - s(1.0),
         );
+        let selected = selected_directory == Some(world.directory.as_str());
         bg.rect(
             row,
-            if hovered(pointer, &row) {
+            if selected {
+                ROW_SELECTED
+            } else if hovered(pointer, &row) {
                 ROW_HOVER
             } else if slot % 2 == 0 {
                 ROW
@@ -1070,13 +1086,15 @@ pub fn draw_worlds(
                 ROW_ALT
             },
         );
+        if selected {
+            bg.rect_outline(row, scale.max(1.0), SELECTION_BORDER);
+        }
         buttons.push(Button {
-            action: Action::WorldOpen(index),
+            action: Action::WorldSelect(index),
             rect: row,
         });
 
-        let open_w = s(32.0);
-        let text_w = row.w - s(48.0);
+        let text_w = row.w - s(10.0);
         fg.text(
             &fit_text(&world.name, text_w, scale),
             row.x + s(5.0),
@@ -1091,23 +1109,27 @@ pub fn draw_worlds(
             scale,
             TEXT_DIM,
         );
-        fg.text_centered(
-            "Open",
-            row.x + row.w - open_w / 2.0,
-            row.y + s(7.0),
-            scale,
-            if hovered(pointer, &row) {
-                TEXT
-            } else {
-                TEXT_DIM
-            },
-        );
     }
 
-    let button_y = list_rect.y + list_h + s(12.0);
+    let first_button_y = list_rect.y + list_h + s(8.0);
     let button_w = (panel_w - s(6.0)) / 2.0;
-    let new_world = Rect::new(panel_x, button_y, button_w, s(20.0));
-    let back = Rect::new(panel_x + button_w + s(6.0), button_y, button_w, s(20.0));
+    let play = Rect::new(panel_x, first_button_y, button_w, s(20.0));
+    let new_world = Rect::new(
+        panel_x + button_w + s(6.0),
+        first_button_y,
+        button_w,
+        s(20.0),
+    );
+    let can_manage = selected_directory.is_some();
+    draw_button_state(
+        bg,
+        fg,
+        play,
+        "Play Selected",
+        scale,
+        can_manage && hovered(pointer, &play),
+        can_manage,
+    );
     draw_button(
         bg,
         fg,
@@ -1116,23 +1138,73 @@ pub fn draw_worlds(
         scale,
         hovered(pointer, &new_world),
     );
-    draw_button(bg, fg, back, "Back", scale, hovered(pointer, &back));
+    if can_manage {
+        buttons.push(Button {
+            action: Action::WorldOpenSelected,
+            rect: play,
+        });
+    }
     buttons.push(Button {
         action: Action::WorldNew,
         rect: new_world,
     });
+
+    let second_button_y = first_button_y + s(24.0);
+    let small_button_w = (panel_w - s(12.0)) / 3.0;
+    let rename = Rect::new(panel_x, second_button_y, small_button_w, s(20.0));
+    let delete = Rect::new(
+        panel_x + small_button_w + s(6.0),
+        second_button_y,
+        small_button_w,
+        s(20.0),
+    );
+    let back = Rect::new(
+        panel_x + (small_button_w + s(6.0)) * 2.0,
+        second_button_y,
+        small_button_w,
+        s(20.0),
+    );
+    draw_button_state(
+        bg,
+        fg,
+        rename,
+        "Rename",
+        scale,
+        can_manage && hovered(pointer, &rename),
+        can_manage,
+    );
+    draw_button_state(
+        bg,
+        fg,
+        delete,
+        "Delete",
+        scale,
+        can_manage && hovered(pointer, &delete),
+        can_manage,
+    );
+    draw_button(bg, fg, back, "Back", scale, hovered(pointer, &back));
+    if can_manage {
+        buttons.push(Button {
+            action: Action::WorldRenameSelected,
+            rect: rename,
+        });
+        buttons.push(Button {
+            action: Action::WorldDeleteSelected,
+            rect: delete,
+        });
+    }
     buttons.push(Button {
         action: Action::WorldsBack,
         rect: back,
     });
 
     if let Some(error) = error {
-        fg.text_centered(error, cx, button_y + s(28.0), scale, OFFLINE);
+        fg.text_centered(error, cx, second_button_y + s(28.0), scale, OFFLINE);
     } else {
         fg.text_centered(
-            "Click a world to open it",
+            "Select a world, then choose an action",
             cx,
-            button_y + s(28.0),
+            second_button_y + s(28.0),
             scale,
             TEXT_DIM,
         );
@@ -1242,6 +1314,131 @@ pub fn draw_world_create(
         },
         Button {
             action: Action::WorldCreateCancel,
+            rect: cancel,
+        },
+    ]
+}
+
+/// Rename form; the save service applies the same validation as world creation.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_world_rename(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    name: &str,
+    focused: bool,
+    error: Option<&str>,
+    pointer: Option<[f32; 2]>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Vec<Button> {
+    let s = |value: f32| value * scale;
+    let cx = width / 2.0;
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.08, 0.08, 0.08, 1.0]);
+    fg.text_centered("Rename World", cx, height * 0.22, scale * 1.5, TEXT);
+
+    let field_w = s(300.0).min(width - s(16.0));
+    let field = Rect::new(cx - field_w / 2.0, height * 0.42, field_w, s(22.0));
+    fg.text("World Name", field.x, field.y - s(12.0), scale, TEXT_DIM);
+    bg.rect(field, [0.0, 0.0, 0.0, 0.78]);
+    bg.rect_outline(
+        field,
+        if focused { s(2.0) } else { scale.max(1.0) },
+        if focused {
+            SELECTION_BORDER
+        } else {
+            BUTTON_BORDER
+        },
+    );
+    let value = if name.is_empty() { "World name" } else { name };
+    fg.text(
+        &fit_text(value, field_w - s(8.0), scale),
+        field.x + s(4.0),
+        field.y + s(7.0),
+        scale,
+        if name.is_empty() { TEXT_DIM } else { TEXT },
+    );
+
+    let button_y = height * 0.62;
+    let button_w = s(145.0);
+    let save = Rect::new(cx - button_w - s(5.0), button_y, button_w, s(20.0));
+    let cancel = Rect::new(cx + s(5.0), button_y, button_w, s(20.0));
+    draw_button(bg, fg, save, "Save Name", scale, hovered(pointer, &save));
+    draw_button(bg, fg, cancel, "Cancel", scale, hovered(pointer, &cancel));
+    if let Some(error) = error {
+        fg.text_centered(error, cx, button_y + s(30.0), scale, OFFLINE);
+    }
+
+    vec![
+        Button {
+            action: Action::WorldRenameFocus,
+            rect: field,
+        },
+        Button {
+            action: Action::WorldRenameSubmit,
+            rect: save,
+        },
+        Button {
+            action: Action::WorldRenameCancel,
+            rect: cancel,
+        },
+    ]
+}
+
+/// Delete is a separate, explicit confirmation step.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_world_delete_confirm(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    name: &str,
+    error: Option<&str>,
+    pointer: Option<[f32; 2]>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Vec<Button> {
+    let s = |value: f32| value * scale;
+    let cx = width / 2.0;
+    let panel_w = s(300.0).min(width - s(16.0));
+    let panel_h = s(104.0);
+    let panel = Rect::new(
+        cx - panel_w / 2.0,
+        (height - panel_h) / 2.0,
+        panel_w,
+        panel_h,
+    );
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.0, 0.0, 0.0, 0.82]);
+    bg.rect(panel, PANEL);
+    bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
+    fg.text_centered("Delete World?", cx, panel.y + s(12.0), scale * 1.4, TEXT);
+    fg.text_centered(
+        &fit_text(
+            &format!("Delete \"{name}\"? This cannot be undone."),
+            panel_w - s(16.0),
+            scale,
+        ),
+        cx,
+        panel.y + s(38.0),
+        scale,
+        TEXT_DIM,
+    );
+
+    let button_w = (panel_w - s(18.0)) / 2.0;
+    let button_y = panel.y + panel_h - s(26.0);
+    let delete = Rect::new(panel.x + s(4.0), button_y, button_w, s(20.0));
+    let cancel = Rect::new(panel.x + s(14.0) + button_w, button_y, button_w, s(20.0));
+    draw_button(bg, fg, delete, "Delete", scale, hovered(pointer, &delete));
+    draw_button(bg, fg, cancel, "Cancel", scale, hovered(pointer, &cancel));
+    if let Some(error) = error {
+        fg.text_centered(error, cx, panel.y + panel_h + s(8.0), scale, OFFLINE);
+    }
+    vec![
+        Button {
+            action: Action::WorldDeleteConfirm,
+            rect: delete,
+        },
+        Button {
+            action: Action::WorldDeleteCancel,
             rect: cancel,
         },
     ]
@@ -1699,7 +1896,7 @@ mod tests {
     }
 
     #[test]
-    fn world_list_pages_rows_and_opens_the_clicked_world() {
+    fn world_list_pages_rows_and_selects_the_clicked_world() {
         let worlds: Vec<WorldMetadata> = (0..WORLD_ROWS + 2)
             .map(|index| WorldMetadata {
                 directory: format!("World {index}"),
@@ -1714,23 +1911,22 @@ mod tests {
             .collect();
         let mut bg = UiBatch::default();
         let mut fg = UiBatch::default();
-        let first = draw_worlds(&mut bg, &mut fg, &worlds, 0, None, None, 2.0, 1280.0, 720.0);
-        assert!(
-            first
-                .iter()
-                .any(|button| button.action == Action::WorldOpen(0))
+        let first = draw_worlds(
+            &mut bg, &mut fg, &worlds, None, 0, None, None, 2.0, 1280.0, 720.0,
         );
-        assert!(
-            first
-                .iter()
-                .any(|button| button.action == Action::WorldOpen(WORLD_ROWS - 1))
-        );
-        assert!(
-            !first
-                .iter()
-                .any(|button| button.action == Action::WorldOpen(WORLD_ROWS))
-        );
-        let first_row = rect_of(&first, Action::WorldOpen(0));
+        assert!(first
+            .iter()
+            .any(|button| button.action == Action::WorldSelect(0)));
+        assert!(first
+            .iter()
+            .any(|button| button.action == Action::WorldSelect(WORLD_ROWS - 1)));
+        assert!(!first
+            .iter()
+            .any(|button| button.action == Action::WorldSelect(WORLD_ROWS)));
+        assert!(!first
+            .iter()
+            .any(|button| button.action == Action::WorldOpenSelected));
+        let first_row = rect_of(&first, Action::WorldSelect(0));
         assert_eq!(
             hit_test(
                 &first,
@@ -1739,24 +1935,40 @@ mod tests {
                     first_row.y + first_row.h / 2.0
                 ]
             ),
-            Some(Action::WorldOpen(0))
+            Some(Action::WorldSelect(0))
         );
 
-        let last = draw_worlds(&mut bg, &mut fg, &worlds, 2, None, None, 2.0, 1280.0, 720.0);
-        assert!(
-            last.iter()
-                .any(|button| button.action == Action::WorldOpen(WORLD_ROWS + 1))
+        let last = draw_worlds(
+            &mut bg,
+            &mut fg,
+            &worlds,
+            Some("World 3"),
+            2,
+            None,
+            None,
+            2.0,
+            1280.0,
+            720.0,
         );
-        assert!(
-            !last
-                .iter()
-                .any(|button| button.action == Action::WorldOpen(1))
-        );
+        assert!(last
+            .iter()
+            .any(|button| button.action == Action::WorldSelect(WORLD_ROWS + 1)));
+        assert!(!last
+            .iter()
+            .any(|button| button.action == Action::WorldSelect(1)));
+        assert!(last
+            .iter()
+            .any(|button| button.action == Action::WorldOpenSelected));
         assert!(last.iter().any(|button| button.action == Action::WorldNew));
-        assert!(
-            last.iter()
-                .any(|button| button.action == Action::WorldsBack)
-        );
+        assert!(last
+            .iter()
+            .any(|button| button.action == Action::WorldRenameSelected));
+        assert!(last
+            .iter()
+            .any(|button| button.action == Action::WorldDeleteSelected));
+        assert!(last
+            .iter()
+            .any(|button| button.action == Action::WorldsBack));
     }
 
     #[test]
@@ -1789,6 +2001,30 @@ mod tests {
         let name = rect_of(&buttons, Action::WorldNameFocus);
         let seed = rect_of(&buttons, Action::WorldSeedFocus);
         assert!(name.y + name.h <= seed.y);
+        assert!(!bg.is_empty());
+        assert!(!fg.is_empty());
+    }
+
+    #[test]
+    fn rename_and_delete_screens_have_separate_submit_and_cancel_actions() {
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let rename = draw_world_rename(
+            &mut bg, &mut fg, "World", true, None, None, 2.0, 1280.0, 720.0,
+        );
+        for action in [
+            Action::WorldRenameFocus,
+            Action::WorldRenameSubmit,
+            Action::WorldRenameCancel,
+        ] {
+            rect_of(&rename, action);
+        }
+
+        let confirm =
+            draw_world_delete_confirm(&mut bg, &mut fg, "World", None, None, 2.0, 1280.0, 720.0);
+        let delete = rect_of(&confirm, Action::WorldDeleteConfirm);
+        let cancel = rect_of(&confirm, Action::WorldDeleteCancel);
+        assert!(delete.x + delete.w <= cancel.x);
         assert!(!bg.is_empty());
         assert!(!fg.is_empty());
     }
@@ -2081,11 +2317,9 @@ mod tests {
             .map(|index| rect_of(&first, Action::ServerSelect(index)))
             .collect();
         assert_eq!(rows.len(), SERVER_ROWS);
-        assert!(
-            !first
-                .iter()
-                .any(|b| b.action == Action::ServerSelect(SERVER_ROWS))
-        );
+        assert!(!first
+            .iter()
+            .any(|b| b.action == Action::ServerSelect(SERVER_ROWS)));
 
         let last = server_screen(&list, &PingBoard::default(), None, 2);
         rect_of(&last, Action::ServerSelect(SERVER_ROWS + 1));
