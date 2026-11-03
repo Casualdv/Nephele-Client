@@ -12,7 +12,9 @@ use std::collections::HashSet;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
+use crate::perf;
 use nephele_assets::TextureArray;
 use nephele_render::{mesh_column, ColumnMeshJob, MeshData};
 
@@ -58,7 +60,14 @@ impl MeshPool {
                         break;
                     };
                     let key = job.key;
-                    let mesh = mesh_column(&job, &layers);
+                    let mesh = if perf::enabled() {
+                        let started_at = Instant::now();
+                        let mesh = mesh_column(&job, &layers);
+                        perf::record_mesh_build_time(started_at.elapsed());
+                        mesh
+                    } else {
+                        mesh_column(&job, &layers)
+                    };
                     if result_tx.send((key, mesh)).is_err() {
                         break;
                     }

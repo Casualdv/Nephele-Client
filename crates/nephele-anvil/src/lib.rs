@@ -12,8 +12,10 @@ pub mod chunk;
 pub mod nbt;
 pub mod region;
 
-pub use chunk::{parse_chunk, ChunkError, StoredChunk, StoredSection, SECTION_VOLUME};
-pub use nbt::{parse as parse_nbt, NbtError, Tag};
+pub use chunk::{
+    encode_chunk_nbt, parse_chunk, ChunkError, StoredChunk, StoredSection, SECTION_VOLUME,
+};
+pub use nbt::{encode as encode_nbt, parse as parse_nbt, NbtError, Tag};
 pub use region::{RegionError, RegionFile};
 
 /// World-space chunk coordinates of region `(region_x, region_z)` plus local

@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, m6-perf]
   pull_request:
 
 concurrency:

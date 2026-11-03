@@ -1,7 +1,9 @@
 use nephele_assets::{
     face_textures, is_transparent, item_texture_name, TextureArray, MISSING_TEXTURE,
 };
-use nephele_world::shapes::{block_shape, is_full_cube};
+use nephele_world::shapes::{
+    block_shape, door_shape, is_door, is_full_cube, is_pane, pane_shape, PaneConnections, PaneShape,
+};
 use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World};
 
 #[repr(C)]
@@ -12,11 +14,18 @@ pub struct Vertex {
     pub shade: f32,
     /// Texture-array layer for this face.
     pub layer: u32,
+    /// Combined block/sky illumination with ambient occlusion, in 0..=1.
+    pub light: f32,
 }
 
 impl Vertex {
-    pub const ATTRIBUTES: [wgpu::VertexAttribute; 4] =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32, 3 => Uint32];
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+        0 => Float32x3,
+        1 => Float32x2,
+        2 => Float32,
+        3 => Uint32,
+        4 => Float32
+    ];
 
     pub const fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -164,6 +173,7 @@ pub fn build_break_overlay(x: i32, y: i32, z: i32, layer: u32) -> MeshData {
                 // Vanilla renders the crack overlay unshaded.
                 shade: 1.0,
                 layer,
+                light: 1.0,
             });
         }
         mesh.indices
@@ -190,6 +200,8 @@ pub fn break_overlay_texture(stage: u8) -> &'static str {
 }
 
 const PLANE_LEN: usize = 16 * 256;
+const LIGHT_VOLUME: usize = 16 * 16 * 256;
+const CORNER_LEN: usize = 256;
 
 /// Everything needed to mesh one chunk column *without* touching the world:
 /// the column's own blocks plus the four neighbouring 16×256 faces used for
@@ -210,18 +222,32 @@ pub struct ColumnMeshJob {
     pub north: Vec<u16>,
     /// Blocks of the neighbour at local z = 0, indexed `y * 16 + x`.
     pub south: Vec<u16>,
+    /// Effective 0..15 light for each local block cell, indexed `y * 256 + z * 16 + x`.
+    pub light_levels: Vec<u8>,
+    /// Whether this dimension has skylight. Used above the build height and for
+    /// direct-sky fallback in locally generated chunks without light arrays.
+    pub has_skylight: bool,
+    /// Four corner columns, NW/NE/SW/SE, used by smooth-light samples at chunk corners.
+    pub corners: [Vec<u16>; 4],
+    pub corner_lights: [Vec<u8>; 4],
+    pub west_lights: Vec<u8>,
+    pub east_lights: Vec<u8>,
+    pub north_lights: Vec<u8>,
+    pub south_lights: Vec<u8>,
 }
 
 impl ColumnMeshJob {
     pub fn from_world(key: (i32, i32), world: &World) -> Self {
         let mut sections = vec![None; nephele_world::SECTION_COUNT];
-        if let Some(column) = world.get(ChunkCoord::new(key.0, key.1)) {
+        let column = world.get(ChunkCoord::new(key.0, key.1));
+        if let Some(column) = column {
             for (index, section) in column.iter_sections() {
                 if section.non_air_count() > 0 {
                     sections[index] = Some(section.blocks().to_vec());
                 }
             }
         }
+        let has_skylight = world.has_skylight();
         Self {
             key,
             sections,
@@ -229,6 +255,24 @@ impl ColumnMeshJob {
             east: side_plane(world, key.0 + 1, key.1, Axis::X, 0),
             north: side_plane(world, key.0, key.1 - 1, Axis::Z, 15),
             south: side_plane(world, key.0, key.1 + 1, Axis::Z, 0),
+            light_levels: light_volume(column, has_skylight),
+            has_skylight,
+            corners: [
+                corner_column(world, key.0 - 1, key.1 - 1, 15, 15),
+                corner_column(world, key.0 + 1, key.1 - 1, 0, 15),
+                corner_column(world, key.0 - 1, key.1 + 1, 15, 0),
+                corner_column(world, key.0 + 1, key.1 + 1, 0, 0),
+            ],
+            corner_lights: [
+                light_corner_column(world, key.0 - 1, key.1 - 1, 15, 15, has_skylight),
+                light_corner_column(world, key.0 + 1, key.1 - 1, 0, 15, has_skylight),
+                light_corner_column(world, key.0 - 1, key.1 + 1, 15, 0, has_skylight),
+                light_corner_column(world, key.0 + 1, key.1 + 1, 0, 0, has_skylight),
+            ],
+            west_lights: light_side_plane(world, key.0 - 1, key.1, Axis::X, 15, has_skylight),
+            east_lights: light_side_plane(world, key.0 + 1, key.1, Axis::X, 0, has_skylight),
+            north_lights: light_side_plane(world, key.0, key.1 - 1, Axis::Z, 15, has_skylight),
+            south_lights: light_side_plane(world, key.0, key.1 + 1, Axis::Z, 0, has_skylight),
         }
     }
 
@@ -239,6 +283,7 @@ impl ColumnMeshJob {
                 job.sections[index] = Some(section.blocks().to_vec());
             }
         }
+        job.light_levels = light_volume(Some(column), job.has_skylight);
         job
     }
 
@@ -259,7 +304,10 @@ impl ColumnMeshJob {
                 None => 0,
             };
         }
-        // Exactly one axis stepped out of the column; faces never move two.
+        if !inside_x && !inside_z {
+            return self.corners[corner_index(x, z)][yi];
+        }
+        // Exactly one axis stepped out of the column, or a diagonal corner.
         let row = yi * 16;
         if !inside_x {
             return if x < 0 {
@@ -275,7 +323,45 @@ impl ColumnMeshJob {
                 self.south[row + x as usize]
             };
         }
-        // Diagonal neighbours are never queried.
+        0
+    }
+
+    /// Effective block/sky light in 0..=15. Out-of-column reads use the same
+    /// border snapshot as `block`, including diagonal corner columns.
+    #[inline]
+    pub fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        if y < 0 {
+            return 0;
+        }
+        if y >= 256 {
+            return if self.has_skylight { 15 } else { 0 };
+        }
+        let yi = y as usize;
+        let inside_x = (0..16).contains(&x);
+        let inside_z = (0..16).contains(&z);
+
+        if inside_x && inside_z {
+            return self.light_levels[yi * 256 + z as usize * 16 + x as usize];
+        }
+        if !inside_x && !inside_z {
+            return self.corner_lights[corner_index(x, z)][yi];
+        }
+
+        let row = yi * 16;
+        if !inside_x {
+            return if x < 0 {
+                self.west_lights[row + z as usize]
+            } else {
+                self.east_lights[row + z as usize]
+            };
+        }
+        if !inside_z {
+            return if z < 0 {
+                self.north_lights[row + x as usize]
+            } else {
+                self.south_lights[row + x as usize]
+            };
+        }
         0
     }
 }
@@ -307,6 +393,117 @@ fn side_plane(world: &World, cx: i32, cz: i32, axis: Axis, local: usize) -> Vec<
         }
     }
     out
+}
+
+fn corner_index(x: i32, z: i32) -> usize {
+    match (x < 0, z < 0) {
+        (true, true) => 0,
+        (false, true) => 1,
+        (true, false) => 2,
+        (false, false) => 3,
+    }
+}
+
+fn corner_column(world: &World, cx: i32, cz: i32, x: usize, z: usize) -> Vec<u16> {
+    let mut out = vec![0; CORNER_LEN];
+    if let Some(column) = world.get(ChunkCoord::new(cx, cz)) {
+        for (y, raw) in out.iter_mut().enumerate() {
+            *raw = column.get_block(x, y, z).raw();
+        }
+    }
+    out
+}
+
+fn light_corner_column(
+    world: &World,
+    cx: i32,
+    cz: i32,
+    x: usize,
+    z: usize,
+    has_skylight: bool,
+) -> Vec<u8> {
+    trace_light_column(world.get(ChunkCoord::new(cx, cz)), x, z, has_skylight).to_vec()
+}
+
+fn light_side_plane(
+    world: &World,
+    cx: i32,
+    cz: i32,
+    axis: Axis,
+    local: usize,
+    has_skylight: bool,
+) -> Vec<u8> {
+    let column = world.get(ChunkCoord::new(cx, cz));
+    let mut out = vec![0; PLANE_LEN];
+    for t in 0..16 {
+        let (x, z) = match axis {
+            Axis::X => (local, t),
+            Axis::Z => (t, local),
+        };
+        let trace = trace_light_column(column, x, z, has_skylight);
+        for (y, light) in trace.into_iter().enumerate() {
+            out[y * 16 + t] = light;
+        }
+    }
+    out
+}
+
+fn light_volume(column: Option<&ChunkColumn>, has_skylight: bool) -> Vec<u8> {
+    let Some(column) = column else {
+        return vec![if has_skylight { 15 } else { 0 }; LIGHT_VOLUME];
+    };
+    let mut out = vec![0; LIGHT_VOLUME];
+    for z in 0..16 {
+        for x in 0..16 {
+            let trace = trace_light_column(Some(column), x, z, has_skylight);
+            for (y, light) in trace.into_iter().enumerate() {
+                out[y * 256 + z * 16 + x] = light;
+            }
+        }
+    }
+    out
+}
+
+/// Read decoded light when present. A vertical direct-sky trace fills missing
+/// light arrays in locally generated chunks; it deliberately stops at opaque
+/// full cubes, so caves are not made bright by the absence of a light engine.
+fn trace_light_column(
+    column: Option<&ChunkColumn>,
+    x: usize,
+    z: usize,
+    has_skylight: bool,
+) -> [u8; 256] {
+    let mut out = [0; 256];
+    let mut sky_visible = has_skylight;
+
+    for y in (0..256).rev() {
+        let state = column
+            .map(|column| column.get_block(x, y, z))
+            .unwrap_or(BlockState::AIR);
+        let section = column.and_then(|column| column.section(y >> 4));
+        let block_light = section
+            .map(|section| section.block_light_at(x, y & 15, z))
+            .unwrap_or(0);
+        let sky_light = section
+            .and_then(|section| section.sky_light_at(x, y & 15, z))
+            .unwrap_or(if sky_visible && !blocks_direct_sky(state) {
+                15
+            } else {
+                0
+            });
+        out[y] = block_light.max(sky_light);
+
+        if blocks_direct_sky(state) {
+            sky_visible = false;
+        }
+    }
+    out
+}
+
+fn blocks_direct_sky(state: BlockState) -> bool {
+    !state.is_air()
+        && !is_transparent(state.id())
+        && is_full_cube(block_shape(state.id(), state.meta()))
 }
 
 /// Mesh a chunk column from an owned snapshot. Pure computation — no world or
@@ -363,6 +560,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                 let bz = (base_z + local_z) as f32;
                 let (lo, hi) = (0.1f32, 0.9f32);
                 let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+                let light = job.light(local_x, y + 1, local_z) as f32 / 15.0;
 
                 let quads = [
                     [
@@ -389,6 +587,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                                 uv: uvs[index],
                                 shade: 1.0,
                                 layer,
+                                light,
                             });
                         }
                         mesh.indices.extend_from_slice(&[
@@ -404,7 +603,14 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                 continue;
             }
             let meta = (raw & 0x0f) as u8;
-            let shape = block_shape(id, meta);
+            let pane_boxes = is_pane(id).then(|| pane_shape_for_block(job, local_x, y, local_z));
+            let shape = if let Some(pane) = pane_boxes.as_ref() {
+                pane.as_slice()
+            } else if is_door(id) {
+                door_shape_for_block(job, id, meta, local_x, y, local_z)
+            } else {
+                block_shape(id, meta)
+            };
             let origin = [
                 (base_x + local_x) as f32,
                 y as f32,
@@ -427,7 +633,8 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                             origin[2] + corner[2],
                         ]
                     });
-                    append_quad(&mut mesh, face, layers[face.slot], positions);
+                    let lights = face_vertex_lights(job, local_x, y, local_z, face);
+                    append_quad(&mut mesh, face, layers[face.slot], positions, lights);
                 }
             } else {
                 // Shape boxes use 0..16 block pixels; convert them to block
@@ -446,7 +653,8 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                                 origin[2] + min[2] + corner[2] * size[2],
                             ]
                         });
-                        append_quad(&mut mesh, face, layers[face.slot], positions);
+                        let lights = face_vertex_lights(job, local_x, y, local_z, face);
+                        append_quad(&mut mesh, face, layers[face.slot], positions, lights);
                     }
                 }
             }
@@ -454,6 +662,135 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
     }
 
     mesh
+}
+
+fn pane_shape_for_block(job: &ColumnMeshJob, x: i32, y: i32, z: i32) -> PaneShape {
+    pane_shape(PaneConnections {
+        west: pane_connects(job.block(x - 1, y, z)),
+        east: pane_connects(job.block(x + 1, y, z)),
+        north: pane_connects(job.block(x, y, z - 1)),
+        south: pane_connects(job.block(x, y, z + 1)),
+    })
+}
+
+fn pane_connects(raw: u16) -> bool {
+    let id = raw >> 4;
+    is_pane(id) || is_full_cube(block_shape(id, (raw & 0x0f) as u8))
+}
+
+fn door_shape_for_block(
+    job: &ColumnMeshJob,
+    id: u16,
+    meta: u8,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> &'static [nephele_world::shapes::ShapeBox] {
+    let lower_y = if meta & 8 != 0 { y - 1 } else { y };
+    let lower = job.block(x, lower_y, z);
+    let upper = job.block(x, lower_y + 1, z);
+    let lower_meta = if lower >> 4 == id && lower & 8 == 0 {
+        (lower & 0x0f) as u8
+    } else if meta & 8 == 0 {
+        meta
+    } else {
+        0
+    };
+    let upper_meta = if upper >> 4 == id && upper & 8 != 0 {
+        (upper & 0x0f) as u8
+    } else if meta & 8 != 0 {
+        meta
+    } else {
+        0
+    };
+    door_shape(lower_meta, upper_meta)
+}
+
+fn face_vertex_lights(job: &ColumnMeshJob, x: i32, y: i32, z: i32, face: &FaceDef) -> [f32; 4] {
+    std::array::from_fn(|corner| vertex_light(job, [x, y, z], face, corner))
+}
+
+fn vertex_light(job: &ColumnMeshJob, block: [i32; 3], face: &FaceDef, corner_index: usize) -> f32 {
+    let corner = face.corners[corner_index];
+    let mut tangent_axes = [0usize; 2];
+    let mut tangent_count = 0;
+    for axis in 0..3 {
+        if face.normal[axis] == 0 {
+            tangent_axes[tangent_count] = axis;
+            tangent_count += 1;
+        }
+    }
+
+    let mut side_a = [0; 3];
+    let mut side_b = [0; 3];
+    side_a[tangent_axes[0]] = if corner[tangent_axes[0]] < 0.5 { -1 } else { 1 };
+    side_b[tangent_axes[1]] = if corner[tangent_axes[1]] < 0.5 { -1 } else { 1 };
+    let diagonal = [
+        side_a[0] + side_b[0],
+        side_a[1] + side_b[1],
+        side_a[2] + side_b[2],
+    ];
+    let outside = [
+        block[0] + face.normal[0],
+        block[1] + face.normal[1],
+        block[2] + face.normal[2],
+    ];
+    let light_samples = [
+        outside,
+        [
+            outside[0] + side_a[0],
+            outside[1] + side_a[1],
+            outside[2] + side_a[2],
+        ],
+        [
+            outside[0] + side_b[0],
+            outside[1] + side_b[1],
+            outside[2] + side_b[2],
+        ],
+        [
+            outside[0] + diagonal[0],
+            outside[1] + diagonal[1],
+            outside[2] + diagonal[2],
+        ],
+    ];
+    let light_sum: u16 = light_samples
+        .iter()
+        .map(|sample| job.light(sample[0], sample[1], sample[2]) as u16)
+        .sum();
+    let face_light = light_sum as f32 / (4.0 * 15.0);
+
+    let ao_side_a = [
+        block[0] + side_a[0],
+        block[1] + side_a[1],
+        block[2] + side_a[2],
+    ];
+    let ao_side_b = [
+        block[0] + side_b[0],
+        block[1] + side_b[1],
+        block[2] + side_b[2],
+    ];
+    let ao_corner = [
+        block[0] + diagonal[0],
+        block[1] + diagonal[1],
+        block[2] + diagonal[2],
+    ];
+    let side_a_occludes = is_ao_occluder(job.block(ao_side_a[0], ao_side_a[1], ao_side_a[2]));
+    let side_b_occludes = is_ao_occluder(job.block(ao_side_b[0], ao_side_b[1], ao_side_b[2]));
+    let corner_occludes = is_ao_occluder(job.block(ao_corner[0], ao_corner[1], ao_corner[2]));
+    let occluders =
+        u8::from(side_a_occludes) + u8::from(side_b_occludes) + u8::from(corner_occludes);
+    let ao = if side_a_occludes && side_b_occludes {
+        0.55
+    } else {
+        1.0 - f32::from(occluders) * 0.15
+    };
+
+    (face_light * ao).clamp(0.0, 1.0)
+}
+
+fn is_ao_occluder(raw: u16) -> bool {
+    let id = raw >> 4;
+    id != 0 && !is_transparent(id) && is_full_cube(block_shape(id, (raw & 0x0f) as u8))
 }
 
 /// Preserve the existing opacity rules, but only remove a complete shared face
@@ -486,14 +823,25 @@ fn should_cull_full_cube_face(
     neighbour == raw && is_transparent(id)
 }
 
-fn append_quad(mesh: &mut MeshData, face: &FaceDef, layer: u32, positions: [[f32; 3]; 4]) {
+fn append_quad(
+    mesh: &mut MeshData,
+    face: &FaceDef,
+    layer: u32,
+    positions: [[f32; 3]; 4],
+    lights: [f32; 4],
+) {
     let base = mesh.vertices.len() as u32;
-    for (position, uv) in positions.into_iter().zip(face.uvs.iter().copied()) {
+    for ((position, uv), light) in positions
+        .into_iter()
+        .zip(face.uvs.iter().copied())
+        .zip(lights)
+    {
         mesh.vertices.push(Vertex {
             position,
             uv,
             shade: face.shade,
             layer,
+            light,
         });
     }
     mesh.indices
@@ -593,6 +941,7 @@ pub fn build_item_mesh(items: &[ItemDraw], atlas: &TextureArray, time: f32) -> M
                     uv: *uv,
                     shade: face.shade,
                     layer: layers[face.slot],
+                    light: 1.0,
                 });
             }
             mesh.indices
@@ -647,6 +996,7 @@ pub fn build_hand_item(item: &HandItem, atlas: &TextureArray) -> MeshData {
                 uv: *uv,
                 shade: face.shade,
                 layer: layers[face.slot],
+                light: 1.0,
             });
         }
         mesh.indices
@@ -679,6 +1029,30 @@ mod tests {
         let mut world = World::new(0);
         world.insert(column);
         world
+    }
+
+    fn set_light_nibble(data: &mut [u8], x: usize, y: usize, z: usize, level: u8) {
+        let index = nephele_world::section_index(x, y, z);
+        let byte = &mut data[index / 2];
+        if index & 1 == 0 {
+            *byte = (*byte & 0xF0) | (level & 0x0F);
+        } else {
+            *byte = (*byte & 0x0F) | ((level & 0x0F) << 4);
+        }
+    }
+
+    fn set_block_light(column: &mut ChunkColumn, x: usize, y: usize, z: usize, level: u8) {
+        let section_index = y >> 4;
+        let mut data = column
+            .section(section_index)
+            .unwrap()
+            .block_light()
+            .to_vec();
+        set_light_nibble(&mut data, x, y & 15, z, level);
+        column
+            .section_mut(section_index)
+            .unwrap()
+            .set_block_light(&data);
     }
 
     #[test]
@@ -748,13 +1122,55 @@ mod tests {
     }
 
     #[test]
-    fn pane_mesh_uses_its_thin_axis_aligned_box() {
+    fn isolated_pane_mesh_uses_the_centre_post() {
         let mesh = single_block_mesh(BlockState::new(101, 0));
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(
             bounds(&mesh.vertices),
-            ([7.0 / 16.0, 40.0, 0.0], [9.0 / 16.0, 41.0, 1.0])
+            (
+                [7.0 / 16.0, 40.0, 7.0 / 16.0],
+                [9.0 / 16.0, 41.0, 9.0 / 16.0]
+            )
         );
+    }
+
+    #[test]
+    fn pane_mesh_connects_to_panes_and_solid_blocks() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(8, 40, 8, BlockState::new(101, 0));
+        column.set_block(9, 40, 8, BlockState::STONE);
+        column.set_block(8, 40, 7, BlockState::new(102, 0));
+        let world = world_with(column.clone());
+        let job = ColumnMeshJob::from_column(&column, &world);
+
+        let shape = pane_shape_for_block(&job, 8, 40, 8);
+        assert_eq!(shape.as_slice().len(), 3);
+        assert!(shape
+            .as_slice()
+            .iter()
+            .any(|part| part.min == [9.0, 0.0, 7.0] && part.max == [16.0, 16.0, 9.0]));
+        assert!(shape
+            .as_slice()
+            .iter()
+            .any(|part| part.min == [7.0, 0.0, 0.0] && part.max == [9.0, 16.0, 7.0]));
+    }
+
+    #[test]
+    fn pane_mesh_connects_across_a_chunk_border() {
+        let mut west = ChunkColumn::empty(0, 0);
+        west.set_block(15, 40, 8, BlockState::new(101, 0));
+        let mut east = ChunkColumn::empty(1, 0);
+        east.set_block(0, 40, 8, BlockState::STONE);
+        let mut world = World::new(0);
+        world.insert(west);
+        world.insert(east);
+        let job = ColumnMeshJob::from_world((0, 0), &world);
+
+        let shape = pane_shape_for_block(&job, 15, 40, 8);
+        assert!(shape
+            .as_slice()
+            .iter()
+            .any(|part| part.min == [9.0, 0.0, 7.0] && part.max == [16.0, 16.0, 9.0]));
     }
 
     #[test]
@@ -763,10 +1179,25 @@ mod tests {
             let mesh = single_block_mesh(BlockState::new(64, meta));
             assert_eq!(mesh.vertices.len(), 24);
             let (min, max) = bounds(&mesh.vertices);
-            assert_eq!(max[0] - min[0], 3.0 / 16.0);
+            assert_eq!(max[2] - min[2], 3.0 / 16.0);
             assert_eq!([min[1], min[2]], [40.0, 0.0]);
-            assert_eq!([max[1], max[2]], [41.0, 1.0]);
+            assert_eq!([max[1], max[0]], [41.0, 1.0]);
         }
+    }
+
+    #[test]
+    fn door_mesh_uses_lower_facing_open_and_upper_hinge_metadata() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(4, 40, 4, BlockState::new(64, 4));
+        column.set_block(4, 41, 4, BlockState::new(64, 9));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+
+        assert_eq!(mesh.vertices.len(), 48);
+        assert_eq!(
+            bounds(&mesh.vertices),
+            ([4.0 + 13.0 / 16.0, 40.0, 4.0], [5.0, 42.0, 5.0])
+        );
     }
 
     #[test]
@@ -851,6 +1282,76 @@ mod tests {
         // Neither side can discard its full face: the slab only covers half of
         // the adjacent stone face, so conservative overdraw is safer than a hole.
         assert_eq!(mesh.vertices.len(), 12 * 4);
+    }
+
+    #[test]
+    fn column_mesh_job_reads_the_stronger_packed_block_or_sky_light() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 40, 5, BlockState::STONE);
+        column.set_block(4, 40, 5, BlockState::STONE);
+        let section = column.section_mut(2).unwrap();
+        let mut block_light = section.block_light().to_vec();
+        let mut sky_light = vec![0; nephele_world::chunk::SECTION_LIGHT_BYTES];
+        set_light_nibble(&mut block_light, 3, 8, 5, 6);
+        set_light_nibble(&mut sky_light, 3, 8, 5, 12);
+        set_light_nibble(&mut block_light, 4, 8, 5, 13);
+        set_light_nibble(&mut sky_light, 4, 8, 5, 4);
+        section.set_block_light(&block_light);
+        section.set_sky_light(&sky_light);
+
+        let world = world_with(column.clone());
+        let job = ColumnMeshJob::from_column(&column, &world);
+        assert_eq!(job.light(3, 40, 5), 12);
+        assert_eq!(job.light(4, 40, 5), 13);
+    }
+
+    #[test]
+    fn light_border_snapshot_includes_side_and_diagonal_neighbours() {
+        let mut current = ChunkColumn::empty(0, 0);
+        current.set_block(15, 40, 8, BlockState::STONE);
+        let mut east = ChunkColumn::empty(1, 0);
+        east.set_block(0, 40, 8, BlockState::STONE);
+        set_block_light(&mut east, 0, 40, 8, 11);
+        let mut northwest = ChunkColumn::empty(-1, -1);
+        northwest.set_block(15, 40, 15, BlockState::STONE);
+        set_block_light(&mut northwest, 15, 40, 15, 7);
+
+        let mut world = World::new(-1);
+        world.insert(current);
+        world.insert(east);
+        world.insert(northwest);
+        let job = ColumnMeshJob::from_world((0, 0), &world);
+
+        assert_eq!(job.light(16, 40, 8), 11);
+        assert_eq!(job.light(-1, 40, -1), 7);
+    }
+
+    #[test]
+    fn missing_local_light_arrays_get_direct_sky_but_caves_stay_dark() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(2, 64, 3, BlockState::STONE);
+        let world = world_with(column.clone());
+        let job = ColumnMeshJob::from_column(&column, &world);
+
+        assert_eq!(job.light(2, 65, 3), 15);
+        assert_eq!(job.light(2, 64, 3), 0);
+        assert_eq!(job.light(2, 63, 3), 0);
+    }
+
+    #[test]
+    fn vertex_lighting_averages_four_samples_then_applies_ambient_occlusion() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(4, 40, 4, BlockState::STONE);
+        column.set_block(5, 40, 4, BlockState::STONE);
+        column.set_block(4, 40, 5, BlockState::STONE);
+        let world = world_with(column.clone());
+        let job = ColumnMeshJob::from_column(&column, &world);
+
+        let light = vertex_light(&job, [4, 40, 4], &FACES[0], 2);
+        assert!((light - 0.55).abs() < 1e-6, "measured corner light {light}");
+
+        let mesh = mesh_column(&job, &atlas());
+        assert!((mesh.vertices[2].light - light).abs() < 1e-6);
     }
 
     #[test]
@@ -990,5 +1491,7 @@ mod tests {
         assert_eq!(job.block(16, 40, 0), 0);
         assert_eq!(job.block(0, -1, 0), 0);
         assert_eq!(job.block(0, 256, 0), 0);
+        assert_eq!(job.light(0, -1, 0), 0);
+        assert_eq!(job.light(0, 256, 0), 15);
     }
 }

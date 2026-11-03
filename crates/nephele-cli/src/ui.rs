@@ -16,6 +16,7 @@ use nephele_assets::{
 };
 use nephele_protocol::packets::play::{ItemStack, HOTBAR_FIRST_SLOT, HOTBAR_SLOTS};
 use nephele_render::{Rect, UiBatch};
+use nephele_world::save::{WorldMetadata, WorldMode};
 use nephele_world::BlockState;
 
 const TEXT: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
@@ -42,6 +43,10 @@ const PING_BAD: [f32; 4] = [0.95, 0.42, 0.42, 1.0];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Title,
+    /// The saved single-player worlds.
+    Worlds,
+    /// World name, seed and game-mode form.
+    WorldCreate,
     /// The saved-server list and its address field.
     Servers,
     Connect,
@@ -60,6 +65,14 @@ pub enum Screen {
 pub enum Action {
     Singleplayer,
     Multiplayer,
+    WorldOpen(usize),
+    WorldNew,
+    WorldsBack,
+    WorldNameFocus,
+    WorldSeedFocus,
+    WorldModeToggle,
+    WorldCreateSubmit,
+    WorldCreateCancel,
     TitleOptions,
     Quit,
     /// Join whichever saved entry is selected.
@@ -994,6 +1007,246 @@ pub fn draw_title(
     buttons
 }
 
+/// How many saved worlds fit on the selection page.
+pub const WORLD_ROWS: usize = 6;
+
+/// The single-player save list. Clicking a row opens that world directly.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_worlds(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    worlds: &[WorldMetadata],
+    scroll: usize,
+    error: Option<&str>,
+    pointer: Option<[f32; 2]>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Vec<Button> {
+    let s = |value: f32| value * scale;
+    let cx = width / 2.0;
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.08, 0.08, 0.08, 1.0]);
+
+    let row_h = s(22.0);
+    let list_h = s(4.0) + row_h * WORLD_ROWS as f32 + s(4.0);
+    let block_h = s(12.0) + s(8.0) + list_h + s(12.0) + s(20.0) + s(8.0) + s(8.0);
+    let top = ((height - block_h) / 2.0).max(s(2.0));
+    let panel_w = s(360.0).min(width - s(8.0));
+    let panel_x = cx - panel_w / 2.0;
+    fg.text_centered("Select World", cx, top, scale * 1.5, TEXT);
+
+    let list_rect = Rect::new(panel_x, top + s(20.0), panel_w, list_h);
+    bg.rect(list_rect, PANEL);
+    bg.rect_outline(list_rect, scale.max(1.0), BUTTON_BORDER);
+
+    let visible = worlds.len().saturating_sub(scroll).min(WORLD_ROWS);
+    if worlds.is_empty() {
+        fg.text_centered(
+            "No worlds saved yet - create one",
+            cx,
+            list_rect.y + list_h / 2.0 - s(4.0),
+            scale,
+            TEXT_DIM,
+        );
+    }
+
+    let mut buttons = Vec::new();
+    for slot in 0..visible {
+        let index = scroll + slot;
+        let world = &worlds[index];
+        let row = Rect::new(
+            list_rect.x + s(2.0),
+            list_rect.y + s(4.0) + slot as f32 * row_h,
+            panel_w - s(4.0),
+            row_h - s(1.0),
+        );
+        bg.rect(
+            row,
+            if hovered(pointer, &row) {
+                ROW_HOVER
+            } else if slot % 2 == 0 {
+                ROW
+            } else {
+                ROW_ALT
+            },
+        );
+        buttons.push(Button {
+            action: Action::WorldOpen(index),
+            rect: row,
+        });
+
+        let open_w = s(32.0);
+        let text_w = row.w - s(48.0);
+        fg.text(
+            &fit_text(&world.name, text_w, scale),
+            row.x + s(5.0),
+            row.y + s(2.0),
+            scale,
+            TEXT,
+        );
+        fg.text(
+            &format!("Seed: {}  Mode: {}", world.seed, world.mode.as_str()),
+            row.x + s(5.0),
+            row.y + s(11.0),
+            scale,
+            TEXT_DIM,
+        );
+        fg.text_centered(
+            "Open",
+            row.x + row.w - open_w / 2.0,
+            row.y + s(7.0),
+            scale,
+            if hovered(pointer, &row) {
+                TEXT
+            } else {
+                TEXT_DIM
+            },
+        );
+    }
+
+    let button_y = list_rect.y + list_h + s(12.0);
+    let button_w = (panel_w - s(6.0)) / 2.0;
+    let new_world = Rect::new(panel_x, button_y, button_w, s(20.0));
+    let back = Rect::new(panel_x + button_w + s(6.0), button_y, button_w, s(20.0));
+    draw_button(
+        bg,
+        fg,
+        new_world,
+        "Create New World",
+        scale,
+        hovered(pointer, &new_world),
+    );
+    draw_button(bg, fg, back, "Back", scale, hovered(pointer, &back));
+    buttons.push(Button {
+        action: Action::WorldNew,
+        rect: new_world,
+    });
+    buttons.push(Button {
+        action: Action::WorldsBack,
+        rect: back,
+    });
+
+    if let Some(error) = error {
+        fg.text_centered(error, cx, button_y + s(28.0), scale, OFFLINE);
+    } else {
+        fg.text_centered(
+            "Click a world to open it",
+            cx,
+            button_y + s(28.0),
+            scale,
+            TEXT_DIM,
+        );
+    }
+    buttons
+}
+
+/// World creation form. Text input itself is handled by `LiveApp`.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_world_create(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    name: &str,
+    seed: &str,
+    mode: WorldMode,
+    name_focused: bool,
+    seed_focused: bool,
+    error: Option<&str>,
+    pointer: Option<[f32; 2]>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Vec<Button> {
+    let s = |value: f32| value * scale;
+    let cx = width / 2.0;
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.08, 0.08, 0.08, 1.0]);
+    fg.text_centered("Create New World", cx, height * 0.16, scale * 1.5, TEXT);
+
+    let field_w = s(300.0).min(width - s(16.0));
+    let field_h = s(22.0);
+    let field_x = cx - field_w / 2.0;
+    let name_label_y = height * 0.28;
+    let name_rect = Rect::new(field_x, name_label_y + s(10.0), field_w, field_h);
+    let seed_label_y = height * 0.43;
+    let seed_rect = Rect::new(field_x, seed_label_y + s(10.0), field_w, field_h);
+
+    fg.text("World Name", field_x, name_label_y, scale, TEXT_DIM);
+    fg.text(
+        "Seed (blank for random)",
+        field_x,
+        seed_label_y,
+        scale,
+        TEXT_DIM,
+    );
+    for (rect, value, placeholder, focused) in [
+        (name_rect, name, "World name", name_focused),
+        (seed_rect, seed, "Random", seed_focused),
+    ] {
+        bg.rect(rect, [0.0, 0.0, 0.0, 0.78]);
+        bg.rect_outline(
+            rect,
+            if focused { s(2.0) } else { scale.max(1.0) },
+            if focused {
+                SELECTION_BORDER
+            } else {
+                BUTTON_BORDER
+            },
+        );
+        let text = if value.is_empty() { placeholder } else { value };
+        let color = if value.is_empty() { TEXT_DIM } else { TEXT };
+        fg.text(
+            &fit_text(text, field_w - s(8.0), scale),
+            rect.x + s(4.0),
+            rect.y + s(7.0),
+            scale,
+            color,
+        );
+    }
+
+    let mode_rect = Rect::new(cx - s(150.0), height * 0.61, s(300.0), field_h);
+    draw_button(
+        bg,
+        fg,
+        mode_rect,
+        &format!("Game Mode: {}  (click to switch)", mode.as_str()),
+        scale,
+        hovered(pointer, &mode_rect),
+    );
+
+    let button_y = height * 0.75;
+    let button_w = s(145.0);
+    let create = Rect::new(cx - button_w - s(5.0), button_y, button_w, s(20.0));
+    let cancel = Rect::new(cx + s(5.0), button_y, button_w, s(20.0));
+    draw_button(bg, fg, create, "Create", scale, hovered(pointer, &create));
+    draw_button(bg, fg, cancel, "Cancel", scale, hovered(pointer, &cancel));
+
+    if let Some(error) = error {
+        fg.text_centered(error, cx, button_y - s(14.0), scale, OFFLINE);
+    }
+
+    vec![
+        Button {
+            action: Action::WorldNameFocus,
+            rect: name_rect,
+        },
+        Button {
+            action: Action::WorldSeedFocus,
+            rect: seed_rect,
+        },
+        Button {
+            action: Action::WorldModeToggle,
+            rect: mode_rect,
+        },
+        Button {
+            action: Action::WorldCreateSubmit,
+            rect: create,
+        },
+        Button {
+            action: Action::WorldCreateCancel,
+            rect: cancel,
+        },
+    ]
+}
+
 /// A splash line, rotated like vanilla's and drawn glyph by glyph.
 fn splash_text(bg: &mut UiBatch, text: &str, cx: f32, cy: f32, scale: f32) {
     let angle: f32 = -20f32.to_radians();
@@ -1443,6 +1696,91 @@ mod tests {
         assert_eq!(gui_scale(320.0, 240.0), 1.0);
         assert_eq!(gui_scale(3840.0, 2160.0), 4.0);
         assert_eq!(gui_scale(100.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn world_list_pages_rows_and_opens_the_clicked_world() {
+        let worlds: Vec<WorldMetadata> = (0..WORLD_ROWS + 2)
+            .map(|index| WorldMetadata {
+                directory: format!("World {index}"),
+                name: format!("World {index}"),
+                seed: index as u64,
+                mode: if index % 2 == 0 {
+                    WorldMode::Creative
+                } else {
+                    WorldMode::Survival
+                },
+            })
+            .collect();
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let first = draw_worlds(&mut bg, &mut fg, &worlds, 0, None, None, 2.0, 1280.0, 720.0);
+        assert!(first
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(0)));
+        assert!(first
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(WORLD_ROWS - 1)));
+        assert!(!first
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(WORLD_ROWS)));
+        let first_row = rect_of(&first, Action::WorldOpen(0));
+        assert_eq!(
+            hit_test(
+                &first,
+                [
+                    first_row.x + first_row.w / 2.0,
+                    first_row.y + first_row.h / 2.0
+                ]
+            ),
+            Some(Action::WorldOpen(0))
+        );
+
+        let last = draw_worlds(&mut bg, &mut fg, &worlds, 2, None, None, 2.0, 1280.0, 720.0);
+        assert!(last
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(WORLD_ROWS + 1)));
+        assert!(!last
+            .iter()
+            .any(|button| button.action == Action::WorldOpen(1)));
+        assert!(last.iter().any(|button| button.action == Action::WorldNew));
+        assert!(last
+            .iter()
+            .any(|button| button.action == Action::WorldsBack));
+    }
+
+    #[test]
+    fn world_creation_form_exposes_both_fields_mode_and_submit_actions() {
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let buttons = draw_world_create(
+            &mut bg,
+            &mut fg,
+            "Build",
+            "12345",
+            WorldMode::Survival,
+            true,
+            false,
+            None,
+            None,
+            2.0,
+            1280.0,
+            720.0,
+        );
+        for action in [
+            Action::WorldNameFocus,
+            Action::WorldSeedFocus,
+            Action::WorldModeToggle,
+            Action::WorldCreateSubmit,
+            Action::WorldCreateCancel,
+        ] {
+            rect_of(&buttons, action);
+        }
+        let name = rect_of(&buttons, Action::WorldNameFocus);
+        let seed = rect_of(&buttons, Action::WorldSeedFocus);
+        assert!(name.y + name.h <= seed.y);
+        assert!(!bg.is_empty());
+        assert!(!fg.is_empty());
     }
 
     #[test]

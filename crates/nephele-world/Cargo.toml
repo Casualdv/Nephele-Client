@@ -7,9 +7,9 @@ license.workspace = true
 description = "Minecraft 1.8.9 world storage and chunk (de)serialisation for Nephele"
 
 [dependencies]
+nephele-anvil = { path = "../nephele-anvil" }
 nephele-protocol = { path = "../nephele-protocol" }
 tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-nephele-anvil = { path = "../nephele-anvil" }

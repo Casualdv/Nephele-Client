@@ -1,10 +1,14 @@
 //! Anvil region files: 32x32 chunks in one `.mca`, 4 KiB sectors, zlib payloads.
 
 use std::fs;
-use std::io::Read;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 
 const SECTOR: usize = 4096;
 const HEADER_SECTORS: usize = 2;
@@ -31,6 +35,12 @@ pub enum RegionError {
         #[source]
         source: std::io::Error,
     },
+    #[error("chunk index {x},{z} is outside the 0..32 region bounds")]
+    BadChunkIndex { x: usize, z: usize },
+    #[error("chunk {x},{z} is too large for an Anvil region ({length} bytes)")]
+    ChunkTooLarge { x: usize, z: usize, length: usize },
+    #[error("region file {path} needs a sector offset larger than 24 bits")]
+    RegionTooLarge { path: PathBuf },
 }
 
 /// One `.mca` region, read into memory.
@@ -118,6 +128,160 @@ impl RegionFile {
         }
         Ok(Some(out))
     }
+
+    /// Appends a zlib-compressed NBT chunk and switches its location-table
+    /// entry to the new sectors. Unmodified chunks keep their existing sectors.
+    pub fn write_chunk(
+        path: impl AsRef<Path>,
+        x: usize,
+        z: usize,
+        nbt: &[u8],
+    ) -> Result<(), RegionError> {
+        let path = path.as_ref().to_path_buf();
+        if x >= CHUNKS_PER_SIDE || z >= CHUNKS_PER_SIDE {
+            return Err(RegionError::BadChunkIndex { x, z });
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| RegionError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        }
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(nbt).map_err(|source| RegionError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let compressed = encoder.finish().map_err(|source| RegionError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let length = compressed
+            .len()
+            .checked_add(1)
+            .ok_or(RegionError::ChunkTooLarge {
+                x,
+                z,
+                length: compressed.len(),
+            })?;
+        let length_u32 =
+            u32::try_from(length).map_err(|_| RegionError::ChunkTooLarge { x, z, length })?;
+        let record_length =
+            length
+                .checked_add(4)
+                .ok_or(RegionError::ChunkTooLarge { x, z, length })?;
+        let sectors = record_length.div_ceil(SECTOR);
+        if sectors == 0 || sectors > u8::MAX as usize {
+            return Err(RegionError::ChunkTooLarge {
+                x,
+                z,
+                length: record_length,
+            });
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| RegionError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let file_length = file
+            .metadata()
+            .map_err(|source| RegionError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        if file_length == 0 {
+            file.set_len((HEADER_SECTORS * SECTOR) as u64)
+                .map_err(|source| RegionError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+        } else if file_length < (HEADER_SECTORS * SECTOR) as u64 {
+            return Err(RegionError::Truncated {
+                path,
+                size: file_length as usize,
+            });
+        }
+
+        let index = x + z * CHUNKS_PER_SIDE;
+        let mut old_location_bytes = [0u8; 4];
+        file.seek(SeekFrom::Start((index * 4) as u64))
+            .and_then(|_| file.read_exact(&mut old_location_bytes))
+            .map_err(|source| RegionError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        let old_location = u32::from_be_bytes(old_location_bytes);
+        let old_start_sector = (old_location >> 8) as u64;
+        let old_sectors = (old_location & 0xFF) as usize;
+        let current_length = file
+            .metadata()
+            .map_err(|source| RegionError::Io {
+                path: path.clone(),
+                source,
+            })?
+            .len();
+        let current_sectors = current_length.div_ceil(SECTOR as u64);
+        let can_reuse = old_start_sector >= HEADER_SECTORS as u64
+            && old_sectors >= sectors
+            && old_start_sector + old_sectors as u64 <= current_sectors;
+        let (start_sector, allocated_sectors) = if can_reuse {
+            (old_start_sector, old_sectors)
+        } else {
+            (current_sectors.max(HEADER_SECTORS as u64), sectors)
+        };
+        if start_sector > 0x00FF_FFFF {
+            return Err(RegionError::RegionTooLarge { path });
+        }
+        let start = start_sector * SECTOR as u64;
+        let mut record = Vec::with_capacity(allocated_sectors * SECTOR);
+        record.extend_from_slice(&length_u32.to_be_bytes());
+        record.push(2); // zlib
+        record.extend_from_slice(&compressed);
+        record.resize(allocated_sectors * SECTOR, 0);
+
+        file.seek(SeekFrom::Start(start))
+            .and_then(|_| file.write_all(&record))
+            .map_err(|source| RegionError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.sync_data().map_err(|source| RegionError::Io {
+            path: path.clone(),
+            source,
+        })?;
+
+        let location = ((start_sector as u32) << 8) | allocated_sectors as u32;
+        let location_offset = (index * 4) as u64;
+        file.seek(SeekFrom::Start(location_offset))
+            .and_then(|_| file.write_all(&location.to_be_bytes()))
+            .map_err(|source| RegionError::Io {
+                path: path.clone(),
+                source,
+            })?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .min(u32::MAX as u64) as u32;
+        let timestamp_offset = (SECTOR + index * 4) as u64;
+        file.seek(SeekFrom::Start(timestamp_offset))
+            .and_then(|_| file.write_all(&timestamp.to_be_bytes()))
+            .map_err(|source| RegionError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.sync_data()
+            .map_err(|source| RegionError::Io { path, source })
+    }
 }
 
 #[cfg(test)]
@@ -170,5 +334,43 @@ mod tests {
             .filter(|(x, z)| region.location(*x, *z).0 == 0)
             .count();
         assert!(empty > 0, "a spawn-only region should have gaps");
+    }
+
+    #[test]
+    fn writing_a_chunk_preserves_other_slots_and_reopens() {
+        let dir = std::env::temp_dir().join(format!(
+            "nephele-anvil-region-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("region/r.-1.0.mca");
+
+        RegionFile::write_chunk(&path, 31, 2, b"hand edited west chunk").unwrap();
+        RegionFile::write_chunk(&path, 3, 5, b"neighbour chunk").unwrap();
+        let before = RegionFile::open(&path).unwrap();
+        let west_offset = before.location(31, 2).0;
+        let length_before_update = fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            before.chunk_nbt(31, 2).unwrap().as_deref(),
+            Some(&b"hand edited west chunk"[..])
+        );
+
+        RegionFile::write_chunk(&path, 3, 5, b"updated neighbour").unwrap();
+        let after = RegionFile::open(&path).unwrap();
+        assert_eq!(after.location(31, 2).0, west_offset);
+        assert_eq!(
+            after.chunk_nbt(31, 2).unwrap().as_deref(),
+            Some(&b"hand edited west chunk"[..])
+        );
+        assert_eq!(
+            after.chunk_nbt(3, 5).unwrap().as_deref(),
+            Some(&b"updated neighbour"[..])
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), length_before_update);
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

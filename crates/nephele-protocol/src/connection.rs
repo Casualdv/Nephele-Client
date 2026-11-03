@@ -205,12 +205,15 @@ impl Connection {
     ///
     /// The response goes out in the clear and encryption starts immediately
     /// afterwards, which is the order the server expects.
+    /// The raw secret is used only for AES/CFB8; both secret and verify token
+    /// ciphertexts are carried in the packet.
     pub async fn send_encryption_response(
         &mut self,
         shared_secret: &[u8; 16],
+        encrypted_shared_secret: &[u8],
         encrypted_verify_token: &[u8],
     ) -> Result<()> {
-        let packet = login::encryption_response(shared_secret, encrypted_verify_token);
+        let packet = login::encryption_response(encrypted_shared_secret, encrypted_verify_token);
         self.write_packet(&packet).await?;
         self.enable_encryption(shared_secret, shared_secret);
         self.state = State::Login;

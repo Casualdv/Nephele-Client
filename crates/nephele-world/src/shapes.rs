@@ -206,12 +206,7 @@ pub fn toggle_door_open(world: &mut World, x: i32, y: i32, z: i32) -> bool {
         return false;
     }
 
-    world.set_block(
-        x,
-        lower_y,
-        z,
-        BlockState::new(lower.id(), lower.meta() ^ 4),
-    )
+    world.set_block(x, lower_y, z, BlockState::new(lower.id(), lower.meta() ^ 4))
 }
 
 /// The boxes making up `id`/`meta`. Unknown blocks are a single full cube.
@@ -321,7 +316,10 @@ mod tests {
             south: true,
         });
         assert_eq!(all.as_slice().len(), 5);
-        assert!(all.as_slice().iter().all(|shape| !is_full_cube(std::slice::from_ref(shape))));
+        assert!(all
+            .as_slice()
+            .iter()
+            .all(|shape| !is_full_cube(std::slice::from_ref(shape))));
     }
 
     #[test]

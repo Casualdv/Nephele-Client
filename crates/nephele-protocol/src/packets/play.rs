@@ -686,7 +686,7 @@ pub fn set_slot(window_id: i8, slot: i16, item: Option<&ItemStack>) -> Packet {
 
 /// `S09 Held Item Change` — the server confirming which slot we're holding.
 pub fn parse_held_item_change(packet: &Packet) -> Result<i16> {
-    packet.reader().read_i16()
+    Ok(i16::from(packet.reader().read_i8()?))
 }
 
 /// `S1F Experience` — the XP bar, level and lifetime total.
@@ -1344,6 +1344,19 @@ mod tests {
     }
 
     #[test]
+    fn held_item_change_reads_the_protocol_byte() {
+        assert_eq!(
+            parse_held_item_change(&Packet::new(clientbound::HELD_ITEM_CHANGE, vec![7],)).unwrap(),
+            7
+        );
+        assert_eq!(
+            parse_held_item_change(&Packet::new(clientbound::HELD_ITEM_CHANGE, vec![0xFF],))
+                .unwrap(),
+            -1
+        );
+    }
+
+    #[test]
     fn brand_plugin_message_uses_mc_channel_and_nested_string() {
         let packet = brand_plugin_message("Nephele");
         assert_eq!(packet.id, serverbound::PLUGIN_MESSAGE);
@@ -1364,10 +1377,12 @@ mod tests {
         let mut w = PacketWriter::new();
         write_position(&mut w, -17, 64, 33);
         w.write_u8(6); // Banner
-        w.write_u8(10).write_string(""); // root compound
+        w.write_u8(10).write_u16(0); // root compound with an empty name
         w.write_u8(8)
-            .write_string("CustomName")
-            .write_string("Notice")
+            .write_u16(10)
+            .write_bytes(b"CustomName")
+            .write_u16(6)
+            .write_bytes(b"Notice")
             .write_u8(0); // root end
         let update =
             parse_block_entity_update(&Packet::new(clientbound::BLOCK_ENTITY_DATA, w.into_bytes()))
@@ -1545,8 +1560,11 @@ mod tests {
         let mut w = PacketWriter::new();
         w.write_i16(276).write_i8(1).write_i16(0);
         // A named compound with one int inside.
-        w.write_u8(10).write_string("");
-        w.write_u8(3).write_string("Damage").write_i32(5);
+        w.write_u8(10).write_u16(0);
+        w.write_u8(3)
+            .write_u16(6)
+            .write_bytes(b"Damage")
+            .write_i32(5);
         w.write_u8(0);
         w.write_i32(999);
         let bytes = w.into_bytes();

@@ -11,6 +11,7 @@ struct VertexIn {
     @location(1) uv: vec2<f32>,
     @location(2) shade: f32,
     @location(3) layer: u32,
+    @location(4) light: f32,
 };
 
 struct VertexOut {
@@ -18,6 +19,7 @@ struct VertexOut {
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) layer: u32,
     @location(2) shade: f32,
+    @location(3) light: f32,
 };
 
 @vertex
@@ -27,6 +29,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
     out.uv = in.uv;
     out.layer = in.layer;
     out.shade = in.shade;
+    out.light = in.light;
     return out;
 }
 
@@ -37,5 +40,5 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if (texel.a < 0.5) {
         discard;
     }
-    return vec4<f32>(texel.rgb * in.shade, 1.0);
+    return vec4<f32>(texel.rgb * in.shade * in.light, 1.0);
 }

@@ -23,8 +23,15 @@ pub fn skip_named_tag(reader: &mut PacketReader<'_>) -> Result<()> {
     if tag == TAG_END {
         return Ok(());
     }
-    let _name = reader.read_string()?;
+    skip_nbt_string(reader)?;
     skip_payload(reader, tag, 0)
+}
+
+/// NBT strings use an unsigned-short byte length, unlike protocol strings,
+/// which use VarInts.
+fn skip_nbt_string(reader: &mut PacketReader<'_>) -> Result<()> {
+    let length = reader.read_u16()? as usize;
+    reader.take(length).map(|_| ())
 }
 
 fn skip_payload(reader: &mut PacketReader<'_>, tag: u8, depth: usize) -> Result<()> {
@@ -43,7 +50,7 @@ fn skip_payload(reader: &mut PacketReader<'_>, tag: u8, depth: usize) -> Result<
             let length = reader.read_i32()?.max(0) as usize;
             reader.take(length).map(|_| ())
         }
-        8 => reader.read_string().map(|_| ()),
+        8 => skip_nbt_string(reader),
         TAG_LIST => {
             let element_type = reader.read_u8()?;
             let length = reader.read_i32()?.max(0) as usize;
@@ -57,7 +64,7 @@ fn skip_payload(reader: &mut PacketReader<'_>, tag: u8, depth: usize) -> Result<
             if child == TAG_END {
                 return Ok(());
             }
-            let _name = reader.read_string()?;
+            skip_nbt_string(reader)?;
             skip_payload(reader, child, depth + 1)?;
         },
         11 => {
@@ -73,19 +80,32 @@ mod tests {
     use super::*;
     use crate::write::PacketWriter;
 
+    fn write_nbt_string(writer: &mut PacketWriter, value: &str) {
+        writer
+            .write_u16(value.len() as u16)
+            .write_bytes(value.as_bytes());
+    }
+
     #[test]
     fn skips_a_nested_compound() {
         let mut w = PacketWriter::new();
         // root compound
-        w.write_u8(TAG_COMPOUND).write_string("display");
+        w.write_u8(TAG_COMPOUND);
+        write_nbt_string(&mut w, "display");
         // name: string inside
-        w.write_u8(8).write_string("Name").write_string("Sword");
+        w.write_u8(8);
+        write_nbt_string(&mut w, "Name");
+        write_nbt_string(&mut w, "Sword");
         // nested compound
-        w.write_u8(TAG_COMPOUND).write_string("Enchantments");
+        w.write_u8(TAG_COMPOUND);
+        write_nbt_string(&mut w, "Enchantments");
         // list of compounds with one entry
-        w.write_u8(TAG_LIST).write_string("List");
+        w.write_u8(TAG_LIST);
+        write_nbt_string(&mut w, "List");
         w.write_u8(TAG_COMPOUND).write_i32(1);
-        w.write_u8(2).write_string("id").write_u16(9);
+        w.write_u8(2);
+        write_nbt_string(&mut w, "id");
+        w.write_u16(9);
         w.write_u8(TAG_END); // ends the list entry
         w.write_u8(TAG_END); // ends "Enchantments"
         w.write_u8(TAG_END); // ends root

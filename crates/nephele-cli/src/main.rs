@@ -3,6 +3,7 @@ mod inventory;
 mod live;
 mod mesher;
 mod paths;
+mod perf;
 mod servers;
 mod settings;
 mod skins;

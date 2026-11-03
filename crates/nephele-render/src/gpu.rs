@@ -119,13 +119,33 @@ impl Renderer {
             .create_surface(window)
             .map_err(|err| RendererError::Surface(err.to_string()))?;
 
+        let power_preference = match std::env::var("NEPHELE_GPU") {
+            Ok(value)
+                if value.eq_ignore_ascii_case("integrated")
+                    || value.eq_ignore_ascii_case("low-power") =>
+            {
+                wgpu::PowerPreference::LowPower
+            }
+            _ => wgpu::PowerPreference::HighPerformance,
+        };
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
+            power_preference,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
             apply_limit_buckets: false,
         }))
         .map_err(|err| RendererError::Adapter(err.to_string()))?;
+
+        if std::env::var("NEPHELE_PERF")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+        {
+            let info = adapter.get_info();
+            eprintln!(
+                "[perf] adapter name={:?} type={:?} backend={:?} driver={:?}",
+                info.name, info.device_type, info.backend, info.driver
+            );
+        }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("nephele device"),
@@ -1556,6 +1576,7 @@ fn panorama_mesh() -> (Vec<Vertex>, Vec<u32>) {
                 uv: *uv,
                 shade: 1.0,
                 layer: layer as u32,
+                light: 1.0,
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);

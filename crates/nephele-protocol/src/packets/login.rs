@@ -30,10 +30,13 @@ pub struct EncryptionRequest {
     pub verify_token: Vec<u8>,
 }
 
-pub fn encryption_response(shared_secret: &[u8], verify_token: &[u8]) -> Packet {
+pub fn encryption_response(
+    encrypted_shared_secret: &[u8],
+    encrypted_verify_token: &[u8],
+) -> Packet {
     let mut w = PacketWriter::new();
-    w.write_byte_array(shared_secret);
-    w.write_byte_array(verify_token);
+    w.write_byte_array(encrypted_shared_secret);
+    w.write_byte_array(encrypted_verify_token);
     Packet::new(SERVERBOUND_ENCRYPTION_RESPONSE, w.into_bytes())
 }
 
@@ -110,5 +113,18 @@ mod tests {
                 .unwrap(),
             256
         );
+    }
+
+    #[test]
+    fn encryption_response_carries_both_rsa_ciphertexts() {
+        let encrypted_secret = [0xA1, 0xA2, 0xA3];
+        let encrypted_token = [0xB1, 0xB2];
+        let packet = encryption_response(&encrypted_secret, &encrypted_token);
+        assert_eq!(packet.id, SERVERBOUND_ENCRYPTION_RESPONSE);
+
+        let mut reader = packet.reader();
+        assert_eq!(reader.read_byte_array().unwrap(), encrypted_secret.to_vec());
+        assert_eq!(reader.read_byte_array().unwrap(), encrypted_token.to_vec());
+        assert!(reader.is_empty());
     }
 }
