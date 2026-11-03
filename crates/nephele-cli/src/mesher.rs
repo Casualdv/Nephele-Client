@@ -63,7 +63,7 @@ impl MeshPool {
                     let mesh = if perf::enabled() {
                         let started_at = Instant::now();
                         let mesh = mesh_column(&job, &layers);
-                        perf::record_mesh_build_time(started_at.elapsed());
+                        perf::record_mesh_build_time(started_at, started_at.elapsed());
                         mesh
                     } else {
                         mesh_column(&job, &layers)

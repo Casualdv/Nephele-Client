@@ -36,6 +36,24 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      - name: Perf instrumentation compiles
+        run: cargo check -p nephele --bin nephele
+
+      - name: Perf measurement script parses
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'scripts/measure_perf.ps1'),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.ToString() }
+            exit 1
+          }
+
       - name: Public tree contains no Minecraft files
         shell: pwsh
         run: ./scripts/check_public_tree.ps1

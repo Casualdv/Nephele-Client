@@ -17,7 +17,10 @@ pub use entity::{
     append_hand, build_entities, EntityDraw, EntityMesh, EntityVertex, HandDraw, HandPose,
 };
 pub use environment::{biome_fog_color, Environment};
-pub use gpu::{DrawOutcome, Renderer, RendererError};
+pub use gpu::{
+    DrawOutcome, Renderer, RendererError, RendererMemory, StartupSample, StartupStage,
+    StartupTimings,
+};
 pub use lines::{block_outline, LineMesh, LineVertex};
 pub use mesh::{
     break_overlay_texture, build_break_overlay, build_column_mesh, build_hand_item,
