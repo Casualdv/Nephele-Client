@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::packet::Packet;
 use crate::packets::status::flatten_chat;
 use crate::write::PacketWriter;
@@ -40,8 +40,10 @@ pub mod clientbound {
     pub const CLOSE_WINDOW: i32 = 0x2E;
     pub const WINDOW_ITEMS: i32 = 0x30;
     pub const CONFIRM_TRANSACTION: i32 = 0x32;
+    pub const BLOCK_ENTITY_DATA: i32 = 0x35;
     pub const PLAYER_LIST_ITEM: i32 = 0x38;
     pub const PLAYER_ABILITIES: i32 = 0x39;
+    pub const PLUGIN_MESSAGE: i32 = 0x3F;
     pub const DISCONNECT: i32 = 0x40;
     pub const SERVER_DIFFICULTY: i32 = 0x41;
     pub const SET_COMPRESSION: i32 = 0x46;
@@ -64,6 +66,7 @@ pub mod serverbound {
     pub const CREATIVE_INVENTORY_ACTION: i32 = 0x10;
     pub const CLIENT_SETTINGS: i32 = 0x15;
     pub const CLIENT_STATUS: i32 = 0x16;
+    pub const PLUGIN_MESSAGE: i32 = 0x17;
 }
 
 /// `C07 Packet Player Digging` status values (`C07PacketPlayerDigging.Action`
@@ -179,6 +182,33 @@ pub struct JoinGame {
     pub reduced_debug_info: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkDataHeader {
+    pub x: i32,
+    pub z: i32,
+    pub ground_up: bool,
+    pub section_mask: u16,
+}
+
+/// Read the fixed header of an `S21 Chunk Data` packet without consuming its
+/// section payload. Partial (`ground_up = false`) packets update only sections
+/// present in `section_mask`; callers must retain the others.
+pub fn parse_chunk_data_header(packet: &Packet) -> Result<ChunkDataHeader> {
+    if packet.id != clientbound::CHUNK_DATA {
+        return Err(Error::UnexpectedPacket {
+            id: packet.id,
+            state: "chunk data",
+        });
+    }
+    let mut r = packet.reader();
+    Ok(ChunkDataHeader {
+        x: r.read_i32()?,
+        z: r.read_i32()?,
+        ground_up: r.read_bool()?,
+        section_mask: r.read_u16()?,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerPositionAndLook {
     pub x: f64,
@@ -232,6 +262,80 @@ pub fn parse_disconnect(packet: &Packet) -> Result<String> {
         Ok(value) => Ok(flatten_chat(&value)),
         Err(_) => Ok(json),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginMessage {
+    pub channel: String,
+    /// Raw channel payload; its format is specific to the channel.
+    pub data: Vec<u8>,
+}
+
+/// `C17 Plugin Message` / `S3F Plugin Message` share a channel string followed
+/// by channel-specific bytes.
+pub fn plugin_message_packet(channel: &str, data: &[u8]) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_string(channel).write_bytes(data);
+    Packet::new(serverbound::PLUGIN_MESSAGE, w.into_bytes())
+}
+
+/// The standard client brand handshake (`MC|Brand` with a nested protocol
+/// string as its channel payload).
+pub fn brand_plugin_message(brand: &str) -> Packet {
+    let mut payload = PacketWriter::new();
+    payload.write_string(brand);
+    plugin_message_packet("MC|Brand", payload.as_slice())
+}
+
+pub fn parse_plugin_message(packet: &Packet) -> Result<PluginMessage> {
+    let mut r = packet.reader();
+    let channel = r.read_string()?;
+    let data = r.read_remaining().to_vec();
+    Ok(PluginMessage { channel, data })
+}
+
+pub fn parse_plugin_brand(data: &[u8]) -> Result<String> {
+    let mut r = crate::read::PacketReader::new(data);
+    let brand = r.read_string()?;
+    if !r.is_empty() {
+        return Err(Error::Protocol(
+            "trailing bytes in MC|Brand plugin payload".into(),
+        ));
+    }
+    Ok(brand)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockEntityUpdate {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// Vanilla's block-entity action id.
+    pub action: u8,
+    /// Serialized root NBT tag, retained verbatim for later block-entity UI.
+    pub nbt: Vec<u8>,
+}
+
+/// Parse `S35 Update Tile Entity`, validating the serialized NBT while keeping
+/// its original bytes so consumers can interpret supported block entities.
+pub fn parse_block_entity_update(packet: &Packet) -> Result<BlockEntityUpdate> {
+    let mut r = packet.reader();
+    let (x, y, z) = r.read_position()?;
+    let action = r.read_u8()?;
+    let nbt_start = r.position();
+    crate::nbt::skip_named_tag(&mut r)?;
+    if !r.is_empty() {
+        return Err(Error::Protocol(
+            "trailing bytes in block-entity update".into(),
+        ));
+    }
+    Ok(BlockEntityUpdate {
+        x,
+        y,
+        z,
+        action,
+        nbt: packet.data[nbt_start..].to_vec(),
+    })
 }
 
 pub fn keep_alive_response(id: i32) -> Packet {
@@ -1029,11 +1133,42 @@ pub struct PlayerListEntry {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PlayerListAddEntry {
+    pub player: PlayerListEntry,
+    pub gamemode: i32,
+    pub ping: i32,
+    /// Raw chat-component JSON, if the server supplied a display name.
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerListGameModeUpdate {
+    pub uuid: [u8; 16],
+    pub gamemode: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerListLatencyUpdate {
+    pub uuid: [u8; 16],
+    pub ping: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerListDisplayNameUpdate {
+    pub uuid: [u8; 16],
+    /// Raw chat-component JSON, or `None` when the display name is cleared.
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum PlayerListUpdate {
     /// The whole tab list entry: name, skin properties, gamemode, ping.
-    Add(Vec<PlayerListEntry>),
+    Add(Vec<PlayerListAddEntry>),
+    UpdateGameMode(Vec<PlayerListGameModeUpdate>),
+    UpdateLatency(Vec<PlayerListLatencyUpdate>),
+    UpdateDisplayName(Vec<PlayerListDisplayNameUpdate>),
     Remove(Vec<[u8; 16]>),
-    /// Gamemode/latency/display-name-only updates, which carry no skin data.
+    /// An action introduced by a different protocol revision.
     Other,
 }
 
@@ -1065,27 +1200,63 @@ pub fn parse_player_list_item(packet: &Packet) -> Result<PlayerListUpdate> {
                         signature,
                     });
                 }
-                // Gamemode, ping and the optional display name follow; we don't
-                // render any of them yet but must consume them to stay framed.
-                let _gamemode = r.read_varint()?;
-                let _ping = r.read_varint()?;
-                if r.read_bool()? {
-                    let _display_name = r.read_string()?;
-                }
-                entries.push(PlayerListEntry {
-                    uuid,
-                    name,
-                    properties,
+                let gamemode = r.read_varint()?;
+                let ping = r.read_varint()?;
+                let display_name = if r.read_bool()? {
+                    Some(r.read_string()?)
+                } else {
+                    None
+                };
+                entries.push(PlayerListAddEntry {
+                    player: PlayerListEntry {
+                        uuid,
+                        name,
+                        properties,
+                    },
+                    gamemode,
+                    ping,
+                    display_name,
                 });
             }
             Ok(PlayerListUpdate::Add(entries))
         }
+        1 => {
+            let mut updates = Vec::with_capacity(count.min(64) as usize);
+            for _ in 0..count {
+                updates.push(PlayerListGameModeUpdate {
+                    uuid: r.read_uuid()?,
+                    gamemode: r.read_varint()?,
+                });
+            }
+            Ok(PlayerListUpdate::UpdateGameMode(updates))
+        }
+        2 => {
+            let mut updates = Vec::with_capacity(count.min(64) as usize);
+            for _ in 0..count {
+                updates.push(PlayerListLatencyUpdate {
+                    uuid: r.read_uuid()?,
+                    ping: r.read_varint()?,
+                });
+            }
+            Ok(PlayerListUpdate::UpdateLatency(updates))
+        }
+        3 => {
+            let mut updates = Vec::with_capacity(count.min(64) as usize);
+            for _ in 0..count {
+                let uuid = r.read_uuid()?;
+                let display_name = if r.read_bool()? {
+                    Some(r.read_string()?)
+                } else {
+                    None
+                };
+                updates.push(PlayerListDisplayNameUpdate { uuid, display_name });
+            }
+            Ok(PlayerListUpdate::UpdateDisplayName(updates))
+        }
         4 => {
             let mut uuids = Vec::with_capacity(count.min(64) as usize);
             for _ in 0..count {
-                let mut uuid = [0u8; 16];
-                uuid.copy_from_slice(r.take(16)?);
-                uuids.push(uuid);
+                uuids.push(r.read_uuid()?);
             }
             Ok(PlayerListUpdate::Remove(uuids))
         }
@@ -1123,6 +1294,28 @@ mod tests {
     }
 
     #[test]
+    fn reads_chunk_section_header_without_consuming_payload() {
+        let mut w = PacketWriter::new();
+        w.write_i32(-3)
+            .write_i32(7)
+            .write_bool(false)
+            .write_u16(0x8100);
+        // The payload is deliberately absent; this helper only reads the fixed
+        // header needed to merge partial section updates.
+        let header = parse_chunk_data_header(&Packet::new(clientbound::CHUNK_DATA, w.into_bytes()))
+            .expect("chunk header");
+        assert_eq!(
+            header,
+            ChunkDataHeader {
+                x: -3,
+                z: 7,
+                ground_up: false,
+                section_mask: 0x8100,
+            }
+        );
+    }
+
+    #[test]
     fn parses_position_and_look() {
         let mut w = PacketWriter::new();
         w.write_f64(0.5)
@@ -1151,6 +1344,43 @@ mod tests {
     }
 
     #[test]
+    fn brand_plugin_message_uses_mc_channel_and_nested_string() {
+        let packet = brand_plugin_message("Nephele");
+        assert_eq!(packet.id, serverbound::PLUGIN_MESSAGE);
+        let message = parse_plugin_message(&packet).expect("plugin message");
+        assert_eq!(message.channel, "MC|Brand");
+        assert_eq!(parse_plugin_brand(&message.data).unwrap(), "Nephele");
+    }
+
+    #[test]
+    fn rejects_trailing_data_in_brand_plugin_message() {
+        let mut payload = PacketWriter::new();
+        payload.write_string("Nephele").write_u8(0);
+        assert!(parse_plugin_brand(payload.as_slice()).is_err());
+    }
+
+    #[test]
+    fn parses_block_entity_update_and_retains_its_nbt() {
+        let mut w = PacketWriter::new();
+        write_position(&mut w, -17, 64, 33);
+        w.write_u8(6); // Banner
+        w.write_u8(10).write_string(""); // root compound
+        w.write_u8(8)
+            .write_string("CustomName")
+            .write_string("Notice")
+            .write_u8(0); // root end
+        let update =
+            parse_block_entity_update(&Packet::new(clientbound::BLOCK_ENTITY_DATA, w.into_bytes()))
+                .expect("block entity update");
+        assert_eq!(
+            (update.x, update.y, update.z, update.action),
+            (-17, 64, 33, 6)
+        );
+        assert_eq!(update.nbt.first(), Some(&10));
+        assert_eq!(update.nbt.last(), Some(&0));
+    }
+
+    #[test]
     fn chat_parses_component() {
         let mut w = PacketWriter::new();
         w.write_string(r#"{"extra":[{"text":"<Nephele> "},{"text":"hi"}],"text":""}"#)
@@ -1159,6 +1389,16 @@ mod tests {
             parse_chat_message(&Packet::new(clientbound::CHAT_MESSAGE, w.into_bytes())).unwrap();
         assert_eq!(text, "<Nephele> hi");
         assert_eq!(position, 0);
+    }
+
+    #[test]
+    fn disconnect_reason_flattens_chat_component() {
+        let mut w = PacketWriter::new();
+        w.write_string(r#"{"text":"Kicked: ","extra":[{"text":"bad protocol"}]}"#);
+        assert_eq!(
+            parse_disconnect(&Packet::new(clientbound::DISCONNECT, w.into_bytes())).unwrap(),
+            "Kicked: bad protocol"
+        );
     }
 
     #[test]
@@ -1489,11 +1729,59 @@ mod entity_tests {
             panic!("expected an add entry");
         };
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "Steve");
-        assert_eq!(entries[0].properties.len(), 1);
-        assert_eq!(entries[0].properties[0].name, "textures");
-        assert_eq!(entries[0].properties[0].value, "eyJ0ZXh0dXJlcyI6e319");
-        assert_eq!(entries[0].properties[0].signature, None);
+        assert_eq!(entries[0].player.name, "Steve");
+        assert_eq!(entries[0].player.properties.len(), 1);
+        assert_eq!(entries[0].player.properties[0].name, "textures");
+        assert_eq!(
+            entries[0].player.properties[0].value,
+            "eyJ0ZXh0dXJlcyI6e319"
+        );
+        assert_eq!(entries[0].player.properties[0].signature, None);
+        assert_eq!(entries[0].gamemode, 0);
+        assert_eq!(entries[0].ping, 42);
+        assert_eq!(entries[0].display_name, None);
+    }
+
+    #[test]
+    fn parses_player_list_gamemode_latency_and_display_name_updates() {
+        let uuid = [5u8; 16];
+
+        let mut w = PacketWriter::new();
+        w.write_varint(1)
+            .write_varint(1)
+            .write_uuid(&uuid)
+            .write_varint(2);
+        assert_eq!(
+            parse_player_list_item(&Packet::new(clientbound::PLAYER_LIST_ITEM, w.into_bytes(),))
+                .unwrap(),
+            PlayerListUpdate::UpdateGameMode(vec![PlayerListGameModeUpdate { uuid, gamemode: 2 }])
+        );
+
+        let mut w = PacketWriter::new();
+        w.write_varint(2)
+            .write_varint(1)
+            .write_uuid(&uuid)
+            .write_varint(83);
+        assert_eq!(
+            parse_player_list_item(&Packet::new(clientbound::PLAYER_LIST_ITEM, w.into_bytes(),))
+                .unwrap(),
+            PlayerListUpdate::UpdateLatency(vec![PlayerListLatencyUpdate { uuid, ping: 83 }])
+        );
+
+        let mut w = PacketWriter::new();
+        w.write_varint(3)
+            .write_varint(1)
+            .write_uuid(&uuid)
+            .write_bool(true)
+            .write_string(r#"{"text":"Alias"}"#);
+        assert_eq!(
+            parse_player_list_item(&Packet::new(clientbound::PLAYER_LIST_ITEM, w.into_bytes(),))
+                .unwrap(),
+            PlayerListUpdate::UpdateDisplayName(vec![PlayerListDisplayNameUpdate {
+                uuid,
+                display_name: Some(r#"{"text":"Alias"}"#.into()),
+            }])
+        );
     }
 
     #[test]

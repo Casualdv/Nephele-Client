@@ -336,9 +336,9 @@ the entity pipeline, which is bound to the skin atlas — via
 `Renderer::set_items(&MeshData)` and one extra draw call after the chunks.
 
 - Block items use their own `[top, bottom, side]` textures.
-- Non-block items (sticks, tools) have no texture in the prepared asset set yet
-  and draw `MISSING_TEXTURE` — visible rather than invisible. The item atlas is
-  prepared (`textures/items`) but not uploaded to any texture array.
+- Mapped non-block items (sticks, crafted tools, armour and common food) use
+  namespaced layers loaded from the prepared sibling `textures/items` directory.
+  Other non-block item ids still use `MISSING_TEXTURE`.
 - `ItemDraw.position` is the **feet** (block-bottom) position; the mesh adds
   `ITEM_HOVER = 0.1` and centres the cube on the block centre.
 
@@ -430,8 +430,9 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
 - The mock's 2x2 recipes are **one log -> 4 planks** (plank meta follows log
   meta), **two planks in one column -> 4 sticks**, and **four planks -> a
   crafting table**. Stack sizes in the grid do not matter, matching vanilla.
-  A pickaxe needs the **3x3** crafting-table window, which does not exist yet -
-  so "punch a tree and make a pickaxe" still ends at the crafting table.
+  The shared `nephele_world::crafting` recipe book also includes 3x3 tools,
+  furnace, chest and iron armour; its result is used by both the mock and local
+  singleplayer.
 - The mock now honours `C10 Creative Inventory Action` by writing the slot and
   echoing `S2F`, which is how tests (and `/give`) put a known stack in a slot.
   The integration test `a_log_in_the_crafting_grid_shows_planks_in_the_output_slot`
@@ -458,9 +459,18 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   the slot before the click.
 - Closing while holding a stack puts it back in the first free hotbar/storage
   slot (a click) instead of vanilla's drop-on-the-ground.
-- **Single-player cannot craft:** there is no recipe evaluator client-side and
-  the output slot is only updated by the server (`S2F` slot 0). The 2x2 recipes
-  exist only in the mock.
+- **Local crafting (added 2026-11-02).** `inventory::crafting_result` delegates
+  to the shared `nephele_world::crafting` recipe book. The player inventory
+  maps its 2x2 grid into that matcher; a placed crafting table opens a local
+  46-slot window with the 3x3 grid. Output clicks consume one item per occupied
+  cell only if the full result fits on the cursor; shift-click crafts repeatedly
+  while ingredients and inventory space remain. Closing a local table returns
+  its grid and cursor atomically, preserving items if the inventory is full.
+- **Local survival block interaction (added 2026-11-02).** Breaking blocks awards
+  a basic block item directly into hotbar/storage (stone -> cobblestone, grass ->
+  dirt, logs preserve species but discard axis bits); survival block placement
+  decrements the selected stack. These local drops are not yet physical item
+  entities and the mapping is not a complete vanilla drop table.
 - **Crafting-table window works end to end (2026-11-02).** Right-clicking a
   placed crafting table with a non-block/empty hand sends `C08` with an empty
   held slot; the mock answers `S2D` (window id 1, `minecraft:crafting_table`,
@@ -470,11 +480,14 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   The mock's 3x3 recipes: planks, sticks, crafting table, torch, furnace, chest,
   pickaxe/axe/shovel/sword in wood/stone/iron, and iron armour. Patterns are
   matched after trimming empty rows/columns, so a shape can sit anywhere in the
-  grid; stack sizes in the grid do not matter. **Only the mock crafts** - a real
-  server computes its own output, which is the whole point of the protocol.
-- Item icons: block items use their block texture; everything else (sticks,
-  tools, armour) draws `MISSING_TEXTURE`, because the item texture atlas is
-  prepared but never uploaded.
+  grid; stack sizes in the grid do not matter. Local singleplayer uses the same
+  recipe matcher; a real multiplayer server still computes its own output.
+- **Item icons (added 2026-11-02).** `TextureArray::load_from_dir` appends
+  namespaced layers from the prepared sibling `textures/items` directory, so
+  item names cannot collide with block layers. Inventory slots render mapped
+  tools, armour, materials and common food as flat icons; dropped-item cubes use
+  the same item texture on each face. Unmapped item ids still use
+  `MISSING_TEXTURE`, and held first-person rendering remains block-only.
 
 **Chat and client-side commands** (added 2026-11-01):
 
@@ -512,12 +525,14 @@ textures, plant edge cases and terrain polish remain; M1 is active again before
 the planned M2 close-out.
 
 **M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
-block drops and pickup, survival inventory, container click protocol, and mock
-2x2/3x3 crafting are implemented. The crafting flow has packet-level mock coverage
-but still needs an interactive hand check. The death screen and respawn are
-implemented. **Still missing:** singleplayer recipe evaluation, eating, armour
-equip and damage reduction, hunger effects, XP orbs, furnace/chest block entities,
-and item-atlas rendering.
+network block drops and pickup, survival inventory, container click protocol,
+mock 2x2/3x3 crafting, and the death screen and respawn are implemented. Local
+singleplayer now evaluates the shared recipe book in both the 2x2 inventory grid
+and a usable 3x3 crafting-table window, awards basic block items when mining, and
+consumes block stacks when placing in survival. The tree-to-pickaxe chain still
+needs an interactive hand check. **Still missing:** eating, armour equip and
+damage reduction, hunger effects, XP orbs, furnace/chest block entities, and
+item icons for unmapped item ids.
 
 ---
 
@@ -577,8 +592,9 @@ and item-atlas rendering.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **436 test cases across the workspace** (435 passed, 1 ignored, including two
-  doctests). `nephele-render` has 43 passing tests, including seven shape-meshing
+- **446 test cases across the workspace** (445 passed, 1 ignored, including two
+  doctests). `nephele-cli` has 65 passing tests; `nephele-assets` has 34;
+  `nephele-render` has 43 passing tests, including seven shape-meshing
   regressions; `nephele-world` has 119 passing tests and one ignored. The six
   real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,
   compression, chat, joining/loading the mock world, drop pickup, and crafting
@@ -590,13 +606,14 @@ and item-atlas rendering.
 
 ## 15. Next move
 
-**M2 is not closed.** The tick, hunger/XP, drops, inventory, containers, mock
-2x2/3x3 recipes, death screen and respawn all work, and the exit chain (log to
-planks to sticks to table to pickaxe) is pinned by
-`the_survival_chain_reaches_a_pickaxe` in `nephele-mock`. What still blocks a real
-survival session: **singleplayer recipe evaluation** (crafting exists only in the
-mock), eating, armour and hunger effects, XP orbs, block entities, item-atlas
-rendering. Do not claim M2 done until the exit criterion has been played.
+**M2 is not closed.** The shared recipe matcher now drives local 2x2 and 3x3
+crafting; placed crafting tables open locally, and survival mining/placement
+updates the inventory. The exit chain (log to planks to sticks to table to
+pickaxe) is pinned by `the_survival_chain_reaches_a_pickaxe` in `nephele-mock`,
+but still needs to be played in a local survival session. Remaining features:
+eating, armour equip/reduction, hunger effects, XP orbs, furnace/chest block
+entities, and broader item-icon coverage. Do not claim M2 done until the exit
+criterion has been played.
 
 Death screen: done. Health reaching 0 raises `Screen::Death` ("You Died!" plus a
 Respawn button). The button sets `Shared::pending_respawn`, which the network loop
@@ -608,20 +625,17 @@ so the screen cannot bounce back before the server's own update lands.
    keeps the direct cube path. Neighbour culling only removes a whole face when
    both states are full cubes; cross-plants and `is_transparent` are unchanged.
    Tests cover the full-cube path, slab, stair, fence, pane, door and torch bounds.
-2. **Doors, next.** The shape table currently supplies only a thin panel box.
-   Resolve the split metadata (lower half: `meta & 4` open and `meta & 3` facing;
-   upper half: `meta & 8` upper bit and `meta & 1` hinge), then add `use_block` to
-   toggle the open bit on both halves and send `S23` for each in the mock. Place
-   the lower half at the hit face and upper half above it, derive facing from yaw,
-   and mirror the client prediction. `C08` already reaches the mock; add the door
-   branch next to the crafting-table branch.
-3. **Verify the crafting table by hand.** The 3x3 window and recipes work against
-   the mock (see §11) at the packet level, but nobody has played it. Also:
-   armour slots take stacks but nothing equips them (no armour logic, no HUD
-   change), and tools/armour still draw `MISSING_TEXTURE`. Test with an empty hand,
-   craft sticks and a pickaxe, and use `/gamemode survival`.
-4. **M1 then M2 close-out.** Follow the remaining renderer/gameplay order in
-   `Future.md`; do not count mock packet coverage as an interactive hand test.
+2. **Verify the local survival chain by hand.** Use `/gamemode survival`, mine a
+   log, craft planks/sticks/a table in the inventory, place and right-click the
+   table, then craft a pickaxe. Check ingredient counts, placement consumption,
+   and that closing the table returns its grid. Mock packet tests are not this
+   interactive check.
+3. **M2 close-out.** Implement eating, armour/hunger effects, XP orbs,
+   furnace/chest block entities, remaining item icons and held-tool sprites. Do
+   not claim the milestone done until the local survival chain has been played.
+4. **M1 close-out.** Address smooth lighting/AO, the biome-parity gap, animated
+   textures, plant edge cases and connected shapes; finish door metadata,
+   placement and interaction. See `Future.md` for the full backlog.
 
 ---
 

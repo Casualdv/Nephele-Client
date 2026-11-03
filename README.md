@@ -25,10 +25,12 @@ talks protocol 47, and joins offline-mode servers.
 - Movement and interaction: vanilla travel physics, sprinting, mining, block
   placement, creative item palette, chat
 - Players: entity tracking, skins and skin loading, humanoid rendering
-- Items: block drops spawn as spinning item entities and are collected into the hotbar
+- Items: server drops render as spinning entities; local survival adds mined
+  block items to inventory
 - First person: a skin-textured arm holding the selected block, with a swing while mining
-- Inventory: survival panel with 2x2 crafting, armour, storage and hotbar; click to move stacks
-- Crafting: right-click a crafting table for the 3x3 grid (tools, torch, furnace, chest, armour)
+- Inventory: survival panel with 2x2 crafting, armour, storage and hotbar;
+  supported tool, armour and food icons
+- Crafting: shared recipes in the survival 2×2 inventory and a usable placed-table 3×3 grid
 - Chat: on-screen log and input, with client-side `/gamemode`, `/tp`, `/setblock`, `/give`
 - UI: title, multiplayer (live ping, MOTD and version), direct connect, pause, settings
   and creative screens; HUD, hotbar, hearts

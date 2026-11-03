@@ -8,6 +8,7 @@ use nephele_protocol::packets::{login, play, status};
 use nephele_protocol::{
     Connection, LoginOutcome, NextState, Packet, PacketWriter, ServerAddress, State,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 
 async fn accept_one() -> (TcpListener, u16) {
@@ -258,6 +259,35 @@ async fn login_rejected_in_online_mode() {
         }
         other => panic!("expected encryption request, got {other:?}"),
     }
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_play_packet_can_arrive_across_many_tcp_writes() {
+    let (listener, port) = accept_one().await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let packet = Packet::new(0x55, vec![0xA5; 300]);
+        let frame = nephele_protocol::framing::encode_frame(&packet.to_payload(), None).unwrap();
+
+        // A 300-byte payload forces a two-byte frame-length VarInt; one-byte
+        // writes split both the prefix and body across TCP reads.
+        for byte in frame {
+            stream.write_all(&[byte]).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let mut client = connect(port).await;
+    client.set_state(State::Play);
+    let packet = tokio::time::timeout(Duration::from_secs(5), client.next_play_packet())
+        .await
+        .expect("packet read timed out")
+        .expect("packet read failed");
+    assert_eq!(packet.id, 0x55);
+    assert_eq!(packet.data, vec![0xA5; 300]);
 
     server.await.unwrap();
 }

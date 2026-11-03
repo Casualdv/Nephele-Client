@@ -132,6 +132,114 @@ pub fn quick_move(inventory: &mut [Option<ItemStack>], slot: usize) -> Vec<usize
     changed
 }
 
+/// Match the shared recipe book against a 3x3 grid.
+pub fn crafting_result(grid: &[Option<ItemStack>; 9]) -> Option<ItemStack> {
+    if grid
+        .iter()
+        .flatten()
+        .any(|item| item.id < 0 || item.count <= 0)
+    {
+        return None;
+    }
+    let ingredients = std::array::from_fn(|index| {
+        grid[index].map(|item| (item.id as u16, item.damage.max(0) as u16))
+    });
+    let recipe = nephele_world::crafting::craft(&ingredients)?;
+    Some(ItemStack::new(
+        recipe.id as i16,
+        recipe.count as i8,
+        recipe.damage as i16,
+    ))
+}
+
+/// Match the 2x2 crafting grid in the player inventory (slots 1..=4).
+pub fn player_crafting_result(slots: &[Option<ItemStack>]) -> Option<ItemStack> {
+    if slots.len() < 5 {
+        return None;
+    }
+    let mut grid = [None; 9];
+    for (grid_slot, inventory_slot) in [(0, 1), (1, 2), (3, 3), (4, 4)] {
+        grid[grid_slot] = slots[inventory_slot];
+    }
+    crafting_result(&grid)
+}
+
+/// Match the 3x3 crafting grid in an open crafting-table window (slots 1..=9).
+pub fn table_crafting_result(slots: &[Option<ItemStack>]) -> Option<ItemStack> {
+    if slots.len() < 10 {
+        return None;
+    }
+    let grid = std::array::from_fn(|index| slots[index + 1]);
+    crafting_result(&grid)
+}
+
+/// Consume one item from each occupied crafting cell.
+pub fn consume_crafting_grid(grid: &mut [Option<ItemStack>]) {
+    for slot in grid {
+        let Some(mut item) = *slot else {
+            continue;
+        };
+        item.count -= 1;
+        *slot = (item.count > 0).then_some(item);
+    }
+}
+
+/// Put a complete crafting result on the cursor, or merge it if the whole
+/// output fits. Returns false without changing the cursor when it cannot fit.
+pub fn take_crafting_result(cursor: &mut Option<ItemStack>, result: ItemStack) -> bool {
+    if result.count <= 0 {
+        return false;
+    }
+    match *cursor {
+        None => *cursor = Some(result),
+        Some(held) if same(held, result) => {
+            let total = i16::from(held.count) + i16::from(result.count);
+            if total > i16::from(MAX_STACK) {
+                return false;
+            }
+            *cursor = Some(ItemStack::new(held.id, total as i8, held.damage));
+        }
+        Some(_) => return false,
+    }
+    true
+}
+
+/// Merge a stack into matching stacks and then empty slots. Any remainder is
+/// returned to the caller, so callers can avoid silently deleting items.
+pub fn insert_stack(slots: &mut [Option<ItemStack>], item: ItemStack) -> Option<ItemStack> {
+    let mut remaining = i16::from(item.count);
+    if remaining <= 0 {
+        return None;
+    }
+
+    for existing in slots.iter_mut().flatten() {
+        if !same(*existing, item) {
+            continue;
+        }
+        let room = i16::from(MAX_STACK) - i16::from(existing.count);
+        let moved = remaining.min(room.max(0));
+        existing.count = (i16::from(existing.count) + moved) as i8;
+        remaining -= moved;
+        if remaining == 0 {
+            return None;
+        }
+    }
+
+    for slot in slots.iter_mut() {
+        if slot.is_some() {
+            continue;
+        }
+        let moved = remaining.min(i16::from(MAX_STACK));
+        *slot = Some(ItemStack::new(item.id, moved as i8, item.damage));
+        remaining -= moved;
+        if remaining == 0 {
+            return None;
+        }
+    }
+
+    Some(ItemStack::new(item.id, remaining as i8, item.damage))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +310,56 @@ mod tests {
             "the rest spills to the next slot"
         );
         assert_eq!(inventory[36], None);
+    }
+
+    #[test]
+    fn player_and_table_grids_use_the_shared_recipe_book() {
+        let mut player = vec![None; 45];
+        player[4] = stack(17, 2);
+        assert_eq!(player_crafting_result(&player), stack(5, 4));
+
+        let mut table = vec![None; 46];
+        table[1] = stack(5, 1);
+        table[2] = stack(5, 1);
+        table[3] = stack(5, 1);
+        table[5] = stack(280, 1);
+        table[8] = stack(280, 1);
+        assert_eq!(table_crafting_result(&table), stack(270, 1));
+    }
+
+    #[test]
+    fn crafting_consumes_one_item_from_each_filled_cell() {
+        let mut grid = [stack(17, 2), None, stack(5, 1)];
+        consume_crafting_grid(&mut grid);
+        assert_eq!(grid, [stack(17, 1), None, None]);
+    }
+
+    #[test]
+    fn crafting_output_is_atomic_with_respect_to_cursor_capacity() {
+        let output = ItemStack::new(5, 4, 0);
+        let mut cursor = None;
+        assert!(take_crafting_result(&mut cursor, output));
+        assert_eq!(cursor, Some(output));
+
+        let mut full = stack(5, 62);
+        assert!(!take_crafting_result(&mut full, output));
+        assert_eq!(full, stack(5, 62));
+
+        let mut incompatible = stack(17, 1);
+        assert!(!take_crafting_result(&mut incompatible, output));
+        assert_eq!(incompatible, stack(17, 1));
+    }
+
+    #[test]
+    fn insert_stack_merges_before_using_an_empty_slot() {
+        let mut slots = [stack(5, 62), None];
+        assert_eq!(insert_stack(&mut slots, ItemStack::new(5, 4, 0)), None);
+        assert_eq!(slots, [stack(5, 64), stack(5, 2)]);
+
+        let mut full = [stack(5, 64)];
+        assert_eq!(
+            insert_stack(&mut full, ItemStack::new(5, 1, 0)),
+            stack(5, 1)
+        );
     }
 }

@@ -4,6 +4,7 @@ use std::path::Path;
 use image::{Rgba, RgbaImage};
 
 use crate::block_textures::{all_texture_names, MISSING_TEXTURE};
+use crate::item_textures::all_item_texture_layers;
 
 /// Vanilla block textures are 16×16.
 pub const TILE_SIZE: u32 = 16;
@@ -24,7 +25,7 @@ pub enum AssetError {
     EmptyArray,
 }
 
-/// One GPU texture-array layer per block texture.
+/// One GPU texture-array layer per referenced block or supported item texture.
 ///
 /// Every block face samples its own layer, so unlike an atlas there is no
 /// bleeding between neighbouring textures and mipmapping stays safe.
@@ -71,8 +72,8 @@ impl TextureArray {
             .map(|(name, _)| *name)
     }
 
-    /// Load every block texture Nephele's block table references from the
-    /// vanilla `textures/blocks` directory.
+    /// Load referenced block textures and supported item textures from the
+    /// vanilla `textures/blocks` and sibling `textures/items` directories.
     pub fn load_from_dir(blocks_dir: &Path) -> Result<Self, AssetError> {
         if !blocks_dir.is_dir() {
             return Err(AssetError::MissingDirectory(
@@ -112,6 +113,24 @@ impl TextureArray {
 
         if tiles.is_empty() {
             return Err(AssetError::NoTextures(blocks_dir.display().to_string()));
+        }
+
+        if let Some(items_dir) = blocks_dir
+            .parent()
+            .map(|textures_dir| textures_dir.join("items"))
+            .filter(|items_dir| items_dir.is_dir())
+        {
+            for (layer, file) in all_item_texture_layers() {
+                let path = items_dir.join(format!("{file}.png"));
+                if !path.is_file() {
+                    continue;
+                }
+                let image = image::open(&path).map_err(|source| AssetError::Image {
+                    path: path.display().to_string(),
+                    source,
+                })?;
+                tiles.push((layer, to_tile(&image.to_rgba8())));
+            }
         }
         Ok(Self::from_tiles(tiles))
     }
@@ -274,6 +293,40 @@ mod tests {
             array.layer_or_missing("nope"),
             array.layer(MISSING_TEXTURE).unwrap()
         );
+    }
+
+    #[test]
+    fn namespaced_item_layers_do_not_collide_with_block_layers() {
+        let array = TextureArray::from_tiles(vec![
+            ("brick", solid(Rgba([255, 0, 0, 255]))),
+            ("item:brick", solid(Rgba([0, 255, 0, 255]))),
+        ]);
+        assert_ne!(array.layer("brick"), array.layer("item:brick"));
+        assert_eq!(
+            array.name_of(array.layer("item:brick").unwrap()),
+            Some("item:brick")
+        );
+    }
+
+    #[test]
+    fn prepared_crafting_items_load_into_the_texture_array_when_available() {
+        let Some(minecraft) = crate::test_support::minecraft() else {
+            eprintln!("skipping item texture check: run `nephele-prepare` first");
+            return;
+        };
+        let atlas = TextureArray::load_from_dir(&minecraft.join("textures/blocks"))
+            .expect("prepared block textures load");
+        let items_dir = minecraft.join("textures/items");
+        for (layer, file) in all_item_texture_layers() {
+            assert!(
+                items_dir.join(format!("{file}.png")).is_file(),
+                "missing item file {file}"
+            );
+            assert!(
+                atlas.layer(layer).is_some(),
+                "missing prepared layer {layer}"
+            );
+        }
     }
 
     #[test]

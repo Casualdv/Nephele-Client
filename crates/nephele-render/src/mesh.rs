@@ -1,4 +1,6 @@
-use nephele_assets::{face_textures, is_transparent, TextureArray, MISSING_TEXTURE};
+use nephele_assets::{
+    face_textures, is_transparent, item_texture_name, TextureArray, MISSING_TEXTURE,
+};
 use nephele_world::shapes::{block_shape, is_full_cube};
 use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World};
 
@@ -530,7 +532,7 @@ pub fn build_world_mesh(world: &World, atlas: &TextureArray) -> MeshData {
 pub struct ItemDraw {
     /// Feet position in world space, i.e. the block corner the item sits on.
     pub position: [f32; 3],
-    /// Item id. Block items (1..255) use that block's textures.
+    /// Item id. Block items use block textures; mapped non-block items use item textures.
     pub item: i16,
     pub meta: i16,
 }
@@ -544,21 +546,23 @@ const ITEM_BOB: f32 = 0.04;
 
 /// Dropped items: a small spinning, bobbing cube per stack.
 ///
-/// Block items get their real textures; anything else (sticks, tools) has no
-/// texture in the prepared asset set yet, so it draws as the missing-texture
-/// tile — visible rather than silently absent, the same content gap as card art
-/// on the other project.
+/// Block items use their block faces. Mapped non-block items use their prepared
+/// item texture on each face; unmapped ids use the generated missing tile.
 pub fn build_item_mesh(items: &[ItemDraw], atlas: &TextureArray, time: f32) -> MeshData {
     let mut mesh = MeshData::default();
     for item in items {
-        let state = BlockState::new(item.item.max(0) as u16, item.meta.clamp(0, 15) as u8);
-        let layers = match face_textures(state) {
-            Some(faces) => [
-                atlas.layer_or_missing(faces.top),
-                atlas.layer_or_missing(faces.bottom),
-                atlas.layer_or_missing(faces.side),
-            ],
-            None => [atlas.layer_or_missing(MISSING_TEXTURE); 3],
+        let layers = if let Some(texture) = item_texture_name(item.item, item.meta) {
+            [atlas.layer_or_missing(texture); 3]
+        } else {
+            let state = BlockState::new(item.item.max(0) as u16, item.meta.clamp(0, 15) as u8);
+            match face_textures(state) {
+                Some(faces) => [
+                    atlas.layer_or_missing(faces.top),
+                    atlas.layer_or_missing(faces.bottom),
+                    atlas.layer_or_missing(faces.side),
+                ],
+                None => [atlas.layer_or_missing(MISSING_TEXTURE); 3],
+            }
         };
 
         // A per-item phase so a pile of drops doesn't spin in lockstep.
@@ -659,10 +663,16 @@ mod tests {
     use nephele_world::ChunkColumn;
 
     fn atlas() -> TextureArray {
-        TextureArray::from_tiles(vec![(
-            "stone",
-            RgbaImage::from_pixel(16, 16, image::Rgba([128, 128, 128, 255])),
-        )])
+        TextureArray::from_tiles(vec![
+            (
+                "stone",
+                RgbaImage::from_pixel(16, 16, image::Rgba([128, 128, 128, 255])),
+            ),
+            (
+                "item:stick",
+                RgbaImage::from_pixel(16, 16, image::Rgba([200, 150, 100, 255])),
+            ),
+        ])
     }
 
     fn world_with(column: ChunkColumn) -> World {
@@ -802,20 +812,20 @@ mod tests {
     }
 
     #[test]
-    fn an_item_without_a_block_texture_still_produces_geometry() {
-        // Stick: an item id above 255, so there is no block texture for it yet.
+    fn a_non_block_item_uses_its_item_texture_layer() {
         let items = [ItemDraw {
             position: [0.0, 64.0, 0.0],
             item: 280,
             meta: 0,
         }];
-        let mesh = build_item_mesh(&items, &atlas(), 0.0);
+        let textures = atlas();
+        let mesh = build_item_mesh(&items, &textures, 0.0);
         assert_eq!(mesh.vertices.len(), 24);
-        // Everything falls back to the missing-texture layer, together.
+        let stick_layer = textures.layer("item:stick").unwrap();
         assert!(mesh
             .vertices
             .iter()
-            .all(|v| v.layer == mesh.vertices[0].layer));
+            .all(|vertex| vertex.layer == stick_layer));
     }
 
     #[test]

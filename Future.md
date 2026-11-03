@@ -164,11 +164,11 @@ per render frame — it no longer does. Keep new simulation work inside
 | Item | Size | Notes |
 |---|---|---|
 | Survival inventory screen (2×2 crafting, armour slots) | L | Done: vanilla layout, cursor stack, left/right/shift clicks via `C0E`. |
-| Crafting table, furnace, chest, hopper, dispenser, brewing, enchanting, anvil, beacon | XL | **Crafting table done** (window id 1, 3×3 grid, recipes in the mock). The rest unstarted. |
+| Crafting table, furnace, chest, hopper, dispenser, brewing, enchanting, anvil, beacon | XL | **Crafting table done** (server window protocol plus a local 3×3 window); furnace/chest and the rest unstarted. |
 | Shift-click, drag-split, item dragging, hotbar swap keys | M | |
 | Item tooltips: name, rarity colour, enchantments | M | |
-| Durability bar, stack counts, item icons | M | |
-| Crafting recipe matching | L | |
+| Durability bar, stack counts, item icons | M | Partial: prepared icons now render for mapped tools, armour, materials and common food; unmapped ids still use the missing tile. |
+| Crafting recipe matching | L | Partial: a shared recipe book drives local 2×2/3×3 grids and the mock's 3×3 recipes, including the tree-to-pickaxe chain. The mock's 2×2 recipes remain separate; most vanilla recipes and container recipes are absent. |
 | Eating, potions, status effects | L | |
 | Enchantments | L | |
 | Health, hunger, saturation, XP, air supply | M | Server-driven; we render and predict. |
@@ -263,12 +263,12 @@ lighting, block shapes. *Exit:* singleplayer world looks like Minecraft from
 above and from underground.
 
 **M2 - Survival loop.** Partly done: fixed 20 Hz tick, hunger/XP data from the
-server, block drops and pickup, survival inventory, container clicks, mock
-2x2/3x3 recipes, and the death screen with respawn. Remaining before the exit
-test can be played for real: singleplayer recipe evaluation (crafting exists
-only in the mock today), eating, armour and hunger effects, XP orbs, block
-entities and item-atlas rendering. *Exit:* punch a tree and make a pickaxe in a
-survival session.
+server, network block drops and pickup, survival inventory, container clicks,
+mock recipes, local 2x2/3x3 recipe evaluation and crafting-table use, mapped item
+icons, and the death screen with respawn. Remaining: interactive verification
+of the local tree-to-pickaxe chain, eating, armour and hunger effects, XP orbs,
+furnace/chest block entities and broader item-icon coverage. *Exit:* punch a
+tree and make a pickaxe in a survival session.
 
 **M3 — Join a real server.** Microsoft auth (**done**, missing only a shippable
 Azure client id), server list (**done**), online-mode handshake (**done**),

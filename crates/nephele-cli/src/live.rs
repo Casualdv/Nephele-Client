@@ -20,7 +20,7 @@ use crate::ui::{self, Action, HudState, Screen};
 use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
 use nephele_client::mining::{Aim, Miner, MiningEvent};
 use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
-use nephele_client::{Event, GameClient, Vec3};
+use nephele_client::{Event, GameClient, LocalContainer, Vec3};
 use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
@@ -29,7 +29,7 @@ use nephele_render::{
     build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw, HandDraw, HandItem,
     ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
 };
-use nephele_world::{raycast, ChunkColumn, ChunkCoord, World};
+use nephele_world::{raycast, BlockState, ChunkColumn, ChunkCoord, World};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{
@@ -173,6 +173,10 @@ struct Shared {
     /// Slots of the server's open container (crafting table), and whether one is.
     window_slots: Vec<Option<ItemStack>>,
     window_open: bool,
+    /// Server window id, or 1 for the local crafting-table window.
+    window_id: Option<u8>,
+    /// Offline crafting-table grid and cursor; the player's inventory stays above.
+    local_container: LocalContainer,
     /// Ask the game thread to send `C0D` for the open container.
     close_window: bool,
     /// Single-player has no server to apply clicks, so the UI applies them.
@@ -183,6 +187,122 @@ struct Shared {
     /// the renderer can interpolate between 20 Hz physics ticks.
     prev_position: [f64; 3],
     tick_at: Instant,
+}
+
+fn refresh_local_crafting_preview(state: &mut Shared) {
+    if !state.local {
+        return;
+    }
+    if state.window_id == Some(1) {
+        sync_local_table_inventory(state);
+    } else {
+        let result = inventory::player_crafting_result(&state.inventory);
+        if let Some(slot) = state.inventory.first_mut() {
+            *slot = result;
+        }
+    }
+}
+
+fn sync_local_table_inventory(state: &mut Shared) {
+    if state.window_id != Some(1) || state.window_slots.len() < 46 {
+        return;
+    }
+    state.window_slots[1..10].copy_from_slice(state.local_container.grid());
+    state.window_slots[0] = inventory::table_crafting_result(&state.window_slots);
+    state.window_slots[10..46].copy_from_slice(&state.inventory[9..45]);
+}
+
+fn open_local_crafting_table(state: &mut Shared) {
+    state.local_container = LocalContainer::default();
+    state.window_slots = vec![None; 46];
+    state.window_id = Some(1);
+    state.window_open = true;
+    sync_local_table_inventory(state);
+}
+
+fn insert_player_stack(slots: &mut [Option<ItemStack>], item: ItemStack) -> Option<ItemStack> {
+    let item = inventory::insert_stack(&mut slots[36..45], item)?;
+    inventory::insert_stack(&mut slots[9..36], item)
+}
+
+fn local_block_drop(block: BlockState) -> Option<ItemStack> {
+    let (id, meta) = match block.id() {
+        0 | 7 | 8..=11 | 18 | 51 | 90 => return None,
+        1 => (4, 0),                  // Stone drops cobblestone.
+        2 => (3, 0),                  // Grass blocks drop dirt.
+        17 => (17, block.meta() & 3), // The log axis is not item metadata.
+        id => (id, block.meta()),
+    };
+    Some(ItemStack::new(id as i16, 1, meta as i16))
+}
+
+fn add_local_item(state: &mut Shared, item: ItemStack) {
+    let Some(item) = inventory::insert_stack(&mut state.inventory[36..45], item) else {
+        return;
+    };
+    let _ = inventory::insert_stack(&mut state.inventory[9..36], item);
+}
+
+fn consume_held_block(state: &mut Shared, slot: usize, block_state: u16) {
+    let Some(item) = state.inventory.get_mut(slot).and_then(Option::as_mut) else {
+        return;
+    };
+    if item.block_state() != Some(block_state) {
+        return;
+    }
+    item.count -= 1;
+    let empty = item.count <= 0;
+    if empty {
+        state.inventory[slot] = None;
+    }
+}
+
+fn take_local_crafting_output(state: &mut Shared, cursor: &mut Option<ItemStack>) {
+    let result = inventory::player_crafting_result(&state.inventory);
+    let Some(result) = result else {
+        return;
+    };
+    if !inventory::take_crafting_result(cursor, result) {
+        return;
+    }
+
+    inventory::consume_crafting_grid(&mut state.inventory[1..5]);
+    refresh_local_crafting_preview(state);
+}
+
+fn shift_craft_local_outputs(state: &mut Shared) {
+    if state.window_id == Some(1) {
+        for _ in 0..64 {
+            let mut container = state.local_container.clone();
+            let Some(result) = container.click(0, 0, true) else {
+                break;
+            };
+
+            let mut inventory = state.inventory.clone();
+            if insert_player_stack(&mut inventory, result).is_some() {
+                break;
+            }
+            state.local_container = container;
+            state.inventory = inventory;
+        }
+        refresh_local_crafting_preview(state);
+        return;
+    }
+
+    for _ in 0..64 {
+        let result = inventory::player_crafting_result(&state.inventory);
+        let Some(result) = result else {
+            break;
+        };
+
+        let mut inventory = state.inventory.clone();
+        if insert_player_stack(&mut inventory, result).is_some() {
+            break;
+        }
+        state.inventory = inventory;
+        inventory::consume_crafting_grid(&mut state.inventory[1..5]);
+    }
+    refresh_local_crafting_preview(state);
 }
 
 pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
@@ -216,6 +336,8 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         inventory_clicks: Vec::new(),
         window_slots: Vec::new(),
         window_open: false,
+        window_id: None,
+        local_container: LocalContainer::default(),
         close_window: false,
         local: false,
         view_distance: nephele_client::VIEW_DISTANCE,
@@ -266,11 +388,6 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
     // changing it in Options takes effect without restarting the world.
     let mut radius;
 
-    let mut inventory = [None; 9];
-    for (index, block) in nephele_client::STARTER_HOTBAR.iter().enumerate() {
-        inventory[index] = Some(ItemStack::new(block.id() as i16, 64, block.meta() as i16));
-    }
-
     {
         let mut state = shared.lock().unwrap();
         let spawn_y = generator.spawn_height() as f64;
@@ -278,9 +395,12 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
         state.spawned = true;
         state.creative = true;
         state.status = format!("Singleplayer (seed {seed})");
-        for (index, item) in inventory.iter().enumerate() {
-            state.inventory[HOTBAR_FIRST_SLOT + index] = *item;
+        state.inventory.fill(None);
+        for (index, block) in nephele_client::STARTER_HOTBAR.iter().enumerate() {
+            state.inventory[HOTBAR_FIRST_SLOT + index] =
+                Some(ItemStack::new(block.id() as i16, 64, block.meta() as i16));
         }
+        refresh_local_crafting_preview(&mut state);
     }
 
     let mut sent: HashSet<(i32, i32)> = HashSet::new();
@@ -324,7 +444,12 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
         // What are we looking at?
         let eye = [position.x, position.y + EYE_HEIGHT, position.z];
         let direction = look_direction(yaw, pitch);
-        let aim = raycast(&world, eye, direction, REACH_CREATIVE).map(|hit| Aim {
+        let reach = if shared.lock().unwrap().creative {
+            REACH_CREATIVE
+        } else {
+            REACH_SURVIVAL
+        };
+        let aim = raycast(&world, eye, direction, reach).map(|hit| Aim {
             x: hit.x,
             y: hit.y,
             z: hit.z,
@@ -352,10 +477,6 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
             shared.lock().unwrap().held_slot = slot;
         }
         if let Some((slot, item)) = give {
-            let hotbar = (slot as usize).saturating_sub(HOTBAR_FIRST_SLOT);
-            if hotbar < inventory.len() {
-                inventory[hotbar] = Some(item);
-            }
             let mut state = shared.lock().unwrap();
             if let Some(entry) = state.inventory.get_mut(slot as usize) {
                 *entry = Some(item);
@@ -377,30 +498,50 @@ fn local_loop(seed: u64, shared: Arc<Mutex<Shared>>, tx: Sender<NetMsg>) -> Resu
         let creative = shared.lock().unwrap().creative;
         for event in miner.tick(&world, aim, attacking, creative) {
             if let MiningEvent::Stop(target) = event {
+                let broken = world.get_block(target.x, target.y, target.z);
                 world.set_block(target.x, target.y, target.z, BlockState::AIR);
                 dirty.insert((target.x.div_euclid(16), target.z.div_euclid(16)));
+                if !creative {
+                    if let Some(item) = local_block_drop(broken) {
+                        add_local_item(&mut shared.lock().unwrap(), item);
+                    }
+                }
             }
         }
         if use_pressed {
             if let Some(aim) = aim {
-                let held = {
-                    let state = shared.lock().unwrap();
-                    state
-                        .inventory
-                        .get(HOTBAR_FIRST_SLOT + state.held_slot.max(0) as usize)
-                        .copied()
-                        .flatten()
-                };
-                if let Some(state_block) = held.and_then(|item| item.block_state()) {
-                    let normal = nephele_world::Face::from_protocol_id(aim.face)
-                        .map(|face| face.normal())
-                        .unwrap_or([0, 1, 0]);
-                    let (bx, by, bz) = (aim.x + normal[0], aim.y + normal[1], aim.z + normal[2]);
-                    if world.get_block(bx, by, bz).is_air()
-                        && !placement_hits_player(&aim, [position.x, position.y, position.z])
-                    {
-                        world.set_block(bx, by, bz, BlockState::from_raw(state_block));
-                        dirty.insert((bx.div_euclid(16), bz.div_euclid(16)));
+                if world.get_block(aim.x, aim.y, aim.z).id()
+                    == nephele_world::crafting::CRAFTING_TABLE
+                {
+                    let mut state = shared.lock().unwrap();
+                    if state.window_id.is_none() {
+                        open_local_crafting_table(&mut state);
+                    }
+                } else {
+                    let (held_slot, held) = {
+                        let state = shared.lock().unwrap();
+                        let slot = HOTBAR_FIRST_SLOT + (state.held_slot.clamp(0, 8) as usize);
+                        (slot, state.inventory.get(slot).copied().flatten())
+                    };
+                    if let Some(state_block) = held.and_then(|item| item.block_state()) {
+                        let normal = nephele_world::Face::from_protocol_id(aim.face)
+                            .map(|face| face.normal())
+                            .unwrap_or([0, 1, 0]);
+                        let (bx, by, bz) =
+                            (aim.x + normal[0], aim.y + normal[1], aim.z + normal[2]);
+                        if world.get_block(bx, by, bz).is_air()
+                            && !placement_hits_player(&aim, [position.x, position.y, position.z])
+                        {
+                            world.set_block(bx, by, bz, BlockState::from_raw(state_block));
+                            dirty.insert((bx.div_euclid(16), bz.div_euclid(16)));
+                            if !creative {
+                                consume_held_block(
+                                    &mut shared.lock().unwrap(),
+                                    held_slot,
+                                    state_block,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -634,7 +775,8 @@ async fn net_loop(
                     } else {
                         state.inventory.copy_from_slice(&client.inventory);
                     }
-                    state.window_open = client.open_window.is_some();
+                    state.window_id = client.open_window.as_ref().map(|open| open.id);
+                    state.window_open = state.window_id.is_some();
                     state.window_slots = client
                         .open_window
                         .as_ref()
@@ -727,6 +869,8 @@ struct FrameView {
     creative: bool,
     /// Left mouse held: drives both the miner and the first-person swing.
     attacking: bool,
+    /// Stack shown under the pointer in the inventory screen.
+    inventory_cursor: Option<ItemStack>,
     inventory: Vec<Option<ItemStack>>,
     window_open: bool,
     window_slots: Vec<Option<ItemStack>>,
@@ -1323,6 +1467,11 @@ impl LiveApp {
                 held_slot: state.held_slot,
                 creative: state.creative,
                 attacking: state.attacking,
+                inventory_cursor: if state.local && state.window_id == Some(1) {
+                    state.local_container.cursor()
+                } else {
+                    self.inventory_cursor
+                },
                 inventory: state.inventory.clone(),
                 window_open: state.window_open,
                 window_slots: state.window_slots.clone(),
@@ -1657,7 +1806,7 @@ impl LiveApp {
                     &mut self.ui_fg,
                     &mut self.ui_icons,
                     &hud,
-                    self.inventory_cursor,
+                    view.inventory_cursor,
                     textures,
                     scale,
                     width,
@@ -2047,25 +2196,67 @@ impl LiveApp {
 
     /// Close the inventory, putting whatever is on the cursor back first.
     fn close_inventory(&mut self) {
-        let open = self.shared.lock().unwrap().window_open;
-        if open {
-            // The server returns the grid and cursor stacks when it closes; the
-            // local cursor just stops existing.
+        let mut state = self.shared.lock().unwrap();
+        if state.window_open {
+            if state.local && state.window_id == Some(1) {
+                // A local crafting table has no server to return its grid. Make
+                // the close atomic so a full inventory never destroys items.
+                let mut inventory = state.inventory.clone();
+                if let Some(cursor) = state.local_container.cursor() {
+                    if insert_player_stack(&mut inventory, cursor).is_some() {
+                        return;
+                    }
+                }
+                for item in state.local_container.grid().iter().flatten() {
+                    if insert_player_stack(&mut inventory, *item).is_some() {
+                        return;
+                    }
+                }
+                state.inventory = inventory;
+                state.local_container = LocalContainer::default();
+                state.window_slots.clear();
+                state.window_open = false;
+                state.window_id = None;
+                state.close_window = false;
+                self.inventory_cursor = None;
+                refresh_local_crafting_preview(&mut state);
+                drop(state);
+                self.enter_game();
+                return;
+            }
+            // The server returns the grid and cursor stacks when it closes.
             self.inventory_cursor = None;
-            self.shared.lock().unwrap().close_window = true;
+            state.close_window = true;
+            drop(state);
             self.enter_game();
             return;
         }
-        if self.inventory_cursor.is_some() {
-            let free = {
-                let state = self.shared.lock().unwrap();
-                (play::HOTBAR_FIRST_SLOT..state.inventory.len())
-                    .chain(9..play::HOTBAR_FIRST_SLOT)
-                    .find(|&slot| state.inventory[slot].is_none())
-            };
-            if let Some(slot) = free {
-                self.inventory_click(slot as i16, 0, false);
+
+        if state.local {
+            let mut inventory = state.inventory.clone();
+            if let Some(cursor) = self.inventory_cursor {
+                if inventory::insert_stack(&mut inventory[9..45], cursor).is_some() {
+                    return;
+                }
             }
+            state.inventory = inventory;
+            self.inventory_cursor = None;
+            drop(state);
+            self.enter_game();
+            return;
+        }
+
+        if self.inventory_cursor.is_some() {
+            let free = (play::HOTBAR_FIRST_SLOT..state.inventory.len())
+                .chain(9..play::HOTBAR_FIRST_SLOT)
+                .find(|&slot| state.inventory[slot].is_none());
+            let Some(slot) = free else {
+                return;
+            };
+            drop(state);
+            self.inventory_click(slot as i16, 0, false);
+        } else {
+            drop(state);
         }
         self.enter_game();
     }
@@ -2083,6 +2274,7 @@ impl LiveApp {
         // An open container replaces the player container: slot numbers are the
         // window's (0 = output, 1..9 = grid, 10.. = storage/hotbar).
         let open = state.window_open;
+        let local_table = state.local && state.window_id == Some(1);
         let count = if open {
             state.window_slots.len()
         } else {
@@ -2098,23 +2290,76 @@ impl LiveApp {
             state.inventory[index]
         };
 
-        if shift {
-            // Mode 1 is server-side when there is one; single-player moves it
-            // locally so the item does not disappear.
-            if state.local && !open {
-                inventory::quick_move(&mut state.inventory, index);
+        if state.local {
+            if local_table {
+                if shift {
+                    if index == 0 {
+                        shift_craft_local_outputs(&mut state);
+                    } else if (1..10).contains(&index) {
+                        let mut container = state.local_container.clone();
+                        let Some(item) = container.click(index, button, true) else {
+                            return;
+                        };
+                        let mut inventory = state.inventory.clone();
+                        let remainder = insert_player_stack(&mut inventory, item);
+                        container.set_grid_cell(index - 1, remainder);
+                        state.local_container = container;
+                        state.inventory = inventory;
+                        refresh_local_crafting_preview(&mut state);
+                    } else {
+                        inventory::quick_move(&mut state.inventory, index - 1);
+                        refresh_local_crafting_preview(&mut state);
+                    }
+                    return;
+                }
+
+                if index < 10 {
+                    state.local_container.click(index, button, false);
+                } else {
+                    let inventory_slot = index - 1;
+                    let (cursor, new_slot) = inventory::click(
+                        state.local_container.cursor(),
+                        state.inventory[inventory_slot],
+                        button,
+                    );
+                    state.local_container.set_cursor(cursor);
+                    state.inventory[inventory_slot] = new_slot;
+                }
+                refresh_local_crafting_preview(&mut state);
+                return;
             }
+
+            if shift {
+                if index == 0 {
+                    shift_craft_local_outputs(&mut state);
+                } else {
+                    inventory::quick_move(&mut state.inventory, index);
+                    refresh_local_crafting_preview(&mut state);
+                }
+                return;
+            }
+
+            if index == 0 {
+                take_local_crafting_output(&mut state, &mut self.inventory_cursor);
+                return;
+            }
+
+            let (cursor, new_slot) = inventory::click(self.inventory_cursor, clicked, button);
+            self.inventory_cursor = cursor;
+            state.inventory[index] = new_slot;
+            refresh_local_crafting_preview(&mut state);
+            return;
+        }
+
+        if shift {
             state
                 .inventory_clicks
                 .push((slot, 0, play::click_mode::SHIFT_CLICK, clicked));
             return;
         }
 
-        let (cursor, new_slot) = inventory::click(self.inventory_cursor, clicked, button);
+        let (cursor, _) = inventory::click(self.inventory_cursor, clicked, button);
         self.inventory_cursor = cursor;
-        if state.local && !open && new_slot != clicked {
-            state.inventory[index] = new_slot;
-        }
         state
             .inventory_clicks
             .push((slot, button, play::click_mode::CLICK, clicked));
@@ -2588,6 +2833,90 @@ fn hotbar_digit(code: KeyCode) -> Option<i16> {
 mod tests {
     use super::*;
 
+    fn local_state_for_test() -> Shared {
+        Shared {
+            player: PlayerState::default(),
+            yaw: 0.0,
+            pitch: 0.0,
+            input: Input::default(),
+            teleport: None,
+            status: String::new(),
+            spawned: false,
+            error: None,
+            attacking: false,
+            use_pressed: false,
+            pending_slot: None,
+            pending_respawn: false,
+            aim: None,
+            break_stage: None,
+            held_slot: 0,
+            creative: false,
+            inventory: vec![None; 45],
+            health: 20.0,
+            food: 20,
+            xp_bar: 0.0,
+            xp_level: 0,
+            chunks: 0,
+            give_item: None,
+            chat_out: Vec::new(),
+            world_edits: Vec::new(),
+            creative_override: None,
+            inventory_clicks: Vec::new(),
+            window_slots: Vec::new(),
+            window_open: false,
+            window_id: None,
+            local_container: LocalContainer::default(),
+            close_window: false,
+            local: true,
+            view_distance: nephele_client::VIEW_DISTANCE,
+            prev_position: [0.5, 64.0, 0.5],
+            tick_at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn local_crafting_table_opens_window_one_and_projects_its_slots() {
+        let mut state = local_state_for_test();
+        state.inventory[9] = Some(ItemStack::new(17, 2, 0));
+        open_local_crafting_table(&mut state);
+
+        assert_eq!(state.window_id, Some(1));
+        assert!(state.window_open);
+        assert_eq!(state.window_slots.len(), 46);
+        assert_eq!(state.window_slots[10], state.inventory[9]);
+
+        state
+            .local_container
+            .set_grid_cell(0, Some(ItemStack::new(17, 1, 0)));
+        refresh_local_crafting_preview(&mut state);
+        assert_eq!(state.window_slots[0], Some(ItemStack::new(5, 4, 0)));
+        assert_eq!(state.window_slots[1], Some(ItemStack::new(17, 1, 0)));
+    }
+
+    #[test]
+    fn local_shift_crafting_preserves_ingredients_until_the_output_fits() {
+        let mut state = local_state_for_test();
+        state.inventory.fill(Some(ItemStack::new(1, 64, 0)));
+        open_local_crafting_table(&mut state);
+        state
+            .local_container
+            .set_grid_cell(0, Some(ItemStack::new(17, 2, 0)));
+        refresh_local_crafting_preview(&mut state);
+
+        shift_craft_local_outputs(&mut state);
+        assert_eq!(state.inventory[36], Some(ItemStack::new(1, 64, 0)));
+        assert_eq!(
+            state.local_container.grid()[0],
+            Some(ItemStack::new(17, 2, 0))
+        );
+
+        state.inventory[36] = None;
+        shift_craft_local_outputs(&mut state);
+        assert_eq!(state.inventory[36], Some(ItemStack::new(5, 8, 0)));
+        assert_eq!(state.local_container.grid()[0], None);
+        assert_eq!(state.window_slots[0], None);
+    }
+
     #[test]
     fn hotbar_digits_map_to_slots() {
         assert_eq!(hotbar_digit(KeyCode::Digit1), Some(0));
@@ -2671,5 +3000,18 @@ mod tests {
 
         let up = look_direction(0.0, std::f32::consts::FRAC_PI_2);
         assert!((up[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn local_survival_drops_logs_without_their_axis_bits() {
+        assert_eq!(
+            local_block_drop(BlockState::new(17, 0b1010)),
+            Some(ItemStack::new(17, 1, 2))
+        );
+        assert_eq!(
+            local_block_drop(BlockState::STONE),
+            Some(ItemStack::new(4, 1, 0))
+        );
+        assert_eq!(local_block_drop(BlockState::BEDROCK), None);
     }
 }

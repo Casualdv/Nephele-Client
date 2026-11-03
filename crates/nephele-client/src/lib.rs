@@ -4,6 +4,7 @@
 //! translates play-state packets into structured [`Event`]s. The renderer will
 //! consume this later; for now the CLI drives it and prints statistics.
 
+pub mod container;
 pub mod entities;
 pub mod mining;
 pub mod physics;
@@ -16,8 +17,11 @@ use std::time::Duration;
 use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::ItemStack;
 use nephele_protocol::{Connection, Error, LoginOutcome, NextState, Packet, Result, ServerAddress};
-use nephele_world::{decode_chunk_bulk, decode_chunk_data, ChunkCoord, ChunkUpdate, World};
+use nephele_world::{
+    decode_chunk_bulk, decode_chunk_data, ChunkColumn, ChunkCoord, ChunkUpdate, World,
+};
 
+pub use container::LocalContainer;
 pub use entities::{Entities, Entity, EntityKind};
 pub use mining::{Aim, Miner, MiningEvent};
 pub use skins::{SkinInfo, Skins};
@@ -29,6 +33,16 @@ pub struct OpenWindowState {
     pub kind: String,
     /// Slot contents as sent by `S30`; empty until the first resync.
     pub slots: Vec<Option<ItemStack>>,
+}
+
+/// The public fields carried by protocol-47's player-list packets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabListEntry {
+    pub name: String,
+    pub gamemode: i32,
+    pub ping: i32,
+    /// Raw chat-component JSON from the server, if present.
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -135,6 +149,19 @@ pub enum Event {
     EntitiesRemoved(usize),
     /// The tab list (and therefore skins) changed.
     PlayerList,
+    /// A block entity update (`S35`) was parsed and retained.
+    BlockEntityUpdated {
+        x: i32,
+        y: i32,
+        z: i32,
+        action: u8,
+    },
+    /// The server announced its brand on `MC|Brand`.
+    ServerBrand(String),
+    /// An unhandled server plugin channel was received.
+    PluginMessage {
+        channel: String,
+    },
     /// Any other packet; carries its id so callers can log/trace.
     Packet(i32),
 }
@@ -211,6 +238,13 @@ pub struct GameClient {
     pub entities: Entities,
     /// Skins advertised on the tab list, keyed by UUID.
     pub skins: Skins,
+    /// Current protocol-47 tab-list rows, keyed by player UUID.
+    pub player_list: HashMap<[u8; 16], TabListEntry>,
+    /// Most recent update-tile-entity NBT, keyed by block position.
+    pub block_entities: HashMap<(i32, i32, i32), play::BlockEntityUpdate>,
+    /// The server's advertised `MC|Brand`, when it sends one.
+    pub server_brand: Option<String>,
+    view_distance: u8,
     pub packets_received: u64,
     pub chunks_loaded: u64,
     pub chunks_unloaded: u64,
@@ -308,6 +342,9 @@ impl GameClient {
                 0x7F,
             ))
             .await?;
+        connection
+            .write_packet(&play::brand_plugin_message("Nephele"))
+            .await?;
         // Vanilla's "perform respawn"; tells the server we are ready.
         connection.write_packet(&play::client_status(0)).await?;
 
@@ -346,6 +383,10 @@ impl GameClient {
             chat: Vec::new(),
             entities: Entities::new(),
             skins: Skins::new(),
+            player_list: HashMap::new(),
+            block_entities: HashMap::new(),
+            server_brand: None,
+            view_distance: VIEW_DISTANCE,
             packets_received: 0,
             chunks_loaded: 0,
             chunks_unloaded: 0,
@@ -390,15 +431,25 @@ impl GameClient {
     async fn handle(&mut self, packet: Packet) -> Result<Event> {
         match packet.id {
             play::clientbound::CHUNK_DATA => {
+                let header = play::parse_chunk_data_header(&packet)?;
                 match decode_chunk_data(&packet, self.world.has_skylight()) {
                     Ok(ChunkUpdate::Load(column)) => {
                         let (x, z) = (column.x, column.z);
-                        self.world.insert(column);
+                        let coord = ChunkCoord::new(x, z);
+                        if header.ground_up {
+                            self.clear_block_entities_in_chunk(coord);
+                            self.world.insert(column);
+                        } else {
+                            let merged = merge_partial_column(self.world.get(coord), column);
+                            self.world.insert(merged);
+                        }
                         self.chunks_loaded += 1;
                         Ok(Event::ChunkLoaded { x, z })
                     }
                     Ok(ChunkUpdate::Unload { x, z }) => {
-                        self.world.remove(ChunkCoord::new(x, z));
+                        let coord = ChunkCoord::new(x, z);
+                        self.world.remove(coord);
+                        self.clear_block_entities_in_chunk(coord);
                         self.chunks_unloaded += 1;
                         Ok(Event::ChunkUnloaded { x, z })
                     }
@@ -410,6 +461,7 @@ impl GameClient {
                 let mut last = (0, 0);
                 for column in columns {
                     last = (column.x, column.z);
+                    self.clear_block_entities_in_chunk(ChunkCoord::new(column.x, column.z));
                     self.world.insert(column);
                     self.chunks_loaded += 1;
                 }
@@ -486,8 +538,29 @@ impl GameClient {
             play::clientbound::RESPAWN => {
                 let respawn = play::parse_respawn(&packet)?;
                 self.world.set_dimension(respawn.dimension);
+                self.entities.clear();
+                self.block_entities.clear();
                 self.info.dimension = respawn.dimension;
+                self.info.gamemode = respawn.gamemode;
+                self.info.level_type = respawn.level_type;
                 self.spawned = false;
+                self.position = Vec3::default();
+                self.yaw = 0.0;
+                self.pitch = 0.0;
+                self.on_ground = true;
+                self.spawn_position = None;
+                self.world_age = 0;
+                self.time_of_day = 0;
+                self.open_window = None;
+                self.connection
+                    .write_packet(&play::client_settings(
+                        "en_US",
+                        self.view_distance,
+                        0,
+                        true,
+                        0x7F,
+                    ))
+                    .await?;
                 Ok(Event::Respawn {
                     dimension: respawn.dimension,
                 })
@@ -710,18 +783,89 @@ impl GameClient {
             play::clientbound::ENTITY_METADATA => Ok(Event::Packet(packet.id)),
             play::clientbound::PLAYER_LIST_ITEM => {
                 let update = play::parse_player_list_item(&packet)?;
-                if let play::PlayerListUpdate::Add(entries) = &update {
-                    for entry in entries {
-                        self.skins.record(entry);
-                    }
-                }
+                self.apply_player_list_update(update);
                 Ok(Event::PlayerList)
+            }
+            play::clientbound::BLOCK_ENTITY_DATA => {
+                let update = play::parse_block_entity_update(&packet)?;
+                let position = (update.x, update.y, update.z);
+                let event = Event::BlockEntityUpdated {
+                    x: update.x,
+                    y: update.y,
+                    z: update.z,
+                    action: update.action,
+                };
+                self.block_entities.insert(position, update);
+                Ok(event)
+            }
+            play::clientbound::PLUGIN_MESSAGE => {
+                let message = play::parse_plugin_message(&packet)?;
+                if message.channel == "MC|Brand" {
+                    let brand = play::parse_plugin_brand(&message.data)?;
+                    self.server_brand = Some(brand.clone());
+                    Ok(Event::ServerBrand(brand))
+                } else {
+                    Ok(Event::PluginMessage {
+                        channel: message.channel,
+                    })
+                }
             }
             play::clientbound::DISCONNECT => {
                 Err(Error::Disconnected(play::parse_disconnect(&packet)?))
             }
             id => Ok(Event::Packet(id)),
         }
+    }
+
+    fn apply_player_list_update(&mut self, update: play::PlayerListUpdate) {
+        match update {
+            play::PlayerListUpdate::Add(entries) => {
+                for added in entries {
+                    self.skins.record(&added.player);
+                    self.player_list.insert(
+                        added.player.uuid,
+                        TabListEntry {
+                            name: added.player.name,
+                            gamemode: added.gamemode,
+                            ping: added.ping,
+                            display_name: added.display_name,
+                        },
+                    );
+                }
+            }
+            play::PlayerListUpdate::UpdateGameMode(updates) => {
+                for update in updates {
+                    if let Some(entry) = self.player_list.get_mut(&update.uuid) {
+                        entry.gamemode = update.gamemode;
+                    }
+                }
+            }
+            play::PlayerListUpdate::UpdateLatency(updates) => {
+                for update in updates {
+                    if let Some(entry) = self.player_list.get_mut(&update.uuid) {
+                        entry.ping = update.ping;
+                    }
+                }
+            }
+            play::PlayerListUpdate::UpdateDisplayName(updates) => {
+                for update in updates {
+                    if let Some(entry) = self.player_list.get_mut(&update.uuid) {
+                        entry.display_name = update.display_name;
+                    }
+                }
+            }
+            play::PlayerListUpdate::Remove(uuids) => {
+                for uuid in uuids {
+                    self.player_list.remove(&uuid);
+                }
+            }
+            play::PlayerListUpdate::Other => {}
+        }
+    }
+
+    fn clear_block_entities_in_chunk(&mut self, coord: ChunkCoord) {
+        self.block_entities
+            .retain(|&(x, _y, z), _| x.div_euclid(16) != coord.x || z.div_euclid(16) != coord.z);
     }
 
     /// Creative mode (`JoinGame.gamemode`'s low three bits).
@@ -885,7 +1029,9 @@ impl GameClient {
                 true,
                 0x7F,
             ))
-            .await
+            .await?;
+        self.view_distance = view_distance;
+        Ok(())
     }
 
     /// Ask the server to respawn us. Vanilla calls this "perform respawn";
@@ -938,6 +1084,28 @@ impl GameClient {
     }
 }
 
+/// Apply one partial section-mask update without dropping sections delivered by
+/// other packets for the same chunk. 1.8 servers may split a column across
+/// several `S21` packets, and those packets need not arrive in section order.
+fn merge_partial_column(existing: Option<&ChunkColumn>, incoming: ChunkColumn) -> ChunkColumn {
+    let Some(existing) = existing else {
+        return incoming;
+    };
+
+    let mut sections = existing.sections().to_vec();
+    for (index, update) in incoming.sections().iter().enumerate() {
+        if let Some(section) = update {
+            sections[index] = Some(section.clone());
+        }
+    }
+
+    let mut merged = ChunkColumn::from_sections(incoming.x, incoming.z, sections);
+    if let Some(biomes) = incoming.biomes().or_else(|| existing.biomes()) {
+        merged.set_biomes(biomes);
+    }
+    merged
+}
+
 impl fmt::Debug for GameClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("GameClient")
@@ -970,6 +1138,62 @@ fn clicked_stack(inventory: &[Option<ItemStack>], slot: i16) -> Option<ItemStack
 mod tests {
     use super::*;
     use std::f32::consts::FRAC_PI_2;
+
+    async fn test_game_client() -> (GameClient, Connection) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = listener.local_addr().unwrap();
+        let (client_stream, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(socket), listener.accept());
+        let client_stream = client_stream.unwrap();
+        let (server_stream, _) = accepted.unwrap();
+        let address = ServerAddress::parse("127.0.0.1").unwrap();
+
+        let client = GameClient {
+            connection: Connection::from_stream(client_stream, nephele_protocol::State::Play),
+            info: JoinInfo {
+                username: "Tester".into(),
+                uuid: "00000000000000000000000000000001".into(),
+                entity_id: 1,
+                gamemode: 0,
+                dimension: 0,
+                level_type: "default".into(),
+                max_players: 20,
+                compression: None,
+            },
+            world: World::new(0),
+            position: Vec3::default(),
+            yaw: 0.0,
+            pitch: 0.0,
+            on_ground: true,
+            spawned: false,
+            health: 20.0,
+            food: 20,
+            saturation: 5.0,
+            xp_bar: 0.0,
+            xp_level: 0,
+            xp_total: 0,
+            world_age: 0,
+            time_of_day: 0,
+            spawn_position: None,
+            inventory: vec![None; play::PLAYER_CONTAINER_SLOTS],
+            held_slot: 0,
+            click_actions: HashMap::new(),
+            open_window: None,
+            chat: Vec::new(),
+            entities: Entities::new(),
+            skins: Skins::new(),
+            player_list: HashMap::new(),
+            block_entities: HashMap::new(),
+            server_brand: None,
+            view_distance: VIEW_DISTANCE,
+            packets_received: 0,
+            chunks_loaded: 0,
+            chunks_unloaded: 0,
+            address,
+        };
+        let peer = Connection::from_stream(server_stream, nephele_protocol::State::Play);
+        (client, peer)
+    }
 
     #[test]
     fn minecraft_yaw_zero_faces_south() {
@@ -1025,5 +1249,138 @@ mod tests {
     fn pitch_sign_is_inverted() {
         assert!(pitch_from_mc(90.0) < 0.0);
         assert!((pitch_to_mc(-FRAC_PI_2) - 90.0).abs() < 1e-3);
+    }
+
+    #[tokio::test]
+    async fn partial_chunk_sections_merge_when_they_arrive_out_of_order() {
+        let (mut client, _peer) = test_game_client().await;
+        let mut upper = ChunkColumn::empty(-2, 3);
+        upper.set_block(1, 130, 2, nephele_world::BlockState::STONE);
+        let mut lower = ChunkColumn::empty(-2, 3);
+        lower.set_block(1, 20, 2, nephele_world::BlockState::DIRT);
+
+        client
+            .handle(nephele_world::encode_chunk_data(&upper, true, false))
+            .await
+            .unwrap();
+        client
+            .handle(nephele_world::encode_chunk_data(&lower, true, false))
+            .await
+            .unwrap();
+
+        assert_eq!(client.world.loaded_chunks(), 1);
+        assert_eq!(
+            client.world.get_block(-31, 130, 50),
+            nephele_world::BlockState::STONE
+        );
+        assert_eq!(
+            client.world.get_block(-31, 20, 50),
+            nephele_world::BlockState::DIRT
+        );
+    }
+
+    #[tokio::test]
+    async fn respawn_clears_dimension_state_and_resends_view_distance() {
+        let (mut client, mut peer) = test_game_client().await;
+        client.send_client_settings(5).await.unwrap();
+        let first_settings = peer.read_packet().await.unwrap();
+        assert_eq!(first_settings.id, play::serverbound::CLIENT_SETTINGS);
+
+        client.world.insert(ChunkColumn::empty(0, 0));
+        client
+            .entities
+            .spawn_mob(7, 1, false, [1.0, 64.0, 1.0], 0.0, 0.0);
+        client.block_entities.insert(
+            (1, 64, 1),
+            play::BlockEntityUpdate {
+                x: 1,
+                y: 64,
+                z: 1,
+                action: 1,
+                nbt: vec![0],
+            },
+        );
+        client.spawned = true;
+        client.position = Vec3::new(1.0, 64.0, 1.0);
+        client.spawn_position = Some((1, 64, 1));
+        client.world_age = 99;
+        client.time_of_day = 1200;
+        client.open_window = Some(OpenWindowState {
+            id: 2,
+            kind: "minecraft:chest".into(),
+            slots: Vec::new(),
+        });
+
+        let mut w = nephele_protocol::PacketWriter::new();
+        w.write_i8(-1).write_u8(3).write_u8(1).write_string("flat");
+        let event = client
+            .handle(Packet::new(play::clientbound::RESPAWN, w.into_bytes()))
+            .await
+            .unwrap();
+        assert_eq!(event, Event::Respawn { dimension: -1 });
+
+        let settings = peer.read_packet().await.unwrap();
+        assert_eq!(settings.id, play::serverbound::CLIENT_SETTINGS);
+        let mut settings_reader = settings.reader();
+        assert_eq!(settings_reader.read_string().unwrap(), "en_US");
+        assert_eq!(settings_reader.read_u8().unwrap(), 5);
+
+        assert_eq!(client.info.dimension, -1);
+        assert_eq!(client.info.gamemode, 1);
+        assert_eq!(client.info.level_type, "flat");
+        assert!(!client.world.has_skylight());
+        assert_eq!(client.world.loaded_chunks(), 0);
+        assert!(client.entities.is_empty());
+        assert!(client.block_entities.is_empty());
+        assert!(!client.spawned);
+        assert_eq!(client.position, Vec3::default());
+        assert_eq!(client.spawn_position, None);
+        assert_eq!((client.world_age, client.time_of_day), (0, 0));
+        assert!(client.open_window.is_none());
+    }
+
+    #[tokio::test]
+    async fn tab_list_actions_keep_rows_current() {
+        let (mut client, _peer) = test_game_client().await;
+        let uuid = [9; 16];
+        client.apply_player_list_update(play::PlayerListUpdate::Add(vec![
+            play::PlayerListAddEntry {
+                player: play::PlayerListEntry {
+                    uuid,
+                    name: "Alex".into(),
+                    properties: Vec::new(),
+                },
+                gamemode: 0,
+                ping: 35,
+                display_name: None,
+            },
+        ]));
+        assert_eq!(client.player_list[&uuid].name, "Alex");
+        assert_eq!(client.skins.get(&uuid).unwrap().name, "Alex");
+
+        client.apply_player_list_update(play::PlayerListUpdate::UpdateLatency(vec![
+            play::PlayerListLatencyUpdate { uuid, ping: 82 },
+        ]));
+        client.apply_player_list_update(play::PlayerListUpdate::UpdateGameMode(vec![
+            play::PlayerListGameModeUpdate { uuid, gamemode: 1 },
+        ]));
+        client.apply_player_list_update(play::PlayerListUpdate::UpdateDisplayName(vec![
+            play::PlayerListDisplayNameUpdate {
+                uuid,
+                display_name: Some(r#"{"text":"A"}"#.into()),
+            },
+        ]));
+        assert_eq!(
+            client.player_list[&uuid],
+            TabListEntry {
+                name: "Alex".into(),
+                gamemode: 1,
+                ping: 82,
+                display_name: Some(r#"{"text":"A"}"#.into()),
+            }
+        );
+
+        client.apply_player_list_update(play::PlayerListUpdate::Remove(vec![uuid]));
+        assert!(!client.player_list.contains_key(&uuid));
     }
 }

@@ -1,5 +1,5 @@
-//! Immediate-mode 2D UI: solid rectangles, atlas sprites, vanilla bitmap text
-//! and isometric block icons.
+//! Immediate-mode 2D UI: solid rectangles, atlas sprites, vanilla bitmap text,
+//! isometric block icons and flat item icons.
 //!
 //! Geometry is emitted in physical screen pixels; the shader turns it into clip
 //! space using the current surface size.
@@ -12,7 +12,7 @@ pub struct UiVertex {
     pub position: [f32; 2],
     pub uv: [f32; 2],
     pub color: [f32; 4],
-    /// Texture-array layer, only used by the block-icon pipeline.
+    /// Texture-array layer used by block and item icons.
     pub layer: u32,
 }
 
