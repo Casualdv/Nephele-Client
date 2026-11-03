@@ -45,7 +45,11 @@ fn fs_sprite(in: VertexOut) -> @location(0) vec4<f32> {
 
 @fragment
 fn fs_block(in: VertexOut) -> @location(0) vec4<f32> {
-    let texel = textureSample(block_textures, ui_sampler, in.uv, in.layer);
+    // `in.layer` is a packed tile slot: 16 tiles per 64×64 layer, 4×4 inside.
+    let local = in.layer % 16u;
+    let offset = vec2<f32>(f32(local % 4u), f32(local / 4u));
+    let uv = (in.uv + offset) * 0.25;
+    let texel = textureSample(block_textures, ui_sampler, uv, in.layer / 16u);
     if (texel.a < 0.1) {
         discard;
     }

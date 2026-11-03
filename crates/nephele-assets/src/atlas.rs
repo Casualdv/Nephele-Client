@@ -1,13 +1,19 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use image::{Rgba, RgbaImage};
 
-use crate::block_textures::{all_texture_names, MISSING_TEXTURE};
+use crate::block_textures::{referenced_texture_names, MISSING_TEXTURE};
 use crate::item_textures::all_item_texture_layers;
 
 /// Vanilla block textures are 16×16.
 pub const TILE_SIZE: u32 = 16;
+/// Tiles packed into one texture-array layer, in a 4×4 grid.
+pub const TILES_PER_LAYER: u32 = 16;
+/// Tiles per row inside one layer.
+pub const TILES_PER_ROW: u32 = 4;
+/// Width and height of one packed texture-array layer.
+pub const LAYER_SIZE: u32 = TILE_SIZE * TILES_PER_ROW;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AssetError {
@@ -25,17 +31,23 @@ pub enum AssetError {
     EmptyArray,
 }
 
-/// One GPU texture-array layer per referenced block or supported item texture.
+/// Packed block and item textures.
 ///
-/// Every block face samples its own layer, so unlike an atlas there is no
-/// bleeding between neighbouring textures and mipmapping stays safe.
+/// Sixteen 16×16 tiles share one 64×64 texture-array layer, so the whole
+/// vanilla set fits in a handful of layers instead of one layer per texture.
+/// [`TextureArray::slot`] returns a *tile slot*: the GPU layer is
+/// `slot / TILES_PER_LAYER` and the 4×4 position inside it is
+/// `slot % TILES_PER_LAYER`. The shaders perform that unpack.
 #[derive(Debug, Clone)]
 pub struct TextureArray {
     tile_size: u32,
+    layer_size: u32,
     layer_count: u32,
+    tile_count: u32,
     pixels: Vec<u8>,
-    index: HashMap<&'static str, u32>,
+    index: HashMap<String, u32>,
     missing: u32,
+    unresolved: Vec<&'static str>,
 }
 
 impl TextureArray {
@@ -43,12 +55,23 @@ impl TextureArray {
         self.tile_size
     }
 
+    /// Width and height of one packed layer (64 for 16×16 tiles).
+    pub fn layer_size(&self) -> u32 {
+        self.layer_size
+    }
+
+    /// Number of texture-array layers uploaded to the GPU.
     pub fn layer_count(&self) -> u32 {
         self.layer_count
     }
 
+    /// Number of individual 16×16 tiles across all layers.
+    pub fn tile_count(&self) -> u32 {
+        self.tile_count
+    }
+
     pub fn bytes_per_layer(&self) -> usize {
-        (self.tile_size * self.tile_size * 4) as usize
+        (self.layer_size * self.layer_size * 4) as usize
     }
 
     /// RGBA8 data for every layer, laid out layer by layer.
@@ -56,24 +79,35 @@ impl TextureArray {
         &self.pixels
     }
 
-    pub fn layer(&self, name: &str) -> Option<u32> {
+    /// Packed tile slot for `name`.
+    pub fn slot(&self, name: &str) -> Option<u32> {
         self.index.get(name).copied()
     }
 
-    /// Layer for `name`, falling back to the generated "missing" texture.
-    pub fn layer_or_missing(&self, name: &str) -> u32 {
-        self.layer(name).unwrap_or(self.missing)
+    /// Tile slot for `name`, falling back to the generated "missing" tile.
+    pub fn slot_or_missing(&self, name: &str) -> u32 {
+        self.slot(name).unwrap_or(self.missing)
     }
 
-    pub fn name_of(&self, layer: u32) -> Option<&'static str> {
+    pub fn name_of(&self, slot: u32) -> Option<&str> {
         self.index
             .iter()
-            .find(|(_, value)| **value == layer)
-            .map(|(name, _)| *name)
+            .find(|(_, value)| **value == slot)
+            .map(|(name, _)| name.as_str())
     }
 
-    /// Load referenced block textures and supported item textures from the
-    /// vanilla `textures/blocks` and sibling `textures/items` directories.
+    /// Texture names referenced by the block table that were not present in
+    /// `textures/blocks`, plus `missing` if a 1.8 variant still resolves to it.
+    pub fn unresolved_names(&self) -> &[&'static str] {
+        &self.unresolved
+    }
+
+    /// Load every `textures/blocks/*.png` plus the supported item textures.
+    ///
+    /// Loading the directory instead of a curated name list means a texture
+    /// that exists in the jar can never be dropped because the hand-written
+    /// table forgot it. `unresolved_names` still reports names the block table
+    /// asks for but the directory does not contain.
     pub fn load_from_dir(blocks_dir: &Path) -> Result<Self, AssetError> {
         if !blocks_dir.is_dir() {
             return Err(AssetError::MissingDirectory(
@@ -81,12 +115,19 @@ impl TextureArray {
             ));
         }
 
-        let mut tiles: Vec<(&'static str, RgbaImage)> = Vec::new();
-        for name in all_texture_names() {
-            let path = blocks_dir.join(format!("{name}.png"));
-            if !path.is_file() {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(blocks_dir)
+            .map_err(|_| AssetError::MissingDirectory(blocks_dir.display().to_string()))?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("png"))
+            .collect();
+        paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        let mut tiles: Vec<(String, RgbaImage)> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
-            }
+            };
             let image = image::open(&path).map_err(|source| AssetError::Image {
                 path: path.display().to_string(),
                 source,
@@ -108,7 +149,7 @@ impl TextureArray {
                 _ => {}
             }
 
-            tiles.push((name, tile));
+            tiles.push((name.to_string(), tile));
         }
 
         if tiles.is_empty() {
@@ -129,49 +170,68 @@ impl TextureArray {
                     path: path.display().to_string(),
                     source,
                 })?;
-                tiles.push((layer, to_tile(&image.to_rgba8())));
+                tiles.push((layer.to_string(), to_tile(&image.to_rgba8())));
             }
         }
-        Ok(Self::from_tiles(tiles))
+
+        let mut array = Self::from_tiles(tiles);
+        let mut unresolved: Vec<&'static str> = Vec::new();
+        for name in referenced_texture_names() {
+            if (name == MISSING_TEXTURE || array.slot(name).is_none())
+                && !unresolved.contains(&name)
+            {
+                unresolved.push(name);
+            }
+        }
+        array.unresolved = unresolved;
+        Ok(array)
     }
 
-    /// Build the array from already-decoded 16×16 RGBA tiles. A generated
-    /// "missing" tile is appended if the caller didn't provide one.
-    pub fn from_tiles(mut tiles: Vec<(&'static str, RgbaImage)>) -> Self {
-        if !tiles.iter().any(|(name, _)| *name == MISSING_TEXTURE) {
-            tiles.push((MISSING_TEXTURE, missing_texture()));
-        }
-        if tiles.is_empty() {
-            tiles.push((MISSING_TEXTURE, missing_texture()));
+    /// Build the packed array from already-decoded 16×16 RGBA tiles. A
+    /// generated "missing" tile is appended if the caller didn't provide one.
+    pub fn from_tiles(mut tiles: Vec<(String, RgbaImage)>) -> Self {
+        if !tiles.iter().any(|(name, _)| name == MISSING_TEXTURE) {
+            tiles.push((MISSING_TEXTURE.to_string(), missing_texture()));
         }
 
-        let layer_count = tiles.len() as u32;
-        let mut pixels =
-            Vec::with_capacity(layer_count as usize * (TILE_SIZE * TILE_SIZE * 4) as usize);
+        let tile_count = tiles.len() as u32;
+        let layer_count = tile_count.div_ceil(TILES_PER_LAYER);
+        let mut pixels = vec![0u8; layer_count as usize * (LAYER_SIZE * LAYER_SIZE * 4) as usize];
         let mut index = HashMap::with_capacity(tiles.len());
         let mut missing = 0;
 
-        for (layer, (name, tile)) in tiles.into_iter().enumerate() {
-            let layer = layer as u32;
+        for (slot, (name, tile)) in tiles.into_iter().enumerate() {
+            let slot = slot as u32;
+            let layer = slot / TILES_PER_LAYER;
+            let local = slot % TILES_PER_LAYER;
+            let tile_x = local % TILES_PER_ROW;
+            let tile_y = local / TILES_PER_ROW;
             if name == MISSING_TEXTURE {
-                missing = layer;
+                missing = slot;
             }
-            index.insert(name, layer);
 
             for y in 0..TILE_SIZE {
                 for x in 0..TILE_SIZE {
                     let pixel = *tile.get_pixel(x.min(tile.width() - 1), y.min(tile.height() - 1));
-                    pixels.extend_from_slice(&pixel.0);
+                    let px = tile_x * TILE_SIZE + x;
+                    let py = tile_y * TILE_SIZE + y;
+                    let offset = ((layer * LAYER_SIZE + py) * LAYER_SIZE + px) as usize * 4;
+                    pixels[offset..offset + 4].copy_from_slice(&pixel.0);
                 }
             }
+
+            index.insert(name, slot);
         }
 
         Self {
             tile_size: TILE_SIZE,
+            layer_size: LAYER_SIZE,
             layer_count,
+            tile_count,
             pixels,
             index,
             missing,
+            unresolved: Vec::new(),
         }
     }
 }
@@ -254,56 +314,77 @@ mod tests {
         RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, color)
     }
 
-    #[test]
-    fn layers_are_sequential_and_unique() {
-        let tiles = vec![
-            ("a", solid(Rgba([255, 0, 0, 255]))),
-            ("b", solid(Rgba([0, 255, 0, 255]))),
-            ("c", solid(Rgba([0, 0, 255, 255]))),
-        ];
-        let array = TextureArray::from_tiles(tiles);
-        assert_eq!(array.layer("a"), Some(0));
-        assert_eq!(array.layer("b"), Some(1));
-        assert_eq!(array.layer("c"), Some(2));
-        // "missing" is appended last.
-        assert_eq!(array.layer(MISSING_TEXTURE), Some(3));
-        assert_eq!(array.layer_count(), 4);
+    fn named(name: &str, color: Rgba<u8>) -> (String, RgbaImage) {
+        (name.to_string(), solid(color))
     }
 
     #[test]
-    fn pixels_are_layer_major() {
+    fn layers_are_sequential_and_unique() {
+        let tiles = vec![
+            named("a", Rgba([255, 0, 0, 255])),
+            named("b", Rgba([0, 255, 0, 255])),
+            named("c", Rgba([0, 0, 255, 255])),
+        ];
+        let array = TextureArray::from_tiles(tiles);
+        assert_eq!(array.slot("a"), Some(0));
+        assert_eq!(array.slot("b"), Some(1));
+        assert_eq!(array.slot("c"), Some(2));
+        // "missing" is appended last.
+        assert_eq!(array.slot(MISSING_TEXTURE), Some(3));
+        assert_eq!(array.tile_count(), 4);
+        assert_eq!(array.layer_count(), 1);
+        assert_eq!(array.layer_size(), LAYER_SIZE);
+    }
+
+    #[test]
+    fn sixteen_tiles_share_one_layer() {
+        let tiles = (0..17)
+            .map(|index| named(&format!("t{index}"), Rgba([index as u8, 0, 0, 255])))
+            .collect();
+        let array = TextureArray::from_tiles(tiles);
+        assert_eq!(array.layer_count(), 2);
+        assert_eq!(array.slot("t0"), Some(0));
+        assert_eq!(array.slot("t15"), Some(15));
+        assert_eq!(array.slot("t16"), Some(16));
+        assert_eq!(array.name_of(16), Some("t16"));
+    }
+
+    #[test]
+    fn pixels_are_layer_major_and_tile_packed() {
         let array = TextureArray::from_tiles(vec![
-            ("a", solid(Rgba([10, 0, 0, 255]))),
-            ("b", solid(Rgba([20, 0, 0, 255]))),
+            named("a", Rgba([10, 0, 0, 255])),
+            named("b", Rgba([20, 0, 0, 255])),
         ]);
-        assert_eq!(array.pixels().len(), 3 * array.bytes_per_layer());
+        assert_eq!(array.pixels().len(), array.bytes_per_layer());
         let bytes = array.bytes_per_layer();
+        // Tile 0 sits at (0, 0), tile 1 at (16, 0) inside the same layer.
         assert_eq!(&array.pixels()[0..4], &[10, 0, 0, 255]);
-        assert_eq!(&array.pixels()[bytes..bytes + 4], &[20, 0, 0, 255]);
-        // every pixel of a layer is the same colour
-        let layer_a = &array.pixels()[0..bytes];
-        assert!(layer_a.chunks_exact(4).all(|p| p == [10, 0, 0, 255]));
+        assert_eq!(&array.pixels()[16 * 4..16 * 4 + 4], &[20, 0, 0, 255]);
+        assert!(array.pixels()[..16 * 4]
+            .chunks_exact(4)
+            .all(|p| p == [10, 0, 0, 255]));
+        assert!(array.pixels()[bytes..].is_empty());
     }
 
     #[test]
     fn unknown_names_fall_back_to_missing() {
-        let array = TextureArray::from_tiles(vec![("x", solid(Rgba([9, 9, 9, 255])))]);
-        assert!(array.layer("nope").is_none());
+        let array = TextureArray::from_tiles(vec![named("x", Rgba([9, 9, 9, 255]))]);
+        assert!(array.slot("nope").is_none());
         assert_eq!(
-            array.layer_or_missing("nope"),
-            array.layer(MISSING_TEXTURE).unwrap()
+            array.slot_or_missing("nope"),
+            array.slot(MISSING_TEXTURE).unwrap()
         );
     }
 
     #[test]
     fn namespaced_item_layers_do_not_collide_with_block_layers() {
         let array = TextureArray::from_tiles(vec![
-            ("brick", solid(Rgba([255, 0, 0, 255]))),
-            ("item:brick", solid(Rgba([0, 255, 0, 255]))),
+            named("brick", Rgba([255, 0, 0, 255])),
+            named("item:brick", Rgba([0, 255, 0, 255])),
         ]);
-        assert_ne!(array.layer("brick"), array.layer("item:brick"));
+        assert_ne!(array.slot("brick"), array.slot("item:brick"));
         assert_eq!(
-            array.name_of(array.layer("item:brick").unwrap()),
+            array.name_of(array.slot("item:brick").unwrap()),
             Some("item:brick")
         );
     }
@@ -323,10 +404,25 @@ mod tests {
                 "missing item file {file}"
             );
             assert!(
-                atlas.layer(layer).is_some(),
+                atlas.slot(layer).is_some(),
                 "missing prepared layer {layer}"
             );
         }
+    }
+
+    #[test]
+    fn prepared_block_textures_report_no_missing_names() {
+        let Some(minecraft) = crate::test_support::minecraft() else {
+            eprintln!("skipping missing-name check: run `nephele-prepare` first");
+            return;
+        };
+        let atlas = TextureArray::load_from_dir(&minecraft.join("textures/blocks"))
+            .expect("prepared block textures load");
+        assert!(
+            atlas.unresolved_names().is_empty(),
+            "unresolved block textures: {:?}",
+            atlas.unresolved_names()
+        );
     }
 
     #[test]

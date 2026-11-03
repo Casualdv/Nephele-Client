@@ -187,8 +187,8 @@ pub fn creative_items() -> &'static [BlockState] {
 fn icon_layers(state: BlockState, textures: &TextureArray) -> Option<(u32, u32)> {
     let faces = face_textures(state)?;
     Some((
-        textures.layer_or_missing(faces.top),
-        textures.layer_or_missing(faces.side),
+        textures.slot_or_missing(faces.top),
+        textures.slot_or_missing(faces.side),
     ))
 }
 
@@ -784,7 +784,7 @@ fn draw_stack(
         }
         None => {
             let texture = item_texture_name(item.id, item.damage).unwrap_or(MISSING_TEXTURE);
-            let layer = textures.layer_or_missing(texture);
+            let layer = textures.slot_or_missing(texture);
             icons.quad(
                 [
                     [inner.x, inner.y],
@@ -1802,7 +1802,7 @@ mod tests {
     #[test]
     fn non_block_inventory_items_use_flat_item_texture_layers() {
         let textures = TextureArray::from_tiles(vec![(
-            "item:stick",
+            "item:stick".to_string(),
             image::RgbaImage::from_pixel(16, 16, image::Rgba([180, 130, 80, 255])),
         )]);
         let mut fg = UiBatch::default();
@@ -1815,7 +1815,7 @@ mod tests {
             &textures,
             1.0,
         );
-        let layer = textures.layer("item:stick").unwrap();
+        let layer = textures.slot("item:stick").unwrap();
         assert_eq!(icons.vertices.len(), 4);
         assert!(icons.vertices.iter().all(|vertex| vertex.layer == layer));
     }

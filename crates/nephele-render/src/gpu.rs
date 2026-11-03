@@ -1383,23 +1383,18 @@ fn create_block_texture_array(
     queue: &wgpu::Queue,
     textures: &TextureArray,
 ) -> wgpu::Texture {
-    let tile = textures.tile_size();
-    // Many devices cap this at 256 layers and the full set is larger, which
-    // used to panic on startup. Draw what fits and say so; packing tiles into
-    // larger layers is the real fix.
-    let requested = textures.layer_count();
-    let layers = requested.min(device.limits().max_texture_array_layers);
-    if layers < requested {
-        tracing::warn!(
-            requested,
-            layers,
-            "texture array clipped to the device limit; the last {} textures fall back to the nearest layer",
-            requested - layers
-        );
-    }
+    // Sixteen 16×16 tiles share one 64×64 layer, so the full vanilla set is
+    // 488 tiles in 31 layers and fits every device's array limit.
+    let layer_size = textures.layer_size();
+    let layers = textures.layer_count();
+    debug_assert!(
+        layers <= device.limits().max_texture_array_layers,
+        "packed texture array needs {layers} layers, device allows {}",
+        device.limits().max_texture_array_layers
+    );
     let size = wgpu::Extent3d {
-        width: tile,
-        height: tile,
+        width: layer_size,
+        height: layer_size,
         depth_or_array_layers: layers,
     };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -1419,11 +1414,11 @@ fn create_block_texture_array(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &textures.pixels()[..textures.bytes_per_layer() * layers as usize],
+        textures.pixels(),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(4 * tile),
-            rows_per_image: Some(tile),
+            bytes_per_row: Some(4 * layer_size),
+            rows_per_image: Some(layer_size),
         },
         size,
     );
