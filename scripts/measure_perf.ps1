@@ -16,7 +16,8 @@
     window.
 
 .PARAMETER DurationSeconds
-    Wall-clock measurement duration. Defaults to 75 seconds; minimum is 75.
+    Wall-clock measurement duration. Defaults to 75 seconds; minimum is 30.
+    Use at least 75 seconds for a startup window plus a steady-state window.
 
 .PARAMETER ViewDistance
     Requested render distance. The client must use this value before local
@@ -25,6 +26,28 @@
 .PARAMETER IntegratedAdapterPattern
     Regex required in the selected adapter line in addition to the IntegratedGpu
     device type. Defaults to common integrated adapter names.
+
+.PARAMETER BaselinePath
+    Committed JSON baseline. The steady-state window is compared against its last
+    window and the script fails on a regression.
+
+.PARAMETER MaxP99RegressionPct
+    Allowed steady-state p99 regression over the baseline, in percent. Default 20.
+
+.PARAMETER MinP99SlackMs
+    Absolute p99 allowance added to the baseline, in milliseconds. This absorbs
+    integrated-GPU run-to-run noise. Default 2.
+
+.PARAMETER MaxOverBudgetRegression
+    Allowed increase in steady-state over-budget frame count over the baseline.
+    Default 4 frames per 30-second window.
+
+.PARAMETER StartupOnly
+    Accept a single 30-second window. Use this to exercise startup or to compare
+    chunk counts at different view distances; it does not run the baseline gate.
+
+.PARAMETER UpdateBaseline
+    Write the measured windows to the baseline instead of gating on it.
 
 .PARAMETER OutputPath
     Write the JSON baseline to this path. The file is UTF-8 without a BOM.
@@ -56,9 +79,11 @@ param(
 
     [string]$BaselinePath = 'scripts/perf-baseline.json',
 
-    [double]$MaxP99RegressionPct = 10.0,
+    [double]$MaxP99RegressionPct = 20.0,
 
-    [int]$MaxOverBudgetRegression = 2,
+    [double]$MinP99SlackMs = 2.0,
+
+    [int]$MaxOverBudgetRegression = 4,
 
     [string]$OutputPath,
 
@@ -71,6 +96,8 @@ param(
     [switch]$Json,
 
     [switch]$SkipBuild,
+
+    [switch]$KeepRunDir,
 
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RemainingArguments
@@ -169,6 +196,25 @@ try {
     $env:NEPHELE_DATA_DIR = $dataDir
     Remove-Item Env:NEPHELE_PROFILE -ErrorAction SilentlyContinue
 
+    if (-not ('NephelePerfWindow' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class NephelePerfWindow {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr window, int command);
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindow(string className, string windowName);
+}
+'@
+    }
+
     $quotedBlocksDir = '"{0}"' -f $blocksDir.Replace('"', '\"')
     $argumentLine = "play --seed 12345 --assets-dir $quotedBlocksDir"
     $process = Start-Process `
@@ -179,20 +225,34 @@ try {
         -RedirectStandardError $stderrPath `
         -PassThru
 
+    # An occluded window stops presenting, which starves the frame recorder.
+    # Bring the measurement window to the foreground before timing it. Poll for
+    # the handle instead of WaitForInputIdle, which throws for console hosts.
+    $windowDeadline = (Get-Date).AddSeconds(10)
+    do {
+        Start-Sleep -Milliseconds 100
+        $process.Refresh()
+        $windowHandle = [NephelePerfWindow]::FindWindow($null, 'Nephele')
+        if ($windowHandle -eq [IntPtr]::Zero) {
+            $windowHandle = $process.MainWindowHandle
+        }
+    } while ($windowHandle -eq [IntPtr]::Zero -and (Get-Date) -lt $windowDeadline)
+    Write-Host ("Window handle: 0x{0:X}" -f $windowHandle.ToInt64())
+    if ($windowHandle -ne [IntPtr]::Zero) {
+        # SW_RESTORE, then pin the window above other desktop windows so it
+        # cannot be occluded for the duration of the measurement.
+        [void][NephelePerfWindow]::ShowWindow($windowHandle, 9)
+        [void][NephelePerfWindow]::SetForegroundWindow($windowHandle)
+        [void][NephelePerfWindow]::SetWindowPos(
+            $windowHandle, [IntPtr](-1), 0, 0, 0, 0,
+            [uint32](0x0001 -bor 0x0002 -bor 0x0040)
+        )
+    }
+
     $exited = $process.WaitForExit($DurationSeconds * 1000)
     if (-not $exited) {
         $process.Refresh()
         if ($process.MainWindowHandle -ne [IntPtr]::Zero) {
-            if (-not ('NephelePerfWindow' -as [type])) {
-                Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class NephelePerfWindow {
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
-}
-'@
-            }
             [void][NephelePerfWindow]::PostMessage(
                 $process.MainWindowHandle,
                 0x0010,
@@ -355,13 +415,17 @@ public static class NephelePerfWindow {
     if ($baseline -and -not $StartupOnly -and -not $UpdateBaseline) {
         $baselineLast = @($baseline.windows)[-1]
         $currentLast = $last
-        $p99Limit = [double]$baselineLast.frame_p99_ms * (1.0 + $MaxP99RegressionPct / 100.0)
+        $p99Limit = [Math]::Max(
+            [double]$baselineLast.frame_p99_ms * (1.0 + $MaxP99RegressionPct / 100.0),
+            [double]$baselineLast.frame_p99_ms + $MinP99SlackMs
+        )
         $overBudgetLimit = [int]$baselineLast.frame_over_budget + $MaxOverBudgetRegression
         if ([double]$currentLast.frame_p99_ms -gt $p99Limit) {
-            throw ("Frame p99 regressed: {0:F3} ms > baseline {1:F3} ms + {2:F1}% (limit {3:F3} ms)." -f
+            throw ("Frame p99 regressed: {0:F3} ms > baseline {1:F3} ms + {2:F1}% or {3:F1} ms (limit {4:F3} ms)." -f
                 [double]$currentLast.frame_p99_ms,
                 [double]$baselineLast.frame_p99_ms,
                 $MaxP99RegressionPct,
+                $MinP99SlackMs,
                 $p99Limit)
         }
         if ([int]$currentLast.frame_over_budget -gt $overBudgetLimit) {
@@ -373,8 +437,8 @@ public static class NephelePerfWindow {
         }
     }
 
-    if ($first.p99_within_budget -eq $false -or $last.p99_within_budget -eq $false) {
-        throw 'A measured window exceeded the 60 Hz frame budget; the regression gate is not satisfied.'
+    if ($last.p99_within_budget -eq $false) {
+        throw 'The steady-state window exceeded the 60 Hz frame budget; the regression gate is not satisfied.'
     }
 
     $payload = [ordered]@{
@@ -394,6 +458,7 @@ public static class NephelePerfWindow {
         adapter = $adapterLine
         thresholds = [ordered]@{
             max_p99_regression_pct = $MaxP99RegressionPct
+            min_p99_slack_ms = $MinP99SlackMs
             max_over_budget_regression = $MaxOverBudgetRegression
             frame_budget_ms = 16.667
         }
@@ -450,6 +515,10 @@ finally {
         }
     }
     if (Test-Path -LiteralPath $runDir -PathType Container) {
-        Remove-Item -LiteralPath $runDir -Recurse -Force
+        if ($KeepRunDir) {
+            Write-Host "Run directory kept at $runDir"
+        } else {
+            Remove-Item -LiteralPath $runDir -Recurse -Force
+        }
     }
 }

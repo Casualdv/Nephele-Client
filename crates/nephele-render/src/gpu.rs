@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use bytemuck::Zeroable;
 use nephele_assets::{Panorama, SkinAtlas, TextureAnimation, TextureArray, UiAtlas};
 use wgpu::util::DeviceExt;
 
@@ -7,7 +8,7 @@ use crate::camera::Camera;
 use crate::entity::{EntityMesh, EntityVertex};
 use crate::environment::Environment;
 use crate::lines::{LineMesh, LineVertex};
-use crate::mesh::{MeshData, Vertex};
+use crate::mesh::{MeshData, Vertex, NO_ANIMATION};
 use crate::ui::{UiBatch, UiVertex};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -40,6 +41,7 @@ pub enum StartupStage {
     ShaderCompile,
     TextureUpload,
     PipelineCreation,
+    PipelineWarmup,
 }
 
 impl StartupStage {
@@ -49,6 +51,7 @@ impl StartupStage {
             StartupStage::ShaderCompile => "shader_compile",
             StartupStage::TextureUpload => "texture_atlas_upload",
             StartupStage::PipelineCreation => "pipeline_creation",
+            StartupStage::PipelineWarmup => "pipeline_warmup",
         }
     }
 }
@@ -942,7 +945,7 @@ impl Renderer {
             )
         });
 
-        Ok(Self {
+        let mut renderer = Self {
             surface,
             device,
             queue,
@@ -997,7 +1000,9 @@ impl Renderer {
                 .unwrap_or(true),
             startup_timings: startup,
             texture_bytes,
-        })
+        };
+        renderer.prewarm(startup_origin);
+        Ok(renderer)
     }
 
     /// Timed shader, texture-upload, and pipeline work performed by `new`.
@@ -1352,58 +1357,7 @@ impl Renderer {
     }
 
     pub fn draw(&mut self, camera: &Camera) -> DrawOutcome {
-        let view_proj = camera.view_projection();
-        let mut uniforms = Uniforms {
-            view_proj: view_proj.to_cols_array_2d(),
-            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
-            camera: [camera.position.x, camera.position.y, camera.position.z, 1.0],
-            fog_color: [
-                self.environment.fog_color[0],
-                self.environment.fog_color[1],
-                self.environment.fog_color[2],
-                1.0,
-            ],
-            environment: [
-                self.environment.time_of_day,
-                self.environment.fog_start,
-                self.environment.fog_end,
-                self.environment.fog_scale,
-            ],
-            animation: [
-                self.animation_started.elapsed().as_secs_f32() * 20.0,
-                0.0,
-                0.0,
-                0.0,
-            ],
-            animations: [[0.0; 4]; MAX_ANIMATIONS * 2],
-        };
-        for (index, animation) in self
-            .block_animations
-            .iter()
-            .take(MAX_ANIMATIONS)
-            .enumerate()
-        {
-            uniforms.animations[index * 2] = [
-                animation.origin[0],
-                animation.origin[1],
-                animation.frame_size[0],
-                animation.frame_size[1],
-            ];
-            uniforms.animations[index * 2 + 1] = [
-                animation.step,
-                animation.frames as f32,
-                animation.frametime,
-                0.0,
-            ];
-        }
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
-        let ui_uniforms = UiUniforms {
-            screen: [self.config.width as f32, self.config.height as f32],
-            _pad: [0.0, 0.0],
-        };
-        self.queue
-            .write_buffer(&self.ui_uniform_buffer, 0, bytemuck::bytes_of(&ui_uniforms));
+        self.write_uniforms(camera);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -1606,6 +1560,235 @@ impl Renderer {
         self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
         DrawOutcome::Presented
+    }
+
+    fn write_uniforms(&self, camera: &Camera) {
+        let view_proj = camera.view_projection();
+        let mut uniforms = Uniforms {
+            view_proj: view_proj.to_cols_array_2d(),
+            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+            camera: [camera.position.x, camera.position.y, camera.position.z, 1.0],
+            fog_color: [
+                self.environment.fog_color[0],
+                self.environment.fog_color[1],
+                self.environment.fog_color[2],
+                1.0,
+            ],
+            environment: [
+                self.environment.time_of_day,
+                self.environment.fog_start,
+                self.environment.fog_end,
+                self.environment.fog_scale,
+            ],
+            animation: [
+                self.animation_started.elapsed().as_secs_f32() * 20.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            animations: [[0.0; 4]; MAX_ANIMATIONS * 2],
+        };
+        for (index, animation) in self
+            .block_animations
+            .iter()
+            .take(MAX_ANIMATIONS)
+            .enumerate()
+        {
+            uniforms.animations[index * 2] = [
+                animation.origin[0],
+                animation.origin[1],
+                animation.frame_size[0],
+                animation.frame_size[1],
+            ];
+            uniforms.animations[index * 2 + 1] = [
+                animation.step,
+                animation.frames as f32,
+                animation.frametime,
+                0.0,
+            ];
+        }
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        let ui_uniforms = UiUniforms {
+            screen: [self.config.width as f32, self.config.height as f32],
+            _pad: [0.0, 0.0],
+        };
+        self.queue
+            .write_buffer(&self.ui_uniform_buffer, 0, bytemuck::bytes_of(&ui_uniforms));
+    }
+
+    /// Compile every render pipeline with one tiny offscreen draw.
+    ///
+    /// Vulkan drivers routinely defer shader compilation until a pipeline is
+    /// first bound, so the first world frame can stall for tens of
+    /// milliseconds per pipeline. Doing a throwaway 4x4 draw of each pipeline
+    /// during construction moves that cost into startup, where the benchmark
+    /// attributes it instead of losing it inside the first visible frames.
+    pub fn prewarm(&mut self, origin: Instant) {
+        let started = Instant::now();
+        let camera = Camera::default();
+        self.write_uniforms(&camera);
+
+        let color = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("prewarm color"),
+            size: wgpu::Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("prewarm depth"),
+            size: wgpu::Extent3d {
+                width: 4,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let dummy_indices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("prewarm indices"),
+                contents: bytemuck::cast_slice(&[0u32, 1, 2]),
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let block_vertices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("prewarm block vertices"),
+                contents: bytemuck::cast_slice(
+                    &[Vertex {
+                        anim: NO_ANIMATION,
+                        ..Vertex::zeroed()
+                    }; 3],
+                ),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let entity_vertices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("prewarm entity vertices"),
+                contents: bytemuck::cast_slice(&[EntityVertex::zeroed(); 3]),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let line_vertices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("prewarm line vertices"),
+                contents: bytemuck::cast_slice(&[LineVertex::zeroed(); 3]),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+        let ui_vertices = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("prewarm ui vertices"),
+                contents: bytemuck::cast_slice(&[UiVertex::zeroed(); 3]),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("prewarm encoder"),
+            });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("prewarm pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            pass.set_pipeline(&self.sky_pipeline);
+            pass.set_bind_group(0, &self.sky_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+
+            if let Some(panorama) = &self.panorama {
+                pass.set_pipeline(&panorama.pipeline);
+                pass.set_bind_group(0, &panorama.bind_group, &[]);
+                pass.set_vertex_buffer(0, panorama.vertices.slice(..));
+                pass.set_index_buffer(panorama.indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..panorama.index_count, 0, 0..1);
+            }
+
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, block_vertices.slice(..));
+            pass.set_index_buffer(dummy_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..3, 0, 0..1);
+
+            pass.set_pipeline(&self.overlay_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_vertex_buffer(0, block_vertices.slice(..));
+            pass.set_index_buffer(dummy_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..3, 0, 0..1);
+
+            pass.set_pipeline(&self.entity_pipeline);
+            pass.set_bind_group(0, &self.entity_bind_group, &[]);
+            pass.set_vertex_buffer(0, entity_vertices.slice(..));
+            pass.set_index_buffer(dummy_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..3, 0, 0..1);
+
+            pass.set_pipeline(&self.line_pipeline);
+            pass.set_bind_group(0, &self.line_bind_group, &[]);
+            pass.set_vertex_buffer(0, line_vertices.slice(..));
+            pass.draw(0..3, 0..1);
+
+            pass.set_pipeline(&self.ui_sprite_pipeline);
+            pass.set_bind_group(0, &self.ui_bind_group, &[]);
+            pass.set_vertex_buffer(0, ui_vertices.slice(..));
+            pass.set_index_buffer(dummy_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..3, 0, 0..1);
+
+            pass.set_pipeline(&self.ui_block_pipeline);
+            pass.set_bind_group(0, &self.ui_bind_group, &[]);
+            pass.set_vertex_buffer(0, ui_vertices.slice(..));
+            pass.set_index_buffer(dummy_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..3, 0, 0..1);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(10)),
+        });
+        self.startup_timings.record(
+            StartupStage::PipelineWarmup,
+            origin,
+            started,
+            Instant::now(),
+        );
     }
 }
 

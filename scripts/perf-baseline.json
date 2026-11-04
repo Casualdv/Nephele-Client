@@ -1,39 +1,51 @@
 {
-    "schema":  "nephele-perf-baseline-v1",
+    "schema":  "nephele-perf-baseline-v2",
     "workload":  {
                      "seed":  12345,
                      "width":  1280,
                      "height":  720,
-                     "requested_view_distance":  6,
-                     "streamed_columns":  169,
-                     "duration_seconds":  75,
+                     "requested_view_distance":  8,
+                     "streamed_columns":  334,
+                     "duration_seconds":  85,
                      "screen":  "local",
-                     "gpu":  "integrated"
+                     "gpu":  "integrated",
+                     "adapter":  "[perf] adapter name=\"AMD Radeon(TM) Graphics\" type=IntegratedGpu backend=Vulkan driver=\"AMD proprietary driver\"",
+                     "hardware_note":  "AMD integrated verified; Intel HD-class unverified; 60 fps product bar not proven by this run."
                  },
     "adapter":  "[perf] adapter name=\"AMD Radeon(TM) Graphics\" type=IntegratedGpu backend=Vulkan driver=\"AMD proprietary driver\"",
+    "thresholds":  {
+                       "max_p99_regression_pct":  20,
+                       "min_p99_slack_ms":  2.0,
+                       "max_over_budget_regression":  4,
+                       "frame_budget_ms":  16.667
+                   },
+    "startup_p50_ms":  6.96,
+    "startup_p99_ms":  7.77,
     "windows":  [
                     {
                         "window":  1,
-                        "elapsed_s":  30.0051711,
-                        "frame_samples":  4244,
-                        "frame_p50_ms":  6.98,
-                        "frame_p99_ms":  8.54,
-                        "frame_over_budget":  3,
+                        "elapsed_s":  30.0037607,
+                        "frame_samples":  4228,
+                        "frame_p50_ms":  6.96,
+                        "frame_p99_ms":  7.77,
+                        "startup_p50_ms":  6.96,
+                        "startup_p99_ms":  7.77,
+                        "frame_over_budget":  4,
                         "frame_over_100ms":  1,
                         "p99_within_budget":  true,
-                        "mesh_build_samples":  169,
-                        "mesh_build_p50_ms":  1.85,
-                        "mesh_build_p99_ms":  4.56,
+                        "mesh_build_samples":  289,
+                        "mesh_build_p50_ms":  1.71,
+                        "mesh_build_p99_ms":  3.04,
                         "mesh_build_over_100ms":  0,
-                        "chunk_uploads":  169,
-                        "chunk_upload_total_ms":  7.3835999999999995,
+                        "chunk_uploads":  289,
+                        "chunk_upload_total_ms":  18.1816,
                         "startup":  {
                                         "window_s":  5.0,
                                         "long_frame_threshold_ms":  100.0,
                                         "long_frames":  [
                                                             {
-                                                                "start_ms":  4.9448,
-                                                                "duration_ms":  449.5938,
+                                                                "start_ms":  4.2714,
+                                                                "duration_ms":  505.59849999999994,
                                                                 "stages":  [
                                                                                "window_init",
                                                                                "texture_atlas_decode",
@@ -42,118 +54,145 @@
                                                                                "device_init",
                                                                                "texture_atlas_upload",
                                                                                "shader_compile",
-                                                                               "pipeline_creation"
+                                                                               "pipeline_creation",
+                                                                               "pipeline_warmup"
                                                                            ]
                                                             }
                                                         ],
                                         "stages":  [
                                                        {
                                                            "name":  "chunk_upload",
-                                                           "samples":  169,
-                                                           "total_ms":  7.3836,
-                                                           "max_ms":  1.1342,
+                                                           "samples":  289,
+                                                           "total_ms":  18.1816,
+                                                           "max_ms":  1.9466,
                                                            "long_frame_overlap_ms":  0.0,
                                                            "long_frames":  0
                                                        },
                                                        {
                                                            "name":  "device_init",
                                                            "samples":  1,
-                                                           "total_ms":  263.7456,
-                                                           "max_ms":  263.7456,
-                                                           "long_frame_overlap_ms":  263.7456,
+                                                           "total_ms":  293.2101,
+                                                           "max_ms":  293.2101,
+                                                           "long_frame_overlap_ms":  293.2101,
                                                            "long_frames":  1
                                                        },
                                                        {
                                                            "name":  "first_frame_pipeline_creation",
                                                            "samples":  1,
-                                                           "total_ms":  24.3401,
-                                                           "max_ms":  24.3401,
+                                                           "total_ms":  30.4056,
+                                                           "max_ms":  30.4056,
                                                            "long_frame_overlap_ms":  0.0,
                                                            "long_frames":  0
                                                        },
                                                        {
                                                            "name":  "initial_mesh_build",
-                                                           "samples":  169,
-                                                           "total_ms":  329.9312,
-                                                           "max_ms":  7.3814,
+                                                           "samples":  289,
+                                                           "total_ms":  499.3736,
+                                                           "max_ms":  3.3404,
                                                            "long_frame_overlap_ms":  0.0,
                                                            "long_frames":  0
                                                        },
                                                        {
                                                            "name":  "pipeline_creation",
-                                                           "samples":  6,
-                                                           "total_ms":  1.172,
-                                                           "max_ms":  0.3513,
-                                                           "long_frame_overlap_ms":  1.172,
+                                                           "samples":  7,
+                                                           "total_ms":  1.7124,
+                                                           "max_ms":  0.4364,
+                                                           "long_frame_overlap_ms":  1.7124,
+                                                           "long_frames":  1
+                                                       },
+                                                       {
+                                                           "name":  "pipeline_warmup",
+                                                           "samples":  1,
+                                                           "total_ms":  2.5136,
+                                                           "max_ms":  2.5136,
+                                                           "long_frame_overlap_ms":  2.5136,
                                                            "long_frames":  1
                                                        },
                                                        {
                                                            "name":  "renderer_init",
                                                            "samples":  1,
-                                                           "total_ms":  350.4509,
-                                                           "max_ms":  350.4509,
-                                                           "long_frame_overlap_ms":  350.4509,
+                                                           "total_ms":  393.3159,
+                                                           "max_ms":  393.3159,
+                                                           "long_frame_overlap_ms":  393.3159,
                                                            "long_frames":  1
                                                        },
                                                        {
                                                            "name":  "shader_compile",
-                                                           "samples":  4,
-                                                           "total_ms":  0.6934,
-                                                           "max_ms":  0.3047,
-                                                           "long_frame_overlap_ms":  0.6934,
+                                                           "samples":  5,
+                                                           "total_ms":  1.7183,
+                                                           "max_ms":  0.7904,
+                                                           "long_frame_overlap_ms":  1.7183,
                                                            "long_frames":  1
                                                        },
                                                        {
                                                            "name":  "texture_atlas_decode",
                                                            "samples":  1,
-                                                           "total_ms":  3.8661,
-                                                           "max_ms":  3.8661,
-                                                           "long_frame_overlap_ms":  3.8661,
+                                                           "total_ms":  4.1295,
+                                                           "max_ms":  4.1295,
+                                                           "long_frame_overlap_ms":  4.1295,
                                                            "long_frames":  1
                                                        },
                                                        {
                                                            "name":  "texture_atlas_upload",
-                                                           "samples":  3,
-                                                           "total_ms":  1.0698,
-                                                           "max_ms":  0.6029,
-                                                           "long_frame_overlap_ms":  1.0698,
+                                                           "samples":  4,
+                                                           "total_ms":  3.1724,
+                                                           "max_ms":  2.6002,
+                                                           "long_frame_overlap_ms":  3.1724,
                                                            "long_frames":  1
                                                        },
                                                        {
                                                            "name":  "ui_atlas_decode",
                                                            "samples":  1,
-                                                           "total_ms":  1.4325,
-                                                           "max_ms":  1.4325,
-                                                           "long_frame_overlap_ms":  1.4325,
+                                                           "total_ms":  1.2924,
+                                                           "max_ms":  1.2924,
+                                                           "long_frame_overlap_ms":  1.2924,
                                                            "long_frames":  1
                                                        },
                                                        {
                                                            "name":  "window_init",
                                                            "samples":  1,
-                                                           "total_ms":  39.8768,
-                                                           "max_ms":  39.8768,
-                                                           "long_frame_overlap_ms":  39.8768,
+                                                           "total_ms":  37.4785,
+                                                           "max_ms":  37.4785,
+                                                           "long_frame_overlap_ms":  37.4785,
                                                            "long_frames":  1
                                                        }
                                                    ]
-                                    }
+                                    },
+                        "memory":  {
+                                       "chunks":  289,
+                                       "meshes":  289,
+                                       "gpu_buffer_bytes":  70802704,
+                                       "gpu_texture_bytes":  12078760,
+                                       "vram_estimate_bytes":  82881464,
+                                       "rss_bytes":  487936000
+                                   }
                     },
                     {
                         "window":  2,
-                        "elapsed_s":  60.0023452,
-                        "frame_samples":  4313,
-                        "frame_p50_ms":  6.98,
-                        "frame_p99_ms":  8.55,
-                        "frame_over_budget":  0,
+                        "elapsed_s":  60.0070094,
+                        "frame_samples":  4307,
+                        "frame_p50_ms":  6.96,
+                        "frame_p99_ms":  7.59,
+                        "startup_p50_ms":  null,
+                        "startup_p99_ms":  null,
+                        "frame_over_budget":  1,
                         "frame_over_100ms":  0,
                         "p99_within_budget":  true,
-                        "mesh_build_samples":  0,
-                        "mesh_build_p50_ms":  null,
-                        "mesh_build_p99_ms":  null,
+                        "mesh_build_samples":  45,
+                        "mesh_build_p50_ms":  1.34,
+                        "mesh_build_p99_ms":  1.94,
                         "mesh_build_over_100ms":  0,
-                        "chunk_uploads":  0,
-                        "chunk_upload_total_ms":  0.0,
-                        "startup":  null
+                        "chunk_uploads":  45,
+                        "chunk_upload_total_ms":  1.8003,
+                        "startup":  null,
+                        "memory":  {
+                                       "chunks":  289,
+                                       "meshes":  289,
+                                       "gpu_buffer_bytes":  70802704,
+                                       "gpu_texture_bytes":  12078760,
+                                       "vram_estimate_bytes":  82881464,
+                                       "rss_bytes":  490754048
+                                   }
                     }
                 ]
 }

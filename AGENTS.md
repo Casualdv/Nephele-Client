@@ -660,6 +660,30 @@ clouds), per-biome fog, conservative height-field occlusion culling, the
 per-frame chunk upload budget and the damage vignette. Measured p99 on the
 integrated Radeon is 7.41 ms at 1280×720 / view distance 8 with vsync off.
 
+**Startup/perf gate landed 2026-11-04** (branch `m6-perf-gate`, rebased on M1):
+- The four >100 ms startup frames were real and survived M1's upload budget.
+  They were first-use pipeline stalls: the first world frame compiled the
+  block, overlay, entity and UI pipelines on Vulkan. `Renderer::prewarm` now
+  draws every pipeline once into a throwaway 4×4 target during construction.
+  The first five seconds now contain exactly one >100 ms frame - the one-time
+  device/pipeline init frame (≈0.4-0.5 s, `device_init` dominates) - and no
+  post-init spikes. Measured startup window (first 30 s): p50 6.96 ms,
+  p99 7.77 ms; steady state p50 6.96 ms, p99 7.59 ms at 1280×720, view
+  distance 8, vsync off, AMD Radeon integrated.
+- `NEPHELE_VIEW_DISTANCE` is authoritative at process start: `LiveApp` seeds
+  `Shared::view_distance` from the parsed settings before the local streamer
+  starts. Chunk counts: distance 4 → 81 chunks (34.9 MB VRAM estimate),
+  8 → 289 (79.0 MB), 12 → 625 (144.6 MB), all `(2r+1)²`.
+- `scripts/measure_perf.ps1` is a gate, not a report. It compares
+  `scripts/perf-baseline.json` and fails when steady-state p99 exceeds the
+  baseline by more than 20% (with a 2 ms floor) or over-budget frames by more
+  than 4 per window. Every window prints chunk/mesh counts, GPU buffer and
+  texture estimates, and RSS; startup p50/p99 are printed and stored but not
+  gated.
+- The selected adapter is printed in every run and stored in the baseline.
+  **Intel HD-class is unverified**; the 60 fps product bar is not proven by
+  these AMD-integrated measurements.
+
 **Open:**
 
 1. **M1b - biome parity, 92.8175%** (11,492 mismatches in 160,000 cells).
@@ -672,8 +696,9 @@ integrated Radeon is 7.41 ms at 1280×720 / view distance 8 with vsync off.
 
 3. **M3 - join a real server.** Dimension change, keepalive, tab list, and a
    shippable Azure app id.
-4. **M6 follow-up.** Attribute the startup frame spikes by stage, and report
-   every measurement window instead of the best one.
+4. **M6 follow-up.** Run the benchmark gate on Intel HD-class hardware; it is
+   currently proven only on the integrated AMD. Add a real-asset run (not just
+   the synthetic placeholder texture) to the committed baseline.
 
 ## 16. Working agreement
 
