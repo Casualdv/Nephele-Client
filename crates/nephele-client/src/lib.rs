@@ -21,7 +21,7 @@ use nephele_world::{
     decode_chunk_bulk, decode_chunk_data, ChunkColumn, ChunkCoord, ChunkUpdate, World,
 };
 
-pub use container::LocalContainer;
+pub use container::{ContainerKind, LocalContainer, LocalFurnace};
 pub use entities::{Entities, Entity, EntityKind};
 pub use mining::{Aim, Miner, MiningEvent};
 pub use skins::{SkinInfo, Skins};

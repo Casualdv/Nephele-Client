@@ -32,6 +32,7 @@ pub mod ravines;
 pub mod raycast;
 pub mod save;
 pub mod shapes;
+pub mod smelting;
 pub mod surface;
 pub mod terrain;
 pub mod world;

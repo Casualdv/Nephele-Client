@@ -62,6 +62,15 @@ pub mod sheets {
     pub const LOGO: SpriteRect = SpriteRect::new(512, 0, 256, 256);
     /// `textures/gui/options_background.png` - the tiled dirt backdrop.
     pub const OPTIONS_BACKGROUND: SpriteRect = SpriteRect::new(512, 256, 16, 16);
+    /// `textures/gui/container/inventory.png` - the player inventory panel.
+    pub const INVENTORY: SpriteRect = SpriteRect::new(0, 512, 256, 256);
+    /// `textures/gui/container/crafting_table.png` - the 3x3 table panel.
+    pub const CRAFTING_TABLE: SpriteRect = SpriteRect::new(256, 512, 256, 256);
+    /// `textures/gui/container/furnace.png` - the furnace panel plus its
+    /// flame and progress-arrow sprites.
+    pub const FURNACE: SpriteRect = SpriteRect::new(512, 512, 256, 256);
+    /// `textures/gui/container/generic_54.png` - the chest panel.
+    pub const CHEST: SpriteRect = SpriteRect::new(768, 512, 256, 256);
 }
 
 /// Individual sprites, in the coordinates vanilla's GUI classes use.
@@ -88,6 +97,21 @@ pub mod sprites {
 
     /// Only the inked part of the 256x256 logo image (the rest is transparent).
     pub const LOGO_INK: SpriteRect = sheets::LOGO.sub(0, 0, 199, 89);
+
+    /// The drawn part of each container panel (the rest of the sheet is unused).
+    pub const INVENTORY_PANEL: SpriteRect = sheets::INVENTORY.sub(0, 0, 176, 166);
+    pub const CRAFTING_TABLE_PANEL: SpriteRect = sheets::CRAFTING_TABLE.sub(0, 0, 176, 166);
+    pub const FURNACE_PANEL: SpriteRect = sheets::FURNACE.sub(0, 0, 176, 166);
+    /// A 27-slot chest: the three chest rows, then the player section, both cut
+    /// from `generic_54.png` so the panel is 176x168 like vanilla's.
+    pub const CHEST_TOP: SpriteRect = sheets::CHEST.sub(0, 0, 176, 72);
+    pub const CHEST_BOTTOM: SpriteRect = sheets::CHEST.sub(0, 126, 176, 96);
+    /// Furnace progress art, taken from the right-hand column of its sheet.
+    pub const FURNACE_FLAME: SpriteRect = sheets::FURNACE.sub(176, 0, 14, 14);
+    pub const FURNACE_ARROW: SpriteRect = sheets::FURNACE.sub(176, 14, 24, 16);
+    /// Empty/full versions of the arrow and flame, so progress can be clipped.
+    pub const FURNACE_ARROW_BACKGROUND: SpriteRect = sheets::FURNACE.sub(176, 30, 24, 16);
+    pub const FURNACE_FLAME_BACKGROUND: SpriteRect = sheets::FURNACE.sub(176, 46, 14, 14);
 }
 
 /// Bitmap font metrics for `ascii.png`.
@@ -184,6 +208,10 @@ impl UiAtlas {
             (sheets::ICONS, "gui/icons.png"),
             (sheets::WIDGETS, "gui/widgets.png"),
             (sheets::LOGO, "gui/title/minecraft.png"),
+            (sheets::INVENTORY, "gui/container/inventory.png"),
+            (sheets::CRAFTING_TABLE, "gui/container/crafting_table.png"),
+            (sheets::FURNACE, "gui/container/furnace.png"),
+            (sheets::CHEST, "gui/container/generic_54.png"),
         ] {
             let full = textures_dir.join(path);
             if !full.is_file() {
