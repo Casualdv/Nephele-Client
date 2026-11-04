@@ -519,7 +519,9 @@ fn flush_dirty_columns(
         .collect();
     save.save_chunks(&columns)
         .map_err(|error| error.to_string())?;
-    dirty.clear();
+    for column in &columns {
+        dirty.remove(&(column.x, column.z));
+    }
     Ok(())
 }
 
@@ -584,6 +586,17 @@ fn local_loop(
     let mut weather_random = seed ^ 0x9E37_79B9_7F4A_7C15;
 
     loop {
+        if std::mem::take(&mut shared.lock().unwrap().pending_respawn) {
+            let mut state = shared.lock().unwrap();
+            let [x, y, z] = state.spawn_point.unwrap_or(world_state.spawn_position);
+            state
+                .player
+                .teleport(x as f64 + 0.5, y as f64, z as f64 + 0.5);
+            state.health = 20.0;
+            state.food = 20;
+            state.food_saturation = 5.0;
+            state.food_exhaustion = 0.0;
+        }
         let (position, yaw, pitch, _on_ground) = step_player(&shared, &world);
         radius = view_radius(shared.lock().unwrap().view_distance);
 
@@ -628,16 +641,20 @@ fn local_loop(
             .copied()
             .filter(|(x, z)| (x - centre.0).abs() > radius + 2 || (z - centre.1).abs() > radius + 2)
             .collect();
+        let mut unloading = Vec::new();
         for coord in stale {
             sent.remove(&coord);
             if dirty.remove(&coord) {
                 if let Some(column) = world.get(ChunkCoord::new(coord.0, coord.1)) {
-                    save.save_chunks(std::slice::from_ref(column))
-                        .map_err(|error| error.to_string())?;
+                    unloading.push(column.clone());
                 }
             }
             world.remove(ChunkCoord::new(coord.0, coord.1));
             let _ = tx.send(NetMsg::Unload(coord.0, coord.1));
+        }
+        if !unloading.is_empty() {
+            save.save_chunks(&unloading)
+                .map_err(|error| error.to_string())?;
         }
         if !columns.is_empty() {
             let _ = tx.send(NetMsg::Chunks(columns));
@@ -2514,7 +2531,7 @@ impl LiveApp {
             return;
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             if self.shared.lock().unwrap().local_stopped {
                 return;
@@ -3713,6 +3730,15 @@ mod tests {
         original.yaw = 1.2;
         original.pitch = -0.35;
         original.held_slot = 6;
+        original.health = 9.5;
+        original.food = 12;
+        original.food_saturation = 2.25;
+        original.food_exhaustion = 0.75;
+        original.xp_bar = 0.5;
+        original.xp_level = 11;
+        original.xp_total = 640;
+        original.xp_seed = 77;
+        original.spawn_point = Some([-20, 73, 40]);
         original.inventory[0] = Some(ItemStack::new(4, 32, 2));
         original.inventory[44] = Some(ItemStack::new(280, 5, 0));
 
@@ -3730,6 +3756,55 @@ mod tests {
         );
         assert_eq!(reopened.held_slot, original.held_slot);
         assert_eq!(reopened.inventory, original.inventory);
+        assert_eq!(
+            (
+                reopened.health,
+                reopened.food,
+                reopened.food_saturation,
+                reopened.food_exhaustion,
+                reopened.xp_bar,
+                reopened.xp_level,
+                reopened.xp_total,
+                reopened.xp_seed,
+                reopened.spawn_point,
+            ),
+            (
+                original.health,
+                original.food,
+                original.food_saturation,
+                original.food_exhaustion,
+                original.xp_bar,
+                original.xp_level,
+                original.xp_total,
+                original.xp_seed,
+                original.spawn_point,
+            )
+        );
+    }
+
+    #[test]
+    fn weather_timer_toggles_rain_and_thunder_deterministically() {
+        let mut state = WorldState {
+            raining: false,
+            rain_time: 2,
+            ..WorldState::default()
+        };
+        let mut random = 1234;
+        advance_weather(&mut state, &mut random);
+        advance_weather(&mut state, &mut random);
+        assert!(state.raining, "rain starts when rainTime runs out");
+        assert_eq!(
+            state.rain_time,
+            12_000 + (weather_roll(&mut 1234) % 12_000) as i32
+        );
+        assert!(!state.thundering);
+
+        // Run the thunder countdown to its end and make sure it toggles.
+        state.thunder_time = 2;
+        for _ in 0..2 {
+            advance_weather(&mut state, &mut random);
+        }
+        assert!(state.thundering);
     }
 
     #[test]

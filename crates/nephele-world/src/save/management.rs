@@ -6,13 +6,19 @@ const ARCHIVE: &str = "..nephele-backups";
 
 pub(super) fn plain_directory(path: &Path) -> io::Result<()> {
     if !fs::symlink_metadata(path)?.file_type().is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected a directory, not a link"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a directory, not a link",
+        ));
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         if fs::symlink_metadata(path)?.file_attributes() & 0x400 != 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "linked directory in save"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "linked directory in save",
+            ));
         }
     }
     Ok(())
@@ -30,14 +36,21 @@ fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {
         } else if ty.is_dir() {
             copy_tree(&entry.path(), &target)?;
         } else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "linked or special file in save"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "linked or special file in save",
+            ));
         }
     }
     Ok(())
 }
 
 fn unique_copy_id() -> String {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().to_string()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string()
 }
 
 fn read_backup(archive: &Path, id: &str) -> Result<WorldSave, SaveError> {
@@ -48,7 +61,10 @@ fn read_backup(archive: &Path, id: &str) -> Result<WorldSave, SaveError> {
     let snapshot = archive.join(id);
     plain_directory(&snapshot)?;
     let mut entries = fs::read_dir(&snapshot)?;
-    let entry = entries.next().transpose()?.ok_or_else(|| SaveError::InvalidMetadata(snapshot.clone()))?;
+    let entry = entries
+        .next()
+        .transpose()?
+        .ok_or_else(|| SaveError::InvalidMetadata(snapshot.clone()))?;
     if entries.next().is_some() {
         return Err(SaveError::InvalidMetadata(snapshot));
     }
@@ -87,15 +103,26 @@ impl WorldSave {
         for entry in fs::read_dir(&archive)? {
             let id = entry?.file_name().to_string_lossy().into_owned();
             if let Ok(world) = read_backup(&archive, &id) {
-                backups.push(WorldMetadata { directory: id, ..world.metadata });
+                backups.push(WorldMetadata {
+                    directory: id,
+                    ..world.metadata
+                });
             }
         }
-        backups.sort_by(|a, b| b.directory.len().cmp(&a.directory.len()).then_with(|| b.directory.cmp(&a.directory)));
+        backups.sort_by(|a, b| {
+            b.directory
+                .len()
+                .cmp(&a.directory.len())
+                .then_with(|| b.directory.cmp(&a.directory))
+        });
         Ok(backups)
     }
 
     /// Restores an independent playable copy. Even if the original still exists, never replace it.
-    pub fn restore_backup(saves_dir: impl AsRef<Path>, id: &str) -> Result<WorldMetadata, SaveError> {
+    pub fn restore_backup(
+        saves_dir: impl AsRef<Path>,
+        id: &str,
+    ) -> Result<WorldMetadata, SaveError> {
         let saves = saves_dir.as_ref();
         let source = read_backup(&saves.join(ARCHIVE), id)?;
         let base = &source.metadata.directory;
@@ -103,7 +130,11 @@ impl WorldSave {
         let mut n = 0usize;
         while saves.join(&name).try_exists()? {
             n += 1;
-            let suffix = if n == 1 { " (restored)".to_string() } else { format!(" (restored {n})") };
+            let suffix = if n == 1 {
+                " (restored)".to_string()
+            } else {
+                format!(" (restored {n})")
+            };
             let mut prefix = base.as_str();
             while prefix.encode_utf16().count() + suffix.len() > MAX_WORLD_NAME_UNITS {
                 prefix = &prefix[..prefix.char_indices().next_back().unwrap().0];
@@ -149,13 +180,22 @@ mod tests {
         a.rename("Renamed").unwrap();
         assert!(a.rename("Other").is_err());
         WorldSave::delete(&saves, "Renamed").unwrap();
-        assert_eq!(WorldSave::restore_backup(&saves, id).unwrap().directory, "Selected");
+        assert_eq!(
+            WorldSave::restore_backup(&saves, id).unwrap().directory,
+            "Selected"
+        );
         assert!(WorldSave::restore_backup(&saves, "../Other").is_err());
         for name in ["Selected", "Selected (restored)"] {
             let mut w = WorldSave::open(&saves, name).unwrap();
-            assert_eq!(w.load_chunk(-1, 0).unwrap().unwrap().get_block(15, 72, 2), BlockState::new(35, 14));
+            assert_eq!(
+                w.load_chunk(-1, 0).unwrap().unwrap().get_block(15, 72, 2),
+                BlockState::new(35, 14)
+            );
         }
-        assert_eq!(fs::read(neighbour.path.join(LEVEL_FILE)).unwrap(), untouched);
+        assert_eq!(
+            fs::read(neighbour.path.join(LEVEL_FILE)).unwrap(),
+            untouched
+        );
         fs::remove_dir_all(saves).unwrap();
     }
 }

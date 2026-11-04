@@ -7,7 +7,6 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -23,8 +22,8 @@ const METADATA_FILE: &str = "nephele.dat";
 const PLAYER_STATE_FILE: &str = "player.dat";
 const LEVEL_FILE: &str = "level.dat";
 const REGION_DIR: &str = "region";
-mod management;
 mod level;
+mod management;
 use level::*;
 const MAX_WORLD_NAME_UNITS: usize = 64;
 const PLAYER_INVENTORY_SLOTS: usize = 45;
@@ -153,7 +152,11 @@ impl fmt::Display for SaveError {
                 )
             }
             Self::InvalidLevelData(path) => {
-                write!(f, "invalid or corrupt vanilla level data at {}", path.display())
+                write!(
+                    f,
+                    "invalid or corrupt vanilla level data at {}",
+                    path.display()
+                )
             }
             Self::InvalidPlayerState(reason) => write!(f, "invalid saved player state: {reason}"),
             Self::ChunkCoordinateMismatch { requested, stored } => write!(
@@ -272,27 +275,31 @@ impl WorldSave {
         let path = saves_dir.as_ref().join(&directory);
         management::plain_directory(&path)?;
         let document = read_level_document(&path)?;
-        let (level_root_name, root_fields, level_data, last_good_level_bytes, metadata) = match document {
-            Some(document) => {
-                let metadata = metadata_from_level(&document.data, &directory)
-                    .or_else(|_| read_metadata(&path.join(METADATA_FILE)))?;
-                (
-                    document.root_name,
-                    document.root_fields,
-                    document.data,
-                    Some(document.raw_bytes),
-                    metadata,
-                )
-            }
-            None => {
-                let metadata = read_metadata(&path.join(METADATA_FILE))?;
-                let level_data = new_level_data(&metadata, &WorldState::default());
-                (String::new(), IndexMap::new(), level_data, None, metadata)
-            }
-        };
+        let (level_root_name, root_fields, level_data, last_good_level_bytes, metadata) =
+            match document {
+                Some(document) => {
+                    let metadata = metadata_from_level(&document.data, &directory)
+                        .or_else(|_| read_metadata(&path.join(METADATA_FILE)))?;
+                    (
+                        document.root_name,
+                        document.root_fields,
+                        document.data,
+                        Some(document.raw_bytes),
+                        metadata,
+                    )
+                }
+                None => {
+                    let metadata = read_metadata(&path.join(METADATA_FILE))?;
+                    let level_data = new_level_data(&metadata, &WorldState::default());
+                    (String::new(), IndexMap::new(), level_data, None, metadata)
+                }
+            };
         Ok(Self {
             path,
-            metadata: WorldMetadata { directory, ..metadata },
+            metadata: WorldMetadata {
+                directory,
+                ..metadata
+            },
             regions: HashMap::new(),
             level_root_name,
             root_fields,
@@ -358,7 +365,8 @@ impl WorldSave {
     /// Writes player state under vanilla's `Data.Player` in `level.dat`.
     pub fn save_player_state(&mut self, state: &SavedPlayerState) -> Result<(), SaveError> {
         validate_player_state(state)?;
-        let player = player_tag_with_state(self.level_data.get("Player"), &self.source_inventory, state);
+        let player =
+            player_tag_with_state(self.level_data.get("Player"), &self.source_inventory, state);
         self.level_data
             .insert("Player".to_string(), Tag::Compound(player));
         self.write_level_dat()
@@ -373,7 +381,11 @@ impl WorldSave {
     ) -> Result<(), SaveError> {
         validate_player_state(player)?;
         update_level_fields(&mut self.level_data, &self.metadata, world);
-        let updated_player = player_tag_with_state(self.level_data.get("Player"), &self.source_inventory, player);
+        let updated_player = player_tag_with_state(
+            self.level_data.get("Player"),
+            &self.source_inventory,
+            player,
+        );
         self.level_data
             .insert("Player".to_string(), Tag::Compound(updated_player));
         self.write_level_dat()
@@ -499,7 +511,8 @@ impl WorldSave {
 
     /// Writes a batch of dirty columns, compacting each touched region once.
     pub fn save_chunks(&mut self, columns: &[ChunkColumn]) -> Result<(), SaveError> {
-        let mut by_region: BTreeMap<(i32, i32), Vec<(usize, usize, Vec<u8>)>> = BTreeMap::new();
+        type RegionUpdates = Vec<(usize, usize, Vec<u8>)>;
+        let mut by_region: BTreeMap<(i32, i32), RegionUpdates> = BTreeMap::new();
         for column in columns {
             let region_coord = (column.x.div_euclid(32), column.z.div_euclid(32));
             let nbt = encode_chunk_nbt(&stored_from_column(column))?;
@@ -510,7 +523,7 @@ impl WorldSave {
             ));
         }
         for (region_coord, updates) in by_region {
-            RegionFile::write_chunks(&self.region_path(region_coord), &updates)?;
+            RegionFile::write_chunks(self.region_path(region_coord), &updates)?;
             self.regions.remove(&region_coord);
         }
         Ok(())
@@ -816,16 +829,26 @@ mod tests {
         inventory[36] = Some(SavedItemStack {
             id: 4,
             count: 31,
-            damage: 2, template_slot: None,
+            damage: 2,
+            template_slot: None,
         });
         inventory[44] = Some(SavedItemStack {
             id: 280,
             count: 5,
-            damage: 0, template_slot: None,
+            damage: 0,
+            template_slot: None,
         });
         let player = SavedPlayerState {
             position: [-23.5, 72.25, 41.75],
-            health: 12.5, food_level: 7, food_saturation: 2.5, food_exhaustion: 1.75, xp_progress: 0.625, xp_level: 18, xp_total: 415, xp_seed: -71, spawn_point: Some([-10,72,19]),
+            health: 12.5,
+            food_level: 7,
+            food_saturation: 2.5,
+            food_exhaustion: 1.75,
+            xp_progress: 0.625,
+            xp_level: 18,
+            xp_total: 415,
+            xp_seed: -71,
+            spawn_point: Some([-10, 72, 19]),
             yaw: 1.25,
             pitch: -0.375,
             held_slot: 7,
@@ -939,6 +962,211 @@ mod tests {
             );
         }
         assert_eq!(fs::read_dir(&saves).unwrap().count(), 0);
+        let _ = fs::remove_dir_all(saves);
+    }
+
+    fn sample_player() -> SavedPlayerState {
+        let mut inventory = vec![None; PLAYER_INVENTORY_SLOTS];
+        inventory[36] = Some(SavedItemStack {
+            id: 276,
+            count: 1,
+            damage: 12,
+            template_slot: None,
+        });
+        inventory[9] = Some(SavedItemStack {
+            id: 4,
+            count: 64,
+            damage: 0,
+            template_slot: None,
+        });
+        SavedPlayerState {
+            position: [12.5, 71.0, -40.25],
+            yaw: 1.25,
+            pitch: -0.4,
+            health: 17.0,
+            food_level: 15,
+            food_saturation: 3.5,
+            food_exhaustion: 0.25,
+            xp_progress: 0.5,
+            xp_level: 4,
+            xp_total: 55,
+            xp_seed: 123,
+            held_slot: 3,
+            spawn_point: Some([10, 71, -38]),
+            inventory,
+        }
+    }
+
+    fn read_level_fields(path: &Path) -> (String, IndexMap<String, Tag>, IndexMap<String, Tag>) {
+        let raw = fs::read(path).unwrap();
+        let mut plain = Vec::new();
+        GzDecoder::new(raw.as_slice())
+            .read_to_end(&mut plain)
+            .unwrap();
+        let (name, tag) = parse_nbt(&plain).unwrap();
+        let Tag::Compound(mut root) = tag else {
+            panic!("level.dat root is not a compound");
+        };
+        let Some(Tag::Compound(data)) = root.shift_remove("Data") else {
+            panic!("level.dat has no Data compound");
+        };
+        (name, root, data)
+    }
+
+    fn write_level_fields(
+        path: &Path,
+        name: &str,
+        root: &IndexMap<String, Tag>,
+        data: &IndexMap<String, Tag>,
+    ) {
+        let mut root = root.clone();
+        root.insert("Data".into(), Tag::Compound(data.clone()));
+        let raw = encode_nbt(name, &Tag::Compound(root)).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw).unwrap();
+        fs::write(path, encoder.finish().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn world_time_weather_and_spawn_roundtrip_through_level_dat() {
+        let saves = temp_saves_dir("world-state");
+        let mut save = WorldSave::create(&saves, "Weather", 99, WorldMode::Survival).unwrap();
+        let state = WorldState {
+            total_time: 48_123,
+            day_time: 17_400,
+            spawn_position: [3, 68, -11],
+            raining: true,
+            rain_time: 4_321,
+            thundering: true,
+            thunder_time: 654,
+        };
+        save.save_snapshot(&sample_player(), &state).unwrap();
+        drop(save);
+
+        let reopened = WorldSave::open(&saves, "Weather").unwrap();
+        assert_eq!(reopened.world_state(), state);
+        assert_eq!(reopened.load_player_state().unwrap(), Some(sample_player()));
+        let _ = fs::remove_dir_all(saves);
+    }
+
+    #[test]
+    fn level_dat_roundtrip_keeps_unknown_tags_identical() {
+        let saves = temp_saves_dir("unknown-tags");
+        let save = WorldSave::create(&saves, "Unknown", 77, WorldMode::Creative).unwrap();
+        let path = saves.join("Unknown").join(LEVEL_FILE);
+        drop(save);
+
+        let (root_name, root, mut data) = read_level_fields(&path);
+        let mut custom = IndexMap::new();
+        custom.insert("flag".into(), Tag::Byte(-3));
+        custom.insert("text".into(), Tag::String("mod data".into()));
+        let mut deep = IndexMap::new();
+        deep.insert("float".into(), Tag::Float(0.5));
+        deep.insert(
+            "list".into(),
+            Tag::List(vec![Tag::Short(7), Tag::Short(-8)]),
+        );
+        custom.insert("deep".into(), Tag::Compound(deep));
+        data.insert("ModCompound".into(), Tag::Compound(custom.clone()));
+        data.insert("ModEmptyList".into(), Tag::EmptyList(10));
+        data.insert("ModLongs".into(), Tag::LongArray(vec![5, -6, 7]));
+        data.insert("ModInts".into(), Tag::IntArray(vec![-1, 2]));
+        write_level_fields(&path, &root_name, &root, &data);
+
+        let mut save = WorldSave::open(&saves, "Unknown").unwrap();
+        let state = WorldState {
+            total_time: 2_400,
+            day_time: 1_200,
+            spawn_position: [4, 70, -9],
+            raining: true,
+            rain_time: 10,
+            thundering: false,
+            thunder_time: 0,
+        };
+        save.save_snapshot(&sample_player(), &state).unwrap();
+
+        let (name, _, after) = read_level_fields(&path);
+        assert_eq!(name, root_name);
+        assert_eq!(after.get("ModCompound"), Some(&Tag::Compound(custom)));
+        assert_eq!(after.get("ModEmptyList"), Some(&Tag::EmptyList(10)));
+        assert_eq!(after.get("ModLongs"), Some(&Tag::LongArray(vec![5, -6, 7])));
+        assert_eq!(after.get("ModInts"), Some(&Tag::IntArray(vec![-1, 2])));
+        // Known vanilla tags are refreshed alongside the preserved ones.
+        assert_eq!(after.get("LevelName"), Some(&Tag::String("Unknown".into())));
+        assert_eq!(after.get("DayTime"), Some(&Tag::Long(1_200)));
+        let _ = fs::remove_dir_all(saves);
+    }
+
+    #[test]
+    fn player_save_keeps_unknown_player_fields() {
+        let saves = temp_saves_dir("player-unknown");
+        let mut save = WorldSave::create(&saves, "Player Mods", 31, WorldMode::Survival).unwrap();
+        save.save_player_state(&sample_player()).unwrap();
+        let path = saves.join("Player Mods").join(LEVEL_FILE);
+        drop(save);
+
+        let (root_name, root, mut data) = read_level_fields(&path);
+        let mut player = data
+            .get("Player")
+            .and_then(Tag::as_compound)
+            .cloned()
+            .expect("saved player tag");
+        player.insert("NeonAbility".into(), Tag::Int(9));
+        let mut custom = IndexMap::new();
+        custom.insert("charge".into(), Tag::Double(1.5));
+        player.insert("NeonState".into(), Tag::Compound(custom.clone()));
+        data.insert("Player".into(), Tag::Compound(player));
+        write_level_fields(&path, &root_name, &root, &data);
+
+        let mut save = WorldSave::open(&saves, "Player Mods").unwrap();
+        let mut changed = sample_player();
+        changed.health = 9.5;
+        save.save_player_state(&changed).unwrap();
+        drop(save);
+
+        let (_, _, after) = read_level_fields(&path);
+        let player = after
+            .get("Player")
+            .and_then(Tag::as_compound)
+            .expect("player survives");
+        assert_eq!(player.get("NeonAbility"), Some(&Tag::Int(9)));
+        assert_eq!(player.get("NeonState"), Some(&Tag::Compound(custom)));
+        assert_eq!(player.get("HealF"), Some(&Tag::Float(9.5)));
+        assert_eq!(
+            WorldSave::open(&saves, "Player Mods")
+                .unwrap()
+                .load_player_state()
+                .unwrap()
+                .unwrap()
+                .health,
+            9.5
+        );
+        let _ = fs::remove_dir_all(saves);
+    }
+
+    #[test]
+    fn saving_keeps_the_previous_level_dat_and_recovers_from_a_truncated_one() {
+        let saves = temp_saves_dir("level-backup");
+        let mut save = WorldSave::create(&saves, "Backup", 5, WorldMode::Survival).unwrap();
+        let level = saves.join("Backup").join(LEVEL_FILE);
+        let backup = saves.join("Backup").join("level.dat.bak");
+
+        let mut state = WorldState {
+            total_time: 100,
+            ..WorldState::default()
+        };
+        save.save_world_state(&state).unwrap();
+        let first = fs::read(&level).unwrap();
+
+        state.total_time = 200;
+        save.save_world_state(&state).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), first);
+        assert_ne!(fs::read(&level).unwrap(), first);
+
+        // A process dying mid-write must leave the backup loadable.
+        fs::write(&level, b"truncated gzip").unwrap();
+        let reopened = WorldSave::open(&saves, "Backup").unwrap();
+        assert_eq!(reopened.world_state().total_time, 100);
         let _ = fs::remove_dir_all(saves);
     }
 }

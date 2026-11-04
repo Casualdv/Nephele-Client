@@ -265,10 +265,7 @@ fn draw_weather(bg: &mut UiBatch, hud: &HudState<'_>, scale: f32, width: f32, he
             let base = (((seed >> 24) & 0xFF) as f32 / 255.0) * height;
             let y = (base + hud.clock * speed) % span - s(14.0);
             let length = s(10.0) + ((seed >> 8) & 7) as f32 * s(1.5);
-            bg.rect(
-                Rect::new(x, y, s(1.4), length),
-                [0.62, 0.72, 0.92, 0.50],
-            );
+            bg.rect(Rect::new(x, y, s(1.4), length), [0.62, 0.72, 0.92, 0.50]);
         }
     }
     if hud.lightning > 0.01 {
@@ -1120,7 +1117,17 @@ pub fn draw_worlds(
     let top = ((height - block_h) / 2.0).max(s(2.0));
     let panel_w = s(360.0).min(width - s(8.0));
     let panel_x = cx - panel_w / 2.0;
-    fg.text_centered(if backups { "Restore World Backup" } else { "Select World" }, cx, top, scale * 1.5, TEXT);
+    fg.text_centered(
+        if backups {
+            "Restore World Backup"
+        } else {
+            "Select World"
+        },
+        cx,
+        top,
+        scale * 1.5,
+        TEXT,
+    );
 
     let list_rect = Rect::new(panel_x, top + s(20.0), panel_w, list_h);
     bg.rect(list_rect, PANEL);
@@ -1129,7 +1136,11 @@ pub fn draw_worlds(
     let visible = worlds.len().saturating_sub(scroll).min(WORLD_ROWS);
     if worlds.is_empty() {
         fg.text_centered(
-            if backups { "No backups saved yet" } else { "No worlds saved yet - create one" },
+            if backups {
+                "No backups saved yet"
+            } else {
+                "No worlds saved yet - create one"
+            },
             cx,
             list_rect.y + list_h / 2.0 - s(4.0),
             scale,
@@ -1177,7 +1188,11 @@ pub fn draw_worlds(
             TEXT,
         );
         fg.text(
-            &if backups { format!("Snapshot {}  Seed: {}", world.directory, world.seed) } else { format!("Seed: {}  Mode: {}", world.seed, world.mode.as_str()) },
+            &if backups {
+                format!("Snapshot {}  Seed: {}", world.directory, world.seed)
+            } else {
+                format!("Seed: {}  Mode: {}", world.seed, world.mode.as_str())
+            },
             row.x + s(5.0),
             row.y + s(11.0),
             scale,
@@ -1196,14 +1211,27 @@ pub fn draw_worlds(
     );
     let can_manage = selected_directory.is_some();
     let mut button = |rect: Rect, label: &str, action: Action, enabled: bool| {
-        draw_button_state(bg, fg, rect, label, scale, enabled && hovered(pointer, &rect), enabled);
+        draw_button_state(
+            bg,
+            fg,
+            rect,
+            label,
+            scale,
+            enabled && hovered(pointer, &rect),
+            enabled,
+        );
         if enabled {
             buttons.push(Button { action, rect });
         }
     };
     let second_button_y = first_button_y + s(24.0);
     if backups {
-        button(play, "Restore Copy", Action::WorldRestoreSelected, can_manage);
+        button(
+            play,
+            "Restore Copy",
+            Action::WorldRestoreSelected,
+            can_manage,
+        );
         button(new_world, "Back", Action::Singleplayer, true);
     } else {
         button(play, "Play Selected", Action::WorldOpenSelected, can_manage);
@@ -1218,7 +1246,12 @@ pub fn draw_worlds(
         let gap = s(3.0);
         let small_w = (panel_w - gap * 4.0) / 5.0;
         for (i, (label, action, enabled)) in controls.into_iter().enumerate() {
-            let rect = Rect::new(panel_x + (small_w + gap) * i as f32, second_button_y, small_w, s(20.0));
+            let rect = Rect::new(
+                panel_x + (small_w + gap) * i as f32,
+                second_button_y,
+                small_w,
+                s(20.0),
+            );
             button(rect, label, action, enabled);
         }
     }
@@ -1227,7 +1260,11 @@ pub fn draw_worlds(
         fg.text_centered(error, cx, second_button_y + s(28.0), scale, OFFLINE);
     } else {
         fg.text_centered(
-            if backups { "Restores a separate playable copy" } else { "Select a world, then choose an action" },
+            if backups {
+                "Restores a separate playable copy"
+            } else {
+                "Select a world, then choose an action"
+            },
             cx,
             second_button_y + s(28.0),
             scale,
@@ -1937,7 +1974,7 @@ mod tests {
         let mut bg = UiBatch::default();
         let mut fg = UiBatch::default();
         let first = draw_worlds(
-            &mut bg, &mut fg, &worlds, None, 0, None, None, 2.0, 1280.0, 720.0,
+            &mut bg, &mut fg, &worlds, false, None, 0, None, None, 2.0, 1280.0, 720.0,
         );
         assert!(first
             .iter()
@@ -1951,11 +1988,27 @@ mod tests {
         assert!(!first
             .iter()
             .any(|button| button.action == Action::WorldOpenSelected));
-        assert!(!first.iter().any(|button| button.action == Action::WorldBackupSelected));
+        assert!(!first
+            .iter()
+            .any(|button| button.action == Action::WorldBackupSelected));
         rect_of(&first, Action::WorldBrowseBackups);
-        let archived = draw_worlds(&mut bg, &mut fg, &worlds, true, Some("World 3"), 0, None, None, 2.0, 1280.0, 720.0);
+        let archived = draw_worlds(
+            &mut bg,
+            &mut fg,
+            &worlds,
+            true,
+            Some("World 3"),
+            0,
+            None,
+            None,
+            2.0,
+            1280.0,
+            720.0,
+        );
         rect_of(&archived, Action::WorldRestoreSelected);
-        assert!(!archived.iter().any(|button| button.action == Action::WorldDeleteSelected));
+        assert!(!archived
+            .iter()
+            .any(|button| button.action == Action::WorldDeleteSelected));
         let first_row = rect_of(&first, Action::WorldSelect(0));
         assert_eq!(
             hit_test(
@@ -2114,6 +2167,11 @@ mod tests {
             captured: false,
             chatting: false,
             window_slots: None,
+            day_time: 6_000,
+            raining: false,
+            thundering: false,
+            lightning: 0.0,
+            clock: 0.0,
         }
     }
 
