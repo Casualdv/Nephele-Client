@@ -365,6 +365,63 @@ async fn play_disconnect_returns_the_server_reason() {
     server.await.unwrap();
 }
 
+#[tokio::test]
+async fn a_cancelled_read_keeps_the_partial_frame() {
+    let (listener, port) = accept_one().await;
+
+    let (mut client, accepted) = tokio::join!(connect(port), listener.accept());
+    let (mut peer, _) = accepted.unwrap();
+    // Synthetic body: restarting the old reader at this split interprets
+    // the tail as the reported 138761173-byte outer length.
+    let mut data = vec![0; 200];
+    let false_header = nephele_protocol::encode_varint(138_761_173);
+    data[1..1 + false_header.len()].copy_from_slice(&false_header);
+    let packet = Packet::new(0x55, data);
+    let frame = nephele_protocol::framing::encode_frame(&packet.to_payload(), None).unwrap();
+    let (head, tail) = frame.split_at(4);
+    peer.write_all(head).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), client.read_packet())
+            .await
+            .is_err()
+    );
+    peer.write_all(tail).await.unwrap();
+    let actual = tokio::time::timeout(Duration::from_secs(2), client.read_packet())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual, packet);
+}
+
+#[tokio::test]
+async fn an_oversized_frame_length_is_rejected_before_waiting_for_a_body() {
+    let (listener, port) = accept_one().await;
+
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // A length prefix larger than the 2 MiB cap, and no body at all: the
+        // reader must reject it instead of blocking until the body arrives.
+        let prefix =
+            nephele_protocol::encode_varint((nephele_protocol::framing::MAX_PACKET_LEN + 1) as i32);
+        stream.write_all(&prefix).await.unwrap();
+        stream.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    });
+
+    let mut client = connect(port).await;
+    client.set_state(State::Play);
+    let error = tokio::time::timeout(Duration::from_secs(5), client.read_packet())
+        .await
+        .expect("the oversized length must not block")
+        .expect_err("an oversized frame must be rejected");
+    assert!(matches!(
+        error,
+        nephele_protocol::Error::PacketTooLarge { .. }
+    ));
+
+    server.await.unwrap();
+}
+
 /// Sanity check that `Connection::from_stream` handles a socket produced by
 /// `TcpStream::connect` too (keeps the test helper honest).
 #[allow(dead_code)]

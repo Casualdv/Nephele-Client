@@ -166,6 +166,15 @@ impl StoredSession {
             .map_err(|err| AuthError::Io(format!("{}: {err}", path.display())))
     }
 
+    /// Whether the cached Minecraft token has expired.
+    ///
+    /// The device-code flow keeps no refresh token, so an expired session cannot
+    /// be renewed silently: the join call fails with Microsoft's opaque 403. The
+    /// caller checks this first so the player is told to sign in again instead.
+    pub fn is_expired(&self) -> bool {
+        unix_now() + 60 >= self.expires_at
+    }
+
     pub fn save(&self, path: &std::path::Path) -> Result<(), AuthError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -527,6 +536,21 @@ mod tests {
     fn form_bodies_are_percent_encoded() {
         let body = form(&[("scope", "service::user.auth.xboxlive.com::MBI_SSL")]);
         assert!(body.starts_with("scope=service%3A%3Auser.auth.xboxlive.com"));
+    }
+
+    #[test]
+    fn an_expired_stored_session_is_detected() {
+        let mut stored = StoredSession {
+            client_id: "id".into(),
+            access_token: "token".into(),
+            expires_at: unix_now() + 3600,
+            id: "uuid".into(),
+            name: "name".into(),
+            refresh_token: None,
+        };
+        assert!(!stored.is_expired());
+        stored.expires_at = unix_now() - 1;
+        assert!(stored.is_expired());
     }
 
     #[test]

@@ -64,6 +64,11 @@ const DOOR_WEST: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [3.0, 16.0, 16.0])];
 /// A standing torch: 2x10x2, centred, resting on the block floor.
 const TORCH: &[ShapeBox] = &[b([7.0, 0.0, 7.0], [9.0, 10.0, 9.0])];
 
+/// A pressure plate's selection bounds: inset 1/16 on each side and 1/16 tall.
+const PLATE: &[ShapeBox] = &[b([1.0, 0.0, 1.0], [15.0, 1.0, 15.0])];
+/// The same plate while pressed, at half its thickness.
+const PLATE_PRESSED: &[ShapeBox] = &[b([1.0, 0.0, 1.0], [15.0, 0.5, 15.0])];
+
 /// Horizontal pane connections around one block.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PaneConnections {
@@ -234,10 +239,29 @@ pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
             }
         }
         50 => TORCH,
+        // Stone, wooden, weighted iron and weighted gold plates. Metadata is
+        // the pressed flag for the first two and the redstone strength for the
+        // weighted ones; either way a non-zero value means pressed.
+        70 | 72 | 147 | 148 => {
+            if meta != 0 {
+                PLATE_PRESSED
+            } else {
+                PLATE
+            }
+        }
         // Air and blocks with no model yet.
         0 => EMPTY,
         _ => FULL,
     }
+}
+
+/// Whether entities collide with `state`.
+///
+/// Vanilla's `BlockBasePressurePlate.getCollisionBoundingBox` returns null for
+/// every plate, so a player walks through it and stands on the block below.
+/// The 1/16 box is the selection/render shape, not a collision volume.
+pub fn has_collision(state: BlockState) -> bool {
+    !matches!(state.id(), 70 | 72 | 147 | 148) && blocks_movement(state)
 }
 
 /// Whether every box fills the block (so the mesher can use the cube path).
@@ -380,6 +404,30 @@ mod tests {
         world.set_block(4, 63, 4, BlockState::STONE);
         assert!(!place_door(&mut world, 4, 64, 4, 64, 0.0));
         assert!(world.get_block(4, 64, 4).is_air());
+    }
+
+    #[test]
+    fn pressure_plates_are_a_sixteenth_high_and_walk_through() {
+        let plate = block_shape(72, 0);
+        assert_eq!(plate.len(), 1);
+        assert_eq!(
+            plate[0].max[1], 1.0,
+            "one pixel is 1/16 of a block, not the old full cube"
+        );
+        assert_eq!(plate[0].min[0], 1.0);
+        assert_eq!(plate[0].max[0], 15.0);
+        assert_eq!(
+            block_shape(72, 1)[0].max[1],
+            0.5,
+            "pressed plates are lower"
+        );
+
+        for id in [70u16, 72, 147, 148] {
+            assert!(!has_collision(BlockState::new(id, 0)), "id {id}");
+            assert!(!is_full_cube(block_shape(id, 0)), "id {id}");
+        }
+        assert!(has_collision(BlockState::new(44, 0)), "slabs still collide");
+        assert!(has_collision(BlockState::STONE));
     }
 
     #[test]

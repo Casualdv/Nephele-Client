@@ -7,11 +7,32 @@ pub const MAX_STRING_CHARS: usize = 32767;
 pub struct PacketReader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Set when this reader belongs to a [`crate::Packet`]; updated on every
+    /// read so the caller can verify the parser consumed the whole payload.
+    consumed: Option<&'a std::sync::atomic::AtomicUsize>,
 }
 
 impl<'a> PacketReader<'a> {
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            consumed: None,
+        }
+    }
+
+    pub(crate) fn tracked(buf: &'a [u8], consumed: &'a std::sync::atomic::AtomicUsize) -> Self {
+        Self {
+            buf,
+            consumed: Some(consumed),
+            pos: 0,
+        }
+    }
+
+    fn note(&self) {
+        if let Some(cell) = self.consumed {
+            cell.fetch_max(self.pos, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub fn position(&self) -> usize {
@@ -32,12 +53,14 @@ impl<'a> PacketReader<'a> {
         }
         let slice = &self.buf[self.pos..self.pos + n];
         self.pos += n;
+        self.note();
         Ok(slice)
     }
 
     pub fn read_remaining(&mut self) -> &'a [u8] {
         let slice = &self.buf[self.pos..];
         self.pos = self.buf.len();
+        self.note();
         slice
     }
 

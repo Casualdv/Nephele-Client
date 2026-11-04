@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -107,7 +108,37 @@ pub struct Connection {
     /// Decrypting on arrival would have turned the post-handshake packet into
     /// unparsed garbage.
     decrypted: usize,
+    /// Opt-in (`NEPHELE_TRACE=1`) ring of the most recently parsed frames.
+    /// Dumped when a frame length or body is rejected, so a desync names the
+    /// packet it followed instead of only showing the garbage length.
+    trace: Option<VecDeque<TraceFrame>>,
+    /// `NEPHELE_TRACE_CAPTURE=<path>` appends every parsed packet as
+    /// `id length hex`, for turning a real-server bug into a test fixture.
+    capture: Option<std::fs::File>,
+    /// `NEPHELE_TRACE_RAW=<path>` appends play-state frames after compression
+    /// is decoded, each with a plain VarInt length prefix. The replay test
+    /// feeds this file back through the framer without a server.
+    raw_capture: Option<std::fs::File>,
+    raw_bytes: usize,
 }
+
+/// One parsed frame, kept for `NEPHELE_TRACE`.
+#[derive(Debug, Clone)]
+struct TraceFrame {
+    id: i32,
+    /// Frame body length on the wire (everything after the length VarInt).
+    length: usize,
+    /// Payload bytes the parser actually read. `None` until the client has
+    /// handled the packet.
+    consumed: Option<usize>,
+    payload_len: usize,
+    skipped: bool,
+}
+
+const TRACE_FRAMES: usize = 16;
+/// Default cap for `NEPHELE_TRACE_RAW`, in bytes (4 MiB is ~a minute of a busy
+/// lobby, which is plenty for a replay fixture).
+const RAW_CAPTURE_MAX: usize = 4 * 1024 * 1024;
 
 impl Connection {
     pub async fn connect(address: &ServerAddress) -> Result<Self> {
@@ -121,6 +152,10 @@ impl Connection {
             dec: None,
             buffer: Vec::new(),
             decrypted: 0,
+            trace: trace_enabled().then(|| VecDeque::with_capacity(TRACE_FRAMES)),
+            capture: capture_file(),
+            raw_capture: raw_capture_file(),
+            raw_bytes: 0,
         })
     }
 
@@ -135,6 +170,10 @@ impl Connection {
             dec: None,
             buffer: Vec::new(),
             decrypted: 0,
+            trace: trace_enabled().then(|| VecDeque::with_capacity(TRACE_FRAMES)),
+            capture: capture_file(),
+            raw_capture: raw_capture_file(),
+            raw_bytes: 0,
         }
     }
 
@@ -333,10 +372,14 @@ impl Connection {
         };
 
         if length <= 0 {
+            self.dump_trace(&format!("invalid frame length {length}"));
             return Err(Error::Protocol(format!("invalid frame length {length}")));
         }
         let length = length as usize;
         if length > MAX_PACKET_LEN {
+            self.dump_trace(&format!(
+                "outer VarInt: wire_body_declared={length} limit={MAX_PACKET_LEN} wire_header_consumed={header}"
+            ));
             return Err(Error::PacketTooLarge {
                 len: length,
                 max: MAX_PACKET_LEN,
@@ -344,15 +387,119 @@ impl Connection {
         }
 
         while self.buffer.len() < header + length {
-            self.fill().await?;
+            self.fill().await.inspect_err(|_| {
+                self.dump_trace(&format!(
+                    "socket read failed: buffered_wire_bytes={} frame_declared={length}",
+                    self.buffer.len()
+                ));
+            })?;
         }
         self.decrypt_upto(header + length);
 
         let body: Vec<u8> = self.buffer[header..header + length].to_vec();
         self.buffer.drain(..header + length);
         self.decrypted -= header + length;
-        let payload = decode_body(&body, self.threshold)?;
-        Packet::from_payload(&payload)
+
+        let payload = match decode_body(&body, self.threshold) {
+            Ok(payload) => payload,
+            Err(err) => {
+                self.dump_trace(&format!("decode failed: wire_body={}", body.len()));
+                return Err(err);
+            }
+        };
+        self.raw_capture_payload(&payload);
+
+        let packet = Packet::from_payload(&payload).inspect_err(|_| {
+            self.dump_trace(&format!(
+                "invalid packet ID: wire_body={} decoded_with_id={}",
+                body.len(),
+                payload.len()
+            ));
+        })?;
+        self.record_trace(&packet, body.len());
+        Ok(packet)
+    }
+
+    /// Append this frame's *decoded* payload to `NEPHELE_TRACE_RAW`.
+    ///
+    /// Compression is per-frame, so the replay capture stores plain payloads
+    /// with a normal length prefix: the framing bug being guarded against is the
+    /// same either way, and a replay then needs no threshold.
+    fn raw_capture_payload(&mut self, payload: &[u8]) {
+        if self.state != State::Play {
+            return;
+        }
+        let Some(file) = self.raw_capture.as_mut() else {
+            return;
+        };
+        if self.raw_bytes + payload.len() > RAW_CAPTURE_MAX {
+            return;
+        }
+        let Ok(frame) = encode_frame(payload, None) else {
+            return;
+        };
+        use std::io::Write;
+        if file.write_all(&frame).is_ok() {
+            self.raw_bytes += frame.len();
+        }
+    }
+
+    /// Remember the last few parsed frames so a desync can be attributed.
+    fn record_trace(&mut self, packet: &Packet, frame_length: usize) {
+        if let Some(capture) = self.capture.as_mut() {
+            use std::io::Write;
+            // Login and play packet ids overlap, so record the state too.
+            let _ = writeln!(
+                capture,
+                "{} {:02X} {} {}",
+                self.state.name(),
+                packet.id,
+                frame_length,
+                hex(&packet.data)
+            );
+        }
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        if trace.len() == TRACE_FRAMES {
+            trace.pop_front();
+        }
+        trace.push_back(TraceFrame {
+            id: packet.id,
+            length: frame_length,
+            consumed: None,
+            payload_len: packet.data.len(),
+            skipped: false,
+        });
+    }
+
+    /// Record how many payload bytes the client's parser read from the most
+    /// recently returned packet. Kept separate from `record_trace` because the
+    /// connection hands the packet out before anything parses it.
+    pub fn note_consumed(&mut self, consumed: usize, skipped: bool) {
+        if let Some(frame) = self.trace.as_mut().and_then(|trace| trace.back_mut()) {
+            frame.consumed = Some(consumed);
+            frame.skipped = skipped;
+        }
+    }
+
+    /// Print the frame ring to stderr when `NEPHELE_TRACE=1` is set.
+    pub fn dump_trace(&self, reason: &str) {
+        let Some(trace) = self.trace.as_ref() else {
+            return;
+        };
+        eprintln!("[nephele trace] {reason}");
+        eprintln!("[nephele trace] last {} parsed frames:", trace.len());
+        for frame in trace {
+            let consumed = frame
+                .consumed
+                .map(|bar| bar.to_string())
+                .unwrap_or_else(|| "-".into());
+            eprintln!(
+                "[nephele trace] id=0x{:02X} wire_body={} decoded_payload={} parser_consumed={} skipped={}",
+                frame.id, frame.length, frame.payload_len, consumed, frame.skipped
+            );
+        }
     }
 
     pub async fn write_packet(&mut self, packet: &Packet) -> Result<()> {
@@ -428,6 +575,36 @@ pub async fn ping(address: &ServerAddress, timeout: Duration) -> Result<StatusRe
     })
     .await
     .map_err(|_| Error::Protocol(format!("timed out pinging {address}")))?
+}
+
+/// `NEPHELE_TRACE=1` turns on the frame ring dump.
+fn trace_enabled() -> bool {
+    std::env::var("NEPHELE_TRACE").is_ok_and(|value| value == "1")
+}
+
+/// `NEPHELE_TRACE_CAPTURE=<path>` opens an append log of every parsed packet.
+fn capture_file() -> Option<std::fs::File> {
+    let path = std::env::var_os("NEPHELE_TRACE_CAPTURE")?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// `NEPHELE_TRACE_RAW=<path>` opens an append log of exact wire frames.
+fn raw_capture_file() -> Option<std::fs::File> {
+    let path = std::env::var_os("NEPHELE_TRACE_RAW")?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
+/// Lowercase hex, for the trace dump.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Decode a VarInt at the start of `bytes` without consuming anything.

@@ -47,6 +47,7 @@ pub mod clientbound {
     pub const DISCONNECT: i32 = 0x40;
     pub const SERVER_DIFFICULTY: i32 = 0x41;
     pub const SET_COMPRESSION: i32 = 0x46;
+    pub const RESOURCE_PACK_SEND: i32 = 0x48;
 }
 
 /// Serverbound packet ids for protocol 47 (Minecraft 1.8.9).
@@ -67,6 +68,7 @@ pub mod serverbound {
     pub const CLIENT_SETTINGS: i32 = 0x15;
     pub const CLIENT_STATUS: i32 = 0x16;
     pub const PLUGIN_MESSAGE: i32 = 0x17;
+    pub const RESOURCE_PACK_STATUS: i32 = 0x19;
 }
 
 /// `C07 Packet Player Digging` status values (`C07PacketPlayerDigging.Action`
@@ -249,11 +251,42 @@ pub fn parse_chat_message(packet: &Packet) -> Result<(String, u8)> {
     let mut r = packet.reader();
     let json = r.read_string()?;
     let position = r.read_u8()?;
+    // The 1.8 packet is exactly a string plus one byte. Trailing bytes mean the
+    // string length or encoding is wrong, which is how a parser desync starts;
+    // fail here instead of letting the stream drift.
+    if !r.is_empty() {
+        return Err(crate::error::Error::Protocol(format!(
+            "chat packet has {} trailing byte(s)",
+            r.remaining()
+        )));
+    }
     let text = match serde_json::from_str::<serde_json::Value>(&json) {
         Ok(value) => flatten_chat(&value),
         Err(_) => json,
     };
     Ok((text, position))
+}
+
+/// `S48`: the server offers a resource pack (URL + SHA-1 hex).
+pub fn parse_resource_pack_send(packet: &Packet) -> Result<(String, String)> {
+    let mut r = packet.reader();
+    Ok((r.read_string()?, r.read_string_max(40)?))
+}
+
+/// Status values for the serverbound `C19`.
+pub mod resource_pack_status {
+    pub const LOADED: i32 = 0;
+    pub const DECLINED: i32 = 1;
+    pub const FAILED: i32 = 2;
+    pub const ACCEPTED: i32 = 3;
+}
+
+/// `C19`: answer a resource-pack offer. Servers wait for this before letting
+/// the player through; declining is the honest answer when we do not download.
+pub fn resource_pack_status(hash: &str, status: i32) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_string(hash).write_varint(status);
+    Packet::new(serverbound::RESOURCE_PACK_STATUS, w.into_bytes())
 }
 
 pub fn parse_disconnect(packet: &Packet) -> Result<String> {
@@ -336,6 +369,16 @@ pub fn parse_block_entity_update(packet: &Packet) -> Result<BlockEntityUpdate> {
         action,
         nbt: packet.data[nbt_start..].to_vec(),
     })
+}
+
+/// `S00`: the server's keep-alive ping.
+///
+/// Protocol 47 carries a VarInt id; the client has to echo it back on the
+/// serverbound `C00` or the server drops the connection after roughly 30
+/// seconds (which Hypixel shows as being routed to limbo).
+pub fn parse_keep_alive(packet: &Packet) -> Result<i32> {
+    let mut r = packet.reader();
+    r.read_varint()
 }
 
 pub fn keep_alive_response(id: i32) -> Packet {
@@ -722,7 +765,9 @@ pub struct UpdateHealth {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Respawn {
-    pub dimension: i8,
+    /// Protocol 47 sends the dimension as a full int here (unlike Join Game,
+    /// which sends a byte).
+    pub dimension: i32,
     pub difficulty: u8,
     pub gamemode: u8,
     pub level_type: String,
@@ -759,7 +804,7 @@ pub fn parse_update_health(packet: &Packet) -> Result<UpdateHealth> {
 pub fn parse_respawn(packet: &Packet) -> Result<Respawn> {
     let mut r = packet.reader();
     Ok(Respawn {
-        dimension: r.read_i8()?,
+        dimension: r.read_i32()?,
         difficulty: r.read_u8()?,
         gamemode: r.read_u8()?,
         level_type: r.read_string()?,
@@ -810,7 +855,8 @@ fn read_fixed_point(r: &mut crate::read::PacketReader<'_>) -> Result<f64> {
 pub struct SpawnPlayer {
     pub entity_id: i32,
     pub uuid: [u8; 16],
-    pub name: String,
+    /// Item id the player is holding (`currentItem`, protocol 47 only).
+    pub current_item: i16,
     pub x: f64,
     pub y: f64,
     pub z: f64,
@@ -818,21 +864,29 @@ pub struct SpawnPlayer {
     pub pitch: f32,
 }
 
+/// `S0C Spawn Player`. Protocol 47 carries no name: it is the UUID plus
+/// `currentItem` short, and the name/skin come from the tab list. Entity
+/// metadata follows; it is not needed to draw the player, so it is left in the
+/// packet.
 pub fn parse_spawn_player(packet: &Packet) -> Result<SpawnPlayer> {
     let mut r = packet.reader();
     let entity_id = r.read_varint()?;
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(r.take(16)?);
-    let name = r.read_string()?;
     let x = read_fixed_point(&mut r)?;
     let y = read_fixed_point(&mut r)?;
     let z = read_fixed_point(&mut r)?;
     let yaw = angle_from_byte(r.read_u8()?);
     let pitch = angle_from_byte(r.read_u8()?);
+    let current_item = r.read_i16()?;
+    // Metadata is the packet's last field. Skipping it is what keeps the
+    // parser honest: under-reading here is indistinguishable from a bad frame
+    // length to a stream-based reader.
+    skip_entity_metadata(&mut r)?;
     Ok(SpawnPlayer {
         entity_id,
         uuid,
-        name,
+        current_item,
         x,
         y,
         z,
@@ -868,6 +922,11 @@ pub fn parse_spawn_mob(packet: &Packet) -> Result<SpawnMob> {
     let yaw = angle_from_byte(r.read_u8()?);
     let pitch = angle_from_byte(r.read_u8()?);
     let head_pitch = angle_from_byte(r.read_u8()?);
+    // Velocity (three shorts), then the metadata trailer.
+    r.read_i16()?;
+    r.read_i16()?;
+    r.read_i16()?;
+    skip_entity_metadata(&mut r)?;
     Ok(SpawnMob {
         entity_id,
         kind,
@@ -887,6 +946,7 @@ pub struct EntityMove {
     pub dx: f64,
     pub dy: f64,
     pub dz: f64,
+    pub on_ground: bool,
 }
 
 fn read_delta(r: &mut crate::read::PacketReader<'_>) -> Result<f64> {
@@ -900,6 +960,7 @@ pub fn parse_entity_relative_move(packet: &Packet) -> Result<EntityMove> {
         dx: read_delta(&mut r)?,
         dy: read_delta(&mut r)?,
         dz: read_delta(&mut r)?,
+        on_ground: r.read_bool()?,
     })
 }
 
@@ -909,6 +970,7 @@ pub struct EntityLookAngles {
     pub entity_id: i32,
     pub yaw: f32,
     pub pitch: f32,
+    pub on_ground: bool,
 }
 
 pub fn parse_entity_look(packet: &Packet) -> Result<EntityLookAngles> {
@@ -917,6 +979,7 @@ pub fn parse_entity_look(packet: &Packet) -> Result<EntityLookAngles> {
         entity_id: r.read_varint()?,
         yaw: angle_from_byte(r.read_u8()?),
         pitch: angle_from_byte(r.read_u8()?),
+        on_ground: r.read_bool()?,
     })
 }
 
@@ -929,6 +992,7 @@ pub struct EntityLookAndMove {
     pub dz: f64,
     pub yaw: f32,
     pub pitch: f32,
+    pub on_ground: bool,
 }
 
 pub fn parse_entity_look_and_relative_move(packet: &Packet) -> Result<EntityLookAndMove> {
@@ -940,6 +1004,7 @@ pub fn parse_entity_look_and_relative_move(packet: &Packet) -> Result<EntityLook
         dz: read_delta(&mut r)?,
         yaw: angle_from_byte(r.read_u8()?),
         pitch: angle_from_byte(r.read_u8()?),
+        on_ground: r.read_bool()?,
     })
 }
 
@@ -952,6 +1017,7 @@ pub struct EntityTeleport {
     pub z: f64,
     pub yaw: f32,
     pub pitch: f32,
+    pub on_ground: bool,
 }
 
 pub fn parse_entity_teleport(packet: &Packet) -> Result<EntityTeleport> {
@@ -963,6 +1029,7 @@ pub fn parse_entity_teleport(packet: &Packet) -> Result<EntityTeleport> {
         z: read_fixed_point(&mut r)?,
         yaw: angle_from_byte(r.read_u8()?),
         pitch: angle_from_byte(r.read_u8()?),
+        on_ground: r.read_bool()?,
     })
 }
 
@@ -1003,10 +1070,64 @@ pub fn parse_destroy_entities(packet: &Packet) -> Result<Vec<i32>> {
     Ok(ids)
 }
 
-/// `S14`: entity is still alive, only its id is sent (keep-alive for the
-/// client's own entity cache).
+/// `S14`: entity is still alive. Protocol 47 still appends a metadata trailer.
 pub fn parse_entity(packet: &Packet) -> Result<i32> {
-    packet.reader().read_varint()
+    let mut r = packet.reader();
+    let entity_id = r.read_varint()?;
+    skip_entity_metadata(&mut r)?;
+    Ok(entity_id)
+}
+
+/// `S1C`: a metadata-only update for an existing entity.
+pub fn parse_entity_metadata(packet: &Packet) -> Result<i32> {
+    let mut r = packet.reader();
+    let entity_id = r.read_varint()?;
+    skip_entity_metadata(&mut r)?;
+    Ok(entity_id)
+}
+
+/// Skip the `EntityMetadata` trailer.
+///
+/// Each entry is `(type << 5) | index`, terminated by `0x7F`. Values are fixed
+/// width except strings and slots; a slot may carry a full NBT tree. There is
+/// no index bounds check because vanilla accepts arbitrary indices.
+pub fn skip_entity_metadata(reader: &mut crate::read::PacketReader<'_>) -> Result<()> {
+    loop {
+        let header = reader.read_u8()?;
+        if header == 0x7F {
+            return Ok(());
+        }
+        match header >> 5 {
+            0 => {
+                reader.read_u8()?;
+            }
+            1 => {
+                reader.read_u16()?;
+            }
+            2 => {
+                reader.read_i32()?;
+            }
+            3 => {
+                reader.read_f32()?;
+            }
+            4 => {
+                reader.read_string()?;
+            }
+            5 => {
+                parse_slot(reader)?;
+            }
+            6 => {
+                reader.read_i32()?;
+                reader.read_i32()?;
+                reader.read_i32()?;
+            }
+            _ => {
+                reader.read_f32()?;
+                reader.read_f32()?;
+                reader.read_f32()?;
+            }
+        }
+    }
 }
 
 /// The object type used for a dropped item stack.
@@ -1040,9 +1161,17 @@ pub fn parse_spawn_object(packet: &Packet) -> Result<SpawnObject> {
     let pitch = angle_from_byte(r.read_u8()?);
     let yaw = angle_from_byte(r.read_u8()?);
     let data = r.read_i32()?;
-    let vx = r.read_i16()? as f64 * VELOCITY_SCALE;
-    let vy = r.read_i16()? as f64 * VELOCITY_SCALE;
-    let vz = r.read_i16()? as f64 * VELOCITY_SCALE;
+    // Vanilla only appends a velocity when `data > 0`. Arrows and some other
+    // objects send `data = 0` with no velocity at all.
+    let velocity = if data > 0 {
+        [
+            r.read_i16()? as f64 * VELOCITY_SCALE,
+            r.read_i16()? as f64 * VELOCITY_SCALE,
+            r.read_i16()? as f64 * VELOCITY_SCALE,
+        ]
+    } else {
+        [0.0; 3]
+    };
     Ok(SpawnObject {
         entity_id,
         kind,
@@ -1052,7 +1181,7 @@ pub fn parse_spawn_object(packet: &Packet) -> Result<SpawnObject> {
         pitch,
         yaw,
         data,
-        velocity: [vx, vy, vz],
+        velocity,
     })
 }
 
@@ -1090,8 +1219,10 @@ pub fn spawn_object(
     w.write_u8(angle_to_byte(pitch))
         .write_u8(angle_to_byte(yaw));
     w.write_i32(data);
-    for value in velocity {
-        w.write_i16((value / VELOCITY_SCALE) as i16);
+    if data > 0 {
+        for value in velocity {
+            w.write_i16((value / VELOCITY_SCALE) as i16);
+        }
     }
     Packet::new(clientbound::SPAWN_OBJECT, w.into_bytes())
 }
@@ -1337,6 +1468,12 @@ mod tests {
     }
 
     #[test]
+    fn keep_alive_ids_round_trip_as_varints() {
+        assert_eq!(parse_keep_alive(&keep_alive_response(300)).unwrap(), 300);
+        assert_eq!(parse_keep_alive(&keep_alive_response(0)).unwrap(), 0);
+    }
+
+    #[test]
     fn keep_alive_echoes_id() {
         let packet = keep_alive_response(7_654_321);
         assert_eq!(packet.id, serverbound::KEEP_ALIVE);
@@ -1370,6 +1507,22 @@ mod tests {
         let mut payload = PacketWriter::new();
         payload.write_string("Nephele").write_u8(0);
         assert!(parse_plugin_brand(payload.as_slice()).is_err());
+    }
+
+    #[test]
+    fn parses_respawn_with_an_int_dimension() {
+        // Protocol 47 sends the dimension as a full int here.
+        let mut w = PacketWriter::new();
+        w.write_i32(-1)
+            .write_u8(3)
+            .write_u8(0)
+            .write_string("default");
+        let respawn =
+            parse_respawn(&Packet::new(clientbound::RESPAWN, w.into_bytes())).expect("respawn");
+        assert_eq!(respawn.dimension, -1);
+        assert_eq!(respawn.difficulty, 3);
+        assert_eq!(respawn.gamemode, 0);
+        assert_eq!(respawn.level_type, "default");
     }
 
     #[test]
@@ -1644,22 +1797,92 @@ mod entity_tests {
         let mut w = PacketWriter::new();
         w.write_varint(99)
             .write_uuid(&uuid)
-            .write_string("Notch")
             .write_i32(32 * 100)
             .write_i32(32 * 64)
             .write_i32(32 * -100)
             .write_u8(deg(90.0))
             .write_u8(deg(45.0))
-            .write_i16(0)
-            .write_bytes(&[0u8; 5]);
+            // `currentItem` short, then entity metadata (immediately ended).
+            .write_i16(276)
+            .write_u8(127);
         let spawn = parse_spawn_player(&Packet::new(clientbound::SPAWN_PLAYER, w.into_bytes()))
             .expect("spawn player");
         assert_eq!(spawn.entity_id, 99);
         assert_eq!(spawn.uuid, uuid);
-        assert_eq!(spawn.name, "Notch");
+        assert_eq!(spawn.current_item, 276);
         assert_eq!((spawn.x, spawn.y, spawn.z), (100.0, 64.0, -100.0));
         assert!((spawn.yaw - 90.0).abs() < 2.0);
         assert!((spawn.pitch - 45.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn spawn_player_consumes_its_metadata_trailer() {
+        let mut w = PacketWriter::new();
+        w.write_varint(7)
+            .write_uuid(&[1u8; 16])
+            .write_i32(32)
+            .write_i32(32 * 2)
+            .write_i32(32 * 3)
+            .write_u8(0)
+            .write_u8(0)
+            .write_i16(0)
+            // Index 0, type 0 (byte), value, end.
+            .write_u8(0x00)
+            .write_u8(42)
+            .write_u8(0x7F);
+        let packet = Packet::new(clientbound::SPAWN_PLAYER, w.into_bytes());
+        let spawn = parse_spawn_player(&packet).expect("spawn player");
+        assert_eq!(spawn.entity_id, 7);
+        assert_eq!(packet.consumed(), packet.data.len());
+    }
+
+    #[test]
+    fn spawn_mob_consumes_velocity_and_metadata() {
+        let mut w = PacketWriter::new();
+        w.write_varint(9)
+            .write_u8(50)
+            .write_i32(32)
+            .write_i32(32 * 64)
+            .write_i32(32 * -8)
+            .write_u8(0)
+            .write_u8(0)
+            .write_u8(0)
+            .write_i16(0)
+            .write_i16(0)
+            .write_i16(0)
+            // Index 1, type 4 (string), value, end.
+            .write_u8((4 << 5) | 1)
+            .write_string("hello")
+            .write_u8(0x7F);
+        let packet = Packet::new(clientbound::SPAWN_MOB, w.into_bytes());
+        let mob = parse_spawn_mob(&packet).expect("spawn mob");
+        assert_eq!(mob.entity_id, 9);
+        assert_eq!(packet.consumed(), packet.data.len());
+    }
+
+    #[test]
+    fn metadata_skipper_walks_every_value_type() {
+        let mut w = PacketWriter::new();
+        w.write_u8(1).write_u8(9); // byte, index 1
+        w.write_u8(1 << 5 | 2).write_i16(-3); // short
+        w.write_u8(2 << 5 | 3).write_i32(4); // int
+        w.write_u8(3 << 5 | 4).write_f32(1.5); // float
+        w.write_u8(4 << 5 | 5).write_string("hi"); // string
+        w.write_u8(5 << 5 | 6).write_i16(-1); // empty slot
+        w.write_u8(6 << 5 | 7)
+            .write_i32(1)
+            .write_i32(2)
+            .write_i32(3); // position
+        w.write_u8(7 << 5 | 8)
+            .write_f32(0.0)
+            .write_f32(90.0)
+            .write_f32(0.0); // rotation
+        w.write_u8(0x7F);
+
+        let bytes = w.into_bytes();
+        let mut reader = crate::read::PacketReader::new(&bytes);
+        skip_entity_metadata(&mut reader).expect("metadata");
+        assert!(reader.is_empty());
     }
 
     #[test]
@@ -1671,7 +1894,8 @@ mod entity_tests {
             .write_i8(-16)
             .write_i8(8)
             .write_u8(deg(180.0))
-            .write_u8(deg(-90.0));
+            .write_u8(deg(-90.0))
+            .write_bool(true);
         let packet = Packet::new(clientbound::ENTITY_LOOK_AND_RELATIVE_MOVE, w.into_bytes());
         let update = parse_entity_look_and_relative_move(&packet).expect("look and move");
         assert_eq!(update.entity_id, 5);
@@ -1689,12 +1913,44 @@ mod entity_tests {
             .write_i32(32 * 70)
             .write_i32(32 * 64)
             .write_u8(0)
-            .write_u8(0);
+            .write_u8(0)
+            .write_bool(false);
         let teleport =
             parse_entity_teleport(&Packet::new(clientbound::ENTITY_TELEPORT, w.into_bytes()))
                 .expect("teleport");
         assert_eq!(teleport.entity_id, 12);
         assert_eq!((teleport.x, teleport.y, teleport.z), (-64.0, 70.0, 64.0));
+    }
+
+    #[test]
+    fn idle_player_packet_is_one_bool() {
+        for on_ground in [true, false] {
+            let packet = player(on_ground);
+            assert_eq!(packet.id, serverbound::PLAYER);
+            let mut reader = packet.reader();
+            assert_eq!(reader.read_bool().unwrap(), on_ground);
+            assert!(reader.is_empty());
+        }
+    }
+
+    #[test]
+    fn resource_pack_offer_and_decline_round_trip() {
+        let mut w = PacketWriter::new();
+        w.write_string("http://example.invalid/pack.zip")
+            .write_string("0123456789abcdef");
+        let (url, hash) = parse_resource_pack_send(&Packet::new(
+            clientbound::RESOURCE_PACK_SEND,
+            w.into_bytes(),
+        ))
+        .expect("offer");
+        assert_eq!(url, "http://example.invalid/pack.zip");
+        assert_eq!(hash, "0123456789abcdef");
+
+        let status = resource_pack_status(&hash, resource_pack_status::DECLINED);
+        assert_eq!(status.id, serverbound::RESOURCE_PACK_STATUS);
+        let mut reader = status.reader();
+        assert_eq!(reader.read_string().unwrap(), hash);
+        assert_eq!(reader.read_varint().unwrap(), 1);
     }
 
     #[test]
@@ -1856,6 +2112,26 @@ mod entity_tests {
         // Item ids are positive in practice, but the low half is signed on the
         // wire, so an empty-ish id must not bleed into the metadata half.
         assert_eq!(item_object_data(0, 5), 0x0005_0000);
+    }
+
+    #[test]
+    fn an_object_without_velocity_still_parses() {
+        // Vanilla omits the three velocity shorts when `data` is not positive.
+        let mut w = PacketWriter::new();
+        w.write_varint(42)
+            .write_u8(60) // arrow
+            .write_i32(32 * 5)
+            .write_i32(32 * 64)
+            .write_i32(32 * -5)
+            .write_u8(0)
+            .write_u8(0)
+            .write_i32(0);
+        let object = parse_spawn_object(&Packet::new(clientbound::SPAWN_OBJECT, w.into_bytes()))
+            .expect("spawn object");
+        assert_eq!(object.entity_id, 42);
+        assert_eq!(object.data, 0);
+        assert_eq!(object.velocity, [0.0; 3]);
+        assert_eq!((object.x, object.y, object.z), (5.0, 64.0, -5.0));
     }
 
     #[test]

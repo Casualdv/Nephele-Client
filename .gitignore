@@ -41,3 +41,7 @@ Cargo.lock.bak
 .idea/
 Thumbs.db
 desktop.ini
+
+# Private multiplayer captures
+/crates/nephele-client/tests/fixtures/hypixel_play_frames.bin
+/crates/nephele-protocol/tests/fixtures/hypixel_chat.hex
