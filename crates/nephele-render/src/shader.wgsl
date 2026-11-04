@@ -47,13 +47,17 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let ddx = dpdx(in.uv);
-    let ddy = dpdy(in.uv);
+    // `in.layer` is a packed tile slot: 16 tiles per 64×64 layer, 4×4 inside.
+    let local = in.layer % 16u;
+    let offset = vec2<f32>(f32(local % 4u), f32(local / 4u));
+    let uv = (in.uv + offset) * 0.25;
+    let ddx = dpdx(uv);
+    let ddy = dpdy(uv);
     var texel = textureSampleGrad(
         block_textures,
         block_sampler,
-        in.uv,
-        i32(in.layer),
+        uv,
+        i32(in.layer / 16u),
         ddx,
         ddy,
     );
@@ -65,11 +69,11 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         let timing = uniforms.animations[in.anim * 2u + 1u];
         let count = max(u32(timing.y), 1u);
         let frame = u32(floor(uniforms.animation.x / max(timing.z, 1.0))) % count;
-        let uv = vec2<f32>(
+        let anim_uv = vec2<f32>(
             frame_info.x + f32(frame) * timing.x + in.uv.x * frame_info.z,
             frame_info.y + in.uv.y * frame_info.w,
         );
-        texel = textureSampleLevel(animation_atlas, block_sampler, uv, 0.0);
+        texel = textureSampleLevel(animation_atlas, block_sampler, anim_uv, 0.0);
     }
 
     // Leaves, glass and other cutout textures use alpha testing.

@@ -93,13 +93,13 @@ impl Viewer {
             Ok(textures) => textures,
             Err(err) => return self.fail(event_loop, err),
         };
-        let referenced = nephele_assets::block_textures::all_texture_names().len();
         println!(
-            "Textures: {} of {} referenced layers loaded ({}x{} px each)",
+            "Textures: {} tiles in {} layers ({}x{} px each, {} unresolved)",
+            textures.tile_count(),
             textures.layer_count(),
-            referenced,
-            textures.tile_size(),
-            textures.tile_size()
+            textures.layer_size(),
+            textures.layer_size(),
+            textures.unresolved_names().len()
         );
 
         let size = window.inner_size();

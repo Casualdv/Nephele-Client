@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn workers_return_meshes_for_every_submitted_job() {
         let layers = Arc::new(TextureArray::from_tiles(vec![(
-            "stone",
+            "stone".to_string(),
             image::RgbaImage::from_pixel(16, 16, image::Rgba([128, 128, 128, 255])),
         )]));
         let mut pool = MeshPool::with_workers(layers, 2);
