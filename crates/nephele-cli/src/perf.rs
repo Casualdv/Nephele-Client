@@ -132,13 +132,8 @@ pub fn process_rss_bytes() -> u64 {
         }
         let mut counters: ProcessMemoryCounters = unsafe { std::mem::zeroed() };
         counters.cb = std::mem::size_of::<ProcessMemoryCounters>() as u32;
-        let ok = unsafe {
-            K32GetProcessMemoryInfo(
-                GetCurrentProcess(),
-                &mut counters,
-                counters.cb,
-            )
-        };
+        let ok =
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
         if ok != 0 {
             return counters.working_set_size as u64;
         }

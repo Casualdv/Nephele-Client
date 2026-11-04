@@ -352,7 +352,7 @@ public static class NephelePerfWindow {
         throw "No baseline at '$baselineFullPath'. Run once with -UpdateBaseline to create it."
     }
 
-    if ($baseline -and -not $StartupOnly) {
+    if ($baseline -and -not $StartupOnly -and -not $UpdateBaseline) {
         $baselineLast = @($baseline.windows)[-1]
         $currentLast = $last
         $p99Limit = [double]$baselineLast.frame_p99_ms * (1.0 + $MaxP99RegressionPct / 100.0)

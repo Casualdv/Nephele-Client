@@ -1,4 +1,4 @@
-﻿use std::time::{Duration, Instant};
+use std::time::{Duration, Instant};
 
 use nephele_assets::{Panorama, SkinAtlas, TextureAnimation, TextureArray, UiAtlas};
 use wgpu::util::DeviceExt;
@@ -516,47 +516,50 @@ impl Renderer {
             bind_group_layouts: &[Some(&sky_bind_group_layout)],
             immediate_size: 0,
         });
-        let sky_pipeline = timed_pipeline(&device, &wgpu::RenderPipelineDescriptor {
-            label: Some("sky pipeline"),
-            layout: Some(&sky_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &sky_shader,
-                entry_point: Some("vs_sky"),
-                compilation_options: Default::default(),
-                buffers: &[],
+        let sky_pipeline = timed_pipeline(
+            &device,
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("sky pipeline"),
+                layout: Some(&sky_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &sky_shader,
+                    entry_point: Some("vs_sky"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &sky_shader,
+                    entry_point: Some("fs_sky"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
             },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &sky_shader,
-                entry_point: Some("fs_sky"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        },
-        startup_origin,
-        &mut startup);
+            startup_origin,
+            &mut startup,
+        );
 
         let line_shader = timed_shader(
             &device,
@@ -1031,9 +1034,7 @@ impl Renderer {
         if let Some(panorama) = &self.panorama {
             buffer_bytes += panorama.vertices.size() + panorama.indices.size();
         }
-        let depth_bytes = u64::from(self.config.width)
-            * u64::from(self.config.height)
-            * 4;
+        let depth_bytes = u64::from(self.config.width) * u64::from(self.config.height) * 4;
         let texture_bytes = self.texture_bytes + depth_bytes;
         RendererMemory {
             buffer_bytes,
@@ -2433,4 +2434,3 @@ fn project_point(view_proj: &glam::Mat4, point: [f32; 3]) -> Option<Projected> {
         inv_w,
     })
 }
-
