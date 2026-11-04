@@ -3,6 +3,7 @@ use std::path::Path;
 
 use image::{Rgba, RgbaImage};
 
+use crate::biome_color::{BiomeColorizer, TintKind};
 use crate::block_textures::{all_texture_names, MISSING_TEXTURE};
 use crate::item_textures::all_item_texture_layers;
 
@@ -58,6 +59,9 @@ pub struct TextureArray {
     animation_width: u32,
     animation_height: u32,
     animation_pixels: Vec<u8>,
+    /// RGBA mask per layer; alpha is 1 where the block face receives biome tint.
+    tint_mask_pixels: Vec<u8>,
+    biome_colors: BiomeColorizer,
 }
 
 impl TextureArray {
@@ -116,6 +120,16 @@ impl TextureArray {
         )
     }
 
+    /// RGBA mask, layer-major, for the biome tint multiplier.
+    pub fn tint_mask_pixels(&self) -> &[u8] {
+        &self.tint_mask_pixels
+    }
+
+    /// Vanilla colour for one tint kind and biome.
+    pub fn tint(&self, kind: TintKind, biome: i32) -> [f32; 3] {
+        self.biome_colors.tint(kind, biome)
+    }
+
     /// Layer for `name`, falling back to the generated "missing" texture.
     pub fn layer_or_missing(&self, name: &str) -> u32 {
         self.layer(name).unwrap_or(self.missing)
@@ -139,6 +153,7 @@ impl TextureArray {
 
         let mut tiles: Vec<(&'static str, RgbaImage)> = Vec::new();
         let mut animation_strips: Vec<(&'static str, Vec<RgbaImage>, u32)> = Vec::new();
+        let mut tint_masks: HashMap<&'static str, Vec<u8>> = HashMap::new();
         for name in all_texture_names() {
             let path = blocks_dir.join(format!("{name}.png"));
             if !path.is_file() {
@@ -158,18 +173,22 @@ impl TextureArray {
             }
 
             // 1.8 stores grass and foliage as grayscale and tints them at
-            // runtime with the biome colour. Bake the plains colour in.
-            match name {
-                "grass_top" => tint(&mut tile, GRASS_TINT),
-                "leaves_oak" | "leaves_acacia" => tint(&mut tile, FOLIAGE_TINT),
-                "grass_side" => {
-                    if let Ok(overlay) = image::open(blocks_dir.join("grass_side_overlay.png")) {
-                        let mut overlay = to_tile(&overlay.to_rgba8());
-                        tint(&mut overlay, GRASS_TINT);
-                        blend_over(&mut tile, &overlay);
+            // runtime with the biome colour. Keep the texture raw here; the
+            // mesher/GPU applies the per-block multiplier. Grass sides need a
+            // mask so the dirt pixels below the overlay stay untinted.
+            if name == "grass_side" {
+                if let Ok(overlay) = image::open(blocks_dir.join("grass_side_overlay.png")) {
+                    let overlay = to_tile(&overlay.to_rgba8());
+                    let mut mask = vec![0u8; 256];
+                    for y in 0..TILE_SIZE {
+                        for x in 0..TILE_SIZE {
+                            mask[(y * TILE_SIZE + x) as usize] =
+                                overlay.get_pixel(x, y).0[3];
+                        }
                     }
+                    blend_over(&mut tile, &overlay);
+                    tint_masks.insert("grass_side", mask);
                 }
-                _ => {}
             }
 
             tiles.push((name, tile));
@@ -196,18 +215,34 @@ impl TextureArray {
                 tiles.push((layer, to_tile(&image.to_rgba8())));
             }
         }
-        Ok(Self::from_tiles_and_animations(tiles, animation_strips))
+        let biome_colors = blocks_dir
+            .parent()
+            .map(BiomeColorizer::load)
+            .unwrap_or_else(BiomeColorizer::fallback);
+        Ok(Self::from_tiles_and_animations(
+            tiles,
+            animation_strips,
+            tint_masks,
+            biome_colors,
+        ))
     }
 
     /// Build the array from already-decoded 16×16 RGBA tiles. A generated
     /// "missing" tile is appended if the caller didn't provide one.
     pub fn from_tiles(tiles: Vec<(&'static str, RgbaImage)>) -> Self {
-        Self::from_tiles_and_animations(tiles, Vec::new())
+        Self::from_tiles_and_animations(
+            tiles,
+            Vec::new(),
+            HashMap::new(),
+            BiomeColorizer::fallback(),
+        )
     }
 
     fn from_tiles_and_animations(
         mut tiles: Vec<(&'static str, RgbaImage)>,
         animation_strips: Vec<(&'static str, Vec<RgbaImage>, u32)>,
+        tint_masks: HashMap<&'static str, Vec<u8>>,
+        biome_colors: BiomeColorizer,
     ) -> Self {
         if !tiles.iter().any(|(name, _)| *name == MISSING_TEXTURE) {
             tiles.push((MISSING_TEXTURE, missing_texture()));
@@ -219,6 +254,8 @@ impl TextureArray {
         let layer_count = tiles.len() as u32;
         let mut pixels =
             Vec::with_capacity(layer_count as usize * (TILE_SIZE * TILE_SIZE * 4) as usize);
+        let mut tint_mask_pixels =
+            Vec::with_capacity(layer_count as usize * (TILE_SIZE * TILE_SIZE * 4) as usize);
         let mut index = HashMap::with_capacity(tiles.len());
         let mut missing = 0;
 
@@ -229,10 +266,16 @@ impl TextureArray {
             }
             index.insert(name, layer);
 
+            let mask = tint_masks.get(name);
+            let default_mask = default_tint_mask(name);
             for y in 0..TILE_SIZE {
                 for x in 0..TILE_SIZE {
                     let pixel = *tile.get_pixel(x.min(tile.width() - 1), y.min(tile.height() - 1));
                     pixels.extend_from_slice(&pixel.0);
+                    let alpha = mask
+                        .map(|mask| mask[(y * TILE_SIZE + x) as usize])
+                        .unwrap_or(default_mask);
+                    tint_mask_pixels.extend_from_slice(&[255, 255, 255, alpha]);
                 }
             }
         }
@@ -289,7 +332,20 @@ impl TextureArray {
             animation_width,
             animation_height,
             animation_pixels,
+            tint_mask_pixels,
+            biome_colors,
         }
+    }
+}
+
+fn default_tint_mask(name: &str) -> u8 {
+    if name == "grass_top"
+        || name == "water_still"
+        || name.starts_with("leaves_")
+    {
+        255
+    } else {
+        0
     }
 }
 
@@ -399,19 +455,7 @@ fn generate_mips(pixels: &[u8], tile: u32, layers: u32) -> Vec<Vec<u8>> {
     mips
 }
 
-/// Plains-biome grass colour (vanilla `0x79C05A`).
-const GRASS_TINT: [f32; 3] = [0.475, 0.753, 0.353];
-/// Plains-biome foliage colour (vanilla `0x59AE30`).
-const FOLIAGE_TINT: [f32; 3] = [0.349, 0.682, 0.188];
 
-fn tint(image: &mut RgbaImage, color: [f32; 3]) {
-    for pixel in image.pixels_mut() {
-        let [r, g, b, _] = pixel.0;
-        pixel.0[0] = (r as f32 * color[0]) as u8;
-        pixel.0[1] = (g as f32 * color[1]) as u8;
-        pixel.0[2] = (b as f32 * color[2]) as u8;
-    }
-}
 
 fn blend_over(base: &mut RgbaImage, overlay: &RgbaImage) {
     for y in 0..base.height().min(overlay.height()) {
@@ -600,11 +644,22 @@ mod tests {
     }
 
     #[test]
-    fn tint_only_scales_rgb() {
-        let mut image = RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, Rgba([100, 200, 50, 128]));
-        tint(&mut image, [0.5, 0.5, 0.5]);
-        let pixel = image.get_pixel(0, 0).0;
-        assert_eq!(pixel, [50, 100, 25, 128]);
+    fn tint_masks_cover_only_the_tinted_textures() {
+        let array = TextureArray::from_tiles(vec![
+            ("grass_top", solid(Rgba([255, 255, 255, 255]))),
+            ("stone", solid(Rgba([255, 255, 255, 255]))),
+            ("leaves_oak", solid(Rgba([255, 255, 255, 255]))),
+            ("water_still", solid(Rgba([255, 255, 255, 255]))),
+        ]);
+        let mask_alpha = |name: &str| {
+            let layer = array.layer(name).unwrap() as usize;
+            let start = layer * 16 * 16 * 4;
+            array.tint_mask_pixels()[start + 3]
+        };
+        assert_eq!(mask_alpha("grass_top"), 255);
+        assert_eq!(mask_alpha("leaves_oak"), 255);
+        assert_eq!(mask_alpha("water_still"), 255);
+        assert_eq!(mask_alpha("stone"), 0);
     }
 
     #[test]

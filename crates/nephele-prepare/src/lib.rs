@@ -25,7 +25,7 @@ pub const VERSION: &str = "1.8.9";
 
 /// Bumped whenever the set or shape of prepared files changes, so a launcher
 /// can tell a stale preparation from a current one without rehashing it.
-pub const OUTPUT_VERSION: u32 = 1;
+pub const OUTPUT_VERSION: u32 = 2;
 
 /// Name of the checksum pin file, looked up from the working directory upward.
 pub const LOCK_FILE_NAME: &str = "research-lock.json";
@@ -44,6 +44,7 @@ pub const ASSET_PREFIXES: &[&str] = &[
     "minecraft/textures/gui/",
     "minecraft/textures/font/",
     "minecraft/textures/misc/",
+    "minecraft/textures/colormap/",
     "minecraft/font/",
     "minecraft/lang/en_US.lang",
     "minecraft/sounds.json",
@@ -355,7 +356,7 @@ mod tests {
                 "client": { "sha1": "3870888a6c3d349d3771a3e9d16c9bf5e076b908", "size": 8461484 },
                 "assetIndex": { "id": "1.8", "sha1": "f6ad102bcaa53b1a58358f16e376d548d44933ec", "size": 78494 }
             },
-            "preparer": { "outputVersion": 1 }
+            "preparer": { "outputVersion": 2 }
         }"#
     }
 
@@ -375,6 +376,7 @@ mod tests {
     fn asset_filter_takes_only_what_the_client_reads() {
         assert!(is_wanted("minecraft/textures/blocks/stone.png"));
         assert!(is_wanted("minecraft/textures/gui/widgets.png"));
+        assert!(is_wanted("minecraft/textures/colormap/grass.png"));
         assert!(is_wanted("minecraft/lang/en_US.lang"));
         assert!(is_wanted("minecraft/sounds.json"));
         assert!(!is_wanted("minecraft/sounds/random/click.ogg"));

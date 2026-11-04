@@ -12,6 +12,7 @@ struct Uniforms {
 @group(0) @binding(1) var block_textures: texture_2d_array<f32>;
 @group(0) @binding(2) var block_sampler: sampler;
 @group(0) @binding(3) var animation_atlas: texture_2d<f32>;
+@group(0) @binding(4) var tint_masks: texture_2d_array<f32>;
 
 struct VertexIn {
     @location(0) position: vec3<f32>,
@@ -19,7 +20,8 @@ struct VertexIn {
     @location(2) shade: f32,
     @location(3) layer: u32,
     @location(4) anim: u32,
-    @location(5) light: f32,
+    @location(5) tint: u32,
+    @location(6) light: f32,
 };
 
 struct VertexOut {
@@ -29,7 +31,8 @@ struct VertexOut {
     @location(2) shade: f32,
     @location(3) @interpolate(flat) anim: u32,
     @location(4) light: f32,
-    @location(5) world_pos: vec3<f32>,
+    @location(5) @interpolate(flat) tint: u32,
+    @location(6) world_pos: vec3<f32>,
 };
 
 @vertex
@@ -41,6 +44,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
     out.shade = in.shade;
     out.anim = in.anim;
     out.light = in.light;
+    out.tint = in.tint;
     out.world_pos = in.position;
     return out;
 }
@@ -77,7 +81,23 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         discard;
     }
 
-    let lit = texel.rgb * in.shade * in.light;
+    // Biome tint. Only the layers vanilla tints carry a non-zero mask, so
+    // stone, wood and dirt keep their own colour even when they share a face.
+    let mask = textureSampleLevel(
+        tint_masks,
+        block_sampler,
+        in.uv,
+        i32(in.layer),
+        0.0,
+    ).a;
+    let tint = vec3<f32>(
+        f32((in.tint >> 16u) & 255u),
+        f32((in.tint >> 8u) & 255u),
+        f32(in.tint & 255u),
+    ) / 255.0;
+    let tinted = texel.rgb * mix(vec3<f32>(1.0), tint, mask);
+
+    let lit = tinted * in.shade * in.light;
     let dist = length(in.world_pos - uniforms.camera.xyz);
     let fog = clamp(
         (dist - uniforms.environment.y)

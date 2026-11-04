@@ -109,6 +109,18 @@ pub struct Renderer {
     item_vertex_capacity: wgpu::BufferAddress,
     item_index_capacity: wgpu::BufferAddress,
     item_index_count: u32,
+    /// The first-person arm and the held block. They get their own pass with a
+    /// cleared depth buffer so the hand never clips into a wall.
+    hand_vertices: wgpu::Buffer,
+    hand_indices: wgpu::Buffer,
+    hand_vertex_capacity: wgpu::BufferAddress,
+    hand_index_capacity: wgpu::BufferAddress,
+    hand_index_count: u32,
+    hand_item_vertices: wgpu::Buffer,
+    hand_item_indices: wgpu::Buffer,
+    hand_item_vertex_capacity: wgpu::BufferAddress,
+    hand_item_index_capacity: wgpu::BufferAddress,
+    hand_item_index_count: u32,
     panorama: Option<PanoramaGpu>,
     show_panorama: bool,
     /// Chunks that survived culling in the last [`Renderer::draw`].
@@ -240,11 +252,23 @@ impl Renderer {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
         let block_textures = create_block_texture_array(&device, &queue, textures);
         let texture_view = block_textures.create_view(&wgpu::TextureViewDescriptor::default());
+        let tint_mask = create_tint_mask_array(&device, &queue, textures);
+        let tint_mask_view = tint_mask.create_view(&wgpu::TextureViewDescriptor::default());
         let (animation_texture, animation_view) =
             create_animation_texture(&device, &queue, textures);
         // Vanilla uses nearest magnification and linear mip transitions.
@@ -280,6 +304,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&animation_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(&tint_mask_view),
                 },
             ],
         });
@@ -783,6 +811,33 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let (hand_vertex_capacity, hand_index_capacity) = (1024, 1024);
+        let hand_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hand vertices"),
+            size: hand_vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let hand_indices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hand indices"),
+            size: hand_index_capacity,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (hand_item_vertex_capacity, hand_item_index_capacity) = (1024, 1024);
+        let hand_item_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hand item vertices"),
+            size: hand_item_vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let hand_item_indices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hand item indices"),
+            size: hand_item_index_capacity,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let panorama = panorama.map(|panorama| {
             create_panorama(
                 &device,
@@ -843,6 +898,16 @@ impl Renderer {
             item_vertex_capacity,
             item_index_capacity,
             item_index_count: 0,
+            hand_vertices,
+            hand_indices,
+            hand_vertex_capacity,
+            hand_index_capacity,
+            hand_index_count: 0,
+            hand_item_vertices,
+            hand_item_indices,
+            hand_item_vertex_capacity,
+            hand_item_index_capacity,
+            hand_item_index_count: 0,
             panorama,
             show_panorama: false,
             drawn_chunks: 0,
@@ -1627,6 +1692,51 @@ fn create_depth_view(
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+fn create_tint_mask_array(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    textures: &TextureArray,
+) -> wgpu::Texture {
+    let tile = textures.tile_size();
+    let requested = textures.layer_count();
+    let layers = requested.min(device.limits().max_texture_array_layers);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("block tint mask array"),
+        size: wgpu::Extent3d {
+            width: tile,
+            height: tile,
+            depth_or_array_layers: layers,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let layer_bytes = (tile * tile * 4) as usize;
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &textures.tint_mask_pixels()[..layer_bytes * layers as usize],
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * tile),
+            rows_per_image: Some(tile),
+        },
+        wgpu::Extent3d {
+            width: tile,
+            height: tile,
+            depth_or_array_layers: layers,
+        },
+    );
+    texture
+}
+
 fn create_block_texture_array(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -1900,6 +2010,7 @@ fn panorama_mesh() -> (Vec<Vertex>, Vec<u32>) {
                 shade: 1.0,
                 layer: layer as u32,
                 anim: crate::mesh::NO_ANIMATION,
+                tint: crate::mesh::NO_TINT,
                 light: 1.0,
             });
         }

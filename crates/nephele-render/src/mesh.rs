@@ -1,6 +1,7 @@
 use nephele_assets::{
-    face_textures, is_transparent, item_texture_name, TextureArray, MISSING_TEXTURE,
+    face_textures, is_transparent, item_texture_name, TextureArray, TintKind, MISSING_TEXTURE,
 };
+use nephele_world::block::ids;
 use nephele_world::shapes::{
     block_shape, door_shape, is_door, is_full_cube, is_pane, pane_shape, PaneConnections, PaneShape,
 };
@@ -16,21 +17,26 @@ pub struct Vertex {
     pub layer: u32,
     /// Optional index into the renderer's `.mcmeta` animation table.
     pub anim: u32,
+    /// Packed 0xRRGGBB biome tint; white means "leave the texture untouched".
+    pub tint: u32,
     /// Combined block/sky illumination with ambient occlusion, in 0..=1.
     pub light: f32,
 }
 
 /// Sentinel for vertices that use a static texture-array layer.
 pub const NO_ANIMATION: u32 = u32::MAX;
+/// Packed white, the no-op biome tint.
+pub const NO_TINT: u32 = 0xFFFFFF;
 
 impl Vertex {
-    pub const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
         0 => Float32x3,
         1 => Float32x2,
         2 => Float32,
         3 => Uint32,
         4 => Uint32,
-        5 => Float32
+        5 => Uint32,
+        6 => Float32
     ];
 
     pub const fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -180,6 +186,7 @@ pub fn build_break_overlay(x: i32, y: i32, z: i32, layer: u32) -> MeshData {
                 shade: 1.0,
                 layer,
                 anim: NO_ANIMATION,
+                tint: NO_TINT,
                 light: 1.0,
             });
         }
@@ -221,6 +228,8 @@ pub struct ColumnMeshJob {
     pub key: (i32, i32),
     /// One entry per 16-block section; `None` when the section is all air.
     pub sections: Vec<Option<Vec<u16>>>,
+    /// 18x18 biome ids including a one-block border, indexed `(z + 1) * 18 + x + 1`.
+    pub biomes: Vec<u8>,
     /// Blocks of the neighbour at local x = 15, indexed `y * 16 + z`.
     pub west: Vec<u16>,
     /// Blocks of the neighbour at local x = 0, indexed `y * 16 + z`.
@@ -255,9 +264,18 @@ impl ColumnMeshJob {
             }
         }
         let has_skylight = world.has_skylight();
+        let mut biomes = vec![1u8; 18 * 18];
+        for z in -1..=16 {
+            for x in -1..=16 {
+                let world_x = key.0 * 16 + x;
+                let world_z = key.1 * 16 + z;
+                biomes[((z + 1) * 18 + x + 1) as usize] = world_biome(world, world_x, world_z);
+            }
+        }
         Self {
             key,
             sections,
+            biomes,
             west: side_plane(world, key.0 - 1, key.1, Axis::X, 15),
             east: side_plane(world, key.0 + 1, key.1, Axis::X, 0),
             north: side_plane(world, key.0, key.1 - 1, Axis::Z, 15),
@@ -292,6 +310,15 @@ impl ColumnMeshJob {
         }
         job.light_levels = light_volume(Some(column), job.has_skylight);
         job
+    }
+
+    /// Biome id at a column-local block position, including the 1-block border.
+    #[inline]
+    pub fn biome(&self, x: i32, z: i32) -> u8 {
+        if !(-1..=16).contains(&x) || !(-1..=16).contains(&z) {
+            return 1;
+        }
+        self.biomes[((z + 1) * 18 + x + 1) as usize]
     }
 
     /// Block lookup in column-local coordinates, where the border neighbours
@@ -380,6 +407,17 @@ enum Axis {
 
 /// Copy one 16×256 face off a neighbouring column. Reads the section data
 /// directly — 4096 array reads instead of 4096 hash-map lookups.
+fn world_biome(world: &World, x: i32, z: i32) -> u8 {
+    let column = world.get(ChunkCoord::new(x.div_euclid(16), z.div_euclid(16)));
+    column
+        .and_then(ChunkColumn::biomes)
+        .map(|biomes| {
+            let index = z.rem_euclid(16) as usize * 16 + x.rem_euclid(16) as usize;
+            biomes.get(index).copied().unwrap_or(1)
+        })
+        .unwrap_or(1)
+}
+
 fn side_plane(world: &World, cx: i32, cz: i32, axis: Axis, local: usize) -> Vec<u16> {
     let mut out = vec![0u16; PLANE_LEN];
     let Some(column) = world.get(ChunkCoord::new(cx, cz)) else {
@@ -513,6 +551,48 @@ fn blocks_direct_sky(state: BlockState) -> bool {
         && is_full_cube(block_shape(state.id(), state.meta()))
 }
 
+const FOLIAGE_PINE: u32 = 0x619961;
+const FOLIAGE_BIRCH: u32 = 0x80A755;
+
+fn tint_for_block(
+    atlas: &TextureArray,
+    job: &ColumnMeshJob,
+    id: u16,
+    meta: u8,
+    x: i32,
+    z: i32,
+) -> u32 {
+    let kind = match id {
+        2 | 31 => TintKind::Grass,
+        8 | 9 => TintKind::Water,
+        ids::LEAVES => {
+            if meta == 1 {
+                return FOLIAGE_PINE;
+            }
+            if meta == 2 {
+                return FOLIAGE_BIRCH;
+            }
+            TintKind::Foliage
+        }
+        _ => return NO_TINT,
+    };
+
+    // Vanilla `BiomeColorHelper` averages the 3x3 biome neighbourhood, which is
+    // what keeps grass and water from hard-switching at a biome edge.
+    let mut red = 0u32;
+    let mut green = 0u32;
+    let mut blue = 0u32;
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let color = atlas.tint(kind, job.biome(x + dx, z + dz) as i32);
+            red += (color[0] * 255.0) as u32;
+            green += (color[1] * 255.0) as u32;
+            blue += (color[2] * 255.0) as u32;
+        }
+    }
+    ((red / 9) << 16) | ((green / 9) << 8) | (blue / 9)
+}
+
 /// Mesh a chunk column from an owned snapshot. Pure computation — no world or
 /// GPU access — so it is safe to run on any thread.
 pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
@@ -570,6 +650,11 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             if is_cross_plant(id) {
                 let layer = layers[2];
                 let anim = anims[2];
+                let block_tint = if id == 31 {
+                    tint_for_block(atlas, job, id, 0, local_x, local_z)
+                } else {
+                    NO_TINT
+                };
                 let bx = (base_x + local_x) as f32;
                 let by = y as f32;
                 let bz = (base_z + local_z) as f32;
@@ -603,6 +688,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                                 shade: 1.0,
                                 layer,
                                 anim,
+                                tint: block_tint,
                                 light,
                             });
                         }
@@ -619,6 +705,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                 continue;
             }
             let meta = (raw & 0x0f) as u8;
+            let block_tint = tint_for_block(atlas, job, id, meta, local_x, local_z);
             let pane_boxes = is_pane(id).then(|| pane_shape_for_block(job, local_x, y, local_z));
             let shape = if let Some(pane) = pane_boxes.as_ref() {
                 pane.as_slice()
@@ -655,6 +742,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                         face,
                         layers[face.slot],
                         anims[face.slot],
+                        block_tint,
                         positions,
                         lights,
                     );
@@ -682,6 +770,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                             face,
                             layers[face.slot],
                             anims[face.slot],
+                            block_tint,
                             positions,
                             lights,
                         );
@@ -858,6 +947,7 @@ fn append_quad(
     face: &FaceDef,
     layer: u32,
     anim: u32,
+    tint: u32,
     positions: [[f32; 3]; 4],
     lights: [f32; 4],
 ) {
@@ -873,6 +963,7 @@ fn append_quad(
             shade: face.shade,
             layer,
             anim,
+            tint,
             light,
         });
     }
@@ -974,6 +1065,7 @@ pub fn build_item_mesh(items: &[ItemDraw], atlas: &TextureArray, time: f32) -> M
                     shade: face.shade,
                     layer: layers[face.slot],
                     anim: NO_ANIMATION,
+                    tint: NO_TINT,
                     light: 1.0,
                 });
             }
@@ -1030,6 +1122,7 @@ pub fn build_hand_item(item: &HandItem, atlas: &TextureArray) -> MeshData {
                 shade: face.shade,
                 layer: layers[face.slot],
                 anim: NO_ANIMATION,
+                tint: NO_TINT,
                 light: 1.0,
             });
         }
