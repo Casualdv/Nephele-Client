@@ -89,6 +89,24 @@ pub struct Connection {
     threshold: Option<u32>,
     enc: Option<Cfb8>,
     dec: Option<Cfb8>,
+    /// Raw bytes read from the socket that are not yet part of a complete
+    /// frame.
+    ///
+    /// Reads are driven from a `select!` alongside the 20 Hz tick, so a packet
+    /// read can be cancelled mid-frame. Buffering the whole frame before
+    /// consuming anything keeps that safe: cancelling drops only an incomplete
+    /// future, never bytes. The previous `read_exact`-per-field reader silently
+    /// dropped whatever it had already consumed, which desynchronised the
+    /// stream and showed up as a zlib error several packets later.
+    buffer: Vec<u8>,
+    /// Length of the decrypted prefix of `buffer`.
+    ///
+    /// Decryption is applied lazily, only to bytes a frame actually needs. It
+    /// has to be lazy: encryption can be switched on mid-stream, and a read
+    /// that ran ahead of that point is holding ciphertext, not plaintext.
+    /// Decrypting on arrival would have turned the post-handshake packet into
+    /// unparsed garbage.
+    decrypted: usize,
 }
 
 impl Connection {
@@ -101,6 +119,8 @@ impl Connection {
             threshold: None,
             enc: None,
             dec: None,
+            buffer: Vec::new(),
+            decrypted: 0,
         })
     }
 
@@ -113,6 +133,8 @@ impl Connection {
             threshold: None,
             enc: None,
             dec: None,
+            buffer: Vec::new(),
+            decrypted: 0,
         }
     }
 
@@ -297,7 +319,19 @@ impl Connection {
     }
 
     pub async fn read_packet(&mut self) -> Result<Packet> {
-        let length = self.read_varint_from_stream().await?;
+        // Decrypt just enough to read the length prefix, then wait for the
+        // whole frame before draining anything.
+        let (length, header) = loop {
+            if let Some((length, used)) = decode_varint_prefix(&self.buffer[..self.decrypted])? {
+                break (length, used);
+            }
+            if self.decrypted < self.buffer.len() {
+                self.decrypt_upto(self.decrypted + 1);
+            } else {
+                self.fill().await?;
+            }
+        };
+
         if length <= 0 {
             return Err(Error::Protocol(format!("invalid frame length {length}")));
         }
@@ -309,12 +343,14 @@ impl Connection {
             });
         }
 
-        let mut body = vec![0u8; length];
-        self.stream.read_exact(&mut body).await?;
-        if let Some(dec) = self.dec.as_mut() {
-            dec.decrypt(&mut body);
+        while self.buffer.len() < header + length {
+            self.fill().await?;
         }
+        self.decrypt_upto(header + length);
 
+        let body: Vec<u8> = self.buffer[header..header + length].to_vec();
+        self.buffer.drain(..header + length);
+        self.decrypted -= header + length;
         let payload = decode_body(&body, self.threshold)?;
         Packet::from_payload(&payload)
     }
@@ -330,24 +366,35 @@ impl Connection {
         Ok(())
     }
 
-    async fn read_varint_from_stream(&mut self) -> Result<i32> {
-        let mut value: u32 = 0;
-        let mut shift = 0u32;
-        loop {
-            let mut byte = [0u8; 1];
-            self.stream.read_exact(&mut byte).await?;
-            if let Some(dec) = self.dec.as_mut() {
-                dec.decrypt(&mut byte);
-            }
-            value |= ((byte[0] & 0x7F) as u32) << shift;
-            if byte[0] & 0x80 == 0 {
-                return Ok(value as i32);
-            }
-            shift += 7;
-            if shift >= 32 {
-                return Err(Error::VarIntTooBig);
-            }
+    /// Read one more chunk off the socket and append it, still encrypted if
+    /// encryption is on, to `buffer`.
+    ///
+    /// Cancelling this future is safe: its only `await` is a single `read`, and
+    /// the bytes it returns are moved into `buffer` before the next await. That
+    /// is the whole reason packets are buffered instead of read field by field.
+    async fn fill(&mut self) -> Result<()> {
+        let mut chunk = [0u8; 8192];
+        let read = self.stream.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(Error::UnexpectedEof { needed: 1 });
         }
+        self.buffer.extend_from_slice(&chunk[..read]);
+        Ok(())
+    }
+
+    /// Decrypt the buffered ciphertext up to `end` bytes.
+    ///
+    /// Bytes that were already decrypted are never touched again, so the CFB8
+    /// feedback keeps advancing in stream order.
+    fn decrypt_upto(&mut self, end: usize) {
+        let end = end.min(self.buffer.len());
+        if end <= self.decrypted {
+            return;
+        }
+        if let Some(dec) = self.dec.as_mut() {
+            dec.decrypt(&mut self.buffer[self.decrypted..end]);
+        }
+        self.decrypted = end;
     }
 
     pub async fn shutdown(&mut self) {
@@ -381,6 +428,24 @@ pub async fn ping(address: &ServerAddress, timeout: Duration) -> Result<StatusRe
     })
     .await
     .map_err(|_| Error::Protocol(format!("timed out pinging {address}")))?
+}
+
+/// Decode a VarInt at the start of `bytes` without consuming anything.
+///
+/// `None` means "not enough bytes yet, read more"; a fifth continuation byte is
+/// an error rather than another request for data.
+fn decode_varint_prefix(bytes: &[u8]) -> Result<Option<(i32, usize)>> {
+    let mut value = 0u32;
+    for index in 0..5 {
+        let Some(&byte) = bytes.get(index) else {
+            return Ok(None);
+        };
+        value |= ((byte & 0x7F) as u32) << (7 * index);
+        if byte & 0x80 == 0 {
+            return Ok(Some((value as i32, index + 1)));
+        }
+    }
+    Err(Error::VarIntTooBig)
 }
 
 #[cfg(test)]
@@ -426,5 +491,57 @@ mod tests {
             ServerAddress::parse("localhost").unwrap().to_string(),
             "localhost:25565"
         );
+    }
+
+    /// Cancelling a packet read mid-frame must not lose the rest of the frame.
+    ///
+    /// This is the bug that showed up on a real server as
+    /// `compression failure: corrupt deflate stream`: the network loop reads
+    /// packets inside a `select!` against the 20 Hz ticker, so a tick landing
+    /// mid-frame used to cancel a `read_exact` that had already swallowed part
+    /// of the body. The stream then started one frame late and every later
+    /// length was garbage.
+    #[tokio::test]
+    async fn cancelling_a_mid_frame_read_keeps_the_stream_in_sync() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let first = encode_frame(&Packet::new(0x03, b"first".to_vec()).to_payload(), None).unwrap();
+        let second =
+            encode_frame(&Packet::new(0x04, b"second".to_vec()).to_payload(), None).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.unwrap();
+            // Split the first frame so the client is guaranteed to be parked
+            // inside the body read when the timeout fires.
+            peer.write_all(&first[..4]).await.unwrap();
+            peer.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            peer.write_all(&first[4..]).await.unwrap();
+            peer.write_all(&second).await.unwrap();
+            peer.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        });
+
+        let stream = TcpStream::connect(address).await.unwrap();
+        let mut connection = Connection::from_stream(stream, State::Play);
+
+        // Stand in for the ticker winning the race.
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(10), connection.read_packet()).await;
+        assert!(cancelled.is_err(), "the read should have been cancelled");
+
+        let decoded = connection.read_packet().await.expect("the cancelled frame");
+        assert_eq!(
+            decoded.to_payload(),
+            Packet::new(0x03, b"first".to_vec()).to_payload()
+        );
+        let decoded = connection.read_packet().await.expect("the following frame");
+        assert_eq!(
+            decoded.to_payload(),
+            Packet::new(0x04, b"second".to_vec()).to_payload()
+        );
+
+        server.await.unwrap();
     }
 }
