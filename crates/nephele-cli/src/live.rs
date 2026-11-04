@@ -1642,6 +1642,11 @@ impl LiveApp {
 
         let mut state = self.shared.lock().unwrap();
         state.input = input;
+        if std::env::var_os("NEPHELE_TRACE_INPUT").is_some()
+            && (input.forward != 0.0 || input.strafe != 0.0)
+        {
+            eprintln!("movement input {input:?}");
+        }
     }
 
     /// Rebuild the selection outline and the crack overlay when they move.
@@ -2259,7 +2264,10 @@ impl LiveApp {
                 if let Err(err) =
                     runtime.block_on(net_loop(address, username, session_path, shared, tx))
                 {
+                    eprintln!("network loop stopped: {err}");
                     let _ = error_tx.send(NetMsg::Error(err));
+                } else {
+                    eprintln!("network loop finished");
                 }
             });
     }
@@ -3142,6 +3150,12 @@ impl ApplicationHandler for LiveApp {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if std::env::var_os("NEPHELE_TRACE_INPUT").is_some() {
+                    eprintln!(
+                        "key {:?} {:?} screen={:?} captured={}",
+                        event.physical_key, event.state, self.screen, self.mouse_captured
+                    );
+                }
                 // While the chat line is open it owns the keyboard.
                 if self.chat_open && event.state == ElementState::Pressed {
                     match event.physical_key {
