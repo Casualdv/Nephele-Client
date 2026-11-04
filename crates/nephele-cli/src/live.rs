@@ -1025,6 +1025,9 @@ async fn net_loop(
                             let _ = tx.send(NetMsg::Skins(skins));
                         }
                     }
+                    Ok(Event::Malformed { id, message }) => {
+                        eprintln!("skipping packet 0x{id:02X}: {message}");
+                    }
                     Ok(_) => {}
                     Err(err) => return Err(err.to_string()),
                 }

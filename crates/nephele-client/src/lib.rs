@@ -84,6 +84,14 @@ pub struct JoinInfo {
 pub enum Event {
     /// No packet arrived within the tick timeout.
     Idle,
+    /// A packet arrived whole but this client could not parse it.
+    ///
+    /// Reported instead of ending the session: the stream is still in sync, so
+    /// the worst case is one ignored message.
+    Malformed {
+        id: i32,
+        message: String,
+    },
     /// A chunk column was loaded.
     ChunkLoaded {
         x: i32,
@@ -420,7 +428,19 @@ impl GameClient {
             Ok(Err(err)) => return Err(err),
         };
         self.packets_received += 1;
-        self.handle(packet).await
+        let id = packet.id;
+        match self.handle(packet).await {
+            Ok(event) => Ok(event),
+            // The frame itself is intact - the framer already consumed exactly
+            // its declared length - so a parse failure is one packet we don't
+            // understand, not a broken stream. Dropping the connection here
+            // used to freeze the whole client on servers that send anything
+            // unexpected, which read as "the game stopped responding".
+            Err(err) => Ok(Event::Malformed {
+                id,
+                message: err.to_string(),
+            }),
+        }
     }
 
     /// Run ticks until `duration` has elapsed, returning the number of events
