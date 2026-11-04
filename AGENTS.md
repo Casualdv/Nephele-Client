@@ -129,6 +129,48 @@ crates/
       skins.rs          skin fetch/cache
 ```
 
+### Launcher v2, packaging and release gates (2026-11-03)
+
+- `crates/nephele-launcher/src/app.rs` owns the multi-page launcher UI;
+  `profiles.rs`, `updates.rs` and `crash.rs` own the local profile/config,
+  signed-release and report logic. `nephele-assets::UiAtlas::launcher_fallback`
+  is an original bitmap typeface, so first-run setup can render before any game
+  resources have been prepared.
+- Profiles store an offline player name or Microsoft account mode, update
+  channel (Stable/Preview) and selected installed version in
+  `%APPDATA%\Nephele\launcher.json`. The device-code UI uses compiled public
+  application id `NEPHELE_CLIENT_ID`; session tokens are stored locally in
+  `auth.json`, shared by online profiles, and are never attached to crash
+  reports. The app
+  starts in the launcher UI even if resources are missing; it searches the
+  normal Minecraft install paths, offers a folder/jar picker, verifies the
+  player's own 1.8.9 jar through `nephele-prepare`, and extracts into the
+  per-user data directory. Do not bundle the game jar or prepared assets.
+- News and update metadata come from the project's GitHub Releases API. The
+  raw manifest is RSA-3072 PKCS#1 v1.5 / SHA-256 verified against
+  `PINNED_UPDATE_PUBLIC_MODULUS_HEX` before parsing; each downloaded executable
+  is then checked against the signed SHA-256/size, staged under a version-safe
+  directory and selected via `current-version.txt`. A failed/unknown signature
+  must stay a hard failure; never add an unsigned fallback.
+- Crash reports are saved locally first. `crash_upload_opt_in` defaults to
+  false, and sending also requires the explicit Upload button. The compiled
+  HTTPS endpoint comes from `NEPHELE_CRASH_REPORT_URL`; no endpoint is currently
+  deployed, so release builds must configure one before uploads can work.
+- `installer/Nephele.iss`, `scripts/package_windows.ps1` and
+  `.github/workflows/release.yml` build the per-user Windows installer and
+  release assets. Release requires Actions secret
+  `NEPHELE_UPDATE_SIGNING_KEY_B64`, Authenticode secrets
+  `NEPHELE_CODESIGN_PFX_B64` / `NEPHELE_CODESIGN_PASSWORD`, and repository
+  variables `NEPHELE_CLIENT_ID` and `NEPHELE_CRASH_REPORT_URL`. The update private key is stored outside
+  the repo at `%LOCALAPPDATA%\Nephele\release-keys\update-signing-key.pem`;
+  back it up securely before relying on it and never commit it. The pinned
+  public modulus is public source, not a secret.
+- **M5 public-release acceptance is not complete yet.** No crash-report service,
+  Authenticode certificate, or shippable Azure client id for Microsoft sign-in
+  is configured (see §8), and an end-to-end installed release
+  has not been tested on a clean machine. The launcher supports local/offline
+  play with the player's own 1.8.9 installation.
+
 ### User files (`.local/` is legacy)
 
 `paths::user_data_dir()` is the single answer to "where do user files go":

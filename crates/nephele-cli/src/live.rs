@@ -31,7 +31,7 @@ use nephele_render::{
     ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
 };
 use nephele_world::save::{
-    self, SavedItemStack, SavedPlayerState, WorldMetadata, WorldMode, WorldSave,
+    self, SavedItemStack, SavedPlayerState, WorldMetadata, WorldMode, WorldSave, WorldState,
 };
 use nephele_world::{raycast, BlockState, ChunkColumn, ChunkCoord, World};
 use winit::application::ApplicationHandler;
@@ -45,7 +45,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 const MOUSE_SENSITIVITY: f32 = 0.0022;
 const TICK: Duration = Duration::from_millis(50);
-const PLAYER_STATE_SAVE_INTERVAL: Duration = Duration::from_secs(1);
+const PLAYER_STATE_SAVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Vanilla's `PlayerControllerMP.getBlockReachDistance`.
 const REACH_CREATIVE: f64 = 5.0;
 const REACH_SURVIVAL: f64 = 4.5;
@@ -162,8 +162,20 @@ struct Shared {
     inventory: Vec<Option<ItemStack>>,
     health: f32,
     food: i32,
+    food_saturation: f32,
+    food_exhaustion: f32,
     xp_bar: f32,
     xp_level: i32,
+    xp_total: i32,
+    xp_seed: i32,
+    /// Bed spawn saved in `level.dat`, preserved across sessions.
+    spawn_point: Option<[i32; 3]>,
+    /// World age and time of day, in 20 Hz ticks.
+    day_time: i64,
+    raining: bool,
+    thundering: bool,
+    /// Lightning flash strength, decayed by the render thread.
+    lightning: f32,
     chunks: usize,
     /// Requested by the creative inventory, applied by the network thread.
     give_item: Option<(i16, ItemStack)>,
@@ -334,8 +346,17 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         inventory: vec![None; 45],
         health: 20.0,
         food: 20,
+        food_saturation: 5.0,
+        food_exhaustion: 0.0,
         xp_bar: 0.0,
         xp_level: 0,
+        xp_total: 0,
+        xp_seed: 0,
+        spawn_point: None,
+        day_time: 0,
+        raining: false,
+        thundering: false,
+        lightning: 0.0,
         chunks: 0,
         give_item: None,
         chat_out: Vec::new(),
@@ -399,7 +420,16 @@ fn saved_local_player_state(state: &Shared) -> SavedPlayerState {
         position: [state.player.x, state.player.y, state.player.z],
         yaw: state.yaw,
         pitch: state.pitch,
+        health: state.health,
+        food_level: state.food,
+        food_saturation: state.food_saturation,
+        food_exhaustion: state.food_exhaustion,
+        xp_progress: state.xp_bar,
+        xp_level: state.xp_level,
+        xp_total: state.xp_total,
+        xp_seed: state.xp_seed,
         held_slot: state.held_slot.clamp(0, 8),
+        spawn_point: state.spawn_point,
         inventory: state
             .inventory
             .iter()
@@ -408,6 +438,7 @@ fn saved_local_player_state(state: &Shared) -> SavedPlayerState {
                     id: item.id,
                     count: item.count,
                     damage: item.damage,
+                    template_slot: None,
                 })
             })
             .collect(),
@@ -420,6 +451,15 @@ fn restore_local_player_state(state: &mut Shared, saved: &SavedPlayerState) {
         .teleport(saved.position[0], saved.position[1], saved.position[2]);
     state.yaw = saved.yaw;
     state.pitch = saved.pitch;
+    state.health = saved.health;
+    state.food = saved.food_level;
+    state.food_saturation = saved.food_saturation;
+    state.food_exhaustion = saved.food_exhaustion;
+    state.xp_bar = saved.xp_progress;
+    state.xp_level = saved.xp_level;
+    state.xp_total = saved.xp_total;
+    state.xp_seed = saved.xp_seed;
+    state.spawn_point = saved.spawn_point;
     state.held_slot = saved.held_slot;
     state.inventory.fill(None);
     for (slot, item) in saved.inventory.iter().enumerate() {
@@ -427,6 +467,60 @@ fn restore_local_player_state(state: &mut Shared, saved: &SavedPlayerState) {
             state.inventory[slot] = Some(ItemStack::new(item.id, item.count, item.damage));
         }
     }
+}
+
+/// Deterministic xorshift dice for weather, so a reload does not reshuffle it.
+fn weather_roll(seed: &mut u64) -> u32 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    (*seed >> 32) as u32
+}
+
+/// Vanilla's `WorldServer.updateWeather` rhythm, counted in 20 Hz ticks.
+fn advance_weather(state: &mut WorldState, random: &mut u64) {
+    state.rain_time = state.rain_time.saturating_sub(1);
+    if state.rain_time <= 0 {
+        state.raining = !state.raining;
+        state.rain_time = 12_000 + (weather_roll(random) % 12_000) as i32;
+        if state.raining {
+            state.thunder_time = 6_000 + (weather_roll(random) % 12_000) as i32;
+        } else {
+            state.thundering = false;
+            state.thunder_time = 0;
+        }
+    }
+    if !state.raining {
+        return;
+    }
+    state.thunder_time = state.thunder_time.saturating_sub(1);
+    if state.thunder_time <= 0 {
+        state.thundering = !state.thundering;
+        state.thunder_time = if state.thundering {
+            3_600 + (weather_roll(random) % 7_200) as i32
+        } else {
+            12_000 + (weather_roll(random) % 12_000) as i32
+        };
+    }
+}
+
+/// Write every column touched since the last autosave in one region pass.
+fn flush_dirty_columns(
+    save: &mut WorldSave,
+    world: &World,
+    dirty: &mut HashSet<(i32, i32)>,
+) -> Result<(), String> {
+    if dirty.is_empty() {
+        return Ok(());
+    }
+    let columns: Vec<ChunkColumn> = dirty
+        .iter()
+        .filter_map(|(x, z)| world.get(ChunkCoord::new(*x, *z)).cloned())
+        .collect();
+    save.save_chunks(&columns)
+        .map_err(|error| error.to_string())?;
+    dirty.clear();
+    Ok(())
 }
 
 /// Single-player: generate terrain around the player, simulate, and let them
@@ -444,7 +538,12 @@ fn local_loop(
     let saved_player = save
         .load_player_state()
         .map_err(|error| error.to_string())?;
+    let mut world_state = save.world_state();
     let generator = TerrainGenerator::new(seed);
+    let spawn_y = generator.spawn_height();
+    if world_state.spawn_position == WorldState::default().spawn_position {
+        world_state.spawn_position = [0, spawn_y, 0];
+    }
     let mut world = World::new(0);
     // Honour the render-distance setting; `radius` is re-read every tick so
     // changing it in Options takes effect without restarting the world.
@@ -452,15 +551,20 @@ fn local_loop(
 
     {
         let mut state = shared.lock().unwrap();
-        let spawn_y = generator.spawn_height() as f64;
         state.spawned = true;
         state.creative = mode.is_creative();
         state.status = format!("{} (seed {seed})", save.metadata().name);
         state.inventory.fill(None);
+        state.day_time = world_state.day_time;
+        state.raining = world_state.raining;
+        state.thundering = world_state.thundering;
         if let Some(saved_player) = saved_player.as_ref() {
             restore_local_player_state(&mut state, saved_player);
         } else {
-            state.player.teleport(0.5, spawn_y, 0.5);
+            let [sx, sy, sz] = world_state.spawn_position;
+            state
+                .player
+                .teleport(sx as f64 + 0.5, sy as f64, sz as f64 + 0.5);
             state.held_slot = 0;
         }
         if saved_player.is_none() && mode.is_creative() {
@@ -473,13 +577,30 @@ fn local_loop(
     }
 
     let mut sent: HashSet<(i32, i32)> = HashSet::new();
+    let mut dirty: HashSet<(i32, i32)> = HashSet::new();
     let mut miner = Miner::default();
     let mut last_saved_player = saved_player;
-    let mut player_save_deadline = Instant::now() + PLAYER_STATE_SAVE_INTERVAL;
+    let mut autosave_deadline = Instant::now() + PLAYER_STATE_SAVE_INTERVAL;
+    let mut weather_random = seed ^ 0x9E37_79B9_7F4A_7C15;
 
     loop {
         let (position, yaw, pitch, _on_ground) = step_player(&shared, &world);
         radius = view_radius(shared.lock().unwrap().view_distance);
+
+        // Advance the clock and weather at 20 Hz, like vanilla's WorldServer.
+        world_state.total_time = world_state.total_time.wrapping_add(1);
+        world_state.day_time = world_state.day_time.wrapping_add(1);
+        advance_weather(&mut world_state, &mut weather_random);
+        {
+            let mut state = shared.lock().unwrap();
+            state.day_time = world_state.day_time;
+            state.raining = world_state.raining;
+            state.thundering = world_state.thundering;
+            state.lightning = (state.lightning - 0.08).max(0.0);
+            if world_state.thundering && weather_roll(&mut weather_random) % 700 == 0 {
+                state.lightning = 1.0;
+            }
+        }
 
         // Stream generated columns around the player.
         let centre = (
@@ -509,6 +630,12 @@ fn local_loop(
             .collect();
         for coord in stale {
             sent.remove(&coord);
+            if dirty.remove(&coord) {
+                if let Some(column) = world.get(ChunkCoord::new(coord.0, coord.1)) {
+                    save.save_chunks(std::slice::from_ref(column))
+                        .map_err(|error| error.to_string())?;
+                }
+            }
             world.remove(ChunkCoord::new(coord.0, coord.1));
             let _ = tx.send(NetMsg::Unload(coord.0, coord.1));
         }
@@ -571,17 +698,17 @@ fn local_loop(
             let _ = tx.send(NetMsg::Chat(line));
         }
 
-        let mut dirty: HashSet<(i32, i32)> = HashSet::new();
+        let mut changed: HashSet<(i32, i32)> = HashSet::new();
         for (x, y, z, state) in edits {
             world.set_block(x, y, z, BlockState::from_raw(state));
-            dirty.insert((x.div_euclid(16), z.div_euclid(16)));
+            changed.insert((x.div_euclid(16), z.div_euclid(16)));
         }
         let creative = shared.lock().unwrap().creative;
         for event in miner.tick(&world, aim, attacking, creative) {
             if let MiningEvent::Stop(target) = event {
                 let broken = world.get_block(target.x, target.y, target.z);
                 world.set_block(target.x, target.y, target.z, BlockState::AIR);
-                dirty.insert((target.x.div_euclid(16), target.z.div_euclid(16)));
+                changed.insert((target.x.div_euclid(16), target.z.div_euclid(16)));
                 if !creative {
                     if let Some(item) = local_block_drop(broken) {
                         add_local_item(&mut shared.lock().unwrap(), item);
@@ -594,7 +721,7 @@ fn local_loop(
                 let targeted = world.get_block(aim.x, aim.y, aim.z);
                 if nephele_world::shapes::is_door(targeted.id()) {
                     if nephele_world::shapes::toggle_door_open(&mut world, aim.x, aim.y, aim.z) {
-                        dirty.insert((aim.x.div_euclid(16), aim.z.div_euclid(16)));
+                        changed.insert((aim.x.div_euclid(16), aim.z.div_euclid(16)));
                     }
                 } else if targeted.id() == nephele_world::crafting::CRAFTING_TABLE {
                     let mut state = shared.lock().unwrap();
@@ -626,7 +753,7 @@ fn local_loop(
                                     yaw,
                                 )
                             {
-                                dirty.insert((bx.div_euclid(16), bz.div_euclid(16)));
+                                changed.insert((bx.div_euclid(16), bz.div_euclid(16)));
                                 if !creative {
                                     consume_held_block(
                                         &mut shared.lock().unwrap(),
@@ -639,7 +766,7 @@ fn local_loop(
                             && !placement_hits_player(&aim, player_feet)
                         {
                             world.set_block(bx, by, bz, block);
-                            dirty.insert((bx.div_euclid(16), bz.div_euclid(16)));
+                            changed.insert((bx.div_euclid(16), bz.div_euclid(16)));
                             if !creative {
                                 consume_held_block(
                                     &mut shared.lock().unwrap(),
@@ -652,9 +779,9 @@ fn local_loop(
                 }
             }
         }
-        for (cx, cz) in dirty {
+        for (cx, cz) in changed {
+            dirty.insert((cx, cz));
             if let Some(column) = world.get(ChunkCoord::new(cx, cz)) {
-                save.save_chunk(column).map_err(|error| error.to_string())?;
                 let _ = tx.send(NetMsg::Chunks(vec![column.clone()]));
             }
         }
@@ -679,24 +806,18 @@ fn local_loop(
             (shutdown, edits)
         };
         if shutdown {
-            let mut final_dirty = HashSet::new();
             for (x, y, z, block) in pending_edits {
                 if world.set_block(x, y, z, BlockState::from_raw(block)) {
-                    final_dirty.insert((x.div_euclid(16), z.div_euclid(16)));
+                    dirty.insert((x.div_euclid(16), z.div_euclid(16)));
                 }
             }
 
             let mut save_error = None;
-            for (cx, cz) in final_dirty {
-                if let Some(column) = world.get(ChunkCoord::new(cx, cz)) {
-                    if let Err(error) = save.save_chunk(column) {
-                        save_error = Some(error.to_string());
-                        break;
-                    }
-                }
+            if let Err(error) = flush_dirty_columns(&mut save, &world, &mut dirty) {
+                save_error = Some(error);
             }
             let player_state = saved_local_player_state(&shared.lock().unwrap());
-            if let Err(error) = save.save_player_state(&player_state) {
+            if let Err(error) = save.save_snapshot(&player_state, &world_state) {
                 save_error.get_or_insert_with(|| error.to_string());
             }
             shared.lock().unwrap().local_stopped = true;
@@ -707,14 +828,18 @@ fn local_loop(
         }
 
         let now = Instant::now();
-        if now >= player_save_deadline {
+        if now >= autosave_deadline {
+            flush_dirty_columns(&mut save, &world, &mut dirty)?;
             let player_state = saved_local_player_state(&shared.lock().unwrap());
             if last_saved_player.as_ref() != Some(&player_state) {
-                save.save_player_state(&player_state)
+                save.save_snapshot(&player_state, &world_state)
                     .map_err(|error| error.to_string())?;
                 last_saved_player = Some(player_state);
+            } else {
+                save.save_world_state(&world_state)
+                    .map_err(|error| error.to_string())?;
             }
-            player_save_deadline = now + PLAYER_STATE_SAVE_INTERVAL;
+            autosave_deadline = now + PLAYER_STATE_SAVE_INTERVAL;
         }
     }
 }
@@ -1036,6 +1161,11 @@ struct FrameView {
     xp_level: i32,
     chunks: usize,
     feet: [f64; 3],
+    /// World age and weather for the sky tint and rain.
+    day_time: i64,
+    raining: bool,
+    thundering: bool,
+    lightning: f32,
     /// Fraction of the way through the current 20 Hz tick.
     alpha: f64,
 }
@@ -1113,6 +1243,8 @@ struct LiveApp {
     saves_dir: std::path::PathBuf,
     worlds: Vec<WorldMetadata>,
     worlds_scroll: usize,
+    /// True while the list shows restorable snapshots instead of live worlds.
+    worlds_are_backups: bool,
     selected_world: Option<String>,
     world_error: Option<String>,
     world_name_input: String,
@@ -1220,6 +1352,7 @@ impl LiveApp {
             saves_dir,
             worlds: Vec::new(),
             worlds_scroll: 0,
+            worlds_are_backups: false,
             selected_world: None,
             world_error: None,
             world_name_input: String::new(),
@@ -1676,6 +1809,10 @@ impl LiveApp {
                 xp_level: state.xp_level,
                 chunks: state.chunks,
                 feet,
+                day_time: state.day_time,
+                raining: state.raining,
+                thundering: state.thundering,
+                lightning: state.lightning,
                 alpha,
             }
         };
@@ -1897,6 +2034,11 @@ impl LiveApp {
             } else {
                 None
             },
+            day_time: view.day_time,
+            raining: view.raining,
+            thundering: view.thundering,
+            lightning: view.lightning,
+            clock: self.time,
         };
 
         self.buttons = match self.screen {
@@ -1910,10 +2052,11 @@ impl LiveApp {
                 width,
                 height,
             ),
-            Screen::Worlds => ui::draw_worlds(
+            Screen::Worlds | Screen::WorldBackups => ui::draw_worlds(
                 &mut self.ui_bg,
                 &mut self.ui_fg,
                 &self.worlds,
+                self.worlds_are_backups,
                 self.selected_world.as_deref(),
                 self.worlds_scroll,
                 self.world_error.as_deref(),
@@ -2123,7 +2266,12 @@ impl LiveApp {
     }
 
     fn refresh_worlds(&mut self) {
-        match save::list_worlds(&self.saves_dir) {
+        let result = if self.worlds_are_backups {
+            WorldSave::list_backups(&self.saves_dir)
+        } else {
+            save::list_worlds(&self.saves_dir)
+        };
+        match result {
             Ok(worlds) => {
                 let previous_selection = self.selected_world.clone();
                 self.worlds = worlds;
@@ -2158,9 +2306,48 @@ impl LiveApp {
         self.set_mouse_capture(false);
         self.world_error = None;
         self.worlds_scroll = 0;
+        self.worlds_are_backups = false;
         self.selected_world = None;
         self.screen = Screen::Worlds;
         self.refresh_worlds();
+    }
+
+    fn open_world_backups(&mut self) {
+        self.world_error = None;
+        self.worlds_scroll = 0;
+        self.worlds_are_backups = true;
+        self.selected_world = None;
+        self.screen = Screen::WorldBackups;
+        self.refresh_worlds();
+    }
+
+    fn backup_selected_world(&mut self) {
+        let Some(directory) = self.selected_world.clone() else {
+            return;
+        };
+        match WorldSave::backup(&self.saves_dir, &directory) {
+            Ok(_) => {
+                self.world_error = None;
+                self.refresh_worlds();
+            }
+            Err(error) => self.world_error = Some(error.to_string()),
+        }
+    }
+
+    fn restore_selected_backup(&mut self) {
+        let Some(id) = self.selected_world.clone() else {
+            return;
+        };
+        match WorldSave::restore_backup(&self.saves_dir, &id) {
+            Ok(metadata) => {
+                self.worlds_are_backups = false;
+                self.selected_world = Some(metadata.directory);
+                self.world_error = None;
+                self.screen = Screen::Worlds;
+                self.refresh_worlds();
+            }
+            Err(error) => self.world_error = Some(error.to_string()),
+        }
     }
 
     fn open_world_create(&mut self) {
@@ -2829,6 +3016,9 @@ impl LiveApp {
                 self.world_error = None;
                 self.screen = Screen::WorldDeleteConfirm;
             }
+            Action::WorldBackupSelected => self.backup_selected_world(),
+            Action::WorldBrowseBackups => self.open_world_backups(),
+            Action::WorldRestoreSelected => self.restore_selected_backup(),
             Action::WorldsBack => {
                 self.world_error = None;
                 self.screen = Screen::Title;
@@ -3141,6 +3331,13 @@ impl ApplicationHandler for LiveApp {
                     self.open_selected_world();
                     return;
                 }
+                if self.screen == Screen::WorldBackups
+                    && event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::Enter)
+                {
+                    self.restore_selected_backup();
+                    return;
+                }
                 if self.screen == Screen::WorldDeleteConfirm
                     && event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Enter)
@@ -3156,7 +3353,9 @@ impl ApplicationHandler for LiveApp {
                             Screen::Inventory => self.close_inventory(),
                             Screen::Settings => self.screen = self.settings_return,
                             Screen::Title => {}
-                            Screen::Worlds | Screen::Servers => self.screen = Screen::Title,
+                            Screen::Worlds | Screen::WorldBackups | Screen::Servers => {
+                                self.screen = Screen::Title
+                            }
                             Screen::WorldCreate => {
                                 self.screen = Screen::Worlds;
                                 self.world_error = None;
@@ -3188,6 +3387,7 @@ impl ApplicationHandler for LiveApp {
                             | Screen::Settings
                             | Screen::Title
                             | Screen::Worlds
+                            | Screen::WorldBackups
                             | Screen::WorldCreate
                             | Screen::WorldRename
                             | Screen::WorldDeleteConfirm
@@ -3475,8 +3675,17 @@ mod tests {
             inventory: vec![None; 45],
             health: 20.0,
             food: 20,
+            food_saturation: 5.0,
+            food_exhaustion: 0.0,
             xp_bar: 0.0,
             xp_level: 0,
+            xp_total: 0,
+            xp_seed: 0,
+            spawn_point: None,
+            day_time: 0,
+            raining: false,
+            thundering: false,
+            lightning: 0.0,
             chunks: 0,
             give_item: None,
             chat_out: Vec::new(),

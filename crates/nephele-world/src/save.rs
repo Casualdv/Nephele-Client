@@ -1,12 +1,17 @@
 //! Single-player world metadata and Anvil chunk persistence.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use indexmap::IndexMap;
 use nephele_anvil::{
     encode_chunk_nbt, encode_nbt, parse_chunk, parse_nbt, RegionFile, StoredChunk, StoredSection,
     Tag,
@@ -16,9 +21,14 @@ use crate::chunk::{ChunkColumn, Section, SECTION_COUNT, SECTION_VOLUME};
 
 const METADATA_FILE: &str = "nephele.dat";
 const PLAYER_STATE_FILE: &str = "player.dat";
+const LEVEL_FILE: &str = "level.dat";
 const REGION_DIR: &str = "region";
+mod management;
+mod level;
+use level::*;
 const MAX_WORLD_NAME_UNITS: usize = 64;
 const PLAYER_INVENTORY_SLOTS: usize = 45;
+const VANILLA_LEVEL_VERSION: i32 = 19133;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorldMode {
@@ -61,6 +71,7 @@ pub struct SavedItemStack {
     pub id: i16,
     pub count: i8,
     pub damage: i16,
+    pub template_slot: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,8 +79,42 @@ pub struct SavedPlayerState {
     pub position: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    pub health: f32,
+    pub food_level: i32,
+    pub food_saturation: f32,
+    pub food_exhaustion: f32,
+    pub xp_progress: f32,
+    pub xp_level: i32,
+    pub xp_total: i32,
+    pub xp_seed: i32,
     pub held_slot: i16,
+    pub spawn_point: Option<[i32; 3]>,
     pub inventory: Vec<Option<SavedItemStack>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldState {
+    pub total_time: i64,
+    pub day_time: i64,
+    pub spawn_position: [i32; 3],
+    pub raining: bool,
+    pub rain_time: i32,
+    pub thundering: bool,
+    pub thunder_time: i32,
+}
+
+impl Default for WorldState {
+    fn default() -> Self {
+        Self {
+            total_time: 0,
+            day_time: 0,
+            spawn_position: [0, 64, 0],
+            raining: false,
+            rain_time: 6_000,
+            thundering: false,
+            thunder_time: 0,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -81,6 +126,7 @@ pub enum SaveError {
     InvalidWorldName(String),
     AlreadyExists(PathBuf),
     InvalidMetadata(PathBuf),
+    InvalidLevelData(PathBuf),
     InvalidPlayerState(String),
     ChunkCoordinateMismatch {
         requested: (i32, i32),
@@ -106,6 +152,9 @@ impl fmt::Display for SaveError {
                     path.display()
                 )
             }
+            Self::InvalidLevelData(path) => {
+                write!(f, "invalid or corrupt vanilla level data at {}", path.display())
+            }
             Self::InvalidPlayerState(reason) => write!(f, "invalid saved player state: {reason}"),
             Self::ChunkCoordinateMismatch { requested, stored } => write!(
                 f,
@@ -126,6 +175,7 @@ impl Error for SaveError {
             Self::InvalidWorldName(_)
             | Self::AlreadyExists(_)
             | Self::InvalidMetadata(_)
+            | Self::InvalidLevelData(_)
             | Self::InvalidPlayerState(_)
             | Self::ChunkCoordinateMismatch { .. } => None,
         }
@@ -161,10 +211,15 @@ pub struct WorldSave {
     path: PathBuf,
     metadata: WorldMetadata,
     regions: HashMap<(i32, i32), RegionFile>,
+    level_root_name: String,
+    root_fields: IndexMap<String, Tag>,
+    source_inventory: Vec<Tag>,
+    level_data: IndexMap<String, Tag>,
+    last_good_level_bytes: Option<Vec<u8>>,
 }
 
 impl WorldSave {
-    /// Creates a save at `<saves_dir>/<name>` and writes its metadata.
+    /// Creates a vanilla-readable save at `<saves_dir>/<name>`.
     pub fn create(
         saves_dir: impl AsRef<Path>,
         name: &str,
@@ -190,30 +245,69 @@ impl WorldSave {
             seed,
             mode,
         };
-        write_metadata(&path.join(METADATA_FILE), &metadata)?;
-        Ok(Self {
+        let level_data = new_level_data(&metadata, &WorldState::default());
+        let mut save = Self {
             path,
             metadata,
             regions: HashMap::new(),
-        })
+            level_root_name: String::new(),
+            root_fields: IndexMap::new(),
+            source_inventory: Vec::new(),
+            level_data,
+            last_good_level_bytes: None,
+        };
+        if let Err(error) = save
+            .write_level_dat()
+            .and_then(|()| write_legacy_metadata(&save.path, &save.metadata))
+        {
+            let _ = fs::remove_dir_all(&save.path);
+            return Err(error);
+        }
+        Ok(save)
     }
 
     /// Opens an existing save by its directory name.
     pub fn open(saves_dir: impl AsRef<Path>, directory: &str) -> Result<Self, SaveError> {
         let directory = validate_directory_name(directory)?;
         let path = saves_dir.as_ref().join(&directory);
-        let metadata_path = path.join(METADATA_FILE);
-        let mut metadata = read_metadata(&metadata_path)?;
-        metadata.directory = directory;
+        management::plain_directory(&path)?;
+        let document = read_level_document(&path)?;
+        let (level_root_name, root_fields, level_data, last_good_level_bytes, metadata) = match document {
+            Some(document) => {
+                let metadata = metadata_from_level(&document.data, &directory)
+                    .or_else(|_| read_metadata(&path.join(METADATA_FILE)))?;
+                (
+                    document.root_name,
+                    document.root_fields,
+                    document.data,
+                    Some(document.raw_bytes),
+                    metadata,
+                )
+            }
+            None => {
+                let metadata = read_metadata(&path.join(METADATA_FILE))?;
+                let level_data = new_level_data(&metadata, &WorldState::default());
+                (String::new(), IndexMap::new(), level_data, None, metadata)
+            }
+        };
         Ok(Self {
             path,
-            metadata,
+            metadata: WorldMetadata { directory, ..metadata },
             regions: HashMap::new(),
+            level_root_name,
+            root_fields,
+            source_inventory: inventory_entries(level_data.get("Player")).to_vec(),
+            level_data,
+            last_good_level_bytes,
         })
     }
 
     pub fn metadata(&self) -> &WorldMetadata {
         &self.metadata
+    }
+
+    pub fn world_state(&self) -> WorldState {
+        world_state_from_level(&self.level_data)
     }
 
     /// Persists a changed mode in the world's metadata.
@@ -223,107 +317,86 @@ impl WorldSave {
         }
         let previous = self.metadata.mode;
         self.metadata.mode = mode;
-        if let Err(error) = write_metadata(&self.path.join(METADATA_FILE), &self.metadata) {
+        self.level_data.insert(
+            "GameType".to_string(),
+            Tag::Int(match mode {
+                WorldMode::Survival => 0,
+                WorldMode::Creative => 1,
+            }),
+        );
+        self.level_data.insert(
+            "LevelName".to_string(),
+            Tag::String(self.metadata.name.clone()),
+        );
+        if let Err(error) = self.write_level_dat() {
             self.metadata.mode = previous;
+            self.level_data.insert(
+                "GameType".to_string(),
+                Tag::Int(if previous.is_creative() { 1 } else { 0 }),
+            );
             return Err(error);
         }
+        let _ = write_legacy_metadata(&self.path, &self.metadata);
         Ok(())
     }
 
-    /// Loads the saved local player's position, orientation, selected slot and inventory.
+    /// Loads the vanilla `Data.Player` compound, falling back to Nephele's
+    /// pre-level.dat player file for worlds created by early M5 builds.
     pub fn load_player_state(&self) -> Result<Option<SavedPlayerState>, SaveError> {
-        let path = self.path.join(PLAYER_STATE_FILE);
-        if !path.exists() {
-            return Ok(None);
+        if let Some(player) = self.level_data.get("Player") {
+            return parse_vanilla_player(player).map(Some);
         }
-        let bytes = fs::read(&path)?;
-        let (_, root) = parse_nbt(&bytes)?;
-        let read_double = |name: &str| match root.get(name) {
-            Some(Tag::Double(value)) => Ok(*value),
-            _ => Err(SaveError::InvalidPlayerState(format!("missing {name}"))),
-        };
-        let yaw = match root.get("Yaw") {
-            Some(Tag::Float(value)) => *value,
-            _ => return Err(SaveError::InvalidPlayerState("missing yaw".to_string())),
-        };
-        let pitch = match root.get("Pitch") {
-            Some(Tag::Float(value)) => *value,
-            _ => return Err(SaveError::InvalidPlayerState("missing pitch".to_string())),
-        };
-        let held_slot = match root.get("HeldSlot") {
-            Some(Tag::Short(value)) => *value,
-            _ => {
-                return Err(SaveError::InvalidPlayerState(
-                    "missing held slot".to_string(),
-                ));
-            }
-        };
-        let entries = root
-            .get("Inventory")
-            .and_then(Tag::as_list)
-            .ok_or_else(|| SaveError::InvalidPlayerState("missing inventory".to_string()))?;
-        let mut inventory = vec![None; PLAYER_INVENTORY_SLOTS];
-        for entry in entries {
-            let slot = match entry.get("Slot") {
-                Some(Tag::Byte(value)) if (0..PLAYER_INVENTORY_SLOTS as i8).contains(value) => {
-                    *value as usize
-                }
-                _ => continue,
-            };
-            let (Some(Tag::Short(id)), Some(Tag::Byte(count)), Some(Tag::Short(damage))) =
-                (entry.get("Id"), entry.get("Count"), entry.get("Damage"))
-            else {
-                continue;
-            };
-            if *count > 0 {
-                inventory[slot] = Some(SavedItemStack {
-                    id: *id,
-                    count: *count,
-                    damage: *damage,
-                });
-            }
+        let legacy = self.path.join(PLAYER_STATE_FILE);
+        if legacy.is_file() {
+            let bytes = fs::read(&legacy)?;
+            let (_, root) = parse_nbt(&bytes)?;
+            return parse_legacy_player(&root).map(Some);
         }
-
-        let state = SavedPlayerState {
-            position: [read_double("X")?, read_double("Y")?, read_double("Z")?],
-            yaw,
-            pitch,
-            held_slot,
-            inventory,
-        };
-        validate_player_state(&state)?;
-        Ok(Some(state))
+        Ok(None)
     }
 
-    /// Writes the local player's state into this world's `player.dat`.
-    pub fn save_player_state(&self, state: &SavedPlayerState) -> Result<(), SaveError> {
+    /// Writes player state under vanilla's `Data.Player` in `level.dat`.
+    pub fn save_player_state(&mut self, state: &SavedPlayerState) -> Result<(), SaveError> {
         validate_player_state(state)?;
+        let player = player_tag_with_state(self.level_data.get("Player"), &self.source_inventory, state);
+        self.level_data
+            .insert("Player".to_string(), Tag::Compound(player));
+        self.write_level_dat()
+    }
 
-        let mut inventory = Vec::new();
-        for (slot, item) in state.inventory.iter().enumerate() {
-            let Some(item) = item else {
-                continue;
-            };
-            let mut stack = HashMap::new();
-            stack.insert("Slot".to_string(), Tag::Byte(slot as i8));
-            stack.insert("Id".to_string(), Tag::Short(item.id));
-            stack.insert("Count".to_string(), Tag::Byte(item.count));
-            stack.insert("Damage".to_string(), Tag::Short(item.damage));
-            inventory.push(Tag::Compound(stack));
-        }
+    /// Atomically persists level/player state together, keeping the previous
+    /// complete `level.dat` in `level.dat.bak` before replacing it.
+    pub fn save_snapshot(
+        &mut self,
+        player: &SavedPlayerState,
+        world: &WorldState,
+    ) -> Result<(), SaveError> {
+        validate_player_state(player)?;
+        update_level_fields(&mut self.level_data, &self.metadata, world);
+        let updated_player = player_tag_with_state(self.level_data.get("Player"), &self.source_inventory, player);
+        self.level_data
+            .insert("Player".to_string(), Tag::Compound(updated_player));
+        self.write_level_dat()
+    }
 
-        let mut player = HashMap::new();
-        player.insert("Version".to_string(), Tag::Int(1));
-        player.insert("X".to_string(), Tag::Double(state.position[0]));
-        player.insert("Y".to_string(), Tag::Double(state.position[1]));
-        player.insert("Z".to_string(), Tag::Double(state.position[2]));
-        player.insert("Yaw".to_string(), Tag::Float(state.yaw));
-        player.insert("Pitch".to_string(), Tag::Float(state.pitch));
-        player.insert("HeldSlot".to_string(), Tag::Short(state.held_slot));
-        player.insert("Inventory".to_string(), Tag::List(inventory));
+    pub fn save_world_state(&mut self, world: &WorldState) -> Result<(), SaveError> {
+        update_level_fields(&mut self.level_data, &self.metadata, world);
+        self.write_level_dat()
+    }
 
-        let bytes = encode_nbt("Player", &Tag::Compound(player))?;
-        fs::write(self.path.join(PLAYER_STATE_FILE), bytes)?;
+    fn write_level_dat(&mut self) -> Result<(), SaveError> {
+        let mut root = self.root_fields.clone();
+        root.insert("Data".into(), Tag::Compound(self.level_data.clone()));
+        let raw = encode_nbt(&self.level_root_name, &Tag::Compound(root))?;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw)?;
+        let bytes = encoder.finish()?;
+        atomic_write_with_backup(
+            &self.path.join(LEVEL_FILE),
+            self.last_good_level_bytes.as_deref(),
+            &bytes,
+        )?;
+        self.last_good_level_bytes = Some(bytes);
         Ok(())
     }
 
@@ -337,13 +410,20 @@ impl WorldSave {
             self.metadata.directory == directory
         };
         let previous = self.metadata.clone();
+        let previous_level_data = self.level_data.clone();
 
         if same_path {
             self.metadata.name = name.to_string();
-            if let Err(error) = write_metadata(&self.path.join(METADATA_FILE), &self.metadata) {
+            self.level_data.insert(
+                "LevelName".to_string(),
+                Tag::String(self.metadata.name.clone()),
+            );
+            if let Err(error) = self.write_level_dat() {
                 self.metadata = previous;
+                self.level_data = previous_level_data;
                 return Err(error);
             }
+            let _ = write_legacy_metadata(&self.path, &self.metadata);
             return Ok(self.metadata.clone());
         }
 
@@ -356,14 +436,20 @@ impl WorldSave {
         self.path = new_path.clone();
         self.metadata.directory = directory;
         self.metadata.name = name.to_string();
+        self.level_data.insert(
+            "LevelName".to_string(),
+            Tag::String(self.metadata.name.clone()),
+        );
         self.regions.clear();
-        if let Err(error) = write_metadata(&self.path.join(METADATA_FILE), &self.metadata) {
+        if let Err(error) = self.write_level_dat() {
             self.path = old_path.clone();
             self.metadata = previous;
+            self.level_data = previous_level_data;
             self.regions.clear();
             let _ = fs::rename(new_path, old_path);
             return Err(error);
         }
+        let _ = write_legacy_metadata(&self.path, &self.metadata);
         Ok(self.metadata.clone())
     }
 
@@ -408,16 +494,25 @@ impl WorldSave {
     /// Writes exactly this chunk to its region file. Callers decide which chunks
     /// are dirty; clean chunks are never serialized or rewritten here.
     pub fn save_chunk(&mut self, column: &ChunkColumn) -> Result<(), SaveError> {
-        let region_coord = (column.x.div_euclid(32), column.z.div_euclid(32));
-        let region_path = self.region_path(region_coord);
-        let bytes = encode_chunk_nbt(&stored_from_column(column))?;
-        RegionFile::write_chunk(
-            &region_path,
-            column.x.rem_euclid(32) as usize,
-            column.z.rem_euclid(32) as usize,
-            &bytes,
-        )?;
-        self.regions.remove(&region_coord);
+        self.save_chunks(std::slice::from_ref(column))
+    }
+
+    /// Writes a batch of dirty columns, compacting each touched region once.
+    pub fn save_chunks(&mut self, columns: &[ChunkColumn]) -> Result<(), SaveError> {
+        let mut by_region: BTreeMap<(i32, i32), Vec<(usize, usize, Vec<u8>)>> = BTreeMap::new();
+        for column in columns {
+            let region_coord = (column.x.div_euclid(32), column.z.div_euclid(32));
+            let nbt = encode_chunk_nbt(&stored_from_column(column))?;
+            by_region.entry(region_coord).or_default().push((
+                column.x.rem_euclid(32) as usize,
+                column.z.rem_euclid(32) as usize,
+                nbt,
+            ));
+        }
+        for (region_coord, updates) in by_region {
+            RegionFile::write_chunks(&self.region_path(region_coord), &updates)?;
+            self.regions.remove(&region_coord);
+        }
         Ok(())
     }
 
@@ -445,10 +540,8 @@ pub fn list_worlds(saves_dir: impl AsRef<Path>) -> Result<Vec<WorldMetadata>, Sa
         if validate_directory_name(&directory).is_err() {
             continue;
         }
-        let metadata_path = entry.path().join(METADATA_FILE);
-        if let Ok(mut metadata) = read_metadata(&metadata_path) {
-            metadata.directory = directory;
-            worlds.push(metadata);
+        if let Ok(world) = WorldSave::open(saves_dir, &directory) {
+            worlds.push(world.metadata);
         }
     }
     worlds.sort_by(|left, right| {
@@ -521,8 +614,9 @@ fn validate_player_state(state: &SavedPlayerState) -> Result<(), SaveError> {
     Ok(())
 }
 
-fn write_metadata(path: &Path, metadata: &WorldMetadata) -> Result<(), SaveError> {
-    let mut values = HashMap::new();
+fn write_legacy_metadata(directory: &Path, metadata: &WorldMetadata) -> Result<(), SaveError> {
+    let path = directory.join(METADATA_FILE);
+    let mut values = IndexMap::new();
     values.insert("Name".to_string(), Tag::String(metadata.name.clone()));
     values.insert("Seed".to_string(), Tag::Long(metadata.seed as i64));
     values.insert(
@@ -662,7 +756,7 @@ mod tests {
     use crate::block::BlockState;
     use crate::chunk::SECTION_LIGHT_BYTES;
 
-    fn temp_saves_dir(label: &str) -> PathBuf {
+    pub(super) fn temp_saves_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "nephele-world-save-{}-{label}-{}",
             std::process::id(),
@@ -717,20 +811,21 @@ mod tests {
     #[test]
     fn player_position_orientation_and_inventory_roundtrip_in_world_data() {
         let saves = temp_saves_dir("player-state");
-        let save = WorldSave::create(&saves, "Player State", 91, WorldMode::Survival).unwrap();
+        let mut save = WorldSave::create(&saves, "Player State", 91, WorldMode::Survival).unwrap();
         let mut inventory = vec![None; PLAYER_INVENTORY_SLOTS];
-        inventory[0] = Some(SavedItemStack {
+        inventory[36] = Some(SavedItemStack {
             id: 4,
             count: 31,
-            damage: 2,
+            damage: 2, template_slot: None,
         });
         inventory[44] = Some(SavedItemStack {
             id: 280,
             count: 5,
-            damage: 0,
+            damage: 0, template_slot: None,
         });
         let player = SavedPlayerState {
             position: [-23.5, 72.25, 41.75],
+            health: 12.5, food_level: 7, food_saturation: 2.5, food_exhaustion: 1.75, xp_progress: 0.625, xp_level: 18, xp_total: 415, xp_seed: -71, spawn_point: Some([-10,72,19]),
             yaw: 1.25,
             pitch: -0.375,
             held_slot: 7,
@@ -742,7 +837,7 @@ mod tests {
 
         let reopened = WorldSave::open(&saves, "Player State").unwrap();
         assert_eq!(reopened.load_player_state().unwrap(), Some(player));
-        assert!(saves.join("Player State").join(PLAYER_STATE_FILE).is_file());
+        assert!(saves.join("Player State").join(LEVEL_FILE).is_file());
 
         let _ = fs::remove_dir_all(saves);
     }

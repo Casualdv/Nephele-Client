@@ -5,6 +5,11 @@
 
 # Build output
 /target
+/dist/
+
+# Release credentials are never repository material.
+*.pem
+*.pfx
 
 # --- Mojang artifacts -------------------------------------------------------
 *.jar

@@ -1,0 +1,77 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Validate public source tree
+        shell: pwsh
+        run: ./scripts/check_public_tree.ps1
+
+      - name: Format, lint and test
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw "cargo fmt failed" }
+          cargo clippy --workspace --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed" }
+          cargo test --workspace
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+
+      - name: Build, sign and package
+        shell: pwsh
+        env:
+          NEPHELE_CLIENT_ID: ${{ vars.NEPHELE_CLIENT_ID }}
+          NEPHELE_CRASH_REPORT_URL: ${{ vars.NEPHELE_CRASH_REPORT_URL }}
+          NEPHELE_UPDATE_SIGNING_KEY_B64: ${{ secrets.NEPHELE_UPDATE_SIGNING_KEY_B64 }}
+          NEPHELE_CODESIGN_PFX_B64: ${{ secrets.NEPHELE_CODESIGN_PFX_B64 }}
+          NEPHELE_CODESIGN_PASSWORD: ${{ secrets.NEPHELE_CODESIGN_PASSWORD }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $version = $tag -replace '^v', ''
+          ./scripts/package_windows.ps1 -Version $version -Tag $tag -Release
+          if ($LASTEXITCODE -ne 0) { throw "Package script failed" }
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $version = $tag -replace '^v', ''
+          $stage = Join-Path $PWD "dist\stage-$version"
+          $installer = Join-Path $PWD "dist\NepheleSetup-$version-win-x64.exe"
+          $assets = @(
+            $installer,
+            (Join-Path $stage "versions\$version\nephele.exe"),
+            (Join-Path $stage "versions\$version\nephele-launcher.exe"),
+            (Join-Path $stage "versions\$version\nephele-prepare.exe"),
+            (Join-Path $stage "versions\$version\research-lock.json"),
+            (Join-Path $stage "update-manifest.json"),
+            (Join-Path $stage "update-manifest.sig")
+          )
+          $pre = $tag -match '(?i)(alpha|beta|preview|rc)'
+          $createArgs = @('release', 'create', $tag) + $assets + @('--title', "Nephele $version", '--generate-notes')
+          if ($pre) { $createArgs += '--prerelease' }
+          gh @createArgs
+          if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed" }

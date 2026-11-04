@@ -10,6 +10,8 @@ description = "Minecraft 1.8.9 world storage and chunk (de)serialisation for Nep
 nephele-anvil = { path = "../nephele-anvil" }
 nephele-protocol = { path = "../nephele-protocol" }
 tracing = { workspace = true }
+flate2 = { workspace = true }
+indexmap = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

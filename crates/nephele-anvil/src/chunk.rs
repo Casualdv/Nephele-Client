@@ -6,6 +6,7 @@
 //! `Level.Biomes` holds one biome id per column, 16x16, X fastest.
 
 use crate::nbt::{self, NbtError, Tag};
+use indexmap::IndexMap;
 
 pub const SECTION_VOLUME: usize = 4096;
 
@@ -178,7 +179,7 @@ pub fn encode_chunk_nbt(chunk: &StoredChunk) -> Result<Vec<u8>, ChunkError> {
     let section_tags = sections
         .iter()
         .map(|section| {
-            let mut fields = std::collections::HashMap::new();
+            let mut fields = IndexMap::new();
             fields.insert("Y".to_string(), Tag::Byte(section.y));
             fields.insert(
                 "Blocks".to_string(),
@@ -224,7 +225,7 @@ pub fn encode_chunk_nbt(chunk: &StoredChunk) -> Result<Vec<u8>, ChunkError> {
         })
         .collect();
 
-    let mut level = std::collections::HashMap::new();
+    let mut level = IndexMap::new();
     level.insert("xPos".to_string(), Tag::Int(chunk.x));
     level.insert("zPos".to_string(), Tag::Int(chunk.z));
     level.insert("LastUpdate".to_string(), Tag::Long(0));
@@ -238,7 +239,7 @@ pub fn encode_chunk_nbt(chunk: &StoredChunk) -> Result<Vec<u8>, ChunkError> {
     level.insert("TileEntities".to_string(), Tag::List(Vec::new()));
     level.insert("TileTicks".to_string(), Tag::List(Vec::new()));
 
-    let mut root = std::collections::HashMap::new();
+    let mut root = IndexMap::new();
     root.insert("Level".to_string(), Tag::Compound(level));
     Ok(nbt::encode("", &Tag::Compound(root))?)
 }

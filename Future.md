@@ -234,13 +234,13 @@ No audio exists yet.
 
 | Item | Size | Notes |
 |---|---|---|
-| Launcher v2: profiles, versions, news, update check | L | v0.1 exists. |
-| Signed auto-update | L | |
-| Crash reporter with opt-in upload | M | |
-| Telemetry opt-in only, and never on by default | S | |
+| Launcher v2: profiles, versions, news, update check | L | Implemented, including offline/Microsoft profiles; client id + clean-machine release smoke test remain. |
+| Signed auto-update | L | RSA-signed manifest and SHA-256 asset verification implemented; release secret must be configured. |
+| Crash reporter with opt-in upload | M | Local report + explicit consent implemented; HTTPS upload endpoint still needs deployment/configuration. |
+| Telemetry opt-in only, and never on by default | S | No analytics; crash upload consent defaults off. |
 | Mod/plugin API for client modules | XL | Only if we want a third-party ecosystem. |
-| Terms, privacy policy, non-affiliation disclaimer | S | Required before public release. |
-| Branding, installer, packaging | M | |
+| Terms, privacy policy, non-affiliation disclaimer | S | Launcher pages and README disclaimer added; legal review still required before public release. |
+| Branding, installer, packaging | M | Original launcher mark, Inno Setup installer and Windows release workflow implemented; Authenticode certificate is not configured. |
 
 ### 11. Testing and parity
 
@@ -271,15 +271,18 @@ furnace/chest block entities and broader item-icon coverage. *Exit:* punch a
 tree and make a pickaxe in a survival session.
 
 **M3 — Join a real server.** Microsoft auth (**done**, missing only a shippable
-Azure client id), server list (**done**), online-mode handshake (**done**),
+Azure client id; the v2 launcher now exposes the device-code flow), server list (**done**), online-mode handshake (**done**),
 dimension change. *Exit:* join a public 1.8.9 server and play.
 
 **M4 — PvP client.** HUD modules, toggle sprint, zoom, crosshair/hit indicators,
 chat, scoreboard, tab list. *Exit:* playable at a competitive level on an old
 laptop.
 
-**M5 — Product.** Launcher v2, auto-update, crash reporting, legal pages,
-installer. *Exit:* a stranger can download, install and play without help.
+**M5 — Product.** Launcher v2, signed update path, opt-in crash reporting, legal
+pages and Windows installer are implemented. **Not closed:** the crash endpoint,
+Authenticode certificate and shippable Microsoft client id are not configured,
+and the release has not been installed and played on a clean machine. *Exit:* a
+stranger can download, install and play without help.
 
 **M6 — Depth.** Entities and mobs, block entities, particles, audio, singleplayer
 saving, structures.

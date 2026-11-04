@@ -45,6 +45,7 @@ pub enum Screen {
     Title,
     /// The saved single-player worlds.
     Worlds,
+    WorldBackups,
     /// World name, seed and game-mode form.
     WorldCreate,
     /// Rename the selected single-player world.
@@ -74,6 +75,9 @@ pub enum Action {
     WorldNew,
     WorldRenameSelected,
     WorldDeleteSelected,
+    WorldBackupSelected,
+    WorldBrowseBackups,
+    WorldRestoreSelected,
     WorldsBack,
     WorldNameFocus,
     WorldSeedFocus,
@@ -138,6 +142,14 @@ pub struct HudState<'a> {
     pub chatting: bool,
     /// Slots of the open container window (a crafting table), if any.
     pub window_slots: Option<&'a [Option<ItemStack>]>,
+    /// World age and weather, for the sky tint and rain streaks.
+    pub day_time: i64,
+    pub raining: bool,
+    pub thundering: bool,
+    /// Lightning flash strength, 0..=1, already decayed by the game thread.
+    pub lightning: f32,
+    /// Seconds since launch; drives rain-streak animation.
+    pub clock: f32,
 }
 
 /// Vanilla's automatic GUI scale: integers only so the pixel font stays crisp.
@@ -208,6 +220,65 @@ fn hovered(pointer: Option<[f32; 2]>, rect: &Rect) -> bool {
     pointer.map(|[x, y]| rect.contains(x, y)).unwrap_or(false)
 }
 
+fn weather_hash(mut n: u32) -> u32 {
+    n ^= n >> 16;
+    n = n.wrapping_mul(0x7feb_352d);
+    n ^= n >> 15;
+    n = n.wrapping_mul(0x846c_a68b);
+    n ^= n >> 16;
+    n
+}
+
+/// Night darkening, rain streaks and lightning, drawn over the world and under
+/// the HUD. The renderer owns the sky itself, so this is the presentation layer.
+fn draw_weather(bg: &mut UiBatch, hud: &HudState<'_>, scale: f32, width: f32, height: f32) {
+    let s = |v: f32| v * scale;
+    let phase = (hud.day_time.rem_euclid(24_000) as f32) / 24_000.0;
+    let sun = (phase * std::f32::consts::TAU).sin();
+    let daylight = sun.max(0.0);
+    let night = (1.0 - daylight) * 0.45;
+    if night > 0.01 {
+        bg.rect(
+            Rect::new(0.0, 0.0, width, height),
+            [0.02, 0.03, 0.10, night],
+        );
+    }
+    if daylight > 0.02 && daylight < 0.45 {
+        let warmth = (1.0 - daylight / 0.45) * 0.12;
+        bg.rect(
+            Rect::new(0.0, 0.0, width, height),
+            [0.55, 0.24, 0.06, warmth],
+        );
+    }
+    if hud.raining {
+        let alpha = if hud.thundering { 0.42 } else { 0.26 };
+        bg.rect(
+            Rect::new(0.0, 0.0, width, height),
+            [0.14, 0.17, 0.25, alpha],
+        );
+        let count = ((width * height) / (16_000.0 * scale * scale)).clamp(48.0, 240.0) as usize;
+        let span = height + s(14.0);
+        for index in 0..count {
+            let seed = weather_hash(index as u32);
+            let x = ((seed & 0xFFFF) as f32 / 65_535.0) * width;
+            let speed = 420.0 + ((seed >> 16) & 0xFF) as f32 * 2.2;
+            let base = (((seed >> 24) & 0xFF) as f32 / 255.0) * height;
+            let y = (base + hud.clock * speed) % span - s(14.0);
+            let length = s(10.0) + ((seed >> 8) & 7) as f32 * s(1.5);
+            bg.rect(
+                Rect::new(x, y, s(1.4), length),
+                [0.62, 0.72, 0.92, 0.50],
+            );
+        }
+    }
+    if hud.lightning > 0.01 {
+        bg.rect(
+            Rect::new(0.0, 0.0, width, height),
+            [0.95, 0.97, 1.0, 0.55 * hud.lightning],
+        );
+    }
+}
+
 /// Draw the in-game HUD: crosshair, hotbar, health, food, XP and a debug line.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_hud(
@@ -223,6 +294,8 @@ pub fn draw_hud(
     let s = |v: f32| v * scale;
     let cx = width / 2.0;
     let mut buttons = Vec::new();
+
+    draw_weather(bg, hud, scale, width, height);
 
     // --- hotbar ------------------------------------------------------------
     let hotbar = Rect::new(cx - s(91.0), height - s(22.0), s(182.0), s(22.0));
@@ -1028,6 +1101,7 @@ pub fn draw_worlds(
     bg: &mut UiBatch,
     fg: &mut UiBatch,
     worlds: &[WorldMetadata],
+    backups: bool,
     selected_directory: Option<&str>,
     scroll: usize,
     error: Option<&str>,
@@ -1046,7 +1120,7 @@ pub fn draw_worlds(
     let top = ((height - block_h) / 2.0).max(s(2.0));
     let panel_w = s(360.0).min(width - s(8.0));
     let panel_x = cx - panel_w / 2.0;
-    fg.text_centered("Select World", cx, top, scale * 1.5, TEXT);
+    fg.text_centered(if backups { "Restore World Backup" } else { "Select World" }, cx, top, scale * 1.5, TEXT);
 
     let list_rect = Rect::new(panel_x, top + s(20.0), panel_w, list_h);
     bg.rect(list_rect, PANEL);
@@ -1055,7 +1129,7 @@ pub fn draw_worlds(
     let visible = worlds.len().saturating_sub(scroll).min(WORLD_ROWS);
     if worlds.is_empty() {
         fg.text_centered(
-            "No worlds saved yet - create one",
+            if backups { "No backups saved yet" } else { "No worlds saved yet - create one" },
             cx,
             list_rect.y + list_h / 2.0 - s(4.0),
             scale,
@@ -1103,7 +1177,7 @@ pub fn draw_worlds(
             TEXT,
         );
         fg.text(
-            &format!("Seed: {}  Mode: {}", world.seed, world.mode.as_str()),
+            &if backups { format!("Snapshot {}  Seed: {}", world.directory, world.seed) } else { format!("Seed: {}  Mode: {}", world.seed, world.mode.as_str()) },
             row.x + s(5.0),
             row.y + s(11.0),
             scale,
@@ -1121,88 +1195,39 @@ pub fn draw_worlds(
         s(20.0),
     );
     let can_manage = selected_directory.is_some();
-    draw_button_state(
-        bg,
-        fg,
-        play,
-        "Play Selected",
-        scale,
-        can_manage && hovered(pointer, &play),
-        can_manage,
-    );
-    draw_button(
-        bg,
-        fg,
-        new_world,
-        "Create New World",
-        scale,
-        hovered(pointer, &new_world),
-    );
-    if can_manage {
-        buttons.push(Button {
-            action: Action::WorldOpenSelected,
-            rect: play,
-        });
-    }
-    buttons.push(Button {
-        action: Action::WorldNew,
-        rect: new_world,
-    });
-
+    let mut button = |rect: Rect, label: &str, action: Action, enabled: bool| {
+        draw_button_state(bg, fg, rect, label, scale, enabled && hovered(pointer, &rect), enabled);
+        if enabled {
+            buttons.push(Button { action, rect });
+        }
+    };
     let second_button_y = first_button_y + s(24.0);
-    let small_button_w = (panel_w - s(12.0)) / 3.0;
-    let rename = Rect::new(panel_x, second_button_y, small_button_w, s(20.0));
-    let delete = Rect::new(
-        panel_x + small_button_w + s(6.0),
-        second_button_y,
-        small_button_w,
-        s(20.0),
-    );
-    let back = Rect::new(
-        panel_x + (small_button_w + s(6.0)) * 2.0,
-        second_button_y,
-        small_button_w,
-        s(20.0),
-    );
-    draw_button_state(
-        bg,
-        fg,
-        rename,
-        "Rename",
-        scale,
-        can_manage && hovered(pointer, &rename),
-        can_manage,
-    );
-    draw_button_state(
-        bg,
-        fg,
-        delete,
-        "Delete",
-        scale,
-        can_manage && hovered(pointer, &delete),
-        can_manage,
-    );
-    draw_button(bg, fg, back, "Back", scale, hovered(pointer, &back));
-    if can_manage {
-        buttons.push(Button {
-            action: Action::WorldRenameSelected,
-            rect: rename,
-        });
-        buttons.push(Button {
-            action: Action::WorldDeleteSelected,
-            rect: delete,
-        });
+    if backups {
+        button(play, "Restore Copy", Action::WorldRestoreSelected, can_manage);
+        button(new_world, "Back", Action::Singleplayer, true);
+    } else {
+        button(play, "Play Selected", Action::WorldOpenSelected, can_manage);
+        button(new_world, "Create New World", Action::WorldNew, true);
+        let controls = [
+            ("Rename", Action::WorldRenameSelected, can_manage),
+            ("Delete", Action::WorldDeleteSelected, can_manage),
+            ("Back Up", Action::WorldBackupSelected, can_manage),
+            ("Backups", Action::WorldBrowseBackups, true),
+            ("Back", Action::WorldsBack, true),
+        ];
+        let gap = s(3.0);
+        let small_w = (panel_w - gap * 4.0) / 5.0;
+        for (i, (label, action, enabled)) in controls.into_iter().enumerate() {
+            let rect = Rect::new(panel_x + (small_w + gap) * i as f32, second_button_y, small_w, s(20.0));
+            button(rect, label, action, enabled);
+        }
     }
-    buttons.push(Button {
-        action: Action::WorldsBack,
-        rect: back,
-    });
 
     if let Some(error) = error {
         fg.text_centered(error, cx, second_button_y + s(28.0), scale, OFFLINE);
     } else {
         fg.text_centered(
-            "Select a world, then choose an action",
+            if backups { "Restores a separate playable copy" } else { "Select a world, then choose an action" },
             cx,
             second_button_y + s(28.0),
             scale,
@@ -1926,6 +1951,11 @@ mod tests {
         assert!(!first
             .iter()
             .any(|button| button.action == Action::WorldOpenSelected));
+        assert!(!first.iter().any(|button| button.action == Action::WorldBackupSelected));
+        rect_of(&first, Action::WorldBrowseBackups);
+        let archived = draw_worlds(&mut bg, &mut fg, &worlds, true, Some("World 3"), 0, None, None, 2.0, 1280.0, 720.0);
+        rect_of(&archived, Action::WorldRestoreSelected);
+        assert!(!archived.iter().any(|button| button.action == Action::WorldDeleteSelected));
         let first_row = rect_of(&first, Action::WorldSelect(0));
         assert_eq!(
             hit_test(
@@ -1942,6 +1972,7 @@ mod tests {
             &mut bg,
             &mut fg,
             &worlds,
+            false,
             Some("World 3"),
             2,
             None,

@@ -34,12 +34,14 @@ talks protocol 47, and joins offline-mode servers.
 - Chat: on-screen log and input, with client-side `/gamemode`, `/tp`, `/setblock`, `/give`
 - UI: title, multiplayer (live ping, MOTD and version), direct connect, pause, settings
   and creative screens; HUD, hotbar, hearts
+- Launcher: first-run resource setup, saved offline/Microsoft profiles, stable/preview versions, signed release/news checks, legal pages and opt-in crash reports
 
 **Not implemented yet**
 
-- Microsoft sign-in and the protocol's encryption handshake, so **online-mode
-  servers cannot be joined** — Nephele only speaks to offline-mode servers
-- Sound, mob behaviour, survival gameplay, world saving and loading
+- Public Microsoft sign-in is available only in builds configured with the
+  project's Entra client id; unconfigured builds can play singleplayer and
+  offline-mode servers
+- Sound, mob behaviour and complete survival gameplay
 
 ## Requirements
 
@@ -78,10 +80,11 @@ all, which is the quickest way to see the renderer work.
 cargo run -p nephele-launcher
 ```
 
-A window with Play, a demo-world button and the resource status. It runs
-`nephele-prepare` by itself the first time resources are needed, and launches
-the game as a **child process**, so a crash in the client leaves the launcher
-open with a message instead of taking the whole app down with it.
+The launcher opens before resources are prepared, then helps locate your own
+Minecraft 1.8.9 install and extracts the verified resources locally. It has
+saved offline/Microsoft profiles, stable/preview versions, signed release/news
+checks, legal pages and opt-in crash reports. The game runs as a **child
+process**, so a crash leaves the launcher open with a locally saved report.
 
 ### Preparing the resources
 

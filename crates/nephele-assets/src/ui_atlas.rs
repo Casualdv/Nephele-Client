@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use image::{Rgba, RgbaImage};
+use image::{GenericImageView, Rgba, RgbaImage};
 
 use crate::atlas::AssetError;
 
@@ -220,6 +220,41 @@ impl UiAtlas {
         }
     }
 
+    /// Small original bitmap typeface for the launcher when the user has not
+    /// prepared their own game resources yet. The launcher must be able to
+    /// explain first-run setup without depending on Minecraft's font texture.
+    pub fn launcher_fallback() -> Self {
+        let mut image = RgbaImage::from_pixel(ATLAS_SIZE, ATLAS_SIZE, Rgba([0, 0, 0, 0]));
+        for code in 0u32..=255 {
+            let ch = char::from_u32(code).unwrap_or(' ');
+            let rendered = if ch.is_ascii_lowercase() {
+                ch.to_ascii_uppercase()
+            } else {
+                ch
+            };
+            let rows = glyph_5x7(rendered);
+            let col = code % 16;
+            let row = code / 16;
+            for (y, bits) in rows.iter().enumerate() {
+                for x in 0..5 {
+                    if bits & (1 << (4 - x)) != 0 {
+                        image.put_pixel(
+                            col * 8 + 1 + x,
+                            row * 8 + y as u32,
+                            Rgba([255, 255, 255, 255]),
+                        );
+                    }
+                }
+            }
+        }
+        let font_sheet = image.view(0, 0, 128, 128).to_image();
+        font::set_widths(font::measure(&font_sheet));
+        image.put_pixel(WHITE.x, WHITE.y, Rgba([255, 255, 255, 255]));
+        Self {
+            pixels: image.into_raw(),
+        }
+    }
+
     pub fn pixels(&self) -> &[u8] {
         &self.pixels
     }
@@ -234,6 +269,77 @@ impl UiAtlas {
             (WHITE.x as f32 + inset) / size,
             (WHITE.y as f32 + inset) / size,
         ]
+    }
+}
+
+/// A compact 5x7 uppercase bitmap font. Lowercase ASCII is mapped to the same
+/// legible glyphs so every launcher page can be rendered before game assets
+/// exist, without embedding or downloading a third-party font.
+fn glyph_5x7(ch: char) -> [u8; 7] {
+    match ch {
+        'A' => [14, 17, 17, 31, 17, 17, 17],
+        'B' => [30, 17, 17, 30, 17, 17, 30],
+        'C' => [14, 17, 16, 16, 16, 17, 14],
+        'D' => [30, 17, 17, 17, 17, 17, 30],
+        'E' => [31, 16, 16, 30, 16, 16, 31],
+        'F' => [31, 16, 16, 30, 16, 16, 16],
+        'G' => [14, 17, 16, 23, 17, 17, 15],
+        'H' => [17, 17, 17, 31, 17, 17, 17],
+        'I' => [14, 4, 4, 4, 4, 4, 14],
+        'J' => [7, 2, 2, 2, 18, 18, 12],
+        'K' => [17, 18, 20, 24, 20, 18, 17],
+        'L' => [16, 16, 16, 16, 16, 16, 31],
+        'M' => [17, 27, 21, 21, 17, 17, 17],
+        'N' => [17, 25, 21, 19, 17, 17, 17],
+        'O' => [14, 17, 17, 17, 17, 17, 14],
+        'P' => [30, 17, 17, 30, 16, 16, 16],
+        'Q' => [14, 17, 17, 17, 21, 18, 13],
+        'R' => [30, 17, 17, 30, 20, 18, 17],
+        'S' => [15, 16, 16, 14, 1, 1, 30],
+        'T' => [31, 4, 4, 4, 4, 4, 4],
+        'U' => [17, 17, 17, 17, 17, 17, 14],
+        'V' => [17, 17, 17, 17, 17, 10, 4],
+        'W' => [17, 17, 17, 21, 21, 21, 10],
+        'X' => [17, 17, 10, 4, 10, 17, 17],
+        'Y' => [17, 17, 10, 4, 4, 4, 4],
+        'Z' => [31, 1, 2, 4, 8, 16, 31],
+        '0' => [14, 17, 19, 21, 25, 17, 14],
+        '1' => [4, 12, 4, 4, 4, 4, 14],
+        '2' => [14, 17, 1, 2, 4, 8, 31],
+        '3' => [30, 1, 1, 14, 1, 1, 30],
+        '4' => [2, 6, 10, 18, 31, 2, 2],
+        '5' => [31, 16, 16, 30, 1, 1, 30],
+        '6' => [14, 16, 16, 30, 17, 17, 14],
+        '7' => [31, 1, 2, 4, 8, 8, 8],
+        '8' => [14, 17, 17, 14, 17, 17, 14],
+        '9' => [14, 17, 17, 15, 1, 1, 14],
+        '.' => [0, 0, 0, 0, 0, 12, 12],
+        ',' => [0, 0, 0, 0, 4, 4, 8],
+        ':' => [0, 12, 12, 0, 12, 12, 0],
+        ';' => [0, 12, 12, 0, 4, 4, 8],
+        '!' => [4, 4, 4, 4, 4, 0, 4],
+        '?' => [14, 17, 1, 2, 4, 0, 4],
+        '-' => [0, 0, 0, 31, 0, 0, 0],
+        '_' => [0, 0, 0, 0, 0, 0, 31],
+        '/' => [1, 2, 2, 4, 8, 8, 16],
+        '\\' => [16, 8, 8, 4, 2, 2, 1],
+        '(' => [2, 4, 8, 8, 8, 4, 2],
+        ')' => [8, 4, 2, 2, 2, 4, 8],
+        '[' => [14, 8, 8, 8, 8, 8, 14],
+        ']' => [14, 2, 2, 2, 2, 2, 14],
+        '+' => [0, 4, 4, 31, 4, 4, 0],
+        '=' => [0, 31, 0, 31, 0, 0, 0],
+        '\'' => [4, 4, 8, 0, 0, 0, 0],
+        '"' => [10, 10, 0, 0, 0, 0, 0],
+        '#' => [10, 31, 10, 10, 31, 10, 0],
+        '%' => [17, 2, 4, 8, 16, 17, 0],
+        '&' => [12, 18, 20, 8, 21, 18, 13],
+        '*' => [0, 21, 14, 31, 14, 21, 0],
+        '<' => [2, 4, 8, 16, 8, 4, 2],
+        '>' => [8, 4, 2, 1, 2, 4, 8],
+        '|' => [4, 4, 4, 4, 4, 4, 4],
+        ' ' => [0; 7],
+        _ => [31, 17, 5, 4, 4, 0, 4],
     }
 }
 
@@ -294,5 +400,21 @@ mod tests {
     fn sub_rects_are_relative() {
         let base = SpriteRect::new(128, 0, 256, 256);
         assert_eq!(base.sub(54, 0, 9, 9), SpriteRect::new(182, 0, 9, 9));
+    }
+
+    #[test]
+    fn launcher_fallback_contains_its_original_bitmap_font_and_fill_texel() {
+        let atlas = UiAtlas::launcher_fallback();
+        let pixels = atlas.pixels();
+        let at = |x: usize, y: usize| {
+            let index = (y * ATLAS_SIZE as usize + x) * 4;
+            &pixels[index..index + 4]
+        };
+        assert_eq!(at(10, 32)[3], 255, "the A glyph has visible ink");
+        assert_eq!(
+            at(WHITE.x as usize, WHITE.y as usize),
+            &[255, 255, 255, 255]
+        );
+        assert_eq!(pixels.len(), (ATLAS_SIZE * ATLAS_SIZE * 4) as usize);
     }
 }
