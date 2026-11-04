@@ -679,7 +679,9 @@ integrated Radeon is 7.41 ms at 1280×720 / view distance 8 with vsync off.
   baseline by more than 20% (with a 2 ms floor) or over-budget frames by more
   than 4 per window. Every window prints chunk/mesh counts, GPU buffer and
   texture estimates, and RSS; startup p50/p99 are printed and stored but not
-  gated.
+  gated. `NEPHELE_PERF=1` pins the client window always-on-top so Windows
+  cannot throttle it mid-run, and the script refuses to start while another
+  `nephele` process holds the GPU.
 - The selected adapter is printed in every run and stored in the baseline.
   **Intel HD-class is unverified**; the 60 fps product bar is not proven by
   these AMD-integrated measurements.

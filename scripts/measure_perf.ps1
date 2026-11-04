@@ -107,6 +107,14 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $jsonRequested = $Json -or ($RemainingArguments -contains '--json')
 
+# A second client on the same GPU (even a debug build from another checkout)
+# steals frame time and makes the gate fail for reasons unrelated to the code.
+$otherClients = @(Get-Process -Name nephele -ErrorAction SilentlyContinue)
+if ($otherClients.Count -gt 0) {
+    $pids = ($otherClients | ForEach-Object { $_.Id }) -join ', '
+    throw "Another nephele process is running (PID $pids). Close it before measuring; the frame gate needs an idle GPU."
+}
+
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 . 'C:\Users\dariu\AppData\Local\Temp\opencode\cargo-env.ps1'
 
@@ -205,10 +213,6 @@ public static class NephelePerfWindow {
     public static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr window, int command);
-    [DllImport("user32.dll")]
-    public static extern bool SetForegroundWindow(IntPtr window);
-    [DllImport("user32.dll")]
-    public static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr FindWindow(string className, string windowName);
 }
@@ -225,9 +229,9 @@ public static class NephelePerfWindow {
         -RedirectStandardError $stderrPath `
         -PassThru
 
-    # An occluded window stops presenting, which starves the frame recorder.
-    # Bring the measurement window to the foreground before timing it. Poll for
-    # the handle instead of WaitForInputIdle, which throws for console hosts.
+    # `NEPHELE_PERF=1` makes the client keep its window always-on-top, so it
+    # cannot be occluded and throttled mid-measurement. Restore it in case the
+    # shell started it minimised.
     $windowDeadline = (Get-Date).AddSeconds(10)
     do {
         Start-Sleep -Milliseconds 100
@@ -237,16 +241,8 @@ public static class NephelePerfWindow {
             $windowHandle = $process.MainWindowHandle
         }
     } while ($windowHandle -eq [IntPtr]::Zero -and (Get-Date) -lt $windowDeadline)
-    Write-Host ("Window handle: 0x{0:X}" -f $windowHandle.ToInt64())
     if ($windowHandle -ne [IntPtr]::Zero) {
-        # SW_RESTORE, then pin the window above other desktop windows so it
-        # cannot be occluded for the duration of the measurement.
         [void][NephelePerfWindow]::ShowWindow($windowHandle, 9)
-        [void][NephelePerfWindow]::SetForegroundWindow($windowHandle)
-        [void][NephelePerfWindow]::SetWindowPos(
-            $windowHandle, [IntPtr](-1), 0, 0, 0, 0,
-            [uint32](0x0001 -bor 0x0002 -bor 0x0040)
-        )
     }
 
     $exited = $process.WaitForExit($DurationSeconds * 1000)

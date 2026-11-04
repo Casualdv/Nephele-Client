@@ -39,7 +39,7 @@ use winit::event::{
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{CursorGrabMode, Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId, WindowLevel};
 
 const MOUSE_SENSITIVITY: f32 = 0.0022;
 const TICK: Duration = Duration::from_millis(50);
@@ -1197,6 +1197,12 @@ impl LiveApp {
             Ok(window) => Arc::new(window),
             Err(err) => return self.fail(event_loop, err),
         };
+        if perf::enabled() {
+            // Windows throttles occluded windows, which stretches a 30-second
+            // report window past the benchmark timeout. A measured run owns
+            // the desktop for its duration; normal play stays a normal window.
+            window.set_window_level(WindowLevel::AlwaysOnTop);
+        }
         perf::record_stage_span("window_init", window_start, Instant::now());
 
         let texture_decode_start = Instant::now();
