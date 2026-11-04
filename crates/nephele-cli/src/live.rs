@@ -1209,6 +1209,15 @@ impl LiveApp {
         for name in missing {
             tracing::warn!(texture = name, "unresolved block texture");
         }
+        let unmapped_items = nephele_assets::unmapped_item_ids();
+        tracing::info!(
+            mapped = nephele_assets::all_item_texture_layers().len(),
+            unmapped = unmapped_items.len(),
+            "item icons resolved"
+        );
+        for id in &unmapped_items {
+            tracing::warn!(item = id, "item id has no sprite");
+        }
         // The UI sheets live one level up: `textures/font`, `textures/gui`.
         let ui_root = self
             .options

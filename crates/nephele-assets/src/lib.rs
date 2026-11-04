@@ -21,7 +21,7 @@ pub mod ui_atlas;
 pub use atlas::{AssetError, TextureAnimation, TextureArray, TILE_SIZE};
 pub use block_models::{BlockModel, BlockModels, Element, FaceSpec, ModelFace};
 pub use block_textures::{face_textures, is_transparent, FaceTextures, MISSING_TEXTURE};
-pub use item_textures::{all_item_texture_layers, item_texture_name};
+pub use item_textures::{all_item_texture_layers, item_texture_name, unmapped_item_ids};
 pub use skin_atlas::{default_skin, SkinAtlas, ATLAS_SIZE, SKIN_SIZE, SLOT_SIZE};
 pub use title::{Panorama, SplashTexts, PANORAMA_FACES};
 pub use ui_atlas::{font, sheets, sprites, SpriteRect, UiAtlas};
