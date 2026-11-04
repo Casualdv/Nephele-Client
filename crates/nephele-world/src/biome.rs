@@ -130,8 +130,39 @@ pub static BIOMES: [Biome; 40] = [
     b(39, "Mesa Plateau", BiomeClass::Mesa, 2.0, 0.0, false),
 ];
 
-/// Every registered id also has a mutation at `id + 128`.
 pub const MUTATED: i32 = 128;
+
+/// The base ids for which `BiomeGenBase`'s static block registers a mutated
+/// biome. Every other `base + 128` id is null in vanilla's `biomeList`.
+pub const MUTATION_BASES: [i32; 21] = [
+    1, 2, 3, 4, 5, 6, 12, 21, 23, 27, 28, 29, 30, 32, 33, 34, 35, 36, 37, 38, 39,
+];
+
+pub const fn has_mutation(base_id: i32) -> bool {
+    matches!(
+        base_id,
+        1 | 2
+            | 3
+            | 4
+            | 5
+            | 6
+            | 12
+            | 21
+            | 23
+            | 27
+            | 28
+            | 29
+            | 30
+            | 32
+            | 33
+            | 34
+            | 35
+            | 36
+            | 37
+            | 38
+            | 39
+    )
+}
 
 pub fn base(id: i32) -> Option<&'static Biome> {
     if (0..BIOMES.len() as i32).contains(&id) {
@@ -156,6 +187,9 @@ pub fn any(id: i32) -> Option<AnyBiome> {
     } else {
         (id, false)
     };
+    if mutated && !has_mutation(base_id) {
+        return None;
+    }
     let base = *base(base_id)?;
     let class = if mutated {
         mutated_class(base_id)
@@ -171,15 +205,22 @@ pub fn any(id: i32) -> Option<AnyBiome> {
 }
 
 /// Which class the mutated variant of `base_id` is built as.
+///
+/// `BiomeGenMutated.getBiomeClass` returns its base biome's class, so a
+/// mutation matches its base in `isEqualTo`. The few biomes that build a
+/// concrete subclass for their mutation keep that subclass instead.
 fn mutated_class(base_id: i32) -> BiomeClass {
     match base_id {
         1 => BiomeClass::Plains,
-        4 => BiomeClass::Forest,
+        2 => BiomeClass::Desert,
+        4 | 27 | 28 | 29 => BiomeClass::Forest,
+        5 | 30 | 32 | 33 => BiomeClass::Taiga,
+        6 => BiomeClass::Swamp,
         12 | 13 => BiomeClass::Snow,
+        21 | 23 => BiomeClass::Jungle,
         3 | 20 | 34 => BiomeClass::Hills,
-        37..=39 => BiomeClass::Mesa,
         35 | 36 => BiomeClass::SavannaMutated,
-        32 | 33 => BiomeClass::Taiga,
+        37..=39 => BiomeClass::Mesa,
         _ => BiomeClass::Mutated,
     }
 }
@@ -335,12 +376,38 @@ mod tests {
         assert!(is_equal_to(4, 18));
         assert!(is_equal_to(4, 27));
         assert!(!is_equal_to(4, 1));
-        // Mutations are a different class, except where vanilla overrides the
-        // mutation with a real subclass: mutated forest is still BiomeGenForest,
-        // mutated hills are still BiomeGenHills.
+        // `BiomeGenMutated` delegates its class to the base biome, so every
+        // mutation matches its base; the concrete-subclass mutations match too.
         assert!(is_equal_to(4, 4 + MUTATED));
         assert!(is_equal_to(3, 3 + MUTATED));
-        assert!(!is_equal_to(5, 5 + MUTATED));
+        assert!(is_equal_to(5, 5 + MUTATED));
+        assert!(is_equal_to(2, 2 + MUTATED));
+        assert!(!is_equal_to(5, 4));
+    }
+
+    #[test]
+    fn only_registered_mutations_resolve() {
+        for base_id in MUTATION_BASES {
+            assert!(any(base_id + MUTATED).is_some(), "base {base_id}");
+        }
+        assert!(
+            any(141).is_none(),
+            "Ice Mountains has no registered mutation"
+        );
+        assert!(
+            any(148).is_none(),
+            "Extreme Hills Edge has no registered mutation"
+        );
+    }
+
+    #[test]
+    fn mutated_classes_follow_the_base_biome() {
+        assert_eq!(any(129).unwrap().class, BiomeClass::Plains);
+        assert_eq!(any(130).unwrap().class, BiomeClass::Desert);
+        assert_eq!(any(133).unwrap().class, BiomeClass::Taiga);
+        assert_eq!(any(149).unwrap().class, BiomeClass::Jungle);
+        assert_eq!(any(158).unwrap().class, BiomeClass::Taiga);
+        assert_eq!(any(161).unwrap().class, BiomeClass::Taiga);
     }
 
     #[test]
