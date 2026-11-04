@@ -313,19 +313,43 @@ pub fn join_server(access_token: &str, uuid: &str, server_hash: &str) -> Result<
     });
 
     let payload = body.to_string();
-    match ureq::post(JOIN_URL)
-        .set("Content-Type", "application/json")
-        .send_string(&payload)
-    {
-        // Success is 204 No Content, so there is nothing to parse.
-        Ok(_) => Ok(()),
-        Err(ureq::Error::Status(204, _)) => Ok(()),
-        Err(ureq::Error::Status(code, response)) => {
-            let text = response.into_string().unwrap_or_default();
-            Err(AuthError::Microsoft(format!("{code}: {text}")))
+    // The session server is the last hop before a server lets us in, and it
+    // answers 502/503/504 often enough to matter - during maintenance, and when
+    // one account re-joins repeatedly in quick succession. A transient 5xx used
+    // to abort the join outright, which looks like "the client is broken".
+    const ATTEMPTS: [u64; 3] = [0, 1_500, 4_000];
+    let mut last = String::new();
+    for wait in ATTEMPTS {
+        if wait > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(wait));
         }
-        Err(err) => Err(AuthError::Network(err.to_string())),
+        match ureq::post(JOIN_URL)
+            .set("Content-Type", "application/json")
+            .send_string(&payload)
+        {
+            // Success is 204 No Content, so there is nothing to parse.
+            Ok(_) => return Ok(()),
+            Err(ureq::Error::Status(204, _)) => return Ok(()),
+            Err(ureq::Error::Status(code, response)) if (500..=504).contains(&code) => {
+                last = response.into_string().unwrap_or_default();
+            }
+            Err(ureq::Error::Status(code @ (401 | 403), response)) => {
+                let text = response.into_string().unwrap_or_default();
+                return Err(AuthError::Microsoft(format!(
+                    "{code}: {text} (the stored session is stale - run `nephele auth` again)"
+                )));
+            }
+            Err(ureq::Error::Status(code, response)) => {
+                let text = response.into_string().unwrap_or_default();
+                return Err(AuthError::Microsoft(format!("{code}: {text}")));
+            }
+            Err(err) => return Err(AuthError::Network(err.to_string())),
+        }
     }
+    Err(AuthError::Microsoft(format!(
+        "the Mojang session server is unavailable (503 after {ATTEMPTS_COUNT} attempts): {last}",
+        ATTEMPTS_COUNT = ATTEMPTS.len()
+    )))
 }
 /// The signed-in account's name and UUID.
 pub fn fetch_profile(access_token: &str) -> Result<Profile, AuthError> {
