@@ -4,6 +4,7 @@
 //! translates play-state packets into structured [`Event`]s. The renderer will
 //! consume this later; for now the CLI drives it and prints statistics.
 
+pub mod block_entities;
 pub mod container;
 pub mod entities;
 pub mod mining;
@@ -21,8 +22,9 @@ use nephele_world::{
     decode_chunk_bulk, decode_chunk_data, ChunkColumn, ChunkCoord, ChunkUpdate, World,
 };
 
+pub use block_entities::{BannerPattern, BlockEntity, BlockEntityKind};
 pub use container::LocalContainer;
-pub use entities::{Entities, Entity, EntityKind};
+pub use entities::{Entities, Entity, EntityKind, EntityMetadata};
 pub use mining::{Aim, Miner, MiningEvent};
 pub use skins::{SkinInfo, Skins};
 
@@ -156,6 +158,24 @@ pub enum Event {
         z: i32,
         action: u8,
     },
+    /// One entity's `S1C` metadata was applied.
+    EntityMetadataUpdated {
+        entity_id: i32,
+    },
+    /// One entity's `S04` equipment slot was applied.
+    EntityEquipmentUpdated {
+        entity_id: i32,
+        slot: i16,
+    },
+    /// One entity started an animation (`S0B`).
+    EntityAnimation {
+        entity_id: i32,
+        animation: u8,
+    },
+    /// A server-triggered particle burst (`S2A`).
+    Particles(Vec<play::ParticleSpawn>),
+    /// A server-triggered positional sound (`S29`).
+    SoundEffect(play::SoundEffect),
     /// The server announced its brand on `MC|Brand`.
     ServerBrand(String),
     /// An unhandled server plugin channel was received.
@@ -242,6 +262,8 @@ pub struct GameClient {
     pub player_list: HashMap<[u8; 16], TabListEntry>,
     /// Most recent update-tile-entity NBT, keyed by block position.
     pub block_entities: HashMap<(i32, i32, i32), play::BlockEntityUpdate>,
+    /// Decoded block entities for rendering, keyed by block position.
+    pub block_entity_views: HashMap<(i32, i32, i32), BlockEntity>,
     /// The server's advertised `MC|Brand`, when it sends one.
     pub server_brand: Option<String>,
     view_distance: u8,
@@ -403,6 +425,7 @@ impl GameClient {
             skins: Skins::new(),
             player_list: HashMap::new(),
             block_entities: HashMap::new(),
+            block_entity_views: HashMap::new(),
             server_brand: None,
             view_distance: VIEW_DISTANCE,
             packets_received: 0,
@@ -558,6 +581,7 @@ impl GameClient {
                 self.world.set_dimension(respawn.dimension);
                 self.entities.clear();
                 self.block_entities.clear();
+                self.block_entity_views.clear();
                 self.info.dimension = respawn.dimension;
                 self.info.gamemode = respawn.gamemode;
                 self.info.level_type = respawn.level_type;
@@ -798,7 +822,39 @@ impl GameClient {
                 let _ = play::parse_entity(&packet)?;
                 Ok(Event::Packet(packet.id))
             }
-            play::clientbound::ENTITY_METADATA => Ok(Event::Packet(packet.id)),
+            play::clientbound::ENTITY_METADATA => {
+                let update = play::parse_entity_metadata(&packet)?;
+                self.entities.apply_metadata(&update);
+                Ok(Event::EntityMetadataUpdated {
+                    entity_id: update.entity_id,
+                })
+            }
+            play::clientbound::ENTITY_EQUIPMENT => {
+                let update = play::parse_entity_equipment(&packet)?;
+                self.entities
+                    .apply_equipment(update.entity_id, update.slot, update.item);
+                Ok(Event::EntityEquipmentUpdated {
+                    entity_id: update.entity_id,
+                    slot: update.slot,
+                })
+            }
+            play::clientbound::ANIMATION => {
+                let animation = play::parse_entity_animation(&packet)?;
+                self.entities
+                    .play_animation(animation.entity_id, animation.animation);
+                Ok(Event::EntityAnimation {
+                    entity_id: animation.entity_id,
+                    animation: animation.animation,
+                })
+            }
+            play::clientbound::PARTICLE => {
+                let particle = play::parse_particle(&packet)?;
+                Ok(Event::Particles(vec![particle]))
+            }
+            play::clientbound::SOUND_EFFECT => {
+                let sound = play::parse_sound_effect(&packet)?;
+                Ok(Event::SoundEffect(sound))
+            }
             play::clientbound::PLAYER_LIST_ITEM => {
                 let update = play::parse_player_list_item(&packet)?;
                 self.apply_player_list_update(update);
@@ -813,6 +869,8 @@ impl GameClient {
                     z: update.z,
                     action: update.action,
                 };
+                let view = BlockEntity::from_update(&update);
+                self.block_entity_views.insert(position, view);
                 self.block_entities.insert(position, update);
                 Ok(event)
             }
@@ -882,8 +940,13 @@ impl GameClient {
     }
 
     fn clear_block_entities_in_chunk(&mut self, coord: ChunkCoord) {
+        let in_chunk = |&(x, _y, z): &(i32, i32, i32)| {
+            x.div_euclid(16) == coord.x && z.div_euclid(16) == coord.z
+        };
         self.block_entities
-            .retain(|&(x, _y, z), _| x.div_euclid(16) != coord.x || z.div_euclid(16) != coord.z);
+            .retain(|position, _| !in_chunk(position));
+        self.block_entity_views
+            .retain(|position, _| !in_chunk(position));
     }
 
     /// Creative mode (`JoinGame.gamemode`'s low three bits).
@@ -1202,6 +1265,7 @@ mod tests {
             skins: Skins::new(),
             player_list: HashMap::new(),
             block_entities: HashMap::new(),
+            block_entity_views: HashMap::new(),
             server_brand: None,
             view_distance: VIEW_DISTANCE,
             packets_received: 0,

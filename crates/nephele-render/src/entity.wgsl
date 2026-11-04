@@ -2,6 +2,7 @@
 
 struct Uniforms {
     view_proj: mat4x4<f32>,
+    world_light: f32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -39,6 +40,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     if (texel.a < 0.1) {
         discard;
     }
-    let rgb = texel.rgb * in.shade * in.color.rgb;
+    let rgb = texel.rgb * in.shade * in.color.rgb * uniforms.world_light;
     return vec4<f32>(rgb, texel.a * in.color.a);
 }

@@ -132,6 +132,7 @@ impl TextureArray {
                 tiles.push((layer, to_tile(&image.to_rgba8())));
             }
         }
+        tiles.extend(crate::particle_textures::layers());
         Ok(Self::from_tiles(tiles))
     }
 

@@ -9,11 +9,13 @@ pub mod entity;
 pub mod gpu;
 pub mod lines;
 pub mod mesh;
+pub mod particle;
 pub mod ui;
 
 pub use camera::Camera;
 pub use entity::{
-    append_hand, build_entities, EntityDraw, EntityMesh, EntityVertex, HandDraw, HandPose,
+    append_block_entity, append_hand, build_entities, mob_model, BlockEntityDraw, BlockEntityModel,
+    EntityDraw, EntityMesh, EntityVertex, HandDraw, HandPose, MobModel,
 };
 pub use gpu::{DrawOutcome, Renderer, RendererError, StartupSample, StartupStage, StartupTimings};
 pub use lines::{block_outline, LineMesh, LineVertex};
@@ -22,4 +24,5 @@ pub use mesh::{
     build_item_mesh, build_world_mesh, mesh_column, ColumnMeshJob, HandItem, ItemDraw, MeshData,
     Vertex,
 };
+pub use particle::{build_particle_mesh, ParticleDraw, ParticleKind};
 pub use ui::{Rect, UiBatch, UiVertex};

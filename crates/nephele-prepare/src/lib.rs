@@ -25,25 +25,30 @@ pub const VERSION: &str = "1.8.9";
 
 /// Bumped whenever the set or shape of prepared files changes, so a launcher
 /// can tell a stale preparation from a current one without rehashing it.
-pub const OUTPUT_VERSION: u32 = 1;
+pub const OUTPUT_VERSION: u32 = 2;
 
 /// Name of the checksum pin file, looked up from the working directory upward.
 pub const LOCK_FILE_NAME: &str = "research-lock.json";
 
+/// Asset index id for the pinned 1.8.9 assets.
+pub const ASSET_INDEX_ID: &str = "1.8";
+
 /// Name of the manifest written next to the prepared files.
 pub const MANIFEST_NAME: &str = "prepared.json";
 
-/// The asset subtrees the client reads. 1.8.9 ships all of these inside the
-/// client jar; only sounds live in the asset object store, and Nephele has no
-/// audio yet, so a jar-only preparation is complete.
+/// The asset subtrees the client reads. 1.8.9 ships most of these inside the
+/// client jar; sounds live in the asset object store, which
+/// [`prepare_with_assets`] copies when the player has one.
 pub const ASSET_PREFIXES: &[&str] = &[
     "minecraft/blockstates/",
     "minecraft/models/",
     "minecraft/textures/blocks/",
     "minecraft/textures/items/",
+    "minecraft/textures/entity/",
     "minecraft/textures/gui/",
     "minecraft/textures/font/",
     "minecraft/textures/misc/",
+    "minecraft/texts/",
     "minecraft/font/",
     "minecraft/lang/en_US.lang",
     "minecraft/sounds.json",
@@ -205,9 +210,86 @@ pub fn digest_of(files: &BTreeMap<String, String>) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Copy every `minecraft/sounds/**` object named by the asset index.
+///
+/// 1.8.9 does not put Ogg files in the client jar, so this is the only source
+/// for the game's sound effects. Each object is addressed by its SHA-1 and
+/// copied to the prepared tree under its virtual asset path.
+fn copy_sound_objects(
+    assets_root: &Path,
+    assets_dir: &Path,
+    files: &mut BTreeMap<String, String>,
+) -> Result<(), PrepareError> {
+    let index_path = assets_root
+        .join("indexes")
+        .join(format!("{ASSET_INDEX_ID}.json"));
+    if !index_path.is_file() {
+        eprintln!(
+            "  sounds    skipped: {} does not exist (pass --assets-dir to enable audio)",
+            index_path.display()
+        );
+        return Ok(());
+    }
+    let text = fs::read_to_string(&index_path).map_err(|e| io_err(&index_path, e))?;
+    let index: serde_json::Value = serde_json::from_str(&text)?;
+    let Some(objects) = index.get("objects").and_then(|value| value.as_object()) else {
+        return Err(PrepareError::Message(format!(
+            "{} has no objects map",
+            index_path.display()
+        )));
+    };
+    let objects_root = assets_root.join("objects");
+    let mut copied = 0usize;
+    let mut missing = 0usize;
+    for (virtual_path, value) in objects {
+        if virtual_path != "minecraft/sounds.json" && !virtual_path.starts_with("minecraft/sounds/")
+        {
+            continue;
+        }
+        let Some(hash) = value.get("hash").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if hash.len() < 2 {
+            continue;
+        }
+        let source = objects_root.join(&hash[..2]).join(hash);
+        if !source.is_file() {
+            missing += 1;
+            continue;
+        }
+        let target = assets_dir.join(virtual_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        }
+        fs::copy(&source, &target).map_err(|e| io_err(&target, e))?;
+        files.insert(virtual_path.clone(), sha1_file(&target)?);
+        copied += 1;
+    }
+    println!("  sounds    {copied} object(s) copied");
+    if missing > 0 {
+        eprintln!(
+            "  sounds    {missing} object(s) absent from {}; run the launcher once to populate it",
+            objects_root.display()
+        );
+    }
+    Ok(())
+}
+
 /// Verifies `jar` against the lock, extracts the asset subtree into
 /// `out_dir/assets/`, and writes `out_dir/prepared.json`.
 pub fn prepare(jar: &Path, out_dir: &Path, lock: &Lock) -> Result<Prepared, PrepareError> {
+    prepare_with_assets(jar, out_dir, lock, None)
+}
+
+/// [`prepare`] plus sound objects from an extracted Minecraft `assets` folder
+/// (the one containing `indexes/` and `objects/`). A missing or incomplete
+/// object store is reported but does not make a texture-only preparation fail.
+pub fn prepare_with_assets(
+    jar: &Path,
+    out_dir: &Path,
+    lock: &Lock,
+    assets_root: Option<&Path>,
+) -> Result<Prepared, PrepareError> {
     if lock.minecraft.version != VERSION {
         return Err(PrepareError::Message(format!(
             "research-lock.json pins Minecraft {}, but this preparer speaks {VERSION}",
@@ -257,6 +339,10 @@ pub fn prepare(jar: &Path, out_dir: &Path, lock: &Lock) -> Result<Prepared, Prep
         let mut out = File::create(&target).map_err(|e| io_err(&target, e))?;
         io::copy(&mut entry, &mut out).map_err(|e| io_err(&target, e))?;
         files.insert(virtual_path.to_string(), sha1_file(&target)?);
+    }
+
+    if let Some(assets_root) = assets_root {
+        copy_sound_objects(assets_root, &assets_dir, &mut files)?;
     }
 
     if files.is_empty() {
@@ -355,7 +441,7 @@ mod tests {
                 "client": { "sha1": "3870888a6c3d349d3771a3e9d16c9bf5e076b908", "size": 8461484 },
                 "assetIndex": { "id": "1.8", "sha1": "f6ad102bcaa53b1a58358f16e376d548d44933ec", "size": 78494 }
             },
-            "preparer": { "outputVersion": 1 }
+            "preparer": { "outputVersion": 2 }
         }"#
     }
 
@@ -376,7 +462,11 @@ mod tests {
         assert!(is_wanted("minecraft/textures/blocks/stone.png"));
         assert!(is_wanted("minecraft/textures/gui/widgets.png"));
         assert!(is_wanted("minecraft/lang/en_US.lang"));
+        assert!(is_wanted("minecraft/textures/entity/zombie/zombie.png"));
+        assert!(is_wanted("minecraft/texts/splashes.txt"));
         assert!(is_wanted("minecraft/sounds.json"));
+        // Sound objects live in the asset index, not the jar; copy_sound_objects
+        // handles them separately.
         assert!(!is_wanted("minecraft/sounds/random/click.ogg"));
         assert!(!is_wanted("minecraft/lang/de_DE.lang"));
         assert!(!is_wanted("minecraft/icon/icon_16x16.png"));

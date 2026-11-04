@@ -2,6 +2,7 @@ mod commands;
 mod inventory;
 mod live;
 mod mesher;
+mod particles;
 mod paths;
 mod perf;
 mod servers;

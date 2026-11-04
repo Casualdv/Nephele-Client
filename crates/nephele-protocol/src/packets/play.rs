@@ -9,11 +9,13 @@ pub mod clientbound {
     pub const JOIN_GAME: i32 = 0x01;
     pub const CHAT_MESSAGE: i32 = 0x02;
     pub const TIME_UPDATE: i32 = 0x03;
+    pub const ENTITY_EQUIPMENT: i32 = 0x04;
     pub const SPAWN_POSITION: i32 = 0x05;
     pub const UPDATE_HEALTH: i32 = 0x06;
     pub const RESPAWN: i32 = 0x07;
     pub const PLAYER_POSITION_AND_LOOK: i32 = 0x08;
     pub const HELD_ITEM_CHANGE: i32 = 0x09;
+    pub const ANIMATION: i32 = 0x0B;
     pub const SPAWN_PLAYER: i32 = 0x0C;
     /// An entity was picked up or absorbed by another one.
     pub const COLLECT_ITEM: i32 = 0x0D;
@@ -35,6 +37,8 @@ pub mod clientbound {
     pub const BLOCK_CHANGE: i32 = 0x23;
     pub const BLOCK_BREAK_ANIMATION: i32 = 0x25;
     pub const MAP_CHUNK_BULK: i32 = 0x26;
+    pub const SOUND_EFFECT: i32 = 0x29;
+    pub const PARTICLE: i32 = 0x2A;
     pub const SET_SLOT: i32 = 0x2F;
     pub const OPEN_WINDOW: i32 = 0x2D;
     pub const CLOSE_WINDOW: i32 = 0x2E;
@@ -338,6 +342,208 @@ pub fn parse_block_entity_update(packet: &Packet) -> Result<BlockEntityUpdate> {
     })
 }
 
+/// One value in 1.8's `DataWatcher` metadata format.
+///
+/// The wire tags the low five bits with the field index and the high three
+/// bits with the value type. This is the 1.8 layout, not 1.9+'s type-per-entry
+/// layout.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EntityMetadataValue {
+    Byte(i8),
+    Short(i16),
+    Int(i32),
+    Float(f32),
+    String(String),
+    Slot(Option<ItemStack>),
+    Vector([i32; 3]),
+    Rotation([f32; 3]),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityMetadataUpdate {
+    pub entity_id: i32,
+    pub values: Vec<(u8, EntityMetadataValue)>,
+}
+
+impl EntityMetadataUpdate {
+    pub fn get(&self, index: u8) -> Option<&EntityMetadataValue> {
+        self.values
+            .iter()
+            .find_map(|(i, value)| (*i == index).then_some(value))
+    }
+}
+
+/// Parse `S1C Entity Metadata` in the 1.8.9 `DataWatcher` format.
+pub fn parse_entity_metadata(packet: &Packet) -> Result<EntityMetadataUpdate> {
+    let mut r = packet.reader();
+    let entity_id = r.read_varint()?;
+    let mut values = Vec::new();
+    loop {
+        let header = r.read_u8()?;
+        if header == 0x7f {
+            break;
+        }
+        let index = header & 0x1f;
+        let value = match header >> 5 {
+            0 => EntityMetadataValue::Byte(r.read_i8()?),
+            1 => EntityMetadataValue::Short(r.read_i16()?),
+            2 => EntityMetadataValue::Int(r.read_i32()?),
+            3 => EntityMetadataValue::Float(r.read_f32()?),
+            4 => EntityMetadataValue::String(r.read_string()?),
+            5 => EntityMetadataValue::Slot(parse_slot(&mut r)?),
+            6 => EntityMetadataValue::Vector([r.read_i32()?, r.read_i32()?, r.read_i32()?]),
+            7 => EntityMetadataValue::Rotation([r.read_f32()?, r.read_f32()?, r.read_f32()?]),
+            kind => {
+                return Err(Error::Protocol(format!(
+                    "unknown 1.8 metadata type {kind} for index {index}"
+                )))
+            }
+        };
+        values.push((index, value));
+    }
+    if !r.is_empty() {
+        return Err(Error::Protocol("trailing bytes in entity metadata".into()));
+    }
+    Ok(EntityMetadataUpdate { entity_id, values })
+}
+
+/// Equipment slot indices from `S04 Entity Equipment`.
+pub mod equipment_slot {
+    pub const HELD: i16 = 0;
+    pub const BOOTS: i16 = 1;
+    pub const LEGGINGS: i16 = 2;
+    pub const CHESTPLATE: i16 = 3;
+    pub const HELMET: i16 = 4;
+    pub const COUNT: usize = 5;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityEquipment {
+    pub entity_id: i32,
+    pub slot: i16,
+    pub item: Option<ItemStack>,
+}
+
+/// Parse `S04 Entity Equipment`.
+pub fn parse_entity_equipment(packet: &Packet) -> Result<EntityEquipment> {
+    let mut r = packet.reader();
+    let entity_id = r.read_varint()?;
+    let slot = r.read_i16()?;
+    let item = parse_slot(&mut r)?;
+    if !r.is_empty() {
+        return Err(Error::Protocol("trailing bytes in entity equipment".into()));
+    }
+    Ok(EntityEquipment {
+        entity_id,
+        slot,
+        item,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityAnimation {
+    pub entity_id: i32,
+    pub animation: u8,
+}
+
+/// Parse `S0B Animation` (arm swing, hurt, leave bed, ...).
+pub fn parse_entity_animation(packet: &Packet) -> Result<EntityAnimation> {
+    let mut r = packet.reader();
+    Ok(EntityAnimation {
+        entity_id: r.read_varint()?,
+        animation: r.read_u8()?,
+    })
+}
+
+/// One `S2A Particle` burst.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParticleSpawn {
+    pub particle_id: i32,
+    pub long_distance: bool,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub offset_z: f32,
+    pub speed: f32,
+    pub count: i32,
+    /// Block/item arguments used by `iconcrack_` and `blockcrack_` particles.
+    pub arguments: Vec<i32>,
+}
+
+/// Parse `S2A Particle`. The number of trailing VarInt arguments is fixed by
+/// the particle type: item crack has two, block crack/dust have one.
+pub fn parse_particle(packet: &Packet) -> Result<ParticleSpawn> {
+    let mut r = packet.reader();
+    let particle_id = r.read_i32()?;
+    let long_distance = r.read_bool()?;
+    let x = r.read_f32()?;
+    let y = r.read_f32()?;
+    let z = r.read_f32()?;
+    let offset_x = r.read_f32()?;
+    let offset_y = r.read_f32()?;
+    let offset_z = r.read_f32()?;
+    let speed = r.read_f32()?;
+    let count = r.read_i32()?;
+    let argument_count = match particle_id {
+        36 => 2,
+        37 | 38 => 1,
+        _ => 0,
+    };
+    let mut arguments = Vec::with_capacity(argument_count);
+    for _ in 0..argument_count {
+        arguments.push(r.read_varint()?);
+    }
+    if !r.is_empty() {
+        return Err(Error::Protocol("trailing bytes in particle packet".into()));
+    }
+    Ok(ParticleSpawn {
+        particle_id,
+        long_distance,
+        x,
+        y,
+        z,
+        offset_x,
+        offset_y,
+        offset_z,
+        speed,
+        count,
+        arguments,
+    })
+}
+
+/// One `S29 Sound Effect` notification.
+///
+/// Coordinates are fixed-point eighths of a block, as in 1.8.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SoundEffect {
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub volume: f32,
+    pub pitch: f32,
+}
+
+pub fn parse_sound_effect(packet: &Packet) -> Result<SoundEffect> {
+    let mut r = packet.reader();
+    let name = r.read_string()?;
+    let x = r.read_i32()? as f64 / 8.0;
+    let y = r.read_i32()? as f64 / 8.0;
+    let z = r.read_i32()? as f64 / 8.0;
+    let volume = r.read_f32()?;
+    let pitch = r.read_f32()?;
+    Ok(SoundEffect {
+        name,
+        x,
+        y,
+        z,
+        volume,
+        pitch,
+    })
+}
+
 pub fn keep_alive_response(id: i32) -> Packet {
     let mut w = PacketWriter::new();
     w.write_varint(id);
@@ -413,7 +619,7 @@ pub fn client_status(action: i32) -> Packet {
     Packet::new(serverbound::CLIENT_STATUS, w.into_bytes())
 }
 
-/// `C07 Player Digging` — start / abort / stop breaking a block.
+/// `C07 Player Digging` â€” start / abort / stop breaking a block.
 pub fn player_digging(status: u8, x: i32, y: i32, z: i32, face: u8) -> Packet {
     let mut w = PacketWriter::new();
     w.write_varint(status as i32);
@@ -444,19 +650,19 @@ pub fn block_placement(
     Packet::new(serverbound::PLAYER_BLOCK_PLACEMENT, w.into_bytes())
 }
 
-/// `C09 Held Item Change` — select a hotbar slot (0..8).
+/// `C09 Held Item Change` â€” select a hotbar slot (0..8).
 pub fn held_item_change(slot: i16) -> Packet {
     let mut w = PacketWriter::new();
     w.write_i16(slot);
     Packet::new(serverbound::HELD_ITEM_CHANGE, w.into_bytes())
 }
 
-/// `C0A Animation` — swing the arm. The 1.8 packet has no body.
+/// `C0A Animation` â€” swing the arm. The 1.8 packet has no body.
 pub fn swing_arm() -> Packet {
     Packet::new(serverbound::ANIMATION, Vec::new())
 }
 
-/// `C10 Creative Inventory Action` — put a stack into (or clear) a container slot.
+/// `C10 Creative Inventory Action` â€” put a stack into (or clear) a container slot.
 pub fn creative_set_slot(slot: i16, item: Option<&ItemStack>) -> Packet {
     let mut w = PacketWriter::new();
     w.write_i16(slot);
@@ -464,7 +670,7 @@ pub fn creative_set_slot(slot: i16, item: Option<&ItemStack>) -> Packet {
     Packet::new(serverbound::CREATIVE_INVENTORY_ACTION, w.into_bytes())
 }
 
-/// `C0E Click Window` — a single click in an open container.
+/// `C0E Click Window` â€” a single click in an open container.
 ///
 /// `action` is the client's running counter for this window; the server echoes
 /// it back in `S32 Confirm Transaction` so the client can tell which prediction
@@ -668,14 +874,14 @@ pub fn parse_confirm_transaction(packet: &Packet) -> Result<ConfirmTransaction> 
     })
 }
 
-/// `S32` written from the server side — answers one `C0E`.
+/// `S32` written from the server side â€” answers one `C0E`.
 pub fn confirm_transaction(window_id: i8, action: i16, accepted: bool) -> Packet {
     let mut w = PacketWriter::new();
     w.write_i8(window_id).write_i16(action).write_bool(accepted);
     Packet::new(clientbound::CONFIRM_TRANSACTION, w.into_bytes())
 }
 
-/// `S2F` written from the server side — the mock server uses it when a pickup
+/// `S2F` written from the server side â€” the mock server uses it when a pickup
 /// lands in a slot.
 pub fn set_slot(window_id: i8, slot: i16, item: Option<&ItemStack>) -> Packet {
     let mut w = PacketWriter::new();
@@ -684,12 +890,12 @@ pub fn set_slot(window_id: i8, slot: i16, item: Option<&ItemStack>) -> Packet {
     Packet::new(clientbound::SET_SLOT, w.into_bytes())
 }
 
-/// `S09 Held Item Change` — the server confirming which slot we're holding.
+/// `S09 Held Item Change` â€” the server confirming which slot we're holding.
 pub fn parse_held_item_change(packet: &Packet) -> Result<i16> {
     Ok(i16::from(packet.reader().read_i8()?))
 }
 
-/// `S1F Experience` — the XP bar, level and lifetime total.
+/// `S1F Experience` â€” the XP bar, level and lifetime total.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Experience {
     /// Progress towards the next level, 0..1.
@@ -1070,7 +1276,7 @@ pub fn item_object_data(item: i16, meta: i16) -> i32 {
     i32::from(item as u16) | (i32::from(meta as u16) << 16)
 }
 
-/// `S0E` written from the server side — used by the mock server, and by the
+/// `S0E` written from the server side â€” used by the mock server, and by the
 /// round-trip test that keeps the writer and the parser in step.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_object(
@@ -1677,7 +1883,7 @@ mod entity_tests {
         assert_eq!(update.entity_id, 5);
         assert_eq!((update.dx, update.dy, update.dz), (1.0, -0.5, 0.25));
         assert!((update.yaw - 180.0).abs() < 2.0);
-        // Pitch is unsigned on the wire: -90° arrives as 270°.
+        // Pitch is unsigned on the wire: -90Â° arrives as 270Â°.
         assert!((update.pitch - 270.0).abs() < 2.0);
     }
 
@@ -1868,5 +2074,83 @@ mod entity_tests {
                 collector: 1
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod entity_wire_tests {
+    use super::*;
+
+    #[test]
+    fn parses_18_metadata_flags_name_and_health() {
+        let mut w = PacketWriter::new();
+        w.write_varint(7)
+            .write_u8(0x00)
+            .write_i8(0x22)
+            .write_u8(0x82)
+            .write_string("Zombie")
+            .write_u8(0x66)
+            .write_f32(12.5)
+            .write_u8(0x7f);
+        let update =
+            parse_entity_metadata(&Packet::new(clientbound::ENTITY_METADATA, w.into_bytes()))
+                .expect("metadata");
+        assert_eq!(update.entity_id, 7);
+        assert_eq!(update.get(0), Some(&EntityMetadataValue::Byte(0x22)));
+        assert_eq!(
+            update.get(2),
+            Some(&EntityMetadataValue::String("Zombie".into()))
+        );
+        assert_eq!(update.get(6), Some(&EntityMetadataValue::Float(12.5)));
+    }
+
+    #[test]
+    fn parses_equipment_slot_and_item() {
+        let mut w = PacketWriter::new();
+        w.write_varint(7).write_i16(equipment_slot::HELMET);
+        write_slot(&mut w, Some(&ItemStack::new(310, 1, 0)));
+        let equipment =
+            parse_entity_equipment(&Packet::new(clientbound::ENTITY_EQUIPMENT, w.into_bytes()))
+                .expect("equipment");
+        assert_eq!(equipment.entity_id, 7);
+        assert_eq!(equipment.slot, 4);
+        assert_eq!(equipment.item, Some(ItemStack::new(310, 1, 0)));
+    }
+
+    #[test]
+    fn parses_particles_and_block_argument() {
+        let mut w = PacketWriter::new();
+        w.write_i32(37)
+            .write_bool(false)
+            .write_f32(1.0)
+            .write_f32(64.0)
+            .write_f32(-2.0)
+            .write_f32(0.2)
+            .write_f32(0.3)
+            .write_f32(0.4)
+            .write_f32(0.05)
+            .write_i32(12)
+            .write_varint(1 << 4);
+        let particle =
+            parse_particle(&Packet::new(clientbound::PARTICLE, w.into_bytes())).expect("particle");
+        assert_eq!(particle.particle_id, 37);
+        assert_eq!(particle.count, 12);
+        assert_eq!(particle.arguments, vec![16]);
+    }
+
+    #[test]
+    fn parses_sound_coordinates_as_eighths() {
+        let mut w = PacketWriter::new();
+        w.write_string("dig.stone")
+            .write_i32(8)
+            .write_i32(16)
+            .write_i32(-8)
+            .write_f32(0.8)
+            .write_f32(1.1);
+        let sound = parse_sound_effect(&Packet::new(clientbound::SOUND_EFFECT, w.into_bytes()))
+            .expect("sound");
+        assert_eq!(sound.name, "dig.stone");
+        assert_eq!((sound.x, sound.y, sound.z), (1.0, 2.0, -1.0));
+        assert!((sound.volume - 0.8).abs() < 1e-6);
     }
 }

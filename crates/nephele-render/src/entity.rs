@@ -45,6 +45,37 @@ pub struct EntityMesh {
     pub indices: Vec<u32>,
 }
 
+/// Which box model to build for a non-player entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobModel {
+    Player,
+    Biped,
+    Enderman,
+    Creeper,
+    Quadruped,
+    Slime,
+    Spider,
+    Chicken,
+    Squid,
+    Bat,
+}
+
+/// Map protocol-47 mob ids to the models this client can draw.
+pub fn mob_model(kind: u8) -> MobModel {
+    match kind {
+        50 => MobModel::Creeper,
+        51 | 54 | 57 => MobModel::Biped,
+        52 | 59 => MobModel::Spider,
+        55 | 62 => MobModel::Slime,
+        58 => MobModel::Enderman,
+        65 => MobModel::Bat,
+        90..=92 | 95 | 96 => MobModel::Quadruped,
+        93 => MobModel::Chicken,
+        94 => MobModel::Squid,
+        _ => MobModel::Biped,
+    }
+}
+
 impl EntityMesh {
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
@@ -68,6 +99,15 @@ pub struct EntityDraw {
     pub tint: [f32; 4],
     /// Uniform scale; 1.0 is a normal adult.
     pub scale: f32,
+    /// Box model to build. Players use the original skin layout.
+    pub model: MobModel,
+    /// Walk cycle phase in radians. Limbs swing around it.
+    pub walk: f32,
+    /// Vanilla's crouch flag: lowers the head/body for humanoids.
+    pub crouch: bool,
+    /// Invisible entities draw at reduced alpha so their nametag/equipment
+    /// still has a visible owner.
+    pub invisible: bool,
 }
 
 impl EntityDraw {
@@ -80,6 +120,34 @@ impl EntityDraw {
             slot,
             tint: [1.0; 4],
             scale: 1.0,
+            model: MobModel::Player,
+            walk: 0.0,
+            crouch: false,
+            invisible: false,
+        }
+    }
+
+    pub fn mob(
+        feet: [f32; 3],
+        yaw: f32,
+        head_yaw: f32,
+        pitch: f32,
+        slot: u32,
+        kind: u8,
+        walk: f32,
+    ) -> Self {
+        Self {
+            feet,
+            yaw,
+            head_yaw,
+            pitch,
+            slot,
+            tint: [1.0; 4],
+            scale: 1.0,
+            model: mob_model(kind),
+            walk,
+            crouch: false,
+            invisible: false,
         }
     }
 }
@@ -265,7 +333,10 @@ const CORNER_UV: [[[f32; 2]; 4]; 6] = [
 pub fn build_entities(draws: &[EntityDraw]) -> EntityMesh {
     let mut mesh = EntityMesh::default();
     for draw in draws {
-        append_humanoid(&mut mesh, draw);
+        match draw.model {
+            MobModel::Player => append_humanoid(&mut mesh, draw),
+            model => append_mob(&mut mesh, draw, model),
+        }
     }
     mesh
 }
@@ -359,12 +430,544 @@ pub fn append_hand(mesh: &mut EntityMesh, hand: &HandDraw) -> HandPose {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MobPart {
+    origin: [f32; 3],
+    size: [f32; 3],
+    uv: [f32; 2],
+    pivot: [f32; 3],
+    angle: [f32; 3],
+    follows_head: bool,
+}
+
+impl MobPart {
+    fn new(origin: [f32; 3], size: [f32; 3], uv: [f32; 2]) -> Self {
+        Self {
+            origin,
+            size,
+            uv,
+            pivot: [0.0; 3],
+            angle: [0.0; 3],
+            follows_head: false,
+        }
+    }
+
+    fn pivot(mut self, pivot: [f32; 3]) -> Self {
+        self.pivot = pivot;
+        self
+    }
+
+    fn angle(mut self, angle: [f32; 3]) -> Self {
+        self.angle = angle;
+        self
+    }
+
+    fn head(mut self) -> Self {
+        self.follows_head = true;
+        self
+    }
+}
+
+fn append_mob(mesh: &mut EntityMesh, draw: &EntityDraw, model: MobModel) {
+    let mut parts = Vec::new();
+    match model {
+        MobModel::Biped => {
+            let swing = draw.walk.sin() * 0.7;
+            let arm = -swing * 0.75;
+            let leg = swing;
+            let crouch = if draw.crouch { 2.0 } else { 0.0 };
+            let drop = [0.0, -crouch, 0.0];
+            parts.push(
+                MobPart::new([-4.0, 24.0, -4.0], [8.0, 8.0, 8.0], [0.0, 0.0])
+                    .pivot([0.0, 24.0, 0.0])
+                    .head(),
+            );
+            parts.push(MobPart::new(
+                [-4.0 + drop[0], 12.0 + drop[1], -2.0],
+                [8.0, 12.0, 4.0],
+                [16.0, 16.0],
+            ));
+            parts.push(
+                MobPart::new([-8.0, 12.0 + drop[1], -2.0], [4.0, 12.0, 4.0], [40.0, 16.0])
+                    .pivot([-4.0, 22.0 + drop[1], 0.0])
+                    .angle([arm, 0.0, 0.0]),
+            );
+            parts.push(
+                MobPart::new([4.0, 12.0 + drop[1], -2.0], [4.0, 12.0, 4.0], [40.0, 16.0])
+                    .pivot([4.0, 22.0 + drop[1], 0.0])
+                    .angle([-arm, 0.0, 0.0]),
+            );
+            parts.push(
+                MobPart::new([-4.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 16.0])
+                    .pivot([-2.0, 12.0, 0.0])
+                    .angle([-leg, 0.0, 0.0]),
+            );
+            parts.push(
+                MobPart::new([0.0, 0.0, -2.0], [4.0, 12.0, 4.0], [0.0, 16.0])
+                    .pivot([2.0, 12.0, 0.0])
+                    .angle([leg, 0.0, 0.0]),
+            );
+        }
+        MobModel::Enderman => {
+            let swing = draw.walk.sin() * 0.35;
+            parts.push(
+                MobPart::new([-4.0, 24.0, -4.0], [8.0, 8.0, 8.0], [0.0, 0.0])
+                    .pivot([0.0, 24.0, 0.0])
+                    .head(),
+            );
+            parts.push(MobPart::new(
+                [-4.0, 12.0, -2.0],
+                [8.0, 12.0, 4.0],
+                [32.0, 16.0],
+            ));
+            parts.push(
+                MobPart::new([-7.0, -6.0, -1.0], [2.0, 30.0, 2.0], [56.0, 0.0])
+                    .pivot([-6.0, 24.0, 0.0])
+                    .angle([swing, 0.0, 0.0]),
+            );
+            parts.push(
+                MobPart::new([5.0, -6.0, -1.0], [2.0, 30.0, 2.0], [56.0, 0.0])
+                    .pivot([6.0, 24.0, 0.0])
+                    .angle([-swing, 0.0, 0.0]),
+            );
+            parts.push(
+                MobPart::new([-3.0, -18.0, -1.0], [2.0, 30.0, 2.0], [56.0, 0.0])
+                    .pivot([-2.0, 12.0, 0.0])
+                    .angle([-swing, 0.0, 0.0]),
+            );
+            parts.push(
+                MobPart::new([1.0, -18.0, -1.0], [2.0, 30.0, 2.0], [56.0, 0.0])
+                    .pivot([2.0, 12.0, 0.0])
+                    .angle([swing, 0.0, 0.0]),
+            );
+        }
+        MobModel::Creeper => {
+            let swing = draw.walk.sin() * 0.7;
+            parts.push(
+                MobPart::new([-4.0, 18.0, -4.0], [8.0, 8.0, 8.0], [0.0, 0.0])
+                    .pivot([0.0, 18.0, 0.0])
+                    .head(),
+            );
+            parts.push(MobPart::new(
+                [-4.0, 6.0, -2.0],
+                [8.0, 12.0, 4.0],
+                [16.0, 16.0],
+            ));
+            for (x, z, phase) in [
+                (-2.0, 4.0, 1.0),
+                (2.0, 4.0, -1.0),
+                (-2.0, -4.0, -1.0),
+                (2.0, -4.0, 1.0),
+            ] {
+                parts.push(
+                    MobPart::new([x - 2.0, 0.0, z - 2.0], [4.0, 6.0, 4.0], [0.0, 16.0])
+                        .pivot([x, 6.0, z])
+                        .angle([swing * phase, 0.0, 0.0]),
+                );
+            }
+        }
+        MobModel::Quadruped => {
+            let swing = draw.walk.sin() * 0.7;
+            parts.push(
+                MobPart::new([-4.0, 14.0, 6.0], [8.0, 8.0, 8.0], [0.0, 0.0])
+                    .pivot([0.0, 18.0, 6.0])
+                    .head(),
+            );
+            parts.push(MobPart::new(
+                [-5.0, 6.0, -7.0],
+                [10.0, 10.0, 16.0],
+                [28.0, 8.0],
+            ));
+            for (x, z, phase) in [
+                (-3.0, 7.0, 1.0),
+                (3.0, 7.0, -1.0),
+                (-3.0, -5.0, -1.0),
+                (3.0, -5.0, 1.0),
+            ] {
+                parts.push(
+                    MobPart::new([x - 2.0, 0.0, z - 2.0], [4.0, 6.0, 4.0], [0.0, 16.0])
+                        .pivot([x, 6.0, z])
+                        .angle([swing * phase, 0.0, 0.0]),
+                );
+            }
+        }
+        MobModel::Slime => {
+            let squash = 1.0 + draw.walk.sin() * 0.08;
+            parts.push(MobPart::new(
+                [-4.0, 0.0, -4.0],
+                [8.0, 8.0 * squash, 8.0],
+                [0.0, 0.0],
+            ));
+            parts.push(MobPart::new(
+                [-3.25, 4.5, 3.5],
+                [2.0, 2.0, 1.0],
+                [32.0, 0.0],
+            ));
+            parts.push(MobPart::new([1.25, 4.5, 3.5], [2.0, 2.0, 1.0], [32.0, 4.0]));
+        }
+        MobModel::Spider => {
+            let swing = draw.walk.sin() * 0.5;
+            parts.push(
+                MobPart::new([-4.0, 4.0, 3.0], [8.0, 8.0, 8.0], [32.0, 4.0])
+                    .pivot([0.0, 8.0, 5.0])
+                    .head(),
+            );
+            parts.push(MobPart::new([-3.0, 5.0, -1.0], [6.0, 6.0, 6.0], [0.0, 0.0]));
+            parts.push(MobPart::new(
+                [-5.0, 5.0, -9.0],
+                [10.0, 8.0, 12.0],
+                [0.0, 12.0],
+            ));
+            for (index, phase) in [1.0, -1.0, 0.8, -0.8, -0.8, 0.8, -1.0, 1.0]
+                .into_iter()
+                .enumerate()
+            {
+                let side = if index % 2 == 0 { -1.0 } else { 1.0 };
+                let z = 2.0 - (index as f32 * 0.9);
+                parts.push(
+                    MobPart::new(
+                        [if side < 0.0 { -15.0 } else { 5.0 }, 6.0, z - 1.0],
+                        [10.0, 2.0, 2.0],
+                        [18.0, 0.0],
+                    )
+                    .pivot([4.0 * side, 6.0, z])
+                    .angle([0.0, 0.0, swing * phase * side]),
+                );
+            }
+        }
+        MobModel::Chicken => {
+            let swing = draw.walk.sin() * 0.8;
+            parts.push(
+                MobPart::new([-2.0, 13.0, 3.0], [4.0, 6.0, 3.0], [0.0, 0.0])
+                    .pivot([0.0, 14.0, 4.0])
+                    .head(),
+            );
+            parts.push(MobPart::new(
+                [-2.0, 13.0, 6.0],
+                [4.0, 2.0, 2.0],
+                [14.0, 0.0],
+            ));
+            parts.push(MobPart::new([-3.0, 5.0, -3.0], [6.0, 8.0, 6.0], [0.0, 9.0]));
+            parts.push(
+                MobPart::new([-2.0, 0.0, -2.0], [3.0, 5.0, 3.0], [26.0, 0.0])
+                    .pivot([-0.5, 5.0, 0.0])
+                    .angle([swing, 0.0, 0.0]),
+            );
+            parts.push(
+                MobPart::new([1.0, 0.0, -2.0], [3.0, 5.0, 3.0], [26.0, 0.0])
+                    .pivot([2.5, 5.0, 0.0])
+                    .angle([-swing, 0.0, 0.0]),
+            );
+            parts.push(
+                MobPart::new([-4.0, 5.0, -3.0], [1.0, 4.0, 6.0], [24.0, 13.0])
+                    .pivot([-4.0, 8.0, 0.0])
+                    .angle([0.0, 0.0, draw.walk.cos() * 0.25]),
+            );
+            parts.push(
+                MobPart::new([3.0, 5.0, -3.0], [1.0, 4.0, 6.0], [24.0, 13.0])
+                    .pivot([4.0, 8.0, 0.0])
+                    .angle([0.0, 0.0, -draw.walk.cos() * 0.25]),
+            );
+        }
+        MobModel::Squid => {
+            parts.push(MobPart::new(
+                [-6.0, 8.0, -6.0],
+                [12.0, 16.0, 12.0],
+                [0.0, 0.0],
+            ));
+            for index in 0..8 {
+                let angle = index as f32 * std::f32::consts::TAU / 8.0;
+                parts.push(
+                    MobPart::new(
+                        [angle.cos() * 5.0 - 1.0, -10.0, angle.sin() * 5.0 - 1.0],
+                        [2.0, 18.0, 2.0],
+                        [48.0, 0.0],
+                    )
+                    .pivot([angle.cos() * 5.0, 8.0, angle.sin() * 5.0])
+                    .angle([draw.walk.cos() * 0.2, 0.0, 0.0]),
+                );
+            }
+        }
+        MobModel::Bat => {
+            let flap = draw.walk.cos() * 0.8;
+            parts.push(
+                MobPart::new([-3.0, 16.0, -3.0], [6.0, 6.0, 6.0], [0.0, 0.0])
+                    .pivot([0.0, 19.0, 0.0])
+                    .head(),
+            );
+            parts.push(MobPart::new(
+                [-3.0, 4.0, -3.0],
+                [6.0, 12.0, 6.0],
+                [0.0, 16.0],
+            ));
+            parts.push(
+                MobPart::new([-15.0, 8.0, 0.0], [10.0, 8.0, 1.0], [42.0, 0.0])
+                    .pivot([-3.0, 10.0, 0.0])
+                    .angle([0.0, 0.0, flap]),
+            );
+            parts.push(
+                MobPart::new([5.0, 8.0, 0.0], [10.0, 8.0, 1.0], [42.0, 0.0])
+                    .pivot([3.0, 10.0, 0.0])
+                    .angle([0.0, 0.0, -flap]),
+            );
+        }
+        MobModel::Player => unreachable!("player uses append_humanoid"),
+    }
+
+    for part in parts {
+        append_mob_part(mesh, draw, &part);
+    }
+}
+
+fn append_mob_part(mesh: &mut EntityMesh, draw: &EntityDraw, part: &MobPart) {
+    let body_yaw = draw.yaw.to_radians();
+    let head_yaw = draw.head_yaw.to_radians();
+    let pitch = draw.pitch.to_radians();
+    let scale = draw.scale * PIXEL;
+    let alpha = if draw.invisible { 0.35 } else { draw.tint[3] };
+
+    let model_part = Part {
+        origin: part.origin,
+        size: part.size,
+        uv: part.uv,
+        follows_head: part.follows_head,
+    };
+
+    for (face_index, face) in FACES.iter().enumerate() {
+        let rect = face_rect(&model_part, face);
+        let base = mesh.vertices.len() as u32;
+
+        for (corner_index, corner) in face.corners.iter().enumerate() {
+            let mut local = [
+                part.origin[0] + corner[0] * part.size[0],
+                part.origin[1] + corner[1] * part.size[1],
+                part.origin[2] + corner[2] * part.size[2],
+            ];
+
+            // Limb rotation around its pivot, then the head/body yaw.
+            let [ax, ay, az] = part.angle;
+            local = rotate_around(local, part.pivot, ax, ay, az);
+            if part.follows_head {
+                local = rotate_x(local, part.pivot, pitch);
+                local = rotate_y(local, head_yaw);
+            } else {
+                local = rotate_y(local, body_yaw);
+            }
+
+            let uv_in_rect = CORNER_UV[face_index][corner_index];
+            let u = rect[0] + uv_in_rect[0] * rect[2];
+            let v = rect[1] + uv_in_rect[1] * rect[3];
+
+            mesh.vertices.push(EntityVertex {
+                position: [
+                    draw.feet[0] + local[0] * scale,
+                    draw.feet[1] + local[1] * scale,
+                    draw.feet[2] + local[2] * scale,
+                ],
+                uv: SkinAtlas::uv(draw.slot, u, v),
+                shade: face.shade,
+                color: [draw.tint[0], draw.tint[1], draw.tint[2], alpha],
+            });
+        }
+
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
+fn rotate_around(mut point: [f32; 3], pivot: [f32; 3], x: f32, y: f32, z: f32) -> [f32; 3] {
+    if x != 0.0 {
+        point = rotate_x(point, pivot, x);
+    }
+    if y != 0.0 {
+        point = rotate_y_point(point, pivot, y);
+    }
+    if z != 0.0 {
+        point = rotate_z(point, pivot, z);
+    }
+    point
+}
+
+fn rotate_x(mut point: [f32; 3], pivot: [f32; 3], angle: f32) -> [f32; 3] {
+    let (sin, cos) = angle.sin_cos();
+    let y = point[1] - pivot[1];
+    let z = point[2] - pivot[2];
+    point[1] = pivot[1] + y * cos - z * sin;
+    point[2] = pivot[2] + y * sin + z * cos;
+    point
+}
+
+fn rotate_y(point: [f32; 3], angle: f32) -> [f32; 3] {
+    rotate_y_point(point, [0.0; 3], angle)
+}
+
+fn rotate_y_point(mut point: [f32; 3], pivot: [f32; 3], angle: f32) -> [f32; 3] {
+    // Minecraft yaw grows towards -X, a negative rotation about +Y.
+    let (sin, cos) = (-angle).sin_cos();
+    let x = point[0] - pivot[0];
+    let z = point[2] - pivot[2];
+    point[0] = pivot[0] + x * cos + z * sin;
+    point[2] = pivot[2] - x * sin + z * cos;
+    point
+}
+
+fn rotate_z(mut point: [f32; 3], pivot: [f32; 3], angle: f32) -> [f32; 3] {
+    let (sin, cos) = angle.sin_cos();
+    let x = point[0] - pivot[0];
+    let y = point[1] - pivot[1];
+    point[0] = pivot[0] + x * cos - y * sin;
+    point[1] = pivot[1] + x * sin + y * cos;
+    point
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockEntityModel {
+    Sign,
+    Chest,
+    Banner,
+    BeaconBeam,
+    EnchantingBook,
+}
+
+/// One block entity to append to the entity mesh. `position` is the block's
+/// minimum corner (the same feet-space origin used by block geometry).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlockEntityDraw {
+    pub position: [f32; 3],
+    pub model: BlockEntityModel,
+    pub slot: u32,
+    pub tint: [f32; 4],
+    pub yaw: f32,
+    pub phase: f32,
+}
+
+/// Append a block entity's boxes to `mesh`.
+pub fn append_block_entity(mesh: &mut EntityMesh, draw: &BlockEntityDraw) {
+    match draw.model {
+        BlockEntityModel::Sign => {
+            append_uv_box(
+                mesh,
+                draw,
+                [0.45, 0.0, 0.45],
+                [0.1, 0.75, 0.1],
+                [0.0, 0.0],
+                [16.0, 32.0],
+            );
+            append_uv_box(
+                mesh,
+                draw,
+                [0.1, 0.7, 0.47],
+                [0.8, 0.4, 0.06],
+                [0.0, 0.0],
+                [64.0, 32.0],
+            );
+        }
+        BlockEntityModel::Chest => {
+            append_uv_box(
+                mesh,
+                draw,
+                [0.05, 0.0, 0.1],
+                [0.9, 0.55, 0.8],
+                [0.0, 0.0],
+                [64.0, 64.0],
+            );
+            append_uv_box(
+                mesh,
+                draw,
+                [0.05, 0.55, 0.1],
+                [0.9, 0.2, 0.8],
+                [0.0, 0.0],
+                [64.0, 64.0],
+            );
+        }
+        BlockEntityModel::Banner => {
+            append_uv_box(
+                mesh,
+                draw,
+                [0.46, 0.0, 0.46],
+                [0.08, 1.8, 0.08],
+                [0.0, 0.0],
+                [16.0, 32.0],
+            );
+            let y = 0.75 + draw.phase.sin() * 0.01;
+            append_uv_box(
+                mesh,
+                draw,
+                [0.08, y, 0.47],
+                [0.84, 1.0, 0.04],
+                [0.0, 0.0],
+                [64.0, 64.0],
+            );
+        }
+        BlockEntityModel::BeaconBeam => {
+            append_uv_box(
+                mesh,
+                draw,
+                [0.3, 1.0, 0.3],
+                [0.4, 20.0, 0.4],
+                [0.0, 0.0],
+                [64.0, 64.0],
+            );
+        }
+        BlockEntityModel::EnchantingBook => {
+            let (sin, cos) = draw.phase.sin_cos();
+            append_uv_box(
+                mesh,
+                draw,
+                [0.5 + cos * 0.02 - 0.2, 1.05, 0.3 + sin * 0.02],
+                [0.4, 0.08, 0.3],
+                [0.0, 0.0],
+                [64.0, 32.0],
+            );
+        }
+    }
+}
+
+fn append_uv_box(
+    mesh: &mut EntityMesh,
+    draw: &BlockEntityDraw,
+    origin: [f32; 3],
+    size: [f32; 3],
+    uv: [f32; 2],
+    uv_size: [f32; 2],
+) {
+    let (sin, cos) = (-draw.yaw.to_radians()).sin_cos();
+    for (face_index, face) in FACES.iter().enumerate() {
+        let base = mesh.vertices.len() as u32;
+        for (corner_index, corner) in face.corners.iter().enumerate() {
+            let local = [
+                origin[0] + corner[0] * size[0],
+                origin[1] + corner[1] * size[1],
+                origin[2] + corner[2] * size[2],
+            ];
+            let x = local[0] * cos + local[2] * sin;
+            let z = -local[0] * sin + local[2] * cos;
+            let uv_in_rect = CORNER_UV[face_index][corner_index];
+            let u = uv[0] + uv_in_rect[0] * uv_size[0];
+            let v = uv[1] + uv_in_rect[1] * uv_size[1];
+            mesh.vertices.push(EntityVertex {
+                position: [
+                    draw.position[0] + x,
+                    draw.position[1] + local[1],
+                    draw.position[2] + z,
+                ],
+                uv: SkinAtlas::uv(draw.slot, u, v),
+                shade: face.shade,
+                color: draw.tint,
+            });
+        }
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+}
+
 fn append_humanoid(mesh: &mut EntityMesh, draw: &EntityDraw) {
     let body_yaw = draw.yaw.to_radians();
     let head_yaw = draw.head_yaw.to_radians();
     let pitch = draw.pitch.to_radians();
 
-    for part in &PARTS {
+    let alpha = if draw.invisible { 0.35 } else { draw.tint[3] };
+    for (part_index, part) in PARTS.iter().enumerate() {
         let [ox, oy, oz] = part.origin;
         let [w, h, d] = part.size;
         let yaw = if part.follows_head {
@@ -380,6 +983,27 @@ fn append_humanoid(mesh: &mut EntityMesh, draw: &EntityDraw) {
             for (corner_index, corner) in face.corners.iter().enumerate() {
                 // Box-local position in skin pixels.
                 let mut local = [ox + corner[0] * w, oy + corner[1] * h, oz + corner[2] * d];
+                if draw.crouch && part_index < 4 {
+                    local[1] -= 2.0;
+                }
+                if part_index >= 2 {
+                    let swing = draw.walk.sin() * 0.7;
+                    let angle = match part_index {
+                        2 => -swing * 0.75,
+                        3 => swing * 0.75,
+                        4 => swing,
+                        5 => -swing,
+                        _ => 0.0,
+                    };
+                    let pivot = match part_index {
+                        2 => [-6.0, 22.0, 0.0],
+                        3 => [6.0, 22.0, 0.0],
+                        4 => [-2.0, 12.0, 0.0],
+                        5 => [2.0, 12.0, 0.0],
+                        _ => [0.0; 3],
+                    };
+                    local = rotate_x(local, pivot, angle);
+                }
 
                 if part.follows_head {
                     // Pitch about the neck so the head tips on its axis.
@@ -409,7 +1033,7 @@ fn append_humanoid(mesh: &mut EntityMesh, draw: &EntityDraw) {
                     ],
                     uv,
                     shade: face.shade,
-                    color: [draw.tint[0], draw.tint[1], draw.tint[2], draw.tint[3]],
+                    color: [draw.tint[0], draw.tint[1], draw.tint[2], alpha],
                 });
             }
 

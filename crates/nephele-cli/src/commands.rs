@@ -31,6 +31,7 @@ pub enum Command {
         count: i8,
     },
     Seed,
+    Time(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,11 +51,12 @@ pub enum Parsed {
     Unknown,
 }
 
-pub const HELP: [&str; 5] = [
+pub const HELP: [&str; 6] = [
     "/help - this list",
     "/gamemode <creative|survival> - change the local game mode",
     "/tp <x> <y> <z> - teleport (accepts ~)",
     "/setblock <x> <y> <z> <block> - change a block (accepts ~)",
+    "/time set <day|noon|night|midnight|ticks> - local time",
     "/seed - the world seed (singleplayer)",
 ];
 
@@ -116,6 +118,29 @@ pub fn parse(line: &str, position: [f64; 3]) -> Parsed {
                 Some((id, meta)) => Parsed::Command(Command::SetBlock { x, y, z, id, meta }),
                 None => Parsed::Error(format!("unknown block: {block}")),
             }
+        }
+        "time" => {
+            let Some("set") = words.next() else {
+                return Parsed::Error(
+                    "usage: /time set <day|noon|night|midnight|ticks>".to_string(),
+                );
+            };
+            let Some(value) = words.next() else {
+                return Parsed::Error(
+                    "usage: /time set <day|noon|night|midnight|ticks>".to_string(),
+                );
+            };
+            let time = match value {
+                "day" | "morning" => 1_000,
+                "noon" => 6_000,
+                "night" | "sunset" => 13_000,
+                "midnight" => 18_000,
+                other => match other.parse::<i64>() {
+                    Ok(time) => time,
+                    Err(_) => return Parsed::Error(format!("bad time: {other}")),
+                },
+            };
+            Parsed::Command(Command::Time(time.rem_euclid(24_000)))
         }
         "give" => {
             let Some(block) = words.next() else {
@@ -269,6 +294,20 @@ mod tests {
             parsed("give stone 999"),
             Parsed::Command(Command::Give { count: 64, .. })
         ));
+    }
+
+    #[test]
+    fn time_set_accepts_names_and_ticks() {
+        assert_eq!(
+            parsed("time set night"),
+            Parsed::Command(Command::Time(13_000))
+        );
+        assert_eq!(
+            parsed("time set 25000"),
+            Parsed::Command(Command::Time(1_000))
+        );
+        assert!(matches!(parsed("time set nope"), Parsed::Error(_)));
+        assert!(matches!(parsed("time"), Parsed::Error(_)));
     }
 
     /// Anything that is not ours must reach the server untouched.

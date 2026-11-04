@@ -89,6 +89,8 @@ impl StartupTimings {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+    world_light: f32,
+    _pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -151,6 +153,8 @@ pub struct Renderer {
     show_panorama: bool,
     /// Chunks that survived frustum culling in the last [`Renderer::draw`].
     drawn_chunks: usize,
+    sky_color: wgpu::Color,
+    world_light: f32,
     startup_timings: StartupTimings,
 }
 
@@ -201,10 +205,15 @@ impl Renderer {
             );
         }
 
+        // A full 1.8.9 block + item texture array is larger than the conservative
+        // wgpu default of 256 layers. Ask for the adapter's actual supported
+        // limit instead of silently losing the tail of the atlas.
+        let mut limits = wgpu::Limits::default();
+        limits.max_texture_array_layers = adapter.limits().max_texture_array_layers;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("nephele device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
@@ -251,7 +260,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -624,7 +633,7 @@ impl Renderer {
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -841,6 +850,8 @@ impl Renderer {
             panorama,
             show_panorama: false,
             drawn_chunks: 0,
+            sky_color: SKY_COLOR,
+            world_light: 1.0,
             startup_timings: startup,
         })
     }
@@ -853,6 +864,21 @@ impl Renderer {
     /// Chunks submitted in the last frame, and how many are loaded at all.
     pub fn draw_stats(&self) -> (usize, usize) {
         (self.drawn_chunks, self.chunks.len())
+    }
+
+    /// Scale terrain/entity lighting for time of day (1.0 = day).
+    pub fn set_world_light(&mut self, light: f32) {
+        self.world_light = light.clamp(0.05, 1.0);
+    }
+
+    /// Colour used for the sky clear. The caller drives this from world time.
+    pub fn set_sky_color(&mut self, color: [f32; 3]) {
+        self.sky_color = wgpu::Color {
+            r: color[0] as f64,
+            g: color[1] as f64,
+            b: color[2] as f64,
+            a: 1.0,
+        };
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -1004,7 +1030,7 @@ impl Renderer {
     }
 
     /// Replace every dropped item's geometry. Like entities, the whole buffer
-    /// is rebuilt each frame — a handful of 24-vertex cubes is nothing.
+    /// is rebuilt each frame â€” a handful of 24-vertex cubes is nothing.
     pub fn set_items(&mut self, mesh: &MeshData) {
         self.item_index_count = mesh.indices.len() as u32;
         if mesh.vertices.is_empty() {
@@ -1115,6 +1141,8 @@ impl Renderer {
     pub fn draw(&mut self, camera: &Camera) -> DrawOutcome {
         let uniforms = Uniforms {
             view_proj: camera.view_projection().to_cols_array_2d(),
+            world_light: self.world_light,
+            _pad: [0.0; 3],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -1156,7 +1184,7 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(SKY_COLOR),
+                        load: wgpu::LoadOp::Clear(self.sky_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

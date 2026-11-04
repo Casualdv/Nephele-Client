@@ -7,9 +7,57 @@
 
 use std::collections::HashMap;
 
+use nephele_protocol::packets::play::{
+    equipment_slot, EntityMetadataUpdate, EntityMetadataValue, ItemStack,
+};
+
 /// Blocks per second the server's "teleport" threshold uses. Vanilla treats a
 /// move larger than 4 blocks as absolute and snaps.
 const TELEPORT_DISTANCE: f64 = 4.0;
+
+/// The 1.8 `DataWatcher` fields shared by every living entity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityMetadata {
+    /// Entity flags: 0x01 fire, 0x02 crouched, 0x04 sprinting, 0x08 using,
+    /// 0x20 invisible.
+    pub flags: u8,
+    pub air: i16,
+    pub custom_name: String,
+    pub name_visible: bool,
+    pub silent: bool,
+    pub health: f32,
+}
+
+impl Default for EntityMetadata {
+    fn default() -> Self {
+        Self {
+            flags: 0,
+            air: 300,
+            custom_name: String::new(),
+            name_visible: false,
+            silent: false,
+            health: 20.0,
+        }
+    }
+}
+
+impl EntityMetadata {
+    pub fn on_fire(&self) -> bool {
+        self.flags & 0x01 != 0
+    }
+
+    pub fn crouched(&self) -> bool {
+        self.flags & 0x02 != 0
+    }
+
+    pub fn sprinting(&self) -> bool {
+        self.flags & 0x08 != 0
+    }
+
+    pub fn invisible(&self) -> bool {
+        self.flags & 0x20 != 0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntityKind {
@@ -38,6 +86,13 @@ pub struct Entity {
     pub velocity: [f64; 3],
     /// Client tick this entity spawned on.
     pub spawned_at: u64,
+    /// DataWatcher state: flags, name, health, silence.
+    pub metadata: EntityMetadata,
+    /// Held item, boots, leggings, chestplate, helmet.
+    pub equipment: [Option<ItemStack>; equipment_slot::COUNT],
+    /// Last `S0B` animation id (0 = arm swing) and how many ticks it lasts.
+    pub animation: u8,
+    pub animation_ticks: u8,
 }
 
 impl Entity {
@@ -54,6 +109,10 @@ impl Entity {
             prev_head_yaw: yaw,
             velocity: [0.0; 3],
             spawned_at: tick,
+            metadata: EntityMetadata::default(),
+            equipment: [None; equipment_slot::COUNT],
+            animation: 0,
+            animation_ticks: 0,
         }
     }
 
@@ -67,7 +126,7 @@ impl Entity {
         ]
     }
 
-    /// Yaw at `alpha`, taking the short way round so a turn past ±180° doesn't
+    /// Yaw at `alpha`, taking the short way round so a turn past Â±180Â° doesn't
     /// spin the model the long way. Always normalised into `[0, 360)`.
     pub fn interpolated_yaw(&self, alpha: f64) -> f32 {
         let delta = wrap_degrees(self.yaw - self.prev_yaw);
@@ -96,6 +155,62 @@ impl Entity {
     fn look(&mut self, yaw: f32, pitch: f32) {
         self.yaw = yaw;
         self.pitch = pitch;
+    }
+
+    /// Custom name, falling back to the player-list name for real players.
+    pub fn name(&self) -> &str {
+        if !self.metadata.custom_name.is_empty() {
+            &self.metadata.custom_name
+        } else if let EntityKind::Player { name, .. } = &self.kind {
+            name
+        } else {
+            ""
+        }
+    }
+
+    /// Whether a nametag should be drawn. Players always show their name;
+    /// mobs only when the server marks the custom name visible.
+    pub fn shows_name(&self) -> bool {
+        if self.metadata.custom_name.is_empty() {
+            matches!(self.kind, EntityKind::Player { .. })
+        } else {
+            self.metadata.name_visible
+        }
+    }
+
+    pub fn health(&self) -> f32 {
+        self.metadata.health
+    }
+
+    pub fn invisible(&self) -> bool {
+        self.metadata.invisible()
+    }
+
+    pub fn crouched(&self) -> bool {
+        self.metadata.crouched()
+    }
+
+    pub fn apply_metadata_value(&mut self, index: u8, value: &EntityMetadataValue) {
+        match (index, value) {
+            (0, EntityMetadataValue::Byte(flags)) => self.metadata.flags = *flags as u8,
+            (1, EntityMetadataValue::Short(air)) => self.metadata.air = *air,
+            (2, EntityMetadataValue::String(name)) => self.metadata.custom_name.clone_from(name),
+            (3, EntityMetadataValue::Byte(visible)) => self.metadata.name_visible = *visible != 0,
+            (4, EntityMetadataValue::Byte(silent)) => self.metadata.silent = *silent != 0,
+            (6, EntityMetadataValue::Float(health)) => self.metadata.health = health.max(0.0),
+            _ => {}
+        }
+    }
+
+    pub fn set_equipment(&mut self, slot: i16, item: Option<ItemStack>) {
+        if (0..equipment_slot::COUNT as i16).contains(&slot) {
+            self.equipment[slot as usize] = item;
+        }
+    }
+
+    pub fn play_animation(&mut self, animation: u8) {
+        self.animation = animation;
+        self.animation_ticks = 8;
     }
 }
 
@@ -158,6 +273,10 @@ impl Entities {
             entity.prev = entity.position;
             entity.prev_yaw = entity.yaw;
             entity.prev_head_yaw = entity.head_yaw;
+            entity.animation_ticks = entity.animation_ticks.saturating_sub(1);
+            if entity.animation_ticks == 0 {
+                entity.animation = 0;
+            }
         }
     }
 
@@ -221,6 +340,34 @@ impl Entities {
                 self.tick,
             ),
         );
+    }
+
+    /// Apply one `S1C Entity Metadata` update.
+    pub fn apply_metadata(&mut self, update: &EntityMetadataUpdate) {
+        let Some(entity) = self.map.get_mut(&update.entity_id) else {
+            return;
+        };
+        for (index, value) in &update.values {
+            entity.apply_metadata_value(*index, value);
+        }
+    }
+
+    /// Apply one `S04 Entity Equipment` update.
+    pub fn apply_equipment(&mut self, id: i32, slot: i16, item: Option<ItemStack>) -> bool {
+        let Some(entity) = self.map.get_mut(&id) else {
+            return false;
+        };
+        entity.set_equipment(slot, item);
+        true
+    }
+
+    /// Record an `S0B` animation on one entity.
+    pub fn play_animation(&mut self, id: i32, animation: u8) -> bool {
+        let Some(entity) = self.map.get_mut(&id) else {
+            return false;
+        };
+        entity.play_animation(animation);
+        true
     }
 
     pub fn relative_move(&mut self, id: i32, dx: f64, dy: f64, dz: f64) {
@@ -403,6 +550,33 @@ mod tests {
         entities.relative_move(42, 1.0, 1.0, 1.0);
         entities.look(42, 10.0, 10.0);
         assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn metadata_updates_flags_name_health_and_equipment() {
+        let mut entities = Entities::new();
+        entities.spawn_mob(9, 54, false, [0.0; 3], 0.0, 0.0);
+        let update = EntityMetadataUpdate {
+            entity_id: 9,
+            values: vec![
+                (0, EntityMetadataValue::Byte(0x22)),
+                (2, EntityMetadataValue::String("Bob".into())),
+                (3, EntityMetadataValue::Byte(1)),
+                (6, EntityMetadataValue::Float(7.0)),
+            ],
+        };
+        entities.apply_metadata(&update);
+        entities.apply_equipment(9, equipment_slot::HELMET, Some(ItemStack::new(310, 1, 0)));
+        let entity = entities.get(9).unwrap();
+        assert!(entity.crouched());
+        assert!(entity.invisible());
+        assert_eq!(entity.name(), "Bob");
+        assert!(entity.shows_name());
+        assert_eq!(entity.health(), 7.0);
+        assert_eq!(
+            entity.equipment[equipment_slot::HELMET as usize],
+            Some(ItemStack::new(310, 1, 0))
+        );
     }
 
     #[test]

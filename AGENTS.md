@@ -117,6 +117,7 @@ crates/
   nephele-world/        worldgen + chunk data (the parity-critical crate)
   nephele-render/       mesher, chunk mesh, shader
   nephele-assets/       texture array, atlas, resource paths
+  nephele-audio/        Symphonia Ogg Vorbis decode, cpal mixer, positional sounds
   nephele-cli/src/      lib code used by the CLI binary:
       live.rs           network + local game loops, screens, input
       viewer.rs         offline world viewer
@@ -366,6 +367,52 @@ the entity pipeline, which is bound to the skin atlas — via
   `held_slot` and the inventory) and only attaches the hand on `Screen::Game`.
 
 
+### Entities, mobs, particles and block entities (2026-11-03)
+
+- `nephele-client::entities::EntityMetadata` mirrors 1.8 `DataWatcher` fields:
+  flags (fire/crouch/sprint/use/invisible), air, custom name, name visibility,
+  silence and health. `S1C` is parsed into typed values; `S04` equipment is
+  stored in five slots; `S0B` animation sets an 8-tick swing flag.
+- `nephele-render::entity::MobModel` builds biped, enderman, creeper,
+  quadruped, slime, spider, chicken, squid and bat box models. The player model
+  keeps the 64x64 skin layout; mob textures are packed into spare
+  `SkinAtlas` slots after being padded to 64x64. Limbs use the walk phase;
+  crouch/invisible/tint and held-block equipment are applied by the draw data.
+- `BlockEntityDraw` appends sign, chest, banner, beacon-beam and enchanting-book
+  geometry to the same entity mesh. `nephele-client::block_entities` decodes
+  sign text/colour, banner base/patterns, beacon levels and enchanting tables
+  from `S35` NBT; locally placed blocks are inferred from their block id.
+- `nephele-render::particle` builds camera-facing quads through the terrain
+  pipeline. `particle_textures` generates smoke/flame/crit/portal/splash/heart
+  tiles; block-break particles reuse the broken block's side texture.
+- `nephele-cli::particles` owns particle velocity/lifetime. Local mining and
+  server `S2A` bursts feed it; the mesh is appended to the item buffer so there
+  is no extra GPU pipeline.
+- Local singleplayer advances `Shared::time_of_day`, spawns hostile mobs at
+  night (zombie/skeleton/creeper/spider), plays their idle sounds, emits block
+  break/step/player-hurt sounds, and darkens terrain/entities with
+  `Renderer::set_world_light`. `/time set day|noon|night|midnight|ticks` is a
+  client command.
+- The block/item texture array now reaches **280 layers** on a full 1.8.9
+  preparation. `Renderer::new` requests the adapter's actual
+  `max_texture_array_layers` instead of wgpu's 256 default.
+
+### Audio (2026-11-03)
+
+- `nephele-audio` decodes Ogg Vorbis with Symphonia and mixes through cpal.
+  `SoundCatalog` reads `sounds.json`, resolves weighted samples, and the worker
+  caches decoded sounds. `AudioEngine` mixes up to 64 voices with distance
+  attenuation and stereo panning; a missing output device leaves a silent,
+  non-fatal engine.
+- `nephele-prepare` output version is now **2**: it extracts
+  `textures/entity/` and `texts/` from the jar and copies
+  `minecraft/sounds/**` plus `sounds.json` from the user's asset index object
+  store. `--assets-dir` overrides discovery. A jar-only preparation still works
+  but has no audio.
+- Settings has a **Master Volume** row (default 70%); `AudioEngine::play` is
+  used for local block break/place/step, mob idle, player hurt and server
+  `S29 Sound Effect` events.
+
 ### Smooth lighting — planned, not started
 
 Light **is** decoded: `Section` stores `block_light: Vec<u8>` and
@@ -524,6 +571,11 @@ slabs, stairs, fence posts, panes, doors and torches. Smooth lighting/AO, animat
 textures, plant edge cases and terrain polish remain; M1 is active again before
 the planned M2 close-out.
 
+**M6 depth (2026-11-03):** mob models/metadata, particles, block-entity
+geometry, positional audio and a night singleplayer mob loop are in. Still
+partial: armour rendering, chest/furnace GUIs, block-entity interaction, music
+and records, and deeper mob combat/AI. The prepared asset output version is 2.
+
 **M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
 network block drops and pickup, survival inventory, container click protocol,
 mock 2x2/3x3 crafting, and the death screen and respawn are implemented. Local
@@ -592,13 +644,14 @@ item icons for unmapped item ids.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **446 test cases across the workspace** (445 passed, 1 ignored, including two
-  doctests). `nephele-cli` has 65 passing tests; `nephele-assets` has 34;
-  `nephele-render` has 43 passing tests, including seven shape-meshing
-  regressions; `nephele-world` has 119 passing tests and one ignored. The six
-  real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,
-  compression, chat, joining/loading the mock world, drop pickup, and crafting
-  planks through `C0E`.
+- **The workspace suite is now over 500 cases** and grows with each feature;
+  run `cargo test --workspace` for the authoritative count. New coverage this
+  pass includes 1.8 metadata/equipment/particles/sounds, NBT values, block
+  entity decoding, mob model/particle meshes, audio catalog/decode/mixer tests,
+  local night-time and particle expiry. The six real-socket tests in
+  `crates/nephele-client/tests/join_mock.rs` still cover status, compression,
+  chat, joining/loading the mock world, drop pickup, and crafting planks through
+  `C0E`.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
 
@@ -620,6 +673,10 @@ Respawn button). The button sets `Shared::pending_respawn`, which the network lo
 turns into `client_status(0)` (`GameClient::respawn`), and the stale zero is cleared
 so the screen cannot bounce back before the server's own update lands.
 
+0. **M6 entity/audio depth (2026-11-03).** Mob models, metadata/equipment,
+   particles, block-entity geometry and positional sound are in; the next
+   useful passes are armour overlays, chest/furnace GUIs, block-entity
+   interaction, music/records and stronger local mob combat.
 1. **Mesher consumes `block_shape` — done 2026-11-02.** `mesh_column` walks
    `block_shape(id, meta)`, scales 0..16 box corners into block coordinates and
    keeps the direct cube path. Neighbour culling only removes a whole face when

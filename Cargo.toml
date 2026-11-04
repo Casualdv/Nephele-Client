@@ -6,6 +6,7 @@ members = [
     "crates/nephele-client",
     "crates/nephele-mock",
     "crates/nephele-assets",
+    "crates/nephele-audio",
     "crates/nephele-render",
     "crates/nephele-cli",
     "crates/nephele-prepare",
@@ -45,6 +46,8 @@ glam = "0.34"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+symphonia = { version = "0.5", features = ["ogg", "vorbis"] }
+cpal = "0.15"
 
 [profile.release]
 lto = "thin"
