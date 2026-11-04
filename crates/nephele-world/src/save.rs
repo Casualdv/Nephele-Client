@@ -15,7 +15,10 @@ use nephele_anvil::{
 use crate::chunk::{ChunkColumn, Section, SECTION_COUNT, SECTION_VOLUME};
 
 const METADATA_FILE: &str = "nephele.dat";
+const PLAYER_STATE_FILE: &str = "player.dat";
 const REGION_DIR: &str = "region";
+const MAX_WORLD_NAME_UNITS: usize = 64;
+const PLAYER_INVENTORY_SLOTS: usize = 45;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorldMode {
@@ -53,6 +56,22 @@ pub struct WorldMetadata {
     pub mode: WorldMode,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SavedItemStack {
+    pub id: i16,
+    pub count: i8,
+    pub damage: i16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedPlayerState {
+    pub position: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub held_slot: i16,
+    pub inventory: Vec<Option<SavedItemStack>>,
+}
+
 #[derive(Debug)]
 pub enum SaveError {
     Io(io::Error),
@@ -62,6 +81,7 @@ pub enum SaveError {
     InvalidWorldName(String),
     AlreadyExists(PathBuf),
     InvalidMetadata(PathBuf),
+    InvalidPlayerState(String),
     ChunkCoordinateMismatch {
         requested: (i32, i32),
         stored: (i32, i32),
@@ -86,6 +106,7 @@ impl fmt::Display for SaveError {
                     path.display()
                 )
             }
+            Self::InvalidPlayerState(reason) => write!(f, "invalid saved player state: {reason}"),
             Self::ChunkCoordinateMismatch { requested, stored } => write!(
                 f,
                 "saved chunk coordinates {},{} do not match requested {},{}",
@@ -105,6 +126,7 @@ impl Error for SaveError {
             Self::InvalidWorldName(_)
             | Self::AlreadyExists(_)
             | Self::InvalidMetadata(_)
+            | Self::InvalidPlayerState(_)
             | Self::ChunkCoordinateMismatch { .. } => None,
         }
     }
@@ -208,6 +230,150 @@ impl WorldSave {
         Ok(())
     }
 
+    /// Loads the saved local player's position, orientation, selected slot and inventory.
+    pub fn load_player_state(&self) -> Result<Option<SavedPlayerState>, SaveError> {
+        let path = self.path.join(PLAYER_STATE_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path)?;
+        let (_, root) = parse_nbt(&bytes)?;
+        let read_double = |name: &str| match root.get(name) {
+            Some(Tag::Double(value)) => Ok(*value),
+            _ => Err(SaveError::InvalidPlayerState(format!("missing {name}"))),
+        };
+        let yaw = match root.get("Yaw") {
+            Some(Tag::Float(value)) => *value,
+            _ => return Err(SaveError::InvalidPlayerState("missing yaw".to_string())),
+        };
+        let pitch = match root.get("Pitch") {
+            Some(Tag::Float(value)) => *value,
+            _ => return Err(SaveError::InvalidPlayerState("missing pitch".to_string())),
+        };
+        let held_slot = match root.get("HeldSlot") {
+            Some(Tag::Short(value)) => *value,
+            _ => {
+                return Err(SaveError::InvalidPlayerState(
+                    "missing held slot".to_string(),
+                ));
+            }
+        };
+        let entries = root
+            .get("Inventory")
+            .and_then(Tag::as_list)
+            .ok_or_else(|| SaveError::InvalidPlayerState("missing inventory".to_string()))?;
+        let mut inventory = vec![None; PLAYER_INVENTORY_SLOTS];
+        for entry in entries {
+            let slot = match entry.get("Slot") {
+                Some(Tag::Byte(value)) if (0..PLAYER_INVENTORY_SLOTS as i8).contains(value) => {
+                    *value as usize
+                }
+                _ => continue,
+            };
+            let (Some(Tag::Short(id)), Some(Tag::Byte(count)), Some(Tag::Short(damage))) =
+                (entry.get("Id"), entry.get("Count"), entry.get("Damage"))
+            else {
+                continue;
+            };
+            if *count > 0 {
+                inventory[slot] = Some(SavedItemStack {
+                    id: *id,
+                    count: *count,
+                    damage: *damage,
+                });
+            }
+        }
+
+        let state = SavedPlayerState {
+            position: [read_double("X")?, read_double("Y")?, read_double("Z")?],
+            yaw,
+            pitch,
+            held_slot,
+            inventory,
+        };
+        validate_player_state(&state)?;
+        Ok(Some(state))
+    }
+
+    /// Writes the local player's state into this world's `player.dat`.
+    pub fn save_player_state(&self, state: &SavedPlayerState) -> Result<(), SaveError> {
+        validate_player_state(state)?;
+
+        let mut inventory = Vec::new();
+        for (slot, item) in state.inventory.iter().enumerate() {
+            let Some(item) = item else {
+                continue;
+            };
+            let mut stack = HashMap::new();
+            stack.insert("Slot".to_string(), Tag::Byte(slot as i8));
+            stack.insert("Id".to_string(), Tag::Short(item.id));
+            stack.insert("Count".to_string(), Tag::Byte(item.count));
+            stack.insert("Damage".to_string(), Tag::Short(item.damage));
+            inventory.push(Tag::Compound(stack));
+        }
+
+        let mut player = HashMap::new();
+        player.insert("Version".to_string(), Tag::Int(1));
+        player.insert("X".to_string(), Tag::Double(state.position[0]));
+        player.insert("Y".to_string(), Tag::Double(state.position[1]));
+        player.insert("Z".to_string(), Tag::Double(state.position[2]));
+        player.insert("Yaw".to_string(), Tag::Float(state.yaw));
+        player.insert("Pitch".to_string(), Tag::Float(state.pitch));
+        player.insert("HeldSlot".to_string(), Tag::Short(state.held_slot));
+        player.insert("Inventory".to_string(), Tag::List(inventory));
+
+        let bytes = encode_nbt("Player", &Tag::Compound(player))?;
+        fs::write(self.path.join(PLAYER_STATE_FILE), bytes)?;
+        Ok(())
+    }
+
+    /// Renames the world folder and display name after validating the new name.
+    pub fn rename(&mut self, new_name: &str) -> Result<WorldMetadata, SaveError> {
+        let name = new_name.trim();
+        let directory = validate_directory_name(name)?;
+        let same_path = if cfg!(windows) {
+            self.metadata.directory.eq_ignore_ascii_case(&directory)
+        } else {
+            self.metadata.directory == directory
+        };
+        let previous = self.metadata.clone();
+
+        if same_path {
+            self.metadata.name = name.to_string();
+            if let Err(error) = write_metadata(&self.path.join(METADATA_FILE), &self.metadata) {
+                self.metadata = previous;
+                return Err(error);
+            }
+            return Ok(self.metadata.clone());
+        }
+
+        let new_path = self.path.with_file_name(&directory);
+        if new_path.exists() {
+            return Err(SaveError::AlreadyExists(new_path));
+        }
+        let old_path = self.path.clone();
+        fs::rename(&old_path, &new_path)?;
+        self.path = new_path.clone();
+        self.metadata.directory = directory;
+        self.metadata.name = name.to_string();
+        self.regions.clear();
+        if let Err(error) = write_metadata(&self.path.join(METADATA_FILE), &self.metadata) {
+            self.path = old_path.clone();
+            self.metadata = previous;
+            self.regions.clear();
+            let _ = fs::rename(new_path, old_path);
+            return Err(error);
+        }
+        Ok(self.metadata.clone())
+    }
+
+    /// Deletes an existing world after requiring a valid world metadata file.
+    pub fn delete(saves_dir: impl AsRef<Path>, directory: &str) -> Result<(), SaveError> {
+        let world = Self::open(saves_dir, directory)?;
+        fs::remove_dir_all(world.path)?;
+        Ok(())
+    }
+
     /// Loads a previously saved chunk, or returns `None` for a generated-only chunk.
     pub fn load_chunk(&mut self, x: i32, z: i32) -> Result<Option<ChunkColumn>, SaveError> {
         let region_coord = (x.div_euclid(32), z.div_euclid(32));
@@ -296,9 +462,10 @@ pub fn list_worlds(saves_dir: impl AsRef<Path>) -> Result<Vec<WorldMetadata>, Sa
 
 fn validate_directory_name(name: &str) -> Result<String, SaveError> {
     let invalid = name.is_empty()
-        || name.len() > 96
+        || name.encode_utf16().count() > MAX_WORLD_NAME_UNITS
+        || name != name.trim()
         || name == "."
-        || name == ".."
+        || name.contains("..")
         || name.ends_with('.')
         || name.ends_with(' ')
         || name.chars().any(|ch| {
@@ -308,15 +475,50 @@ fn validate_directory_name(name: &str) -> Result<String, SaveError> {
         .split('.')
         .next()
         .unwrap_or_default()
+        .trim_end_matches([' ', '.'])
         .to_ascii_uppercase();
     let reserved = matches!(device_name.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (1..=9).any(|index| {
             device_name == format!("COM{index}") || device_name == format!("LPT{index}")
-        });
+        })
+        || matches!(
+            device_name.as_str(),
+            "COM¹" | "COM²" | "COM³" | "LPT¹" | "LPT²" | "LPT³"
+        );
     if invalid || reserved {
         return Err(SaveError::InvalidWorldName(name.to_string()));
     }
     Ok(name.to_string())
+}
+
+fn validate_player_state(state: &SavedPlayerState) -> Result<(), SaveError> {
+    if state.inventory.len() != PLAYER_INVENTORY_SLOTS {
+        return Err(SaveError::InvalidPlayerState(format!(
+            "inventory has {} slots, expected {PLAYER_INVENTORY_SLOTS}",
+            state.inventory.len()
+        )));
+    }
+    if state.position.iter().any(|value| !value.is_finite()) {
+        return Err(SaveError::InvalidPlayerState(
+            "position must contain finite coordinates".to_string(),
+        ));
+    }
+    if !state.yaw.is_finite() || !state.pitch.is_finite() {
+        return Err(SaveError::InvalidPlayerState(
+            "yaw and pitch must be finite".to_string(),
+        ));
+    }
+    if !(0..=8).contains(&state.held_slot) {
+        return Err(SaveError::InvalidPlayerState(
+            "held slot must be in 0..=8".to_string(),
+        ));
+    }
+    if state.inventory.iter().flatten().any(|item| item.count <= 0) {
+        return Err(SaveError::InvalidPlayerState(
+            "item counts must be positive".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_metadata(path: &Path, metadata: &WorldMetadata) -> Result<(), SaveError> {
@@ -513,6 +715,87 @@ mod tests {
     }
 
     #[test]
+    fn player_position_orientation_and_inventory_roundtrip_in_world_data() {
+        let saves = temp_saves_dir("player-state");
+        let save = WorldSave::create(&saves, "Player State", 91, WorldMode::Survival).unwrap();
+        let mut inventory = vec![None; PLAYER_INVENTORY_SLOTS];
+        inventory[0] = Some(SavedItemStack {
+            id: 4,
+            count: 31,
+            damage: 2,
+        });
+        inventory[44] = Some(SavedItemStack {
+            id: 280,
+            count: 5,
+            damage: 0,
+        });
+        let player = SavedPlayerState {
+            position: [-23.5, 72.25, 41.75],
+            yaw: 1.25,
+            pitch: -0.375,
+            held_slot: 7,
+            inventory,
+        };
+
+        save.save_player_state(&player).unwrap();
+        drop(save);
+
+        let reopened = WorldSave::open(&saves, "Player State").unwrap();
+        assert_eq!(reopened.load_player_state().unwrap(), Some(player));
+        assert!(saves.join("Player State").join(PLAYER_STATE_FILE).is_file());
+
+        let _ = fs::remove_dir_all(saves);
+    }
+
+    #[test]
+    fn rename_uses_world_name_validation_and_keeps_saved_chunks() {
+        let saves = temp_saves_dir("rename");
+        let mut save = WorldSave::create(&saves, "Before", 17, WorldMode::Creative).unwrap();
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(2, 65, 3, BlockState::STONE);
+        save.save_chunk(&column).unwrap();
+
+        let too_long = "x".repeat(MAX_WORLD_NAME_UNITS + 1);
+        for invalid in ["..", "../outside", "a\\b", "NUL", "COM1", too_long.as_str()] {
+            assert!(matches!(
+                save.rename(invalid),
+                Err(SaveError::InvalidWorldName(_))
+            ));
+        }
+        assert_eq!(save.metadata().directory, "Before");
+        save.rename("After").unwrap();
+
+        assert!(!saves.join("Before").exists());
+        assert!(saves.join("After").join("region/r.0.0.mca").is_file());
+        let mut reopened = WorldSave::open(&saves, "After").unwrap();
+        assert_eq!(reopened.metadata().name, "After");
+        assert_eq!(
+            reopened
+                .load_chunk(0, 0)
+                .unwrap()
+                .unwrap()
+                .get_block(2, 65, 3),
+            BlockState::STONE
+        );
+
+        let _ = fs::remove_dir_all(saves);
+    }
+
+    #[test]
+    fn deleting_a_world_removes_its_own_data() {
+        let saves = temp_saves_dir("delete");
+        let save = WorldSave::create(&saves, "Remove Me", 23, WorldMode::Survival).unwrap();
+        let world_path = saves.join("Remove Me");
+        drop(save);
+
+        WorldSave::delete(&saves, "Remove Me").unwrap();
+
+        assert!(!world_path.exists());
+        assert!(list_worlds(&saves).unwrap().is_empty());
+        let _ = fs::remove_dir_all(saves);
+    }
+
+    #[test]
     fn only_explicitly_saved_chunks_appear_in_the_world() {
         let saves = temp_saves_dir("dirty-only");
         let mut save = WorldSave::create(&saves, "Dirty", 42, WorldMode::Creative).unwrap();
@@ -528,14 +811,39 @@ mod tests {
     #[test]
     fn rejects_world_names_that_could_escape_the_saves_directory() {
         let saves = temp_saves_dir("invalid-name");
-        assert!(matches!(
-            WorldSave::create(&saves, "../outside", 1, WorldMode::Creative),
-            Err(SaveError::InvalidWorldName(_))
-        ));
-        assert!(matches!(
-            WorldSave::create(&saves, "CON", 1, WorldMode::Creative),
-            Err(SaveError::InvalidWorldName(_))
-        ));
+        let too_long = "x".repeat(MAX_WORLD_NAME_UNITS + 1);
+        for name in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "../outside",
+            "..\\..\\evil",
+            "nested/name",
+            "nested\\name",
+            "world..backup",
+            "CON",
+            "con.txt",
+            "NUL",
+            "PRN.log",
+            "AUX",
+            "COM1",
+            "com9.dat",
+            "LPT1",
+            "lpt9.backup",
+            "COM¹",
+            "LPT³",
+            too_long.as_str(),
+        ] {
+            assert!(
+                matches!(
+                    WorldSave::create(&saves, name, 1, WorldMode::Creative),
+                    Err(SaveError::InvalidWorldName(_))
+                ),
+                "accepted unsafe world name {name:?}"
+            );
+        }
+        assert_eq!(fs::read_dir(&saves).unwrap().count(), 0);
         let _ = fs::remove_dir_all(saves);
     }
 }

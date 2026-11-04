@@ -30,7 +30,9 @@ use nephele_render::{
     build_entities, build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw,
     Environment, HandDraw, HandItem, ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
 };
-use nephele_world::save::{self, WorldMetadata, WorldMode, WorldSave};
+use nephele_world::save::{
+    self, SavedItemStack, SavedPlayerState, WorldMetadata, WorldMode, WorldSave,
+};
 use nephele_world::{raycast, BlockState, ChunkColumn, ChunkCoord, World};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -43,6 +45,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 const MOUSE_SENSITIVITY: f32 = 0.0022;
 const TICK: Duration = Duration::from_millis(50);
+const PLAYER_STATE_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 /// Vanilla's `PlayerControllerMP.getBlockReachDistance`.
 const REACH_CREATIVE: f64 = 5.0;
 const REACH_SURVIVAL: f64 = 4.5;
@@ -189,6 +192,9 @@ struct Shared {
     close_window: bool,
     /// Single-player has no server to apply clicks, so the UI applies them.
     local: bool,
+    /// The local simulation thread persists pending player state before stopping.
+    local_shutdown: bool,
+    local_stopped: bool,
     /// Render distance, pushed to the server as a client-settings update.
     view_distance: u8,
     /// Position at the start of the current tick, and when that tick began, so
@@ -351,6 +357,8 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         local_container: LocalContainer::default(),
         close_window: false,
         local: false,
+        local_shutdown: false,
+        local_stopped: true,
         view_distance: configured_view_distance(&settings),
         prev_position: [0.5, 80.0, 0.5],
         tick_at: Instant::now(),
@@ -395,6 +403,41 @@ fn fresh_world_seed() -> u64 {
     time ^ (u64::from(std::process::id()) << 32)
 }
 
+fn saved_local_player_state(state: &Shared) -> SavedPlayerState {
+    SavedPlayerState {
+        position: [state.player.x, state.player.y, state.player.z],
+        yaw: state.yaw,
+        pitch: state.pitch,
+        held_slot: state.held_slot.clamp(0, 8),
+        inventory: state
+            .inventory
+            .iter()
+            .map(|item| {
+                item.map(|item| SavedItemStack {
+                    id: item.id,
+                    count: item.count,
+                    damage: item.damage,
+                })
+            })
+            .collect(),
+    }
+}
+
+fn restore_local_player_state(state: &mut Shared, saved: &SavedPlayerState) {
+    state
+        .player
+        .teleport(saved.position[0], saved.position[1], saved.position[2]);
+    state.yaw = saved.yaw;
+    state.pitch = saved.pitch;
+    state.held_slot = saved.held_slot;
+    state.inventory.fill(None);
+    for (slot, item) in saved.inventory.iter().enumerate() {
+        if let Some(item) = item {
+            state.inventory[slot] = Some(ItemStack::new(item.id, item.count, item.damage));
+        }
+    }
+}
+
 /// Single-player: generate terrain around the player, simulate, and let them
 /// mine and place without a server.
 fn local_loop(
@@ -407,6 +450,9 @@ fn local_loop(
 
     let seed = save.metadata().seed;
     let mode = save.metadata().mode;
+    let saved_player = save
+        .load_player_state()
+        .map_err(|error| error.to_string())?;
     let generator = TerrainGenerator::new(seed);
     let mut world = World::new(0);
     // Honour the render-distance setting; `radius` is re-read every tick so
@@ -416,12 +462,17 @@ fn local_loop(
     {
         let mut state = shared.lock().unwrap();
         let spawn_y = generator.spawn_height() as f64;
-        state.player.teleport(0.5, spawn_y, 0.5);
         state.spawned = true;
         state.creative = mode.is_creative();
         state.status = format!("{} (seed {seed})", save.metadata().name);
         state.inventory.fill(None);
-        if mode.is_creative() {
+        if let Some(saved_player) = saved_player.as_ref() {
+            restore_local_player_state(&mut state, saved_player);
+        } else {
+            state.player.teleport(0.5, spawn_y, 0.5);
+            state.held_slot = 0;
+        }
+        if saved_player.is_none() && mode.is_creative() {
             for (index, block) in nephele_client::STARTER_HOTBAR.iter().enumerate() {
                 state.inventory[HOTBAR_FIRST_SLOT + index] =
                     Some(ItemStack::new(block.id() as i16, 64, block.meta() as i16));
@@ -432,6 +483,8 @@ fn local_loop(
 
     let mut sent: HashSet<(i32, i32)> = HashSet::new();
     let mut miner = Miner::default();
+    let mut last_saved_player = saved_player;
+    let mut player_save_deadline = Instant::now() + PLAYER_STATE_SAVE_INTERVAL;
 
     loop {
         let (position, yaw, pitch, _on_ground) = step_player(&shared, &world);
@@ -626,6 +679,55 @@ fn local_loop(
         }
 
         std::thread::sleep(TICK);
+
+        let (shutdown, pending_edits) = {
+            let mut state = shared.lock().unwrap();
+            let shutdown = state.local_shutdown;
+            let edits = if shutdown {
+                std::mem::take(&mut state.world_edits)
+            } else {
+                Vec::new()
+            };
+            (shutdown, edits)
+        };
+        if shutdown {
+            let mut final_dirty = HashSet::new();
+            for (x, y, z, block) in pending_edits {
+                if world.set_block(x, y, z, BlockState::from_raw(block)) {
+                    final_dirty.insert((x.div_euclid(16), z.div_euclid(16)));
+                }
+            }
+
+            let mut save_error = None;
+            for (cx, cz) in final_dirty {
+                if let Some(column) = world.get(ChunkCoord::new(cx, cz)) {
+                    if let Err(error) = save.save_chunk(column) {
+                        save_error = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+            let player_state = saved_local_player_state(&shared.lock().unwrap());
+            if let Err(error) = save.save_player_state(&player_state) {
+                save_error.get_or_insert_with(|| error.to_string());
+            }
+            shared.lock().unwrap().local_stopped = true;
+            if let Some(error) = save_error {
+                return Err(error);
+            }
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        if now >= player_save_deadline {
+            let player_state = saved_local_player_state(&shared.lock().unwrap());
+            if last_saved_player.as_ref() != Some(&player_state) {
+                save.save_player_state(&player_state)
+                    .map_err(|error| error.to_string())?;
+                last_saved_player = Some(player_state);
+            }
+            player_save_deadline = now + PLAYER_STATE_SAVE_INTERVAL;
+        }
     }
 }
 
@@ -1039,12 +1141,15 @@ struct LiveApp {
     saves_dir: std::path::PathBuf,
     worlds: Vec<WorldMetadata>,
     worlds_scroll: usize,
+    selected_world: Option<String>,
     world_error: Option<String>,
     world_name_input: String,
     world_seed_input: String,
     world_create_mode: WorldMode,
     world_name_focused: bool,
     world_seed_focused: bool,
+    world_rename_name_input: String,
+    world_rename_focused: bool,
     pointer: Option<[f32; 2]>,
     creative_page: usize,
     /// Stack held on the cursor in the inventory screen (client-side only).
@@ -1148,12 +1253,15 @@ impl LiveApp {
             saves_dir,
             worlds: Vec::new(),
             worlds_scroll: 0,
+            selected_world: None,
             world_error: None,
             world_name_input: String::new(),
             world_seed_input,
             world_create_mode: WorldMode::Creative,
             world_name_focused: true,
             world_seed_focused: false,
+            world_rename_name_input: String::new(),
+            world_rename_focused: true,
             pointer: None,
             creative_page: 0,
             inventory_cursor: None,
@@ -1947,6 +2055,7 @@ impl LiveApp {
                 &mut self.ui_bg,
                 &mut self.ui_fg,
                 &self.worlds,
+                self.selected_world.as_deref(),
                 self.worlds_scroll,
                 self.world_error.as_deref(),
                 self.pointer,
@@ -1968,6 +2077,39 @@ impl LiveApp {
                 width,
                 height,
             ),
+            Screen::WorldRename => ui::draw_world_rename(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &self.world_rename_name_input,
+                self.world_rename_focused,
+                self.world_error.as_deref(),
+                self.pointer,
+                scale,
+                width,
+                height,
+            ),
+            Screen::WorldDeleteConfirm => {
+                let name = self
+                    .selected_world
+                    .as_deref()
+                    .and_then(|directory| {
+                        self.worlds
+                            .iter()
+                            .find(|world| world.directory == directory)
+                    })
+                    .map(|world| world.name.as_str())
+                    .unwrap_or("Unknown World");
+                ui::draw_world_delete_confirm(
+                    &mut self.ui_bg,
+                    &mut self.ui_fg,
+                    name,
+                    self.world_error.as_deref(),
+                    self.pointer,
+                    scale,
+                    width,
+                    height,
+                )
+            }
             Screen::Servers => ui::draw_servers(
                 &mut self.ui_bg,
                 &mut self.ui_fg,
@@ -2125,12 +2267,21 @@ impl LiveApp {
     fn refresh_worlds(&mut self) {
         match save::list_worlds(&self.saves_dir) {
             Ok(worlds) => {
+                let previous_selection = self.selected_world.clone();
                 self.worlds = worlds;
                 self.worlds_scroll = self.worlds_scroll.min(self.worlds_max_scroll());
+                self.selected_world = previous_selection
+                    .filter(|directory| {
+                        self.worlds
+                            .iter()
+                            .any(|world| world.directory == *directory)
+                    })
+                    .or_else(|| self.worlds.first().map(|world| world.directory.clone()));
                 self.world_error = None;
             }
             Err(error) => {
                 self.worlds.clear();
+                self.selected_world = None;
                 self.world_error = Some(error.to_string());
             }
         }
@@ -2149,6 +2300,7 @@ impl LiveApp {
         self.set_mouse_capture(false);
         self.world_error = None;
         self.worlds_scroll = 0;
+        self.selected_world = None;
         self.screen = Screen::Worlds;
         self.refresh_worlds();
     }
@@ -2187,6 +2339,7 @@ impl LiveApp {
         ) {
             Ok(save) => {
                 self.world_error = None;
+                self.selected_world = Some(save.metadata().directory.clone());
                 self.refresh_worlds();
                 self.start_local_save(save);
             }
@@ -2194,17 +2347,68 @@ impl LiveApp {
         }
     }
 
-    fn open_saved_world(&mut self, index: usize) {
-        let Some(world) = self.worlds.get(index) else {
+    fn open_selected_world(&mut self) {
+        let Some(directory) = self.selected_world.clone() else {
             return;
         };
-        match WorldSave::open(&self.saves_dir, &world.directory) {
+        match WorldSave::open(&self.saves_dir, &directory) {
             Ok(save) => self.start_local_save(save),
             Err(error) => {
                 let message = error.to_string();
                 self.refresh_worlds();
                 self.world_error = Some(message);
             }
+        }
+    }
+
+    fn open_world_rename(&mut self) {
+        let Some(directory) = self.selected_world.as_deref() else {
+            return;
+        };
+        let Some(name) = self
+            .worlds
+            .iter()
+            .find(|world| world.directory == directory)
+            .map(|world| world.name.clone())
+        else {
+            return;
+        };
+        self.world_rename_name_input = name;
+        self.world_rename_focused = true;
+        self.world_error = None;
+        self.screen = Screen::WorldRename;
+    }
+
+    fn rename_selected_world(&mut self) {
+        let Some(directory) = self.selected_world.clone() else {
+            return;
+        };
+        let result = WorldSave::open(&self.saves_dir, &directory)
+            .and_then(|mut save| save.rename(&self.world_rename_name_input));
+        match result {
+            Ok(metadata) => {
+                self.selected_world = Some(metadata.directory);
+                self.world_error = None;
+                self.screen = Screen::Worlds;
+                self.refresh_worlds();
+            }
+            Err(error) => self.world_error = Some(error.to_string()),
+        }
+    }
+
+    fn confirm_delete_selected_world(&mut self) {
+        let Some(directory) = self.selected_world.clone() else {
+            self.screen = Screen::Worlds;
+            return;
+        };
+        match WorldSave::delete(&self.saves_dir, &directory) {
+            Ok(()) => {
+                self.selected_world = None;
+                self.world_error = None;
+                self.screen = Screen::Worlds;
+                self.refresh_worlds();
+            }
+            Err(error) => self.world_error = Some(error.to_string()),
         }
     }
 
@@ -2235,8 +2439,11 @@ impl LiveApp {
             let mut state = self.shared.lock().unwrap();
             state.creative = mode.is_creative();
             state.local = true;
+            state.local_shutdown = false;
+            state.local_stopped = false;
         }
         let shared = Arc::clone(&self.shared);
+        let finish_shared = Arc::clone(&shared);
         let tx = self.tx.clone();
         let _ = std::thread::Builder::new()
             .name("nephele-local".into())
@@ -2244,7 +2451,32 @@ impl LiveApp {
                 if let Err(err) = local_loop(save, shared, tx.clone()) {
                     let _ = tx.send(NetMsg::Error(err));
                 }
+                finish_shared.lock().unwrap().local_stopped = true;
             });
+    }
+
+    fn stop_local(&self) {
+        let should_wait = {
+            let mut state = self.shared.lock().unwrap();
+            if state.local && !state.local_stopped {
+                state.local_shutdown = true;
+                true
+            } else {
+                false
+            }
+        };
+        if !should_wait {
+            return;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if self.shared.lock().unwrap().local_stopped {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        eprintln!("local world save did not finish before shutdown timeout");
     }
 
     /// Parse the typed address and connect, or report it on the screen.
@@ -2728,8 +2960,17 @@ impl LiveApp {
         match action {
             Action::Singleplayer => self.open_worlds(),
             Action::Multiplayer => self.open_servers(),
-            Action::WorldOpen(index) => self.open_saved_world(index),
+            Action::WorldSelect(index) => {
+                self.selected_world = self.worlds.get(index).map(|world| world.directory.clone());
+                self.world_error = None;
+            }
+            Action::WorldOpenSelected => self.open_selected_world(),
             Action::WorldNew => self.open_world_create(),
+            Action::WorldRenameSelected => self.open_world_rename(),
+            Action::WorldDeleteSelected => {
+                self.world_error = None;
+                self.screen = Screen::WorldDeleteConfirm;
+            }
             Action::WorldsBack => {
                 self.world_error = None;
                 self.screen = Screen::Title;
@@ -2753,6 +2994,20 @@ impl LiveApp {
             }
             Action::WorldCreateSubmit => self.create_local_world(),
             Action::WorldCreateCancel => {
+                self.world_error = None;
+                self.screen = Screen::Worlds;
+            }
+            Action::WorldRenameFocus => {
+                self.world_rename_focused = true;
+                self.world_error = None;
+            }
+            Action::WorldRenameSubmit => self.rename_selected_world(),
+            Action::WorldRenameCancel => {
+                self.world_error = None;
+                self.screen = Screen::Worlds;
+            }
+            Action::WorldDeleteConfirm => self.confirm_delete_selected_world(),
+            Action::WorldDeleteCancel => {
                 self.world_error = None;
                 self.screen = Screen::Worlds;
             }
@@ -2799,7 +3054,10 @@ impl LiveApp {
                     self.apply_settings();
                 }
             }
-            Action::Disconnect => event_loop.exit(),
+            Action::Disconnect => {
+                self.stop_local();
+                event_loop.exit();
+            }
             Action::Respawn => {
                 let mut shared = self.shared.lock().unwrap();
                 shared.pending_respawn = true;
@@ -2860,7 +3118,10 @@ impl ApplicationHandler for LiveApp {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                self.stop_local();
+                event_loop.exit();
+            }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.shift = modifiers.state().shift_key();
             }
@@ -2904,6 +3165,38 @@ impl ApplicationHandler for LiveApp {
                         for ch in text.chars() {
                             if !ch.is_control() && self.chat_input.len() < 256 {
                                 self.chat_input.push(ch);
+                            }
+                        }
+                    }
+                    return;
+                }
+                if self.screen == Screen::WorldRename && event.state == ElementState::Pressed {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Enter) => {
+                            self.rename_selected_world();
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            self.screen = Screen::Worlds;
+                            self.world_error = None;
+                            return;
+                        }
+                        PhysicalKey::Code(KeyCode::Backspace) => {
+                            if self.world_rename_focused {
+                                self.world_rename_name_input.pop();
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                    if self.world_rename_focused {
+                        if let Some(text) = event.text.as_ref() {
+                            for ch in text.chars() {
+                                if !ch.is_control()
+                                    && self.world_rename_name_input.chars().count() < 64
+                                {
+                                    self.world_rename_name_input.push(ch);
+                                }
                             }
                         }
                     }
@@ -2983,6 +3276,20 @@ impl ApplicationHandler for LiveApp {
                     self.join_selected_server();
                     return;
                 }
+                if self.screen == Screen::Worlds
+                    && event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::Enter)
+                {
+                    self.open_selected_world();
+                    return;
+                }
+                if self.screen == Screen::WorldDeleteConfirm
+                    && event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::Enter)
+                {
+                    self.confirm_delete_selected_world();
+                    return;
+                }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match (code, event.state) {
                         (KeyCode::Escape, ElementState::Pressed) => match self.screen {
@@ -2993,6 +3300,10 @@ impl ApplicationHandler for LiveApp {
                             Screen::Title => {}
                             Screen::Worlds | Screen::Servers => self.screen = Screen::Title,
                             Screen::WorldCreate => {
+                                self.screen = Screen::Worlds;
+                                self.world_error = None;
+                            }
+                            Screen::WorldRename | Screen::WorldDeleteConfirm => {
                                 self.screen = Screen::Worlds;
                                 self.world_error = None;
                             }
@@ -3020,6 +3331,8 @@ impl ApplicationHandler for LiveApp {
                             | Screen::Title
                             | Screen::Worlds
                             | Screen::WorldCreate
+                            | Screen::WorldRename
+                            | Screen::WorldDeleteConfirm
                             | Screen::Servers
                             | Screen::Connect
                             | Screen::Death => {}
@@ -3338,10 +3651,38 @@ mod tests {
             local_container: LocalContainer::default(),
             close_window: false,
             local: true,
+            local_shutdown: false,
+            local_stopped: false,
             view_distance: nephele_client::VIEW_DISTANCE,
             prev_position: [0.5, 64.0, 0.5],
             tick_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn local_player_snapshot_restores_position_rotation_and_inventory() {
+        let mut original = local_state_for_test();
+        original.player.teleport(-18.5, 73.25, 42.75);
+        original.yaw = 1.2;
+        original.pitch = -0.35;
+        original.held_slot = 6;
+        original.inventory[0] = Some(ItemStack::new(4, 32, 2));
+        original.inventory[44] = Some(ItemStack::new(280, 5, 0));
+
+        let saved = saved_local_player_state(&original);
+        let mut reopened = local_state_for_test();
+        restore_local_player_state(&mut reopened, &saved);
+
+        assert_eq!(
+            [reopened.player.x, reopened.player.y, reopened.player.z],
+            [original.player.x, original.player.y, original.player.z]
+        );
+        assert_eq!(
+            (reopened.yaw, reopened.pitch),
+            (original.yaw, original.pitch)
+        );
+        assert_eq!(reopened.held_slot, original.held_slot);
+        assert_eq!(reopened.inventory, original.inventory);
     }
 
     #[test]
