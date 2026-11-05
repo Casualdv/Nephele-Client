@@ -51,6 +51,53 @@ const STAIRS: [[ShapeBox; 2]; 4] = [
 /// A fence post; the rails are added by `fence_shape` when it connects.
 const FENCE: &[ShapeBox] = &[b([6.0, 0.0, 6.0], [10.0, 16.0, 10.0])];
 
+/// An isolated iron bar: the vanilla two-pixel post.
+const BARS_POST: ShapeBox = b([7.0, 0.0, 7.0], [9.0, 16.0, 9.0]);
+
+/// Iron bars, as one two-pixel-thick half-slab per connected side.
+///
+/// Vanilla's `bars_*` models are zero-thickness planes plus separate two-pixel
+/// rim boxes. A thin slab has the same silhouette from every angle and needs no
+/// rim geometry, which matters here because the mesher has no per-face UV
+/// sub-ranges to map those rims correctly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BarsShape {
+    boxes: [ShapeBox; 4],
+    len: usize,
+}
+
+impl BarsShape {
+    pub fn as_slice(&self) -> &[ShapeBox] {
+        &self.boxes[..self.len]
+    }
+}
+
+pub fn bars_shape(connections: PaneConnections) -> BarsShape {
+    let mut boxes = [BARS_POST; 4];
+    let mut len = 0;
+    if connections.west {
+        boxes[len] = b([0.0, 0.0, 7.0], [8.0, 16.0, 9.0]);
+        len += 1;
+    }
+    if connections.east {
+        boxes[len] = b([8.0, 0.0, 7.0], [16.0, 16.0, 9.0]);
+        len += 1;
+    }
+    if connections.north {
+        boxes[len] = b([7.0, 0.0, 0.0], [9.0, 16.0, 8.0]);
+        len += 1;
+    }
+    if connections.south {
+        boxes[len] = b([7.0, 0.0, 8.0], [9.0, 16.0, 16.0]);
+        len += 1;
+    }
+    if len == 0 {
+        boxes[0] = BARS_POST;
+        len = 1;
+    }
+    BarsShape { boxes, len }
+}
+
 /// Fence post plus the two rails on each connected side. The rails are the
 /// vanilla heights (6..9 and 12..15), so a fence line reads as rails rather
 /// than a solid wall of planks.
@@ -408,6 +455,29 @@ mod tests {
             south: true,
         });
         assert_eq!(all.as_slice().len(), 9);
+    }
+
+    #[test]
+    fn bars_are_two_pixel_slabs_not_paper_thin_cards() {
+        // An isolated bar is the vanilla two-pixel post.
+        let isolated = bars_shape(PaneConnections::default());
+        assert_eq!(isolated.as_slice(), &[BARS_POST]);
+
+        // A north-south line is one slab per half block, two pixels thick in x
+        // and continuous along z: a plane would vanish edge-on, which is the
+        // "cross-plant" look this shape exists to avoid.
+        let line = bars_shape(PaneConnections {
+            north: true,
+            south: true,
+            ..PaneConnections::default()
+        });
+        assert_eq!(line.as_slice().len(), 2);
+        let north = line.as_slice()[0];
+        assert_eq!(north.min, [7.0, 0.0, 0.0]);
+        assert_eq!(north.max, [9.0, 16.0, 8.0]);
+        let south = line.as_slice()[1];
+        assert_eq!(south.min, [7.0, 0.0, 8.0]);
+        assert_eq!(south.max, [9.0, 16.0, 16.0]);
     }
 
     #[test]
