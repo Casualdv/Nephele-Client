@@ -1,5 +1,5 @@
 use nephele_assets::{
-    face_textures, is_transparent, item_texture_name, TextureArray, MISSING_TEXTURE,
+    face_textures, is_transparent, item_texture_name, TextureArray, TintKind, MISSING_TEXTURE,
 };
 use nephele_world::shapes::{
     block_shape, door_shape, fence_shape, is_door, is_fence, is_full_cube, is_pane, pane_shape,
@@ -15,14 +15,34 @@ pub struct Vertex {
     pub shade: f32,
     /// Packed texture slot: `layer = slot / 16`, tile = `slot % 16`.
     pub layer: u32,
-    /// Optional index into the renderer's `.mcmeta` animation table.
+    /// Packed animation + biome tint. Bits 0..6 are `animation index + 1`
+    /// (0 means none), bit 7 marks "use the texture alpha as a tint mask",
+    /// bits 8..31 are 0xRRGGBB. White is the no-op tint, so the old
+    /// `0xFFFFFFFF` no-animation sentinel becomes `0xFFFFFF00`.
     pub anim: u32,
     /// Combined block/sky illumination with ambient occlusion, in 0..=1.
     pub light: f32,
 }
 
-/// Sentinel for vertices that use a static texture-array layer.
-pub const NO_ANIMATION: u32 = u32::MAX;
+/// Sentinel for vertices with neither an animation nor a biome tint.
+pub const NO_ANIMATION: u32 = 0xFFFFFF00;
+/// Packed white, the no-op biome tint.
+pub const NO_TINT: u32 = 0xFFFFFF;
+/// `anim` bit that makes the shader use the texture alpha as a tint mask.
+pub const TINT_MASK: u32 = 0x80;
+
+fn anim_word(animation: Option<u32>) -> u32 {
+    let code = animation.map(|index| (index + 1).min(0x7F)).unwrap_or(0);
+    (NO_TINT << 8) | code
+}
+
+fn tinted_anim(animation: Option<u32>, tint: u32, mask: bool) -> u32 {
+    let mut code = animation.map(|index| (index + 1).min(0x7F)).unwrap_or(0);
+    if mask {
+        code |= TINT_MASK;
+    }
+    ((tint & 0xFFFFFF) << 8) | code
+}
 
 impl Vertex {
     pub const ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
@@ -231,6 +251,10 @@ pub struct ColumnMeshJob {
     pub key: (i32, i32),
     /// One entry per 16-block section; `None` when the section is all air.
     pub sections: Vec<Option<Vec<u16>>>,
+    /// 18x18 biome ids including a one-block border, indexed
+    /// `(z + 1) * 18 + x + 1`. The mesher averages the 3x3 neighbourhood for
+    /// grass and foliage, the same way vanilla's `BiomeColorHelper` does.
+    pub biomes: Vec<u8>,
     /// Blocks of the neighbour at local x = 15, indexed `y * 16 + z`.
     pub west: Vec<u16>,
     /// Blocks of the neighbour at local x = 0, indexed `y * 16 + z`.
@@ -265,9 +289,17 @@ impl ColumnMeshJob {
             }
         }
         let has_skylight = world.has_skylight();
+        let mut biomes = vec![1u8; 18 * 18];
+        for z in -1..=16 {
+            for x in -1..=16 {
+                biomes[((z + 1) * 18 + x + 1) as usize] =
+                    world_biome(world, key.0 * 16 + x, key.1 * 16 + z);
+            }
+        }
         Self {
             key,
             sections,
+            biomes,
             west: side_plane(world, key.0 - 1, key.1, Axis::X, 15),
             east: side_plane(world, key.0 + 1, key.1, Axis::X, 0),
             north: side_plane(world, key.0, key.1 - 1, Axis::Z, 15),
@@ -302,6 +334,16 @@ impl ColumnMeshJob {
         }
         job.light_levels = light_volume(Some(column), job.has_skylight);
         job
+    }
+
+    /// Block lookup in column-local coordinates, where the border neighbours
+    /// (x/z of -1 or 16) resolve through the side planes.
+    #[inline]
+    pub fn biome(&self, x: i32, z: i32) -> u8 {
+        if !(-1..=16).contains(&x) || !(-1..=16).contains(&z) {
+            return 1;
+        }
+        self.biomes[((z + 1) * 18 + x + 1) as usize]
     }
 
     /// Block lookup in column-local coordinates, where the border neighbours
@@ -390,6 +432,17 @@ enum Axis {
 
 /// Copy one 16×256 face off a neighbouring column. Reads the section data
 /// directly — 4096 array reads instead of 4096 hash-map lookups.
+fn world_biome(world: &World, x: i32, z: i32) -> u8 {
+    let column = world.get(ChunkCoord::new(x.div_euclid(16), z.div_euclid(16)));
+    column
+        .and_then(ChunkColumn::biomes)
+        .map(|biomes| {
+            let index = z.rem_euclid(16) as usize * 16 + x.rem_euclid(16) as usize;
+            biomes.get(index).copied().unwrap_or(1)
+        })
+        .unwrap_or(1)
+}
+
 fn side_plane(world: &World, cx: i32, cz: i32, axis: Axis, local: usize) -> Vec<u16> {
     let mut out = vec![0u16; PLANE_LEN];
     let Some(column) = world.get(ChunkCoord::new(cx, cz)) else {
@@ -529,7 +582,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
     let mut mesh = MeshData::default();
     // Block states repeat heavily, so resolve the texture layers once per
     // distinct state instead of three hash lookups per block.
-    type ResolvedTextures = ([u32; 3], [u32; 3]);
+    type ResolvedTextures = ([u32; 3], [Option<u32>; 3]);
     let mut resolved: std::collections::HashMap<u16, Option<ResolvedTextures>> =
         std::collections::HashMap::with_capacity(64);
 
@@ -555,11 +608,8 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                             atlas.slot_or_missing(textures.bottom),
                             atlas.slot_or_missing(textures.side),
                         ];
-                        let anims = [
-                            atlas.animation(textures.top).unwrap_or(NO_ANIMATION),
-                            atlas.animation(textures.bottom).unwrap_or(NO_ANIMATION),
-                            atlas.animation(textures.side).unwrap_or(NO_ANIMATION),
-                        ];
+                        let anims = [textures.top, textures.bottom, textures.side]
+                            .map(|name| atlas.animation(name));
                         (layers, anims)
                     });
                     *entry.insert(textures)
@@ -574,6 +624,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             let local_y = ((index >> 8) & 15) as i32;
             let y = section_y + local_y;
             let id = raw >> 4;
+            let block_tint = tint_for_block(atlas, job, raw, local_x, local_z);
 
             // Iron bars are zero-thickness planes through the block centre,
             // not a 2-pixel box: squashing the 16px texture into a 2px box
@@ -611,7 +662,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             // cubes is what makes flowers and grass look like solid boxes.
             if is_cross_plant(id) {
                 let layer = layers[2];
-                let anim = anims[2];
+                let anim = tinted_anim(anims[2], block_tint, false);
                 let bx = (base_x + local_x) as f32;
                 let by = y as f32;
                 let bz = (base_z + local_z) as f32;
@@ -700,6 +751,8 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                         face,
                         layers[face.slot],
                         anims[face.slot],
+                        block_tint,
+                        id == 2 && face.slot == 2,
                         positions,
                         lights,
                     );
@@ -727,6 +780,8 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                             face,
                             layers[face.slot],
                             anims[face.slot],
+                            block_tint,
+                            id == 2 && face.slot == 2,
                             positions,
                             lights,
                         );
@@ -906,14 +961,18 @@ fn should_cull_full_cube_face(
     neighbour == raw && is_transparent(id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_quad(
     mesh: &mut MeshData,
     face: &FaceDef,
     layer: u32,
-    anim: u32,
+    anim: Option<u32>,
+    tint: u32,
+    mask: bool,
     positions: [[f32; 3]; 4],
     lights: [f32; 4],
 ) {
+    let anim = tinted_anim(anim, tint, mask);
     let base = mesh.vertices.len() as u32;
     for ((position, uv), light) in positions
         .into_iter()
@@ -942,11 +1001,12 @@ fn append_quad(
 fn append_bars(
     mesh: &mut MeshData,
     layer: u32,
-    anim: u32,
+    animation: Option<u32>,
     light: f32,
     origin: [f32; 3],
     connections: PaneConnections,
 ) {
+    let anim = anim_word(animation);
     let [bx, by, bz] = origin;
     let mut planes: Vec<[[f32; 3]; 4]> = Vec::with_capacity(2);
 
@@ -1014,8 +1074,8 @@ fn append_fire(
         atlas.slot_or_missing("fire_layer_1"),
     ];
     let anims = [
-        atlas.animation("fire_layer_0").unwrap_or(NO_ANIMATION),
-        atlas.animation("fire_layer_1").unwrap_or(NO_ANIMATION),
+        atlas.animation("fire_layer_0"),
+        atlas.animation("fire_layer_1"),
     ];
     let light = (job.light(local_x, y + 1, local_z) as f32 / 15.0).max(0.85);
     let [bx, by, bz] = origin;
@@ -1038,7 +1098,7 @@ fn append_fire(
     for (plane, quad) in quads.into_iter().enumerate() {
         for (side, order) in [[0usize, 1, 2, 3], [3, 2, 1, 0]].into_iter().enumerate() {
             let layer = layers[(plane + side) % 2];
-            let anim = anims[(plane + side) % 2];
+            let anim = anim_word(anims[(plane + side) % 2]);
             let base = mesh.transparent_vertices.len() as u32;
             for index in order {
                 mesh.transparent_vertices.push(Vertex {
@@ -1067,8 +1127,45 @@ fn append_fire(
 fn is_cross_plant(id: u16) -> bool {
     matches!(
         id,
-        6 | 31 | 32 | 37 | 38 | 39 | 40 | 59 | 83 | 141 | 142 | 175
+        6 | 31 | 32 | 37 | 38 | 39 | 40 | 59 | 83 | 104 | 105 | 115 | 141 | 142 | 175
     )
+}
+
+const FOLIAGE_PINE: u32 = 0x619961;
+const FOLIAGE_BIRCH: u32 = 0x80A755;
+
+/// Vanilla `BiomeColorHelper`: average the 3x3 biome neighbourhood so grass
+/// and foliage do not switch colour at a biome edge.
+fn tint_for_block(atlas: &TextureArray, job: &ColumnMeshJob, raw: u16, x: i32, z: i32) -> u32 {
+    let id = raw >> 4;
+    let meta = (raw & 0x0f) as u8;
+    let kind = match id {
+        2 | 31 => TintKind::Grass,
+        8 | 9 => TintKind::Water,
+        18 => {
+            if meta == 1 {
+                return FOLIAGE_PINE;
+            }
+            if meta == 2 {
+                return FOLIAGE_BIRCH;
+            }
+            TintKind::Foliage
+        }
+        _ => return NO_TINT,
+    };
+
+    let mut red = 0u32;
+    let mut green = 0u32;
+    let mut blue = 0u32;
+    for dz in -1..=1 {
+        for dx in -1..=1 {
+            let color = atlas.tint(kind, job.biome(x + dx, z + dz) as i32);
+            red += (color[0] * 255.0) as u32;
+            green += (color[1] * 255.0) as u32;
+            blue += (color[2] * 255.0) as u32;
+        }
+    }
+    ((red / 9) << 16) | ((green / 9) << 8) | (blue / 9)
 }
 /// Mesh one chunk column straight from the world.
 pub fn build_column_mesh(column: &ChunkColumn, world: &World, atlas: &TextureArray) -> MeshData {
@@ -1683,11 +1780,63 @@ mod tests {
                 .iter()
                 .map(|index| mesh.vertices[*index as usize].position)
                 .collect();
-            if positions.iter().all(|p| p[1] >= 65.0) {
+            if positions.iter().all(|p| p[1] >= 65.0) && positions.iter().any(|p| p[1] > 65.0) {
                 quads += 1;
             }
         }
         assert_eq!(quads, 4, "expected two crossed quads drawn both ways");
+    }
+
+    #[test]
+    fn flowers_do_not_cull_the_grass_below_them() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::new(2, 0));
+        column.set_block(3, 65, 3, BlockState::new(38, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+        let top_face = mesh.indices.chunks(6).any(|window| {
+            window.iter().all(|index| {
+                let position = mesh.vertices[*index as usize].position;
+                (position[1] - 65.0).abs() < 1.0e-6
+                    && (3.0..=4.0).contains(&position[0])
+                    && (3.0..=4.0).contains(&position[2])
+            })
+        });
+        assert!(top_face, "the grass top under a flower must not be culled");
+    }
+
+    #[test]
+    fn grass_carries_its_biome_tint_and_masks_the_side_overlay() {
+        let mut column = ChunkColumn::empty(0, 0);
+        let mut biomes = [1u8; 256];
+        biomes.fill(21); // jungle
+        column.set_biomes(&biomes);
+        column.set_block(3, 64, 3, BlockState::new(2, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+
+        let tinted: Vec<u32> = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.anim >> 8)
+            .filter(|tint| *tint != NO_TINT)
+            .collect();
+        assert!(!tinted.is_empty(), "grass must carry a biome tint");
+        assert!(
+            mesh.vertices
+                .iter()
+                .any(|vertex| vertex.anim & TINT_MASK != 0),
+            "grass sides must mark the overlay mask"
+        );
+    }
+
+    #[test]
+    fn anim_words_round_trip_animation_and_tint() {
+        assert_eq!(anim_word(None), NO_ANIMATION);
+        assert_eq!(anim_word(Some(0)) & 0x7F, 1);
+        assert_eq!(tinted_anim(Some(3), 0x79C05A, true) & 0x7F, 4);
+        assert_eq!(tinted_anim(None, 0x79C05A, false) & TINT_MASK, 0);
+        assert_eq!(tinted_anim(None, 0x79C05A, false) >> 8, 0x79C05A);
     }
 
     #[test]

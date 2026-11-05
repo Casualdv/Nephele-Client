@@ -11,6 +11,7 @@
 //! [`UiAtlas`] so the HUD, menus and item icons are a single draw call.
 
 pub mod atlas;
+pub mod biome_color;
 pub mod block_models;
 pub mod block_textures;
 pub mod item_textures;
@@ -19,6 +20,7 @@ pub mod title;
 pub mod ui_atlas;
 
 pub use atlas::{AssetError, TextureAnimation, TextureArray, TILE_SIZE};
+pub use biome_color::{BiomeColorizer, TintKind};
 pub use block_models::{BlockModel, BlockModels, Element, FaceSpec, ModelFace};
 pub use block_textures::{face_textures, is_transparent, FaceTextures, MISSING_TEXTURE};
 pub use item_textures::{all_item_texture_layers, item_texture_name};

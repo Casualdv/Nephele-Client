@@ -1239,6 +1239,8 @@ struct LiveApp {
     skin_loader: SkinLoader,
     /// Per-phase frame timings, printed once a second under `NEPHELE_PROFILE=1`.
     profile: bool,
+    /// Dev-only commands applied once the world has arrived (NEPHELE_CMDS).
+    startup_cmds: Vec<String>,
     prof_ui: f32,
     prof_mesh: f32,
     prof_draw: f32,
@@ -1359,6 +1361,9 @@ impl LiveApp {
             skin_slots: std::collections::HashMap::new(),
             skin_loader: SkinLoader::new(),
             profile: std::env::var("NEPHELE_PROFILE").is_ok(),
+            startup_cmds: std::env::var("NEPHELE_CMDS")
+                .map(|value| value.split(';').map(str::to_string).collect())
+                .unwrap_or_default(),
             prof_ui: 0.0,
             prof_mesh: 0.0,
             prof_draw: 0.0,
@@ -1897,6 +1902,13 @@ impl LiveApp {
                 alpha,
             }
         };
+
+        if self.screen == Screen::Game && !self.startup_cmds.is_empty() && view.chunks > 200 {
+            let commands = std::mem::take(&mut self.startup_cmds);
+            for command in commands {
+                self.run_command(command.trim_start_matches('/'));
+            }
+        }
 
         if let Some(err) = &view.error {
             eprintln!("disconnected: {err}");

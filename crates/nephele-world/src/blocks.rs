@@ -4,7 +4,7 @@
 //! The table is `(id, metadata, name)`. `name` answers by id alone and returns
 
 /// `(id, metadata, name)` for every registered block state.
-pub static VARIANTS: [(u16, u8, &str); 1374] = [
+pub static VARIANTS: [(u16, u8, &str); 1375] = [
     (0, 0, "air"),
     (1, 0, "stone"),
     (1, 1, "granite"),
@@ -262,6 +262,7 @@ pub static VARIANTS: [(u16, u8, &str); 1374] = [
     (50, 3, "wall_torch"),
     (50, 4, "wall_torch"),
     (50, 5, "torch"),
+    (51, 0, "fire"),
     (52, 0, "spawner"),
     (53, 0, "oak_stairs"),
     (53, 1, "oak_stairs"),
