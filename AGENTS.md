@@ -593,7 +593,10 @@ beyond radius + 2 (saving dirty ones first), and autosave runs every 15 s and on
 quit. Night, rain and lightning are drawn as CLI screen-space overlays so the
 M1/M2 renderer stays untouched. **Not verified:** a ten-minute live walk with
 memory profiling, and a real vanilla-client (not just server) load of
-`Data.Player`.
+`Data.Player`. **Known gap:** rewriting an imported chunk regenerates its NBT
+from terrain only, so `Entities`, `TileEntities` and `TileTicks` are dropped;
+Nephele's own worlds never create those, but a future vanilla-world importer
+must merge them rather than re-serialize the chunk wholesale.
 
 ---
 
