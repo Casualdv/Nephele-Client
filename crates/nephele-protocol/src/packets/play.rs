@@ -192,28 +192,7 @@ pub fn write_slot<'a>(
     }
 }
 
-/// `S34` map chunk writer, used by the mock server and tests.
-pub fn map_chunk(
-    map_id: i32,
-    scale: i8,
-    x: i32,
-    z: i32,
-    columns: u8,
-    rows: u8,
-    colors: &[u8],
-) -> Packet {
-    let mut w = PacketWriter::new();
-    w.write_varint(map_id)
-        .write_i8(scale)
-        .write_varint(columns as i32);
-    if columns > 0 {
-        w.write_varint(rows as i32).write_varint(x).write_varint(z);
-    }
-    w.write_byte_array(colors);
-    Packet::new(clientbound::MAP_CHUNK, w.into_bytes())
-}
-
-/// Read a slot, skipping any NBT.
+/// Read a slot, keeping only the `map` NBT id; other NBT is skipped.
 pub fn parse_slot(reader: &mut crate::read::PacketReader<'_>) -> Result<Option<ItemStack>> {
     let id = reader.read_i16()?;
     if id == ItemStack::EMPTY_ID {
@@ -610,9 +589,11 @@ pub fn parse_sound_effect(packet: &Packet) -> Result<SoundEffect> {
 
 /// `S34 Map Chunk`: a rectangle of a map plus its scale.
 ///
-/// This is the interface M3's map parsing should target. The client already
-/// accepts both this and [`MapColumns`]; until a server sends one, the renderer
-/// falls back to a generated placeholder so a framed map is never blank.
+/// This is the pinned interface for N's map parsing. The client does **not**
+/// decode `S33`/`S34` itself; N parses the packet and hands one of these to
+/// `GameClient::apply_map_chunk` (or `Maps::apply_chunk`). Until that lands,
+/// the renderer uses [`nephele_client::MapData::placeholder`] so a framed map
+/// is never blank.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapChunk {
     pub map_id: i32,
@@ -636,64 +617,8 @@ pub struct MapColumns {
     pub colors: Vec<u8>,
 }
 
-pub fn parse_map_chunk(packet: &Packet) -> Result<MapChunk> {
-    let mut r = packet.reader();
-    let map_id = r.read_varint()?;
-    let scale = r.read_i8()?;
-    let columns = r.read_varint()?.clamp(0, 128) as u8;
-    let rows = if columns == 0 {
-        0
-    } else {
-        r.read_varint()?.clamp(0, 128) as u8
-    };
-    let (x, z) = if columns == 0 {
-        (0, 0)
-    } else {
-        (r.read_varint()?, r.read_varint()?)
-    };
-    let colors = r.read_byte_array()?;
-    let expected = columns as usize * rows as usize;
-    if colors.len() != expected {
-        return Err(Error::Protocol(format!(
-            "map chunk {map_id} has {} colours for {columns}x{rows}",
-            colors.len()
-        )));
-    }
-    Ok(MapChunk {
-        map_id,
-        scale,
-        columns,
-        rows,
-        x,
-        z,
-        colors,
-    })
-}
-
-pub fn parse_map_columns(packet: &Packet) -> Result<MapColumns> {
-    let mut r = packet.reader();
-    let map_id = r.read_varint()?;
-    let columns = r.read_u8()?.min(128);
-    let rows = r.read_u8()?.min(128);
-    let x = r.read_u8()?;
-    let z = r.read_u8()?;
-    let colors = r.read_byte_array()?;
-    let expected = columns as usize * rows as usize;
-    if colors.len() != expected {
-        return Err(Error::Protocol(format!(
-            "map columns {map_id} has {} colours for {columns}x{rows}",
-            colors.len()
-        )));
-    }
-    Ok(MapColumns {
-        map_id,
-        columns,
-        rows,
-        x,
-        z,
-        colors,
-    })
-}
+// `S33`/`S34` wire decoding is N's work. The client consumes `MapChunk` /
+// `MapColumns` through `Maps::apply_chunk` / `Maps::apply_columns`.
 
 pub fn keep_alive_response(id: i32) -> Packet {
     let mut w = PacketWriter::new();
@@ -1991,33 +1916,6 @@ mod tests {
 #[cfg(test)]
 mod map_tests {
     use super::*;
-
-    #[test]
-    fn a_map_chunk_round_trips_its_rectangle() {
-        let packet = map_chunk(7, 2, 3, 4, 2, 2, &[1, 2, 3, 4]);
-        let chunk = parse_map_chunk(&packet).expect("map chunk");
-        assert_eq!(chunk.map_id, 7);
-        assert_eq!(chunk.scale, 2);
-        assert_eq!((chunk.columns, chunk.rows), (2, 2));
-        assert_eq!((chunk.x, chunk.z), (3, 4));
-        assert_eq!(chunk.colors, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn map_columns_use_byte_offsets() {
-        let mut w = PacketWriter::new();
-        w.write_varint(9)
-            .write_u8(1)
-            .write_u8(1)
-            .write_u8(10)
-            .write_u8(20)
-            .write_byte_array(&[5]);
-        let columns = parse_map_columns(&Packet::new(clientbound::MAP_COLUMNS, w.into_bytes()))
-            .expect("map columns");
-        assert_eq!(columns.map_id, 9);
-        assert_eq!((columns.x, columns.z), (10, 20));
-        assert_eq!(columns.colors, vec![5]);
-    }
 
     #[test]
     fn a_map_slot_keeps_its_nbt_and_trailing_fields() {

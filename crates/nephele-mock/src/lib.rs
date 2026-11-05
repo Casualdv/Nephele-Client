@@ -300,22 +300,11 @@ async fn send_join_sequence(
     Ok(columns)
 }
 
-/// One framed map in the lobby. The mock sends real `S34` pixels and a frame
-/// whose metadata carries a map item, so the renderer path is exercised end to
-/// end without a real server.
+/// One framed map in the lobby. The mock does not send `S34` pixels: map
+/// parsing belongs to N, so the client's placeholder fallback is what proves
+/// the frame renders a picture until that lands.
 async fn send_lobby_map(connection: &mut Connection, feet_y: f64) -> Result<()> {
     const MAP_ID: i32 = 7;
-    let mut colors = Vec::with_capacity(128 * 128);
-    for y in 0..128 {
-        for x in 0..128 {
-            let index = ((x / 4 + y / 4) % 63 + 1) as u8;
-            colors.push(index);
-        }
-    }
-    connection
-        .write_packet(&play::map_chunk(MAP_ID, 0, 0, 0, 128, 128, &colors))
-        .await?;
-
     let frame_id = 1_000;
     connection
         .write_packet(&play::spawn_object(

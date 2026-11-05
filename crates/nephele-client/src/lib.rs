@@ -874,16 +874,6 @@ impl GameClient {
                 let sound = play::parse_sound_effect(&packet)?;
                 Ok(Event::SoundEffect(sound))
             }
-            play::clientbound::MAP_CHUNK => {
-                let chunk = play::parse_map_chunk(&packet)?;
-                let map = self.maps.apply_chunk(&chunk).clone();
-                Ok(Event::MapUpdated(map))
-            }
-            play::clientbound::MAP_COLUMNS => {
-                let columns = play::parse_map_columns(&packet)?;
-                let map = self.maps.apply_columns(&columns).clone();
-                Ok(Event::MapUpdated(map))
-            }
             play::clientbound::PLAYER_LIST_ITEM => {
                 let update = play::parse_player_list_item(&packet)?;
                 self.apply_player_list_update(update);
@@ -920,6 +910,17 @@ impl GameClient {
             }
             id => Ok(Event::Packet(id)),
         }
+    }
+
+    /// Seam for N's map parsing: merge one `S34` rectangle and return the
+    /// resulting map so the caller can emit `Event::MapUpdated`.
+    pub fn apply_map_chunk(&mut self, chunk: &play::MapChunk) -> MapData {
+        self.maps.apply_chunk(chunk).clone()
+    }
+
+    /// Seam for N's map parsing: merge one `S33` rectangle.
+    pub fn apply_map_columns(&mut self, columns: &play::MapColumns) -> MapData {
+        self.maps.apply_columns(columns).clone()
     }
 
     fn apply_player_list_update(&mut self, update: play::PlayerListUpdate) {

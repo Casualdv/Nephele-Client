@@ -417,14 +417,15 @@ the entity pipeline, which is bound to the skin atlas — via
 - `ItemStack` now keeps the NBT `map` id (`map_id`). `parse_slot` consumes only
   the NBT tag, not the rest of the packet - placement packets put the cursor
   after the held stack. `play::write_slot` writes the same NBT for the mock.
-- **Map interface:** `nephele-client::maps::{Maps, MapData, MAP_SIZE}` is the
-  seam for M3. `S34 Map Chunk` and `S33 Map Columns` parse into `play::MapChunk`
-  / `play::MapColumns`; `GameClient.maps` merges them and emits
-  `Event::MapUpdated(MapData)`. If no pixels arrive, `MapData::placeholder`
-  supplies a deterministic picture, so a framed map is never blank. The CLI
-  assigns one `SkinAtlas` slot per map id (`map:<id>`) and uploads it as a
-  sub-rectangle. `Renderer::set_skins` drains at most four dirty slots per
-  frame, so a burst of maps/skins cannot stall one frame.
+- **Map interface (N owns the wire parsing):** `nephele-client::maps::{Maps,
+  MapData, MAP_SIZE}` plus `play::MapChunk` / `play::MapColumns` are the pinned
+  seam. This client deliberately does **not** decode `S33`/`S34`; N parses the
+  packet and calls `GameClient::apply_map_chunk` / `apply_map_columns`, then
+  emits `Event::MapUpdated(MapData)`. If no pixels arrive,
+  `MapData::placeholder` supplies a deterministic picture, so a framed map is
+  never blank. The CLI assigns one `SkinAtlas` slot per map id (`map:<id>`) and
+  uploads it as a sub-rectangle. `Renderer::set_skins` drains at most four
+  dirty slots per frame, so a burst of maps/skins cannot stall one frame.
 - `SkinAtlas` is now 8x8 slots (2048x2048) with a solid-white slot 1 for tinted
   armour. Skins/maps start at slot 2. The per-slot dirty list is what makes the
   budgeted upload work; do not go back to whole-atlas uploads.
@@ -435,11 +436,12 @@ the entity pipeline, which is bound to the skin atlas — via
 - The mock lobby (`nephele mock-server --bots`) exercises the whole path: eight
   named bots (alternating classic/slim, hash-tinted fallback skins), iron armour
   and a held sword on one, a held map on another, a crouched bot, a swinging
-  bot, and a real `S34` framed map. The real-socket test
-  `the_lobby_has_players_and_a_framed_map` pins the client half.
+  bot, and a framed map item. The real-socket test
+  `the_lobby_has_players_and_a_framed_map` pins the frame/item half and checks
+  the placeholder is a picture.
 - Known limits: armour uses material tints, not the armour layer textures;
-  framed non-map items are flat tints; map parsing is the pinned interface but
-  has only been exercised against the mock, not a live M3 server.
+  framed non-map items are flat tints; the map seam has only been exercised
+  against the mock and the placeholder, not a live N parser.
 
 ### Audio (2026-11-03)
 
@@ -622,10 +624,10 @@ deeper mob combat/AI. The prepared asset output version is 2.
 
 **Lobby pass (2026-11-05):** classic/slim skins with the second layer, nametags
 with backgrounds and distance scaling, held blocks/tools/maps, tinted armour
-shells, item frames with rotation, and `S33`/`S34` map pixels (with a
-placeholder fallback) are in. `nephele mock-server --bots` is the end-to-end
-lobby demo. Still open: real armour layer textures, framed non-map item icons,
-and exercising the map interface against a live M3 server.
+shells, item frames with rotation, and the map interface plus placeholder
+fallback are in. `nephele mock-server --bots` is the end-to-end lobby demo.
+Still open: real armour layer textures, framed non-map item icons, and wiring
+N's `S33`/`S34` parser into `GameClient::apply_map_chunk`.
 
 **M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
 network block drops and pickup, survival inventory, container click protocol,

@@ -155,14 +155,18 @@ impl SkinAtlas {
         self.version = self.version.wrapping_add(1);
     }
 
-    /// Contiguous pixel rows for one slot, for a sub-rectangle texture upload.
-    /// The returned slice starts at the slot's first row; `bytes_per_row` must
-    /// be `4 * ATLAS_SIZE` and `rows_per_image` must be [`SLOT_SIZE`].
-    pub fn slot_pixels(&self, slot: u32) -> &[u8] {
+    /// Contiguous pixels for one slot, for a sub-rectangle texture upload.
+    /// The atlas rows are wider than a slot, so this copies the slot's 256
+    /// rows into a packed buffer; `bytes_per_row` is then `4 * SLOT_SIZE`.
+    pub fn slot_pixels(&self, slot: u32) -> Vec<u8> {
         let (origin_x, origin_y) = slot_origin(slot);
-        let start = ((origin_y * ATLAS_SIZE + origin_x) * 4) as usize;
-        let len = (ATLAS_SIZE * 4 * SLOT_SIZE) as usize;
-        &self.pixels[start..start + len]
+        let row_bytes = (SLOT_SIZE * 4) as usize;
+        let mut out = Vec::with_capacity(row_bytes * SLOT_SIZE as usize);
+        for y in 0..SLOT_SIZE {
+            let start = (((origin_y + y) * ATLAS_SIZE + origin_x) * 4) as usize;
+            out.extend_from_slice(&self.pixels[start..start + row_bytes]);
+        }
+        out
     }
 
     /// Take up to `limit` slots that changed since the last upload.

@@ -966,6 +966,7 @@ impl Renderer {
         let size = nephele_assets::SLOT_SIZE;
         for slot in atlas.take_dirty(UPLOAD_BUDGET) {
             let (x, y, _) = SkinAtlas::slot_rect(slot);
+            let pixels = atlas.slot_pixels(slot);
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.skin_texture,
@@ -973,10 +974,10 @@ impl Renderer {
                     origin: wgpu::Origin3d { x, y, z: 0 },
                     aspect: wgpu::TextureAspect::All,
                 },
-                atlas.slot_pixels(slot),
+                &pixels,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(4 * nephele_assets::ATLAS_SIZE),
+                    bytes_per_row: Some(4 * size),
                     rows_per_image: Some(size),
                 },
                 wgpu::Extent3d {

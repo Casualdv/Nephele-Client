@@ -171,9 +171,13 @@ async fn the_lobby_has_players_and_a_framed_map() {
     let item = state.item.expect("the frame contains an item");
     assert_eq!(item.id, 358, "a filled map item");
     let map_id = item.map_id.expect("the map item carries its id");
+    // N's parser has not supplied pixels here; the stub fallback must still be
+    // a real picture rather than a blank square.
+    let map = client.maps.ensure(map_id);
+    let distinct: std::collections::HashSet<_> = map.pixels.iter().collect();
     assert!(
-        client.maps.get(map_id).is_some(),
-        "map {map_id} should have received S34 pixels"
+        distinct.len() > 4,
+        "map {map_id} placeholder should be a picture, not one flat colour"
     );
 
     client.disconnect().await;
