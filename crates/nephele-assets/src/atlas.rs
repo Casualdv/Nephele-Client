@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use image::{Rgba, RgbaImage};
 
+use crate::biome_color::{BiomeColorizer, TintKind};
 use crate::block_textures::{referenced_texture_names, MISSING_TEXTURE};
 use crate::item_textures::all_item_texture_layers;
 
@@ -73,6 +74,7 @@ pub struct TextureArray {
     animation_height: u32,
     animation_pixels: Vec<u8>,
     unresolved: Vec<&'static str>,
+    biome_colors: BiomeColorizer,
 }
 
 impl TextureArray {
@@ -143,6 +145,11 @@ impl TextureArray {
         )
     }
 
+    /// Vanilla colour for one tint kind and biome.
+    pub fn tint(&self, kind: TintKind, biome: i32) -> [f32; 3] {
+        self.biome_colors.tint(kind, biome)
+    }
+
     /// Tile slot for `name`, falling back to the generated "missing" tile.
     pub fn slot_or_missing(&self, name: &str) -> u32 {
         self.slot(name).unwrap_or(self.missing)
@@ -202,18 +209,20 @@ impl TextureArray {
             }
 
             // 1.8 stores grass and foliage as grayscale and tints them at
-            // runtime with the biome colour. Bake the plains colour in.
-            match name {
-                "grass_top" => tint(&mut tile, GRASS_TINT),
-                "leaves_oak" | "leaves_acacia" => tint(&mut tile, FOLIAGE_TINT),
-                "grass_side" => {
-                    if let Ok(overlay) = image::open(blocks_dir.join("grass_side_overlay.png")) {
-                        let mut overlay = to_tile(&overlay.to_rgba8());
-                        tint(&mut overlay, GRASS_TINT);
-                        blend_over(&mut tile, &overlay);
+            // runtime with the biome colour. Keep the texture raw here and
+            // let the shader apply the per-position multiplier. Grass sides
+            // carry the overlay's coverage in alpha so the shader can tint
+            // only the grass pixels, not the dirt below them.
+            if name == "grass_side" {
+                if let Ok(overlay) = image::open(blocks_dir.join("grass_side_overlay.png")) {
+                    let overlay = to_tile(&overlay.to_rgba8());
+                    let mut blended = tile.clone();
+                    blend_over(&mut blended, &overlay);
+                    for (pixel, source) in blended.pixels_mut().zip(overlay.pixels()) {
+                        pixel.0[3] = source.0[3];
                     }
+                    tile = blended;
                 }
-                _ => {}
             }
 
             tiles.push((name.to_string(), tile));
@@ -241,6 +250,10 @@ impl TextureArray {
             }
         }
         let mut array = Self::from_tiles_and_animations(tiles, animation_strips);
+        array.biome_colors = blocks_dir
+            .parent()
+            .map(BiomeColorizer::load)
+            .unwrap_or_else(BiomeColorizer::fallback);
         let mut unresolved: Vec<&'static str> = Vec::new();
         for name in referenced_texture_names() {
             if (name == MISSING_TEXTURE || array.slot(name).is_none())
@@ -351,6 +364,7 @@ impl TextureArray {
             animation_height,
             animation_pixels,
             unresolved: Vec::new(),
+            biome_colors: BiomeColorizer::fallback(),
         }
     }
 }
@@ -476,20 +490,8 @@ fn generate_mips(pixels: &[u8], layers: u32) -> Vec<Vec<u8>> {
     mips
 }
 
-/// Plains-biome grass colour (vanilla `0x79C05A`).
-const GRASS_TINT: [f32; 3] = [0.475, 0.753, 0.353];
-/// Plains-biome foliage colour (vanilla `0x59AE30`).
-const FOLIAGE_TINT: [f32; 3] = [0.349, 0.682, 0.188];
-
-fn tint(image: &mut RgbaImage, color: [f32; 3]) {
-    for pixel in image.pixels_mut() {
-        let [r, g, b, _] = pixel.0;
-        pixel.0[0] = (r as f32 * color[0]) as u8;
-        pixel.0[1] = (g as f32 * color[1]) as u8;
-        pixel.0[2] = (b as f32 * color[2]) as u8;
-    }
-}
-
+/// Blend the grass-side overlay over the dirt texture. The overlay's alpha is
+/// kept by the caller as a tint mask; nothing is baked in here.
 fn blend_over(base: &mut RgbaImage, overlay: &RgbaImage) {
     for y in 0..base.height().min(overlay.height()) {
         for x in 0..base.width().min(overlay.width()) {
@@ -710,14 +712,6 @@ mod tests {
         let tile = to_tile(&tall);
         assert_eq!((tile.width(), tile.height()), (TILE_SIZE, TILE_SIZE));
         assert_eq!(*tile.get_pixel(0, 0), Rgba([255, 0, 0, 255]));
-    }
-
-    #[test]
-    fn tint_only_scales_rgb() {
-        let mut image = RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, Rgba([100, 200, 50, 128]));
-        tint(&mut image, [0.5, 0.5, 0.5]);
-        let pixel = image.get_pixel(0, 0).0;
-        assert_eq!(pixel, [50, 100, 25, 128]);
     }
 
     #[test]

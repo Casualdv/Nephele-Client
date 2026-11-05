@@ -47,6 +47,17 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    // `in.anim` packs the animation row, the tint-mask flag and the biome tint:
+    // bits 0..6 = animation index + 1 (0 = none), bit 7 = tint mask, bits 8..31
+    // = 0xRRGGBB. White is the no-op tint.
+    let anim_code = in.anim & 0x7Fu;
+    let tint_masked = (in.anim & 0x80u) != 0u;
+    let tint = vec3<f32>(
+        f32((in.anim >> 24u) & 255u),
+        f32((in.anim >> 16u) & 255u),
+        f32((in.anim >> 8u) & 255u),
+    ) / 255.0;
+
     // `in.layer` is a packed tile slot: 16 tiles per 64×64 layer, 4×4 inside.
     let local = in.layer % 16u;
     let offset = vec2<f32>(f32(local % 4u), f32(local / 4u));
@@ -64,9 +75,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
     // `.mcmeta` animations live in a 2D strip atlas. The vertex carries the
     // animation row, while the current frame comes from the tick clock.
-    if (in.anim != 0xFFFFFFFFu) {
-        let frame_info = uniforms.animations[in.anim * 2u];
-        let timing = uniforms.animations[in.anim * 2u + 1u];
+    if (anim_code != 0u) {
+        let index = anim_code - 1u;
+        let frame_info = uniforms.animations[index * 2u];
+        let timing = uniforms.animations[index * 2u + 1u];
         let count = max(u32(timing.y), 1u);
         let frame = u32(floor(uniforms.animation.x / max(timing.z, 1.0))) % count;
         let anim_uv = vec2<f32>(
@@ -75,6 +87,14 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         );
         texel = textureSampleLevel(animation_atlas, block_sampler, anim_uv, 0.0);
     }
+
+    // Grass sides store the overlay coverage in alpha, so the tint applies only
+    // to the grass pixels and the dirt below keeps its own colour.
+    let tint_factor = select(1.0, texel.a, tint_masked);
+    texel = vec4<f32>(
+        texel.rgb * mix(vec3<f32>(1.0), tint, tint_factor),
+        select(texel.a, 1.0, tint_masked),
+    );
 
     // Leaves, glass and other cutout textures use alpha testing.
     if (texel.a < 0.5) {

@@ -597,8 +597,20 @@ pub fn is_transparent(id: u16) -> bool {
             | ids::WATER
             | ids::LEAVES
             | ids::GLASS
+            | 6    // sapling
             | 31   // tall grass
+            | 32   // dead bush
+            | 37 | 38 | 39 | 40 // flowers and mushrooms
+            | 50 | 75 | 76 // torches
             | 51   // fire (crossed, cutout/blended quads)
+            | 59   // wheat
+            | 83   // sugar cane
+            | 104 | 105 // stems
+            | 111  // lily pad
+            | 115  // nether wart
+            | 141 | 142 // carrots / potatoes
+            | 171  // carpet
+            | 175  // double plant
             | 78   // snow layer
             | 95   // stained glass
             | 101  // iron bars

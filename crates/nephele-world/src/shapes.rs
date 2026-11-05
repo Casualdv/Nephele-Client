@@ -110,6 +110,26 @@ const PLATE: &[ShapeBox] = &[b([1.0, 0.0, 1.0], [15.0, 1.0, 15.0])];
 /// The same plate while pressed, at half its thickness.
 const PLATE_PRESSED: &[ShapeBox] = &[b([1.0, 0.0, 1.0], [15.0, 0.5, 15.0])];
 
+/// Cross-quad plants. They have no collision and must not be treated as a
+/// full cube by neighbour culling or ambient occlusion: a flower that claims
+/// to be solid culls the grass top underneath it and leaves a hole.
+const CROSS_PLANTS: [u16; 14] = [6, 31, 32, 37, 38, 39, 40, 59, 83, 104, 105, 115, 141, 142];
+
+/// Flat ground cover: lily pads and carpet occupy one pixel.
+const FLAT_LAYER: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 1.0, 16.0])];
+
+/// Snow layers: two pixels per level, one to eight levels.
+const SNOW_LAYERS: [&[ShapeBox]; 8] = [
+    &[b([0.0, 0.0, 0.0], [16.0, 2.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 4.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 6.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 8.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 10.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 12.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 14.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 16.0, 16.0])],
+];
+
 /// Horizontal pane connections around one block.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PaneConnections {
@@ -284,7 +304,7 @@ pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
                 door_shape(meta, 0)
             }
         }
-        50 => TORCH,
+        50 | 75 | 76 => TORCH,
         // Stone, wooden, weighted iron and weighted gold plates. Metadata is
         // the pressed flag for the first two and the redstone strength for the
         // weighted ones; either way a non-zero value means pressed.
@@ -295,6 +315,12 @@ pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
                 PLATE
             }
         }
+        // Cross-quad plants and crops occupy no solid volume. The mesher draws
+        // their geometry; this entry is what keeps culling and AO honest.
+        id if CROSS_PLANTS.contains(&id) => EMPTY,
+        175 => EMPTY,
+        78 => SNOW_LAYERS[(meta & 7) as usize],
+        111 | 171 => FLAT_LAYER,
         // Fire is drawn as crossed, animated quads by the mesher; it must not
         // masquerade as a full cube to its neighbours.
         51 => EMPTY,
@@ -327,6 +353,21 @@ mod tests {
         assert_eq!(block_shape(44, 0), SLAB_BOTTOM);
         assert_eq!(block_shape(44, 8), SLAB_TOP);
         assert!(!is_full_cube(block_shape(44, 0)));
+    }
+
+    #[test]
+    fn plants_cover_and_fire_are_never_full_cubes() {
+        for id in [
+            6u16, 31, 32, 37, 38, 39, 40, 51, 59, 78, 83, 104, 105, 111, 115, 141, 142, 171, 175,
+        ] {
+            assert!(
+                !is_full_cube(block_shape(id, 0)),
+                "{id} must not report a full cube"
+            );
+        }
+        assert_eq!(block_shape(37, 0), EMPTY);
+        assert_eq!(block_shape(78, 7)[0].max[1], 16.0);
+        assert_eq!(block_shape(111, 0)[0].max[1], 1.0);
     }
 
     #[test]
