@@ -122,6 +122,16 @@ pub fn apply(
     let chunk_x = column.x;
     let chunk_z = column.z;
 
+    // Column order is load-bearing: every column draws from the *same* `rand` —
+    // 256 bedrock rolls, plus extra sandstone rolls in beach and ocean columns — so
+    // a different order hands each column a different slice of the stream.
+    //
+    // `ChunkProviderGenerate.replaceBlocksForBiome` reads as if it iterates x outer
+    // and z inner, but that does **not** reproduce the reference world: with x
+    // outer, 55,403 of the 73,984 columns in the parity window get the wrong
+    // bedrock depth. With z outer — this order — all 221,984 bedrock blocks of
+    // that window match. Measured, not reasoned: see `tests/block_parity.rs` and
+    // AGENTS.md §13.
     for z in 0..16usize {
         for x in 0..16usize {
             let biome_id = biomes[z * 16 + x];

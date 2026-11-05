@@ -201,75 +201,98 @@ decisions. Keep it in sync when direction changes; it is not auto-updated.
 
 ## 6. Worldgen — the heart of the project
 
-Pipeline order per chunk (`VanillaGenerator` in `worldgen.rs`):
+Pipeline, split the way vanilla splits it (`VanillaGenerator` in `worldgen.rs`,
+restructured 2026-11-05 — the split itself is now implemented):
 
 ```
-primer (base terrain density)
-  → surface (biome surface blocks)
+provide_chunk(cx, cz)                        <- no neighbour access at all
+  primer (base terrain density)
+  → surface (biome surface blocks, reseeded from the chunk coords)
   → caves
   → ravines
-  → ores
-  → features (decoration)
+  → structure-start discovery (cached, places nothing)
+  → skylight / height map
+
+populate(world, cx, cz)                      <- reads and writes neighbours
+  (2x2 eligibility rule, then:)
+  structure pieces → water lake → lava lake → 8 dungeon attempts
+  → BiomeDecorator (ores first) → animal spawns → ice/snow
 ```
 
-**That single-pass model cannot reach block parity.** Vanilla splits it in two,
-and the split is load-bearing (source-verified against MCP 1.8.9):
-
-- **`provideChunk`**: base terrain → biome surface → caves → ravines →
-  structure-start discovery (mineshaft, village, stronghold, scattered feature,
-  ocean monument — layouts cached here) → chunk construction, biome storage,
-  skylight. Surface and bedrock reseed from the chunk seed, so they do **not**
-  depend on request order.
-- **`populate`**: structure pieces → water lake → lava lake → 8 dungeon attempts
-  → `BiomeDecorator` (**ores first**, then underwater sand/clay/gravel, trees,
-  big mushrooms, flowers, grass, dead bushes, lilies, mushrooms, reeds, cacti,
-  springs) → animal spawns → ice/snow.
-
-Consequences we have not implemented:
-
-- **Ore placement belongs to the population pass**, not `provideChunk`; it uses
-  the population seed and `+8` offsets, so per-chunk ore generation can never
-  match.
-- Population is a **2×2 rule**: owner `(x,z)` runs only once `(x,z)`,
-  `(x+1,z)`, `(x,z+1)`, `(x+1,z+1)` exist, and eligibility is checked in the
-  order `(x,z)`, `(x-1,z)`, `(x,z-1)`, `(x-1,z-1)`. Writes cross the boundary.
-- The decorating biome is sampled at `(chunkX*16+16, chunkZ*16+16)`.
+- `provide_chunk` is a pure function of the chunk coordinates: surface and
+  bedrock reseed from `x*341873128712 + z*132897987541` (**no world seed**), so
+  request order cannot change the result. `chunks_do_not_depend_on_generation_order`
+  pins that.
+- `populate` is driven by `Chunk.populateChunk`'s rule: when chunk `(x,z)`
+  becomes available, owners `(x,z)`, `(x-1,z)`, `(x,z-1)`, `(x-1,z-1)` are checked
+  **in that order**, and each runs only when `(x,z)`, `(x+1,z)`, `(x,z+1)`,
+  `(x+1,z+1)` all exist and it has not run yet. Population writes into the
+  neighbouring chunk, so load order decides what a shared border ends up as.
+- The decorating biome is sampled at `(chunkX*16+16, chunkZ*16+16)` — the first
+  block of the chunk to the south-east, not the owner's own biome.
 - Population seed: two `nextLong()` draws, each converted `n/2*2+1`, then
-  `(x*first + z*second) XOR seed`. Cave/ravine seeding uses a **17×17** source
-  neighbourhood with **unforced** multipliers `(sx*A) XOR (sz*B) XOR seed`.
+  `(x*first + z*second) XOR seed` (`VanillaGenerator::population_seed`, pinned by
+  a test). Cave/ravine seeding uses a **17×17** source neighbourhood with
+  **unforced** multipliers `(sx*A) XOR (sz*B) XOR seed`.
 - Structure grids use `regionX*341873128712 + regionZ*132897987541 + seed + salt`
   (village 10387312, scattered 14357617, monument 10387313) with floor division
   for negative regions.
 
-
 Environment: **overworld, sea level 63**, infinite generation, biome map from the
 1.8 `GenLayer` stack.
 
+`GenWorld` (`genworld.rs`) is the shim the ported generators talk to:
+`get_block`/`set_block` plus `is_air`/`is_liquid`/`is_replaceable`, `has_chunk`,
+`is_terrain_populated`/`set_terrain_populated`, `height` and `sea_level`.
+`TestWorld` is a bare `HashMap` of chunks behind it, so a generator can be
+transliterated without an entity, chunk-lifecycle or lighting model.
+`impl GenWorld for World` makes the same code usable in the client.
+
+**Still not ported: every feature generator.** `populate_owner` computes the seed
+and the decorating biome and then calls an empty `decorate` stub, so a match
+currently produces *terrain only* — no ores, no trees, no lakes, no dungeons, no
+structure pieces. `crate::ores` and `crate::features` still exist but are no
+longer called from the pipeline: their seeds and `+8` offsets are
+population-shaped. See the parity table below for what that costs.
+
+**Skylight is half-ported, deliberately.** `provide_chunk` ends with vanilla's
+`generateSkylightMap` height pass (`ChunkColumn::generate_height_map`, which
+`World.getHeight` reads back through `GenWorld::height`). The sky-light *nibbles*
+are not written: that needs `Block.getLightOpacity`, which this crate does not
+carry, and `nephele-render` traces a direct-sky column for locally generated
+chunks anyway.
+
 ### Parity status (measure against the reference world, never by eyeball)
 
-| Stage | State | Number |
+The per-stage parity numbers from the single-pass architecture are superseded;
+the block-level harness (`crates/nephele-world/tests/block_parity.rs`, 2026-11-05)
+is the current measurement — 289 chunks / 18,939,904 blocks of
+`parity/blocks-random.bin.gz` (structures **on**, seed 12345, inner ±8 chunks):
+
+| Metric | State | Number |
 |---|---|---|
-| Terrain height field | done | 96% of columns match |
-| Surface blocks | done | 98.8% match (1.2% mismatch) |
-| Caves | done | 308 air/chunk below y=56 |
-| Ravines | done | 426 vs 435 reference (98%) |
-| Ores | done, wrong stage | 5–12% above reference (caves absent when measured) |
-| **Biome map** | **done** | **0 / 160,000 blocks differ** (seed 12345, reference server world) |
-| Features | partial | flowers, grass, dead bush, cactus, oak-shape trees |
+| Biome map | **fixed 2026-11-08** | 0 of 160,000 reference cells (f604822); the block window below pre-dates that fix |
+| Column height | close | 47,298 of 50,956 comparable columns (**92.82%**) |
+| Mismatched blocks, population-only states | expected, not ported | 923,257 (**80.6%** of all diffs) |
+| Mismatched blocks, states both stages place (dirt/gravel veins, lake water, snow) | expected, not ported | 179,019 (15.6%) |
+| Mismatched blocks, terrain-only states | open bug | 43,718 (**0.231%** of blocks) |
 
-**Every number above except the biome map was measured per chunk, which is a
-different pipeline than vanilla's.** Treat them as "our implementation is close"
-rather than parity until the population pass exists and they are re-measured on
-a populated world.
+Of the terrain-only residue, **25,483 are near the surface** (height-field /
+biome divergence) and **18,235 are buried** (cave and ravine shape). Bedrock
+matches the reference *exactly* — all 221,984 bedrock blocks in the window — and
+only under the current surface column order; see §13 before touching it.
 
-**The oracle cannot settle this yet.** The second reference world now exists at
-`Nephele-private/parity/server-random` (level `random`, seed 12345, DEFAULT,
-empty generator settings, **structures on**, 625 chunks / 25×25 from spawn).
-`parity/server` stays as-is for the structures-off comparison. Neither answers a
-block-level question yet: the oracle emits surface heights, not block arrays, so
-a 65,536-state per-chunk export is still the prerequisite. Compare only the
-inner area (roughly ±8 chunks): the outermost ring lacks its populated
-neighbours and is not expected to match.
+Of the 1,145,994 mismatches, 1,001,871 sit in the 261 biome-exact chunks, so the
+biome bug is a second-order contributor to the block diff compared with the
+missing population pass. The wider 625-chunk structures-off scan (§14) measures
+0 cells of the reference world, so this window is now limited by the missing
+population pass alone.
+
+**The oracle now answers block-level questions.** `parity/blocks-random.bin.gz`
+is a 625-chunk block export (structures on) produced by
+`oracle/tools/Export.java`, and the harness compares our freshly generated world
+against it chunk by chunk. Compare only the inner area: the outermost ring of the
+fixture lacks some of its populated neighbours.
 
 
 ### The biome bug — solved 2026-11-05
@@ -357,14 +380,43 @@ Default window covers the whole structures-off reference area. Re-run
 
 ### Reference world
 
-Real 1.8.9 server, **seed 12345**, `generate-structures=false`, `online-mode=false`:
+Two worlds from the real 1.8.9 server, **seed 12345**, `online-mode=false`:
 
 ```
-C:\Users\dariu\Desktop\Nephele-private\parity\server\world\region\
+C:\Users\dariu\Desktop\Nephele-private\parity\server\world\region\        structures off
+C:\Users\dariu\Desktop\Nephele-private\parity\server-random\world\region\ structures on, spawn area only
 ```
 
-Server jar SHA-1 `b58b2ceb36e01bcd8dbf49c8fb66c55a9f0676cd`. This is the ground
-truth for every parity number above.
+Server jar SHA-1 `b58b2ceb36e01bcd8dbf49c8fb66c55a9f0676cd`. These are the ground
+truth for every parity number in §6.
+
+### Block-level diff harness
+
+`parity/blocks-random.bin.gz` — 625 chunks / 25×25 around spawn from the
+**structures-on** world, exported by `oracle/tools/Export.java`. Format (mixed
+byte order, and the "all little endian" comment at the top of `Export.java` is
+wrong about half of it):
+
+```
+char[8] "NEPHBLK1"
+int32   chunk count                    <- big endian
+per chunk:
+  int32  chunkX, chunkZ                <- big endian
+  byte[4096]  biomes, index z*16 + x   (only the first 256 are used)
+  uint16[65536] states, index y*256 + z*16 + x   <- little endian, (id << 4) | meta
+```
+
+Run it with output:
+
+```powershell
+cargo test -p nephele-world --test block_parity -- --nocapture
+```
+
+It generates the fixture's whole span through the real two-stage pipeline, diffs
+the inner ±8 chunks, and prints mismatches by reference block state split into
+`population` / `shared` / `terrain` stages, plus column-height agreement and the
+first differing coordinate. `terrain_states_are_complete` guards the list of
+states `provide_chunk` may write, so the stage attribution cannot silently rot.
 
 ### Pinned checksums (`research-lock.json`)
 
@@ -756,8 +808,23 @@ re-serialize the chunk wholesale.
 - Mesa `func_180629_a` samples the noise with **x on both axes** — a vanilla bug that
   must be preserved, not fixed.
 - Caves' water check is on the shell only; the quirk is load-bearing.
-- Veins centre at `pos+8`, so the ore pass must replay the **9 surrounding chunks**;
-  `decoration_seed = x*341873128712 + z*132897987541`.
+- Veins centre at `pos+8`, so ore placement belongs to the population pass, which
+  must see the **9 surrounding chunks**. The population seed is not the surface
+  seed (`x*341873128712 + z*132897987541`) — it is the two-`nextLong` formula in
+  §6. `crate::ores` still uses the old name; it is not wired into the pipeline.
+- **The surface pass's column order is load-bearing, and the source reads wrong.**
+  `replaceBlocksForBiome` looks like it iterates x outer / z inner, but every column
+  draws from one shared `rand` (256 bedrock rolls, plus the extra sandstone rolls in
+  beach/ocean columns), so the order permutes the stream. x-outer gets 55,403 of
+  73,984 columns' bedrock depth wrong; z-outer — what `surface::apply` does — matches
+  all 221,984 bedrock blocks of the parity window. **Do not "fix" the loop order from
+  a source reading.** This is the clearest case yet for §16's measure-don't-reason rule.
+- `provide_chunk`'s `rand` seed is `x*341873128712 + z*132897987541` with **no world
+  seed**; the population seed is the two-odd-`nextLong` formula in §6. They are not
+  the same and neither is the world seed.
+- `level.get("Biomes")` is stored by `Chunk.getBiomeArray()` as `(byte)biomeID`, so
+  mutated biomes (>= 128) wrap when read back as `u8`. `ChunkColumn::set_biomes` keeps
+  that cast, and the parity harness compares bytes for exactly that reason.
 - **Empty lanes … (n/a here)** — that's a Roblox note, ignore.
 - Biome mutations have height `(0.1, 0.2)`; missing ids 14/15/28 had to be added to a
   `[Biome; 40]` table.
@@ -810,15 +877,17 @@ re-serialize the chunk wholesale.
 
 - Parity claims are **measured**, never asserted. Every number in §6 came from a run
   against the reference world.
-- Reference-world checks live in `genlayer.rs` and `worldgen.rs`;
-  `chunk_biomes_match_a_world_the_real_server_generated` passes and
-  `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **523 test cases across the workspace** (517 passed, 6 ignored). `nephele-world`
-  carries the parity suite, including `debug_stage_trace` and
-  `debug_first_mismatch`. The six real-socket tests in
-  `crates/nephele-client/tests/join_mock.rs` cover status,
-  compression, chat, joining/loading the mock world, drop pickup, and crafting
-  planks through `C0E`.
+- Reference-world checks live in `genlayer.rs`, `worldgen.rs` and
+  `tests/block_parity.rs`. `chunk_biomes_match_a_world_the_real_server_generated`
+  pins chunk `(-28, 4)`; the biome map is **100%** (0 / 160,000 cells, 2026-11-08),
+  and `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
+- **530 test cases across the workspace** (528 passed, 2 ignored, including two
+  doctests). `nephele-cli` has 80 passing tests; `nephele-assets` has 39;
+  `nephele-render` has 50 passing tests, including seven shape-meshing
+  regressions; `nephele-world` has 145 passing tests and one ignored, including
+  the two `block_parity` harness tests. The six real-socket tests in
+  `crates/nephele-client/tests/join_mock.rs` cover status, compression, chat,
+  joining/loading the mock world, drop pickup, and crafting planks through `C0E`.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
 
@@ -842,11 +911,15 @@ integrated Radeon is 7.41 ms at 1280×720 / view distance 8 with vsync off.
 
 **Open:**
 
-1. **M2 - offline survival.** The exit criterion was played end to end offline: logs, planks, sticks, crafting table, then a wooden pickaxe with correct counts and no item loss. Remaining polish only: eating, armour effects, XP orbs, block entities, item-atlas wiring.
+1. **Population pass - the biggest visual gap.** `populate` is still an empty
+   stub; it owns 923,257 of the 1,145,994 block mismatches (80.6%). Port it ores
+   first, then the rest of `BiomeDecorator`.
 
-2. **M3 - join a real server.** Dimension change, keepalive, tab list, and a
+2. **M2 - offline survival.** The exit criterion was played end to end offline: logs, planks, sticks, crafting table, then a wooden pickaxe with correct counts and no item loss. Remaining polish only: eating, armour effects, XP orbs, block entities, item-atlas wiring.
+
+3. **M3 - join a real server.** Dimension change, keepalive, tab list, and a
    shippable Azure app id.
-3. **M6 follow-up.** Attribute the startup frame spikes by stage, and report
+4. **M6 follow-up.** Attribute the startup frame spikes by stage, and report
    every measurement window instead of the best one.
 
 **Landed 2026-11-05: M1b - biome parity, 100%.** 0 of 160,000 reference blocks

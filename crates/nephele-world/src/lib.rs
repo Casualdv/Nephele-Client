@@ -25,6 +25,7 @@ pub mod encode;
 pub mod features;
 pub mod generation;
 pub mod genlayer;
+pub mod genworld;
 pub mod mesa;
 pub mod noise;
 pub mod ores;
@@ -42,6 +43,7 @@ pub use chunk::{section_index, ChunkColumn, Section, SECTION_COUNT, SECTION_DIM,
 pub use decode::{decode_chunk_bulk, decode_chunk_data, ChunkUpdate};
 pub use encode::{encode_chunk_bulk, encode_chunk_data};
 pub use generation::{TerrainGenerator, SEA_LEVEL, SNOW_LINE};
+pub use genworld::{GenWorld, TestWorld};
 pub use noise::{JavaRandom, NoiseImproved, NoiseOctaves};
 pub use raycast::{raycast, raycast_to, Face, RayHit};
 pub use world::{ChunkCoord, World};
