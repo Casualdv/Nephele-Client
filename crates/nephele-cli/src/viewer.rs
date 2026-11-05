@@ -7,7 +7,7 @@ use std::time::Instant;
 use nephele_assets::{TextureArray, UiAtlas};
 use nephele_render::{build_world_mesh, Camera, Environment, Renderer};
 use nephele_world::worldgen::VanillaGenerator;
-use nephele_world::World;
+use nephele_world::{BlockState, World};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -141,6 +141,44 @@ impl Viewer {
                 self.world.insert(generator.column(cx, cz));
             }
         }
+        // Dev scene for shape parity: a wall with bars in front of it, a fence
+        // line, and two fire blocks. `NEPHELE_DEMO=shapes`.
+        if std::env::var("NEPHELE_DEMO").as_deref() == Ok("shapes") {
+            let ground = generator.height_at(8, 8) + 1;
+            for x in 0..24 {
+                for z in 0..24 {
+                    for y in ground..ground + 6 {
+                        self.world.set_block(x, y, z, BlockState::AIR);
+                    }
+                    self.world.set_block(x, ground - 1, z, BlockState::STONE);
+                }
+            }
+            // A wall for the bars to attach to.
+            for y in ground..ground + 3 {
+                for z in 4..=18 {
+                    self.world.set_block(8, y, z, BlockState::STONE);
+                }
+            }
+            // Bars: one against the wall, one line away from it, and a corner.
+            for y in ground..ground + 3 {
+                for z in 8..=14 {
+                    self.world.set_block(7, y, z, BlockState::new(101, 0));
+                }
+                self.world.set_block(7, y, 7, BlockState::new(101, 0));
+                self.world.set_block(6, y, 7, BlockState::new(101, 0));
+            }
+            // Fence line at the far side.
+            for z in 4..=12 {
+                self.world.set_block(14, ground, z, BlockState::new(85, 0));
+            }
+            for x in 4..=9 {
+                self.world.set_block(x, ground, 18, BlockState::new(113, 0));
+            }
+            // Fire on the floor in front of the wall.
+            self.world.set_block(3, ground, 4, BlockState::new(51, 0));
+            self.world.set_block(12, ground, 16, BlockState::new(51, 0));
+        }
+
         let mesh = build_world_mesh(&self.world, &textures);
         println!(
             "World: {} chunks, {} vertices, {} triangles",
@@ -153,6 +191,11 @@ impl Viewer {
         let spawn_height = generator.height_at(8, 8) as f32;
         self.spawn = glam::Vec3::new(8.5, spawn_height + 9.0, 8.5);
         self.camera.position = glam::Vec3::new(8.5, spawn_height + 9.0, 8.5);
+        if std::env::var("NEPHELE_DEMO").as_deref() == Ok("shapes") {
+            self.camera.position = glam::Vec3::new(1.5, spawn_height + 2.2, 2.5);
+            self.camera.yaw = 2.35;
+            self.camera.pitch = -0.12;
+        }
         self.camera.set_aspect(size.width, size.height);
 
         self.renderer = Some(renderer);
