@@ -594,12 +594,10 @@ impl GameClient {
     async fn dispatch(&mut self, packet: &Packet) -> Result<Event> {
         match packet.id {
             play::clientbound::KEEP_ALIVE => {
-                // Without this the server times the session out after ~30 s;
-                // Hypixel routes the player to limbo when that happens.
-                let id = play::parse_keep_alive(packet)?;
-                self.connection
-                    .write_packet(&play::keep_alive_response(id))
-                    .await?;
+                // `Connection::next_play_packet` has already answered it: the
+                // auto-answer lives in the connection so every caller (this
+                // client, the replay tooling) stays responsive. Writing a
+                // second response here would send the frame twice.
                 Ok(Event::Packet(packet.id))
             }
             play::clientbound::RESOURCE_PACK_SEND => {
@@ -2448,7 +2446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_waits_for_a_partial_frame_instead_of_dropping_it() {
+    async fn a_tick_that_times_out_mid_frame_keeps_its_bytes() {
         use tokio::io::AsyncWriteExt;
 
         let (mut client, mut peer) = test_game_client_with_raw_peer().await;
@@ -2464,15 +2462,21 @@ mod tests {
         peer.write_all(&head).await.unwrap();
         peer.flush().await.unwrap();
 
-        // The wait sees the first half straight away; the rest of the frame
-        // arrives after the tick's own timeout. A timeout wrapped around the
-        // read would consume `head` and then fail on the next packet.
+        // The tick's own timeout fires with half a frame buffered, so it
+        // returns `Idle`. Cancelling must not consume `head`: the connection
+        // buffers raw bytes and only drains a frame once all of it is present,
+        // so the next tick finishes the packet instead of desynchronising.
         let (event, ()) = tokio::join!(client.tick(Duration::from_millis(20)), async {
             tokio::time::sleep(Duration::from_millis(150)).await;
             peer.write_all(&tail).await.unwrap();
             peer.flush().await.unwrap();
         });
-        assert_eq!(event.expect("tick"), Event::Chat("split".into()));
+        assert_eq!(event.expect("tick"), Event::Idle);
+
+        assert_eq!(
+            client.tick(Duration::from_secs(2)).await.expect("tick"),
+            Event::Chat("split".into())
+        );
 
         // The stream is still framed: another whole packet must decode.
         let mut w = nephele_protocol::PacketWriter::new();
