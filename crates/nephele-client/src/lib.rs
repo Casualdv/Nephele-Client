@@ -665,6 +665,14 @@ impl GameClient {
             play::clientbound::SET_SLOT => {
                 let update = play::parse_set_slot(&packet)?;
                 if update.window_id == 0 && update.slot >= 0 {
+                    // A server may fill the hotbar with individual Set Slot
+                    // packets before any Window Items has sized the vector, and
+                    // a lobby does exactly that. Growing it here means the first
+                    // item is not silently dropped because slot 36 did not exist
+                    // yet.
+                    if self.inventory.len() < play::PLAYER_CONTAINER_SLOTS {
+                        self.inventory.resize(play::PLAYER_CONTAINER_SLOTS, None);
+                    }
                     let slot = update.slot as usize;
                     if slot < self.inventory.len() {
                         self.inventory[slot] = update.item;
