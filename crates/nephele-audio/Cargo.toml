@@ -1,0 +1,23 @@
+[package]
+name = "nephele-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+glam = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+# kira mixes; it never decodes for us. `nephele-audio` feeds it frames that came
+# out of symphonia, so the codec features are deliberately not enabled.
+kira = { version = "0.12", default-features = false, features = [
+    "cpal",
+    "cpal-realtime",
+] }
+symphonia = { version = "0.5", default-features = false, features = [
+    "ogg",
+    "vorbis",
+] }

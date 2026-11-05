@@ -97,6 +97,8 @@ cargo run -p nephele-launcher                    # the launcher UI
 # development shortcuts (never the only way to reach a screen):
 $env:NEPHELE_SCREEN="servers"   # title|servers|connect|settings|creative|pause|local
 $env:NEPHELE_DATA_DIR="..."     # override the user data directory
+$env:NEPHELE_VOLUME="0.5"       # master audio gain, 0..1 (default 1)
+$env:NEPHELE_MUTE="1"           # no audio device is opened at all
 ```
 
 CI runs fmt, clippy with `-D warnings`, tests, and the publish gate. **A commit that
@@ -117,6 +119,7 @@ crates/
   nephele-world/        worldgen + chunk data (the parity-critical crate)
   nephele-render/       mesher, chunk mesh, shader
   nephele-assets/       texture array, atlas, resource paths
+  nephele-audio/        sound: sounds.json registry, symphonia decode, kira mix
   nephele-cli/src/      lib code used by the CLI binary:
       live.rs           network + local game loops, screens, input
       viewer.rs         offline world viewer
@@ -573,7 +576,6 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   `MISSING_TEXTURE`, and held first-person rendering remains block-only.
 
 **Chat and client-side commands** (added 2026-11-01):
-
 - `T` opens the chat line, `/` opens it with a slash prefilled, `Enter` sends,
   `Esc` closes. While it is open it owns the keyboard, the mouse is released and
   movement keys are dropped; the HUD's "click to look around" hint is suppressed
@@ -595,6 +597,46 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   `start_local` sets it true, so `/gamemode survival` changes mining timing in
   singleplayer without breaking the old default.
 
+**Audio** (added 2026-11-05):
+
+`crates/nephele-audio` decodes with symphonia and mixes with kira. The split is
+deliberate: `decode.rs` turns Ogg Vorbis into interleaved `f32` and needs no
+device, so it is testable; `engine.rs` owns the device and hands kira
+`StaticSoundData`; `registry.rs` parses `sounds.json`; `materials.rs` maps a
+block id to its vanilla `SoundType`.
+
+- **Nothing ships.** Sound files and `sounds.json` itself are *not* in the
+  client jar — they live in the asset object store, addressed by content hash.
+  `nephele-prepare` now takes a `SoundSource` (`prepare_with_sounds`): it
+  verifies the player's own `assets/indexes/1.8.json` against
+  `research-lock.json`, copies `minecraft/sounds/**` and `minecraft/sounds.json`
+  into the prepared tree, and checks every object against its hash. Sounds are
+  additive — no asset store, no audio, but the preparation still succeeds
+  (`--no-sounds` forces that deliberately). `OUTPUT_VERSION` is now 2.
+- **Four hooks, all in `live.rs`:** block break (`MiningEvent::Stop`; in the
+  network loop the block is read from our own copy before the server confirms),
+  block place (the position `client.place(..)` returns, or the local
+  `set_block`), footsteps (`StepTrigger`, vanilla's `0.6 * distance` accumulator,
+  one step per ~1.67 blocks, never while airborne, reset by a teleport) and the
+  hurt sound (the same health-drop edge that drives the damage vignette).
+- **Positional, but the arithmetic is ours.** `attenuation()` ramps linearly to
+  silence at 16 blocks and `stereo_pan()` uses the source's offset along the
+  listener's right ear (`Listener::from_yaw`, matching the camera's
+  `forward = (sin yaw, 0, -cos yaw)`). kira's spatial tracks are deliberately
+  unused: they need one track per sound position.
+- **Volume and pitch are vanilla's:** break/place `(volume+1)/2` at
+  `frequency*0.8`, steps `volume*0.15` at `frequency`, hurt at 0.5 with the
+  `1.0 ± 0.2` jitter. `materials.rs` carries the `SoundType` table read off the
+  reference source's `registerBlock` calls — dirt sounds like gravel, metal is
+  stone 1.5× frequency, glass breaks as glass but places as stone.
+- **Master gain is `NEPHELE_VOLUME` (0..1); `NEPHELE_MUTE=1` skips the device
+  entirely.** There is deliberately no slider yet: the settings screen belongs
+  to `client-ui`. Events 1.8's own `sounds.json` has no entry for
+  (`step.anvil`, `dig.ladder`) stay silent exactly like vanilla;
+  `AudioEngine::silent_events()` counts them.
+- **Not done:** mob sounds, music and records, subtitles, and anything driven by
+  a packet we do not parse. Only the four hooks above fire.
+
 ---
 
 ## 12. Milestones
@@ -614,7 +656,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `saves` | `level.dat`, player data, region writing | `saves` | 90%, needs landing |
 | `entities` | players, skins, nametags, frames, maps on screen | `entities` | 35% |
 | `perf` | startup, view distance, baseline gate | `perf` | done, needs merge |
-| `audio` | everything sound | — | 0%, unassigned |
+| `audio` | everything sound | `audio` | first slice: break/place/step/hurt wired end to end |
 | `product` | launcher v2, updater, installer, legal | `saves` (WIP commit) | 25%, blocked on signing |
 
 Rules that hold across all of them: one worktree per lane (never edit the main
@@ -683,6 +725,15 @@ item icons for unmapped item ids.
 
 **Tooling**
 
+- **`1.8.9`'s client jar contains no sounds and no `sounds.json`.** They are
+  asset *objects*, addressed by SHA-1, and only the asset index knows which
+  object is `sounds/dig/stone1.ogg`. That is why `ASSET_PREFIXES` cannot list
+  them and why `prepare_with_sounds` copies from the object store instead. A
+  jar-only preparation is valid and simply silent.
+- `minecraft/texts/` is **not** in `ASSET_PREFIXES`, so a prepared-only tree has
+  no `splashes.txt` and `title::tests::loads_splashes_and_picks_stably` panics
+  unless a development `assets/vanilla` cache supplies it. Found while adding
+  audio; not fixed here because it belongs to the title/prepare side.
 - `.gitattributes` sets `* text=auto eol=lf`. Keep it.
 - Git identity is repo-local: `Casualdv <Casualdv@users.noreply.github.com>`.
 - `project_root()` walks up from the executable and prefers a `[workspace]` Cargo.toml
@@ -698,10 +749,12 @@ item icons for unmapped item ids.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **446 test cases across the workspace** (445 passed, 1 ignored, including two
-  doctests). `nephele-cli` has 65 passing tests; `nephele-assets` has 34;
-  `nephele-render` has 43 passing tests, including seven shape-meshing
-  regressions; `nephele-world` has 119 passing tests and one ignored. The six
+- **548 test cases across the workspace** (545 passed, 3 ignored, including two
+  doctests). `nephele-cli` has 83 passing tests; `nephele-assets` has 39;
+  `nephele-audio` has 24 plus one that opens the real sound device and is
+  ignored by default; `nephele-render` has 50 passing tests, including seven
+  shape-meshing regressions; `nephele-world` has 131 passing tests and one
+  ignored. The six
   real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,
   compression, chat, joining/loading the mock world, drop pickup, and crafting
   planks through `C0E`.
