@@ -26,7 +26,7 @@ use nephele_world::{
 pub use block_entities::{BannerPattern, BlockEntity, BlockEntityKind};
 pub use container::LocalContainer;
 pub use entities::{Entities, Entity, EntityKind, EntityMetadata};
-pub use maps::{MapData, Maps, MAP_SIZE};
+pub use maps::{MapState, Maps};
 pub use mining::{Aim, Miner, MiningEvent};
 pub use skins::{SkinInfo, Skins};
 
@@ -178,8 +178,11 @@ pub enum Event {
     Particles(Vec<play::ParticleSpawn>),
     /// A server-triggered positional sound (`S29`).
     SoundEffect(play::SoundEffect),
-    /// A map's pixels changed (`S33` / `S34`).
-    MapUpdated(MapData),
+    /// A map's picture or markers changed (`S34`). The pixels live in
+    /// `GameClient::maps` under this id.
+    MapUpdated {
+        map_id: i32,
+    },
     /// The server announced its brand on `MC|Brand`.
     ServerBrand(String),
     /// An unhandled server plugin channel was received.
@@ -910,17 +913,6 @@ impl GameClient {
             }
             id => Ok(Event::Packet(id)),
         }
-    }
-
-    /// Seam for N's map parsing: merge one `S34` rectangle and return the
-    /// resulting map so the caller can emit `Event::MapUpdated`.
-    pub fn apply_map_chunk(&mut self, chunk: &play::MapChunk) -> MapData {
-        self.maps.apply_chunk(chunk).clone()
-    }
-
-    /// Seam for N's map parsing: merge one `S33` rectangle.
-    pub fn apply_map_columns(&mut self, columns: &play::MapColumns) -> MapData {
-        self.maps.apply_columns(columns).clone()
     }
 
     fn apply_player_list_update(&mut self, update: play::PlayerListUpdate) {

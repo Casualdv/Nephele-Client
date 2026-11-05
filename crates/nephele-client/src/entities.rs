@@ -68,15 +68,14 @@ pub enum EntityKind {
     /// A dropped item stack (`S0E` with object type 2).
     Item { id: i16, meta: i16 },
     /// An item frame (`S0E` with object type 71). `direction` is the face it is
-    /// attached to: 0 down, 1 up, 2 north, 3 south, 4 west, 5 east.
-    ItemFrame { direction: u8 },
-}
-
-/// The mutable part of an item frame: the framed stack and its 45° rotation.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ItemFrameState {
-    pub item: Option<ItemStack>,
-    pub rotation: u8,
+    /// attached to: 0 down, 1 up, 2 north, 3 south, 4 west, 5 east. The framed
+    /// stack and rotation arrive later as `S1C` metadata.
+    ItemFrame {
+        direction: u8,
+        item: Option<ItemStack>,
+        /// Rotation in 45-degree steps, 0..=7.
+        rotation: u8,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -103,8 +102,6 @@ pub struct Entity {
     /// Last `S0B` animation id (0 = arm swing) and how many ticks it lasts.
     pub animation: u8,
     pub animation_ticks: u8,
-    /// Item-frame contents, when this entity is a frame.
-    pub item_frame: Option<ItemFrameState>,
 }
 
 impl Entity {
@@ -125,7 +122,6 @@ impl Entity {
             equipment: [None; equipment_slot::COUNT],
             animation: 0,
             animation_ticks: 0,
-            item_frame: None,
         }
     }
 
@@ -212,13 +208,16 @@ impl Entity {
             (4, EntityMetadataValue::Byte(silent)) => self.metadata.silent = *silent != 0,
             (6, EntityMetadataValue::Float(health)) => self.metadata.health = health.max(0.0),
             (8, EntityMetadataValue::Slot(item)) => {
-                if let Some(frame) = &mut self.item_frame {
-                    frame.item = *item;
+                if let EntityKind::ItemFrame { item: framed, .. } = &mut self.kind {
+                    *framed = *item;
                 }
             }
             (9, EntityMetadataValue::Byte(rotation)) => {
-                if let Some(frame) = &mut self.item_frame {
-                    frame.rotation = (*rotation).clamp(0, 7) as u8;
+                if let EntityKind::ItemFrame {
+                    rotation: current, ..
+                } = &mut self.kind
+                {
+                    *current = (*rotation).clamp(0, 7) as u8;
                 }
             }
             _ => {}
@@ -367,16 +366,48 @@ impl Entities {
 
     /// Track an item frame (`S0E`, object type 71).
     pub fn spawn_item_frame(&mut self, id: i32, direction: u8, position: [f64; 3]) {
-        let mut entity = Entity::new(
+        self.map.insert(
             id,
-            EntityKind::ItemFrame { direction },
-            position,
-            0.0,
-            0.0,
-            self.tick,
+            Entity::new(
+                id,
+                EntityKind::ItemFrame {
+                    direction,
+                    item: None,
+                    rotation: 0,
+                },
+                position,
+                0.0,
+                0.0,
+                self.tick,
+            ),
         );
-        entity.item_frame = Some(ItemFrameState::default());
-        self.map.insert(id, entity);
+    }
+
+    /// Apply the two metadata entries an item frame uses: index 8 is the framed
+    /// stack and index 9 is its rotation. `Some(None)` empties the frame.
+    pub fn set_item_frame(
+        &mut self,
+        id: i32,
+        item: Option<Option<ItemStack>>,
+        rotation: Option<u8>,
+    ) {
+        let Some(entity) = self.map.get_mut(&id) else {
+            return;
+        };
+        let EntityKind::ItemFrame {
+            item: framed,
+            rotation: current,
+            ..
+        } = &mut entity.kind
+        else {
+            return;
+        };
+        if let Some(item) = item {
+            *framed = item;
+        }
+        if let Some(rotation) = rotation {
+            *current = rotation & 7;
+        }
     }
 
     /// Apply one `S1C Entity Metadata` update.
@@ -625,17 +656,24 @@ mod tests {
             values: vec![
                 (
                     8,
-                    EntityMetadataValue::Slot(Some(ItemStack::new(358, 1, 0).with_map(7))),
+                    EntityMetadataValue::Slot(Some(ItemStack::new(358, 1, 7))),
                 ),
                 (9, EntityMetadataValue::Byte(5)),
             ],
         };
         entities.apply_metadata(&update);
         let frame = entities.get(42).unwrap();
-        assert!(matches!(frame.kind, EntityKind::ItemFrame { direction: 2 }));
-        let state = frame.item_frame.as_ref().unwrap();
-        assert_eq!(state.item.unwrap().map_id, Some(7));
-        assert_eq!(state.rotation, 5);
+        let EntityKind::ItemFrame {
+            direction,
+            item,
+            rotation,
+        } = &frame.kind
+        else {
+            panic!("expected an item frame");
+        };
+        assert_eq!(*direction, 2);
+        assert_eq!(item.unwrap().damage, 7);
+        assert_eq!(*rotation, 5);
     }
 
     #[test]

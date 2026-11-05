@@ -324,7 +324,12 @@ async fn send_lobby_map(connection: &mut Connection, feet_y: f64) -> Result<()> 
     w.write_u8((5 << 5) | 8);
     play::write_slot(
         &mut w,
-        Some(&play::ItemStack::new(358, 1, 0).with_map(MAP_ID)),
+        // A filled map's damage value is its map id in 1.8.
+        Some(&play::ItemStack::new(
+            play::ITEM_FILLED_MAP,
+            1,
+            MAP_ID as i16,
+        )),
     );
     // Metadata index 9, type 0 (byte): rotation.
     w.write_u8(9);
@@ -561,7 +566,10 @@ async fn send_bot_equipment(connection: &mut Connection, bots: &[MockBot]) -> Re
         let mut w = PacketWriter::new();
         w.write_varint(map_bot.entity_id)
             .write_i16(play::equipment_slot::HELD);
-        play::write_slot(&mut w, Some(&play::ItemStack::new(358, 1, 0).with_map(7)));
+        play::write_slot(
+            &mut w,
+            Some(&play::ItemStack::new(play::ITEM_FILLED_MAP, 1, 7)),
+        );
         connection
             .write_packet(&Packet::new(
                 play::clientbound::ENTITY_EQUIPMENT,

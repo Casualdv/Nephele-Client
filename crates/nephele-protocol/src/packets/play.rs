@@ -1,5 +1,4 @@
 use crate::error::{Error, Result};
-use crate::nbt::Tag;
 use crate::packet::Packet;
 use crate::packets::status::flatten_chat;
 use crate::write::PacketWriter;
@@ -40,10 +39,8 @@ pub mod clientbound {
     pub const MAP_CHUNK_BULK: i32 = 0x26;
     pub const SOUND_EFFECT: i32 = 0x29;
     pub const PARTICLE: i32 = 0x2A;
-    /// `S33` map columns (a rectangular patch of a map).
-    pub const MAP_COLUMNS: i32 = 0x33;
-    /// `S34` map chunk (a rectangle plus a scale).
-    pub const MAP_CHUNK: i32 = 0x34;
+    /// `S34`: map column data (a framed or held map's colours and markers).
+    pub const MAP: i32 = 0x34;
     pub const SET_SLOT: i32 = 0x2F;
     pub const OPEN_WINDOW: i32 = 0x2D;
     pub const CLOSE_WINDOW: i32 = 0x2E;
@@ -121,8 +118,6 @@ pub struct ItemStack {
     pub id: i16,
     pub count: i8,
     pub damage: i16,
-    /// `NBT.map` for map items (id 358), used to look up map pixels.
-    pub map_id: Option<i32>,
 }
 
 impl ItemStack {
@@ -130,17 +125,7 @@ impl ItemStack {
     pub const EMPTY_ID: i16 = -1;
 
     pub const fn new(id: i16, count: i8, damage: i16) -> Self {
-        Self {
-            id,
-            count,
-            damage,
-            map_id: None,
-        }
-    }
-
-    pub const fn with_map(mut self, map_id: i32) -> Self {
-        self.map_id = Some(map_id);
-        self
+        Self { id, count, damage }
     }
 
     /// Block items share their id with the block, so `1` is stone, `4` is
@@ -169,30 +154,16 @@ pub fn write_slot<'a>(
 ) -> &'a mut PacketWriter {
     match item {
         None => writer.write_i16(ItemStack::EMPTY_ID),
-        Some(item) => {
-            writer
-                .write_i16(item.id)
-                .write_i8(item.count)
-                .write_i16(item.damage);
-            match item.map_id {
-                Some(map_id) => {
-                    // Root compound with no name, one `map` int, then TAG_End.
-                    writer
-                        .write_u8(10)
-                        .write_u16(0)
-                        .write_u8(3)
-                        .write_u16(3)
-                        .write_bytes(b"map")
-                        .write_i32(map_id)
-                        .write_u8(0)
-                }
-                None => writer.write_u8(0),
-            }
-        }
+        Some(item) => writer
+            .write_i16(item.id)
+            .write_i8(item.count)
+            .write_i16(item.damage)
+            // No NBT alongside the stack.
+            .write_u8(0),
     }
 }
 
-/// Read a slot, keeping only the `map` NBT id; other NBT is skipped.
+/// Read a slot, skipping any NBT.
 pub fn parse_slot(reader: &mut crate::read::PacketReader<'_>) -> Result<Option<ItemStack>> {
     let id = reader.read_i16()?;
     if id == ItemStack::EMPTY_ID {
@@ -200,22 +171,8 @@ pub fn parse_slot(reader: &mut crate::read::PacketReader<'_>) -> Result<Option<I
     }
     let count = reader.read_i8()?;
     let damage = reader.read_i16()?;
-    // The slot's NBT is a single named root tag. Map items carry `map: <id>`.
-    // Only the tag is consumed: placement packets put the cursor after it.
-    let rest = reader.rest();
-    let map_id = if rest.is_empty() {
-        None
-    } else {
-        let (_, tag, consumed) = crate::nbt::parse_named_tag_prefix(rest)?;
-        reader.take(consumed)?;
-        tag.get("map").and_then(Tag::as_int)
-    };
-    Ok(Some(ItemStack {
-        id,
-        count,
-        damage,
-        map_id,
-    }))
+    crate::nbt::skip_named_tag(reader)?;
+    Ok(Some(ItemStack { id, count, damage }))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -587,38 +544,49 @@ pub fn parse_sound_effect(packet: &Packet) -> Result<SoundEffect> {
     })
 }
 
-/// `S34 Map Chunk`: a rectangle of a map plus its scale.
+/// A filled map item. In 1.8 the item's **damage value is the map id**; that is
+/// how an item frame's framed map is tied to the `S34` pixels.
+pub const ITEM_FILLED_MAP: i16 = 358;
+
+/// One marker drawn on a map: another player or a decoration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MapIcon {
+    /// Icon kind (0 = white arrow, 1..=10 = coloured arrows, ...).
+    pub kind: u8,
+    /// Rotation in 16ths of a turn.
+    pub direction: u8,
+    pub x: i8,
+    pub z: i8,
+}
+
+/// `S34`: a patch of a map's 128x128 colour grid, plus its markers.
 ///
-/// This is the pinned interface for N's map parsing. The client does **not**
-/// decode `S33`/`S34` itself; N parses the packet and hands one of these to
-/// `GameClient::apply_map_chunk` (or `Maps::apply_chunk`). Until that lands,
-/// the renderer uses [`nephele_client::MapData::placeholder`] so a framed map
-/// is never blank.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MapChunk {
+/// This is N's pinned map type. The client does **not** decode `S34` itself;
+/// N's parser fills this and calls `Maps::apply`. Until that lands,
+/// [`nephele_client::MapState::placeholder`] keeps a framed map showing a
+/// picture.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MapUpdate {
     pub map_id: i32,
-    pub scale: i8,
+    /// Map scale, 0..4. Colour indexes are not scaled; this only affects how
+    /// many blocks one pixel covers.
+    pub scale: u8,
+    pub icons: Vec<MapIcon>,
     pub columns: u8,
     pub rows: u8,
-    pub x: i32,
-    pub z: i32,
-    /// `columns * rows` colour indices, row-major.
+    pub start_x: u8,
+    pub start_y: u8,
+    /// `columns * rows` colour indexes, row-major within the patch.
     pub colors: Vec<u8>,
 }
 
-/// `S33 Map Columns`: a rectangle of a map without a scale field.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MapColumns {
-    pub map_id: i32,
-    pub columns: u8,
-    pub rows: u8,
-    pub x: u8,
-    pub z: u8,
-    pub colors: Vec<u8>,
+impl MapUpdate {
+    /// Width of a full map's colour grid in 1.8.
+    pub const SIZE: usize = 128;
 }
 
-// `S33`/`S34` wire decoding is N's work. The client consumes `MapChunk` /
-// `MapColumns` through `Maps::apply_chunk` / `Maps::apply_columns`.
+// `S34` wire decoding is N's work. The client consumes `MapUpdate` through
+// `Maps::apply`; the types above are the interface, not a second parser.
 
 pub fn keep_alive_response(id: i32) -> Packet {
     let mut w = PacketWriter::new();
@@ -1918,26 +1886,12 @@ mod map_tests {
     use super::*;
 
     #[test]
-    fn a_map_slot_keeps_its_nbt_and_trailing_fields() {
-        let mut w = PacketWriter::new();
-        write_slot(&mut w, Some(&ItemStack::new(358, 1, 0).with_map(12)));
-        w.write_u8(0xAA).write_u8(0xBB);
-        let packet = Packet::new(0, w.into_bytes());
-        let mut r = packet.reader();
-        let slot = parse_slot(&mut r).expect("slot").expect("item");
-        assert_eq!(slot.id, 358);
-        assert_eq!(slot.map_id, Some(12));
-        // The placement packet's cursor bytes follow the slot and must survive.
-        assert_eq!(r.read_u8().unwrap(), 0xAA);
-        assert_eq!(r.read_u8().unwrap(), 0xBB);
-    }
-
-    #[test]
     fn item_frame_metadata_carries_item_and_rotation() {
         let mut w = PacketWriter::new();
         w.write_varint(1000);
         w.write_u8((5 << 5) | 8);
-        write_slot(&mut w, Some(&ItemStack::new(358, 1, 0).with_map(7)));
+        // A filled map's damage value is its map id in 1.8.
+        write_slot(&mut w, Some(&ItemStack::new(ITEM_FILLED_MAP, 1, 7)));
         w.write_u8(9);
         w.write_i8(3);
         w.write_u8(0x7F);
@@ -1946,7 +1900,8 @@ mod map_tests {
                 .expect("metadata");
         assert!(matches!(
             update.get(8),
-            Some(EntityMetadataValue::Slot(Some(item))) if item.map_id == Some(7)
+            Some(EntityMetadataValue::Slot(Some(item)))
+                if item.id == ITEM_FILLED_MAP && item.damage == 7
         ));
         assert!(matches!(update.get(9), Some(EntityMetadataValue::Byte(3))));
     }

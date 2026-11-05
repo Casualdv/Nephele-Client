@@ -23,7 +23,9 @@ use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
 use nephele_audio::AudioEngine;
 use nephele_client::mining::{Aim, Miner, MiningEvent};
 use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
-use nephele_client::{BlockEntity, BlockEntityKind, Event, GameClient, LocalContainer, Maps, Vec3};
+use nephele_client::{
+    BlockEntity, BlockEntityKind, Event, GameClient, LocalContainer, MapState, Maps, Vec3,
+};
 use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
@@ -88,7 +90,7 @@ enum NetMsg {
     /// Tab-list skin hashes (uuid, texture hash, slim model).
     Skins(Vec<([u8; 16], String, bool)>),
     /// Map pixels arrived for one map id.
-    Map(nephele_client::MapData),
+    Map(i32, MapState),
     Error(String),
 }
 
@@ -144,14 +146,14 @@ impl EntitySnapshot {
             nephele_client::EntityKind::Item { id, meta } => Some((id, meta)),
             _ => None,
         };
-        let direction = match entity.kind {
-            nephele_client::EntityKind::ItemFrame { direction } => direction,
-            _ => 0,
+        let item_frame = match &entity.kind {
+            nephele_client::EntityKind::ItemFrame {
+                direction,
+                item,
+                rotation,
+            } => Some((*direction, *rotation, *item)),
+            _ => None,
         };
-        let item_frame = entity
-            .item_frame
-            .as_ref()
-            .map(|frame| (direction, frame.rotation, frame.item));
         let held_item = entity.equipment[play::equipment_slot::HELD as usize];
         let armor = [
             entity.equipment[play::equipment_slot::BOOTS as usize],
@@ -1312,8 +1314,10 @@ async fn net_loop(
                             let _ = tx.send(NetMsg::Skins(skins));
                         }
                     }
-                    Ok(Event::MapUpdated(map)) => {
-                        let _ = tx.send(NetMsg::Map(map));
+                    Ok(Event::MapUpdated { map_id }) => {
+                        if let Some(state) = client.maps.get(map_id).cloned() {
+                            let _ = tx.send(NetMsg::Map(map_id, state));
+                        }
                     }
                     Ok(_) => {}
                     Err(err) => return Err(err.to_string()),
@@ -1792,7 +1796,7 @@ impl LiveApp {
 
     fn upload_map(&mut self, id: i32, slot: u32) {
         let data = self.maps.ensure(id).clone();
-        let size = nephele_client::MAP_SIZE as u32;
+        let size = MapState::SIZE as u32;
         let Some(image) = image::RgbaImage::from_raw(size, size, data.to_rgba()) else {
             return;
         };
@@ -1905,11 +1909,11 @@ impl LiveApp {
         // spreads across frames instead of stalling one.
         let mut map_ids = std::collections::HashSet::new();
         for entity in &self.entities {
-            if let Some(id) = entity.held_item.and_then(|item| item.map_id) {
+            if let Some(id) = entity.held_item.and_then(|item| map_id_of(&item)) {
                 map_ids.insert(id);
             }
             if let Some((_, _, Some(item))) = entity.item_frame {
-                if let Some(id) = item.map_id {
+                if let Some(id) = map_id_of(&item) {
                     map_ids.insert(id);
                 }
             }
@@ -1919,7 +1923,7 @@ impl LiveApp {
             .get(play::HOTBAR_FIRST_SLOT + view.held_slot.max(0) as usize)
             .copied()
             .flatten()
-            .and_then(|item| item.map_id)
+            .and_then(|item| map_id_of(&item))
         {
             map_ids.insert(id);
         }
@@ -1946,7 +1950,7 @@ impl LiveApp {
             }
 
             if let Some((direction, rotation, framed)) = entity.item_frame {
-                let map_id = framed.and_then(|item| item.map_id);
+                let map_id = framed.and_then(|item| map_id_of(&item));
                 let (item_slot, item_tint) = match map_id {
                     Some(id) => (self.map_slots.get(&id).copied(), [1.0; 4]),
                     None => (
@@ -2037,7 +2041,7 @@ impl LiveApp {
                 .map(|item| item.and_then(|item| armor_tint(item.id)));
 
             if let Some(held) = entity.held_item {
-                if let Some(id) = held.map_id {
+                if let Some(id) = map_id_of(&held) {
                     draw.held_map_slot = self.map_slots.get(&id).copied();
                 } else {
                     let pose = humanoid_hand(&draw);
@@ -2137,7 +2141,7 @@ impl LiveApp {
                 .copied()
                 .flatten();
             if let Some(held) = held {
-                if let Some(id) = held.map_id {
+                if let Some(id) = map_id_of(&held) {
                     if let Some(slot) = self.map_slots.get(&id).copied() {
                         append_hand_map(&mut entity_mesh, &pose, slot, 0.35);
                     }
@@ -2240,9 +2244,8 @@ impl LiveApp {
                         });
                     }
                 }
-                Ok(NetMsg::Map(map)) => {
-                    let id = map.id;
-                    self.maps.insert(map);
+                Ok(NetMsg::Map(id, state)) => {
+                    self.maps.insert(id, state);
                     let slot = self.ensure_map_slot(id);
                     self.upload_map(id, slot);
                 }
@@ -4016,6 +4019,11 @@ fn armor_tint(item: i16) -> Option<[f32; 4]> {
         _ => return None,
     };
     Some(color)
+}
+
+/// In 1.8 a filled map's damage value is its map id.
+fn map_id_of(item: &ItemStack) -> Option<i32> {
+    (item.id == play::ITEM_FILLED_MAP).then_some(item.damage as i32)
 }
 
 /// A flat colour for a framed non-map item. Maps use their real pixels; this

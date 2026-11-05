@@ -1,107 +1,122 @@
-//! Map item pixels.
+//! Map data (`S34`), stored per map id.
 //!
-//! The wire format (`S34` / `S33`) carries 128×128 colour indices. This module
-//! is the interface between M3's packet parsing and the renderer: packets land
-//! in [`Maps::apply_chunk`] / [`Maps::apply_columns`], and the CLI asks for a
-//! [`MapData`] to upload into the entity atlas. Until a server sends real data,
-//! [`MapData::placeholder`] makes a framed map show a picture instead of a
-//! blank square.
+//! A map is a 128x128 grid of colour indexes that the server patches
+//! incrementally: each packet carries only the rectangle that changed. Framed
+//! maps and held maps share the same ids, so the store is keyed by the id in
+//! the packet and a renderer can look a framed map's picture up by the item's
+//! damage value (in 1.8 a filled map's damage *is* its map id).
+//!
+//! **Wire parsing belongs to N.** This module is the pinned seam: N's parser
+//! fills a [`nephele_protocol::packets::play::MapUpdate`] and calls
+//! [`Maps::apply`]. Until that lands, [`MapState::placeholder`] supplies a
+//! deterministic picture so a framed map is never blank.
 
 use std::collections::HashMap;
 
-use nephele_protocol::packets::play;
+use nephele_protocol::packets::play::{MapIcon, MapUpdate};
 
-/// Edge length of a map in pixels.
-pub const MAP_SIZE: usize = 128;
-
-/// RGBA pixels for one map.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MapData {
-    pub id: i32,
-    pub scale: i8,
-    /// `MAP_SIZE * MAP_SIZE` pixels, row-major.
-    pub pixels: Vec<[u8; 4]>,
+/// One map's picture and markers.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MapState {
+    pub scale: u8,
+    pub icons: Vec<MapIcon>,
+    /// 128x128 colour indexes, row-major. 0 is "no colour"/transparent.
+    pub colors: Vec<u8>,
+    /// How many patches have been applied, which is the only way to tell a map
+    /// that has data from one that has only had its markers sent.
+    pub patches: u32,
 }
 
-impl MapData {
-    pub fn empty(id: i32) -> Self {
-        Self {
-            id,
-            scale: 0,
-            pixels: vec![[0, 0, 0, 0]; MAP_SIZE * MAP_SIZE],
+impl MapState {
+    pub const SIZE: usize = MapUpdate::SIZE;
+    pub const AREA: usize = Self::SIZE * Self::SIZE;
+
+    /// Apply one packet's patch.
+    ///
+    /// A packet with no columns only updates the markers. Out-of-range patches
+    /// are clipped rather than trusted: a server is free to send a rectangle
+    /// that runs off the grid, but writing past the end of the buffer would
+    /// panic.
+    pub fn apply(&mut self, update: &MapUpdate) {
+        if self.colors.len() != Self::AREA {
+            self.colors = vec![0; Self::AREA];
         }
+        self.scale = update.scale;
+        self.icons = update.icons.clone();
+        if update.columns == 0 || update.rows == 0 {
+            return;
+        }
+        for row in 0..update.rows as usize {
+            let y = update.start_y as usize + row;
+            if y >= Self::SIZE {
+                break;
+            }
+            for column in 0..update.columns as usize {
+                let x = update.start_x as usize + column;
+                if x >= Self::SIZE {
+                    break;
+                }
+                let source = row * update.columns as usize + column;
+                if let Some(color) = update.colors.get(source) {
+                    self.colors[y * Self::SIZE + x] = *color;
+                }
+            }
+        }
+        self.patches += 1;
     }
 
-    /// A deterministic, recognisable picture so an unparsed map is not blank.
+    /// Colour index at `(x, y)`, if the map has data.
+    pub fn color_at(&self, x: usize, y: usize) -> Option<u8> {
+        if x >= Self::SIZE || y >= Self::SIZE {
+            return None;
+        }
+        self.colors.get(y * Self::SIZE + x).copied()
+    }
+
+    /// A deterministic picture for a map whose pixels N has not supplied yet.
+    /// The indices go through [`map_color`], so this is a real sky/sun/ground
+    /// image rather than a flat square.
     pub fn placeholder(id: i32) -> Self {
-        let mut data = Self::empty(id);
+        let mut colors = vec![0u8; Self::AREA];
         let seed = id as u32;
-        for y in 0..MAP_SIZE {
-            for x in 0..MAP_SIZE {
-                let border = x < 3 || y < 3 || x >= MAP_SIZE - 3 || y >= MAP_SIZE - 3;
+        for y in 0..Self::SIZE {
+            for x in 0..Self::SIZE {
+                let border = x < 3 || y < 3 || x >= Self::SIZE - 3 || y >= Self::SIZE - 3;
                 let sun = (x as i32 - 96).pow(2) + (y as i32 - 24).pow(2) < 11 * 11;
-                let pixel = if border {
-                    [74, 49, 27, 255]
+                let index = if border {
+                    10 * 4 + 1 // brown frame edge
                 } else if sun {
-                    [255, 220, 72, 255]
+                    14 * 4 + 3 // white/yellow
                 } else if y < 64 {
-                    // Sky with a couple of clouds.
                     let cloud = ((x / 9 + y / 7 + seed as usize) % 11) == 0 && y > 12 && y < 48;
                     if cloud {
-                        [238, 238, 238, 255]
+                        8 * 4 + 2 // white
                     } else {
-                        [92, 148, 214, 255]
+                        12 * 4 + 2 // blue sky
                     }
                 } else {
-                    // Ground with a little deterministic texture.
                     let n = (x as u32 * 31 + y as u32 * 17 + seed) % 13;
-                    [64 + (n * 3) as u8, 132 + (n * 2) as u8, 52, 255]
+                    4 + (n % 3) as u8 // green ground shades
                 };
-                data.pixels[y * MAP_SIZE + x] = pixel;
+                colors[y * Self::SIZE + x] = index;
             }
         }
-        data
-    }
-
-    /// Copy a `S34 Map Chunk` rectangle into this map.
-    pub fn apply_chunk(&mut self, chunk: &play::MapChunk) {
-        self.scale = chunk.scale;
-        self.blit(chunk.x, chunk.z, chunk.columns, chunk.rows, &chunk.colors);
-    }
-
-    /// Copy a `S33 Map Columns` rectangle into this map.
-    pub fn apply_columns(&mut self, columns: &play::MapColumns) {
-        self.blit(
-            columns.x as i32,
-            columns.z as i32,
-            columns.columns,
-            columns.rows,
-            &columns.colors,
-        );
-    }
-
-    fn blit(&mut self, origin_x: i32, origin_z: i32, columns: u8, rows: u8, colors: &[u8]) {
-        for row in 0..rows as i32 {
-            for column in 0..columns as i32 {
-                let x = origin_x + column;
-                let z = origin_z + row;
-                if !(0..MAP_SIZE as i32).contains(&x) || !(0..MAP_SIZE as i32).contains(&z) {
-                    continue;
-                }
-                let source = (row as usize * columns as usize) + column as usize;
-                let Some(color) = colors.get(source) else {
-                    continue;
-                };
-                self.pixels[z as usize * MAP_SIZE + x as usize] = map_color(*color);
-            }
+        Self {
+            scale: 0,
+            icons: Vec::new(),
+            colors,
+            patches: 1,
         }
     }
 
     /// Flatten to the RGBA byte order the atlas upload expects.
     pub fn to_rgba(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(MAP_SIZE * MAP_SIZE * 4);
-        for pixel in &self.pixels {
-            out.extend_from_slice(pixel);
+        let mut out = Vec::with_capacity(Self::AREA * 4);
+        for y in 0..Self::SIZE {
+            for x in 0..Self::SIZE {
+                let index = self.colors.get(y * Self::SIZE + x).copied().unwrap_or(0);
+                out.extend_from_slice(&map_color(index));
+            }
         }
         out
     }
@@ -143,10 +158,10 @@ pub fn map_color(index: u8) -> [u8; 4] {
     ]
 }
 
-/// Every map the server has described, keyed by map id.
+/// Every map the client has received data for, keyed by map id.
 #[derive(Debug, Clone, Default)]
 pub struct Maps {
-    maps: HashMap<i32, MapData>,
+    map: HashMap<i32, MapState>,
 }
 
 impl Maps {
@@ -155,54 +170,43 @@ impl Maps {
     }
 
     pub fn len(&self) -> usize {
-        self.maps.len()
+        self.map.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.maps.is_empty()
+        self.map.is_empty()
     }
 
-    pub fn get(&self, id: i32) -> Option<&MapData> {
-        self.maps.get(&id)
+    pub fn get(&self, id: i32) -> Option<&MapState> {
+        self.map.get(&id)
     }
 
-    /// Get a map, creating the placeholder if the server has not sent pixels.
-    pub fn ensure(&mut self, id: i32) -> &mut MapData {
-        self.maps
+    /// Get a map, creating the placeholder if N has not sent pixels yet.
+    pub fn ensure(&mut self, id: i32) -> &mut MapState {
+        self.map
             .entry(id)
-            .or_insert_with(|| MapData::placeholder(id))
+            .or_insert_with(|| MapState::placeholder(id))
     }
 
-    /// Replace one map wholesale (the event path already carries the merged
-    /// pixels, so the CLI does not need to replay the packet).
-    pub fn insert(&mut self, data: MapData) {
-        self.maps.insert(data.id, data);
+    /// Replace one map with a state already merged on the network thread.
+    pub fn insert(&mut self, id: i32, state: MapState) {
+        self.map.insert(id, state);
     }
 
-    pub fn apply_chunk(&mut self, chunk: &play::MapChunk) -> &MapData {
-        let map = self
-            .maps
-            .entry(chunk.map_id)
-            .or_insert_with(|| MapData::empty(chunk.map_id));
-        map.apply_chunk(chunk);
-        map
+    pub fn iter(&self) -> impl Iterator<Item = (&i32, &MapState)> {
+        self.map.iter()
     }
 
-    pub fn apply_columns(&mut self, columns: &play::MapColumns) -> &MapData {
-        let map = self
-            .maps
-            .entry(columns.map_id)
-            .or_insert_with(|| MapData::empty(columns.map_id));
-        map.apply_columns(columns);
-        map
+    /// Apply a packet, creating the map on first sight. This is the seam N's
+    /// `S34` parser calls.
+    pub fn apply(&mut self, update: &MapUpdate) -> &mut MapState {
+        let state = self.map.entry(update.map_id).or_default();
+        state.apply(update);
+        state
     }
 
     pub fn clear(&mut self) {
-        self.maps.clear();
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&i32, &MapData)> {
-        self.maps.iter()
+        self.map.clear();
     }
 }
 
@@ -210,45 +214,70 @@ impl Maps {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_chunk_lands_at_the_requested_offset() {
-        let mut maps = Maps::new();
-        let chunk = play::MapChunk {
-            map_id: 7,
+    fn update(map_id: i32, columns: u8, rows: u8, start_x: u8, start_y: u8) -> MapUpdate {
+        MapUpdate {
+            map_id,
             scale: 1,
-            columns: 2,
-            rows: 2,
-            x: 10,
-            z: 20,
-            colors: vec![1, 2, 3, 4],
-        };
-        let map = maps.apply_chunk(&chunk);
-        assert_eq!(map.scale, 1);
-        assert_eq!(map.pixels[20 * MAP_SIZE + 10], map_color(1));
-        assert_eq!(map.pixels[21 * MAP_SIZE + 11], map_color(4));
+            icons: Vec::new(),
+            columns,
+            rows,
+            start_x,
+            start_y,
+            colors: (0..columns as usize * rows as usize)
+                .map(|index| (index + 1) as u8)
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_patch_lands_where_the_packet_says() {
+        let mut maps = Maps::new();
+        maps.apply(&update(3, 2, 2, 4, 5));
+
+        let map = maps.get(3).expect("map");
+        assert_eq!(map.colors.len(), MapState::AREA);
+        assert_eq!(map.color_at(4, 5), Some(1));
+        assert_eq!(map.color_at(5, 5), Some(2));
+        assert_eq!(map.color_at(4, 6), Some(3));
+        assert_eq!(map.color_at(5, 6), Some(4));
+        assert_eq!(map.patches, 1);
+    }
+
+    #[test]
+    fn out_of_range_patches_are_clipped() {
+        let mut maps = Maps::new();
+        maps.apply(&update(4, 4, 4, 126, 126));
+        let map = maps.get(4).expect("map");
+        assert_eq!(map.color_at(127, 127), Some(6));
+        // Nothing was written past the grid.
+        assert_eq!(map.colors.len(), MapState::AREA);
+    }
+
+    #[test]
+    fn a_marker_only_packet_keeps_the_picture() {
+        let mut maps = Maps::new();
+        maps.apply(&update(5, 1, 1, 0, 0));
+        let mut marker_only = update(5, 0, 0, 0, 0);
+        marker_only.icons.push(MapIcon {
+            kind: 1,
+            direction: 0,
+            x: 2,
+            z: 3,
+        });
+        maps.apply(&marker_only);
+        let map = maps.get(5).expect("map");
+        assert_eq!(map.color_at(0, 0), Some(1));
+        assert_eq!(map.icons.len(), 1);
+        assert_eq!(map.patches, 1);
     }
 
     #[test]
     fn a_placeholder_is_a_real_picture() {
-        let map = MapData::placeholder(3);
-        assert_eq!(map.pixels.len(), MAP_SIZE * MAP_SIZE);
-        let distinct: std::collections::HashSet<_> = map.pixels.iter().collect();
+        let map = MapState::placeholder(3);
+        assert_eq!(map.colors.len(), MapState::AREA);
+        let distinct: std::collections::HashSet<_> = map.colors.iter().collect();
         assert!(distinct.len() > 4, "placeholder should not be flat");
-        assert_eq!(map.to_rgba().len(), MAP_SIZE * MAP_SIZE * 4);
-    }
-
-    #[test]
-    fn map_columns_share_the_blit_path() {
-        let mut maps = Maps::new();
-        let columns = play::MapColumns {
-            map_id: 9,
-            columns: 1,
-            rows: 1,
-            x: 0,
-            z: 0,
-            colors: vec![5],
-        };
-        assert_eq!(maps.apply_columns(&columns).pixels[0], map_color(5));
+        assert_eq!(map.to_rgba().len(), MapState::AREA * 4);
     }
 
     #[test]

@@ -414,18 +414,17 @@ the entity pipeline, which is bound to the skin atlas — via
   (`textures/blocks/itemframe_background.png`, 16x16) and the item flat in
   front, rotated by metadata. Non-map items use a tinted placeholder; maps use
   the real pixels.
-- `ItemStack` now keeps the NBT `map` id (`map_id`). `parse_slot` consumes only
-  the NBT tag, not the rest of the packet - placement packets put the cursor
-  after the held stack. `play::write_slot` writes the same NBT for the mock.
+- In 1.8 a **filled map's damage value is its map id**. `ItemStack` stays the
+  simple id/count/damage triple; there is no NBT `map` parsing on this branch.
 - **Map interface (N owns the wire parsing):** `nephele-client::maps::{Maps,
-  MapData, MAP_SIZE}` plus `play::MapChunk` / `play::MapColumns` are the pinned
-  seam. This client deliberately does **not** decode `S33`/`S34`; N parses the
-  packet and calls `GameClient::apply_map_chunk` / `apply_map_columns`, then
-  emits `Event::MapUpdated(MapData)`. If no pixels arrive,
-  `MapData::placeholder` supplies a deterministic picture, so a framed map is
-  never blank. The CLI assigns one `SkinAtlas` slot per map id (`map:<id>`) and
-  uploads it as a sub-rectangle. `Renderer::set_skins` drains at most four
-  dirty slots per frame, so a burst of maps/skins cannot stall one frame.
+  MapState}` plus `play::MapUpdate` / `play::MapIcon` are the pinned seam. This
+  client deliberately does **not** decode `S34`; N's parser fills a `MapUpdate`
+  and calls `Maps::apply`, and the client emits `Event::MapUpdated { map_id }`.
+  `GameClient.maps` stores the result. `MapState::placeholder` supplies a
+  deterministic picture, so a framed map is never blank until N lands. The CLI
+  assigns one `SkinAtlas` slot per map id (`map:<id>`) and uploads it as a
+  sub-rectangle. `Renderer::set_skins` drains at most four dirty slots per
+  frame, so a burst of maps/skins cannot stall one frame.
 - `SkinAtlas` is now 8x8 slots (2048x2048) with a solid-white slot 1 for tinted
   armour. Skins/maps start at slot 2. The per-slot dirty list is what makes the
   budgeted upload work; do not go back to whole-atlas uploads.
@@ -626,8 +625,8 @@ deeper mob combat/AI. The prepared asset output version is 2.
 with backgrounds and distance scaling, held blocks/tools/maps, tinted armour
 shells, item frames with rotation, and the map interface plus placeholder
 fallback are in. `nephele mock-server --bots` is the end-to-end lobby demo.
-Still open: real armour layer textures, framed non-map item icons, and wiring
-N's `S33`/`S34` parser into `GameClient::apply_map_chunk`.
+Still open: real armour layer textures, framed non-map item icons, and calling
+`Maps::apply` from N's `S34` parser.
 
 **M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
 network block drops and pickup, survival inventory, container click protocol,

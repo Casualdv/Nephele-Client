@@ -167,14 +167,18 @@ async fn the_lobby_has_players_and_a_framed_map() {
         .iter()
         .find(|entity| matches!(entity.kind, EntityKind::ItemFrame { .. }))
         .expect("the mock spawns a framed map");
-    let state = frame.item_frame.as_ref().expect("item frame state");
-    let item = state.item.expect("the frame contains an item");
-    assert_eq!(item.id, 358, "a filled map item");
-    let map_id = item.map_id.expect("the map item carries its id");
+    let EntityKind::ItemFrame { item, rotation, .. } = &frame.kind else {
+        panic!("expected an item frame");
+    };
+    let item = item.expect("the frame contains an item");
+    assert_eq!(item.id, play::ITEM_FILLED_MAP, "a filled map item");
+    assert_eq!(*rotation, 0);
+    // A filled map's damage value is its map id in 1.8.
+    let map_id = item.damage as i32;
     // N's parser has not supplied pixels here; the stub fallback must still be
     // a real picture rather than a blank square.
     let map = client.maps.ensure(map_id);
-    let distinct: std::collections::HashSet<_> = map.pixels.iter().collect();
+    let distinct: std::collections::HashSet<_> = map.colors.iter().collect();
     assert!(
         distinct.len() > 4,
         "map {map_id} placeholder should be a picture, not one flat colour"
