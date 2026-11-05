@@ -879,12 +879,12 @@ re-serialize the chunk wholesale.
   against the reference world.
 - Reference-world checks live in `genlayer.rs`, `worldgen.rs` and
   `tests/block_parity.rs`. `chunk_biomes_match_a_world_the_real_server_generated`
+
   pins chunk `(-28, 4)`; the biome map is **100%** (0 / 160,000 cells, 2026-11-08),
   and `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **530 test cases across the workspace** (528 passed, 2 ignored, including two
-  doctests). `nephele-cli` has 80 passing tests; `nephele-assets` has 39;
+- **530 test cases across the workspace** (528 passed, 2 ignored, including two  doctests). `nephele-cli` has 80 passing tests; `nephele-assets` has 39;
   `nephele-render` has 50 passing tests, including seven shape-meshing
-  regressions; `nephele-world` has 145 passing tests and one ignored, including
+  regressions; `nephele-world` has 146 passing tests and one ignored, including
   the two `block_parity` harness tests. The six real-socket tests in
   `crates/nephele-client/tests/join_mock.rs` cover status, compression, chat,
   joining/loading the mock world, drop pickup, and crafting planks through `C0E`.
