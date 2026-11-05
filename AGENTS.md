@@ -836,10 +836,10 @@ re-serialize the chunk wholesale.
   structures-off regions and reports **11,492 of 160,000 cells** wrong (92.82%
   parity), so the biome map is close at scale and wrong in patches, not
   unimplemented.
-- **530 test cases across the workspace** (528 passed, 2 ignored, including two
+- **531 test cases across the workspace** (529 passed, 2 ignored, including two
   doctests). `nephele-cli` has 80 passing tests; `nephele-assets` has 39;
   `nephele-render` has 50 passing tests, including seven shape-meshing
-  regressions; `nephele-world` has 145 passing tests and one ignored, including
+  regressions; `nephele-world` has 146 passing tests and one ignored, including
   the two `block_parity` harness tests. The six real-socket tests in
   `crates/nephele-client/tests/join_mock.rs` cover status, compression, chat,
   joining/loading the mock world, drop pickup, and crafting planks through `C0E`.
