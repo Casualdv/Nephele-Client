@@ -520,6 +520,23 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   matched after trimming empty rows/columns, so a shape can sit anywhere in the
   grid; stack sizes in the grid do not matter. Local singleplayer uses the same
   recipe matcher; a real multiplayer server still computes its own output.
+- **Server container windows are sized from `S2D`'s slot count (2026-11-05).**
+  `OpenWindowState.slot_count` keeps the packet's own count and
+  `container_rows()` derives `ceil((slot_count - 36) / 9)` clamped to 1..=6, so
+  Hypixel's six-row "Game Menu" (90 slots) is no longer drawn as a fixed
+  three-row chest. `live::window_kind_for` maps `minecraft:furnace` and
+  `minecraft:crafting_table` to their panels and everything else to
+  `ContainerKind::Chest { rows }`; `ui` crops `generic_54` to
+  `rows*18 + 17` plus the 96-pixel player section and puts the player slots at
+  `rows*18 + 31` / `rows*18 + 89`, matching `ContainerChest`. Server click
+  mapping is untouched: the raw window slot index goes straight back in `C0E`,
+  and only the local furnace/chest path uses the layout table.
+- **HUD sprites are pinned to `icons.png`/`widgets.png` (2026-11-05).** Hearts
+  sample x=52/61 (not 54/63, which drew a background plus a two-pixel-shifted
+  overlay), food comes from y=27, the armour row from y=9 with vanilla item
+  values from slots 5..=8, and the hotbar items use the same `draw_stack` path
+  as the inventory so tools and food get real sprites. Tests pin every sprite to
+  its absolute atlas coordinate.
 - **Item icons (added 2026-11-02).** `TextureArray::load_from_dir` appends
   namespaced layers from the prepared sibling `textures/items` directory, so
   item names cannot collide with block layers. Inventory slots render mapped

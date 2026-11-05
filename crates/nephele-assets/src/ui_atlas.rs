@@ -106,9 +106,10 @@ pub mod sprites {
     pub const INVENTORY_PANEL: SpriteRect = sheets::INVENTORY.sub(0, 0, 176, 166);
     pub const CRAFTING_TABLE_PANEL: SpriteRect = sheets::CRAFTING_TABLE.sub(0, 0, 176, 166);
     pub const FURNACE_PANEL: SpriteRect = sheets::FURNACE.sub(0, 0, 176, 166);
-    /// A 27-slot chest: the three chest rows, then the player section, both cut
-    /// from `generic_54.png` so the panel is 176x168 like vanilla's.
-    pub const CHEST_TOP: SpriteRect = sheets::CHEST.sub(0, 0, 176, 72);
+    /// `generic_54.png`'s chest section. The top is the full six-row header
+    /// (`rows * 18 + 17` tall) and callers crop it to their row count; the
+    /// bottom is the player section, drawn at `(0, 126)` like `GuiChest`.
+    pub const CHEST_TOP: SpriteRect = sheets::CHEST.sub(0, 0, 176, 125);
     pub const CHEST_BOTTOM: SpriteRect = sheets::CHEST.sub(0, 126, 176, 96);
     /// Furnace progress art, taken from the right-hand column of its sheet.
     pub const FURNACE_FLAME: SpriteRect = sheets::FURNACE.sub(176, 0, 14, 14);

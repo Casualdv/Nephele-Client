@@ -826,6 +826,28 @@ fn inventory_panel(scale: f32, width: f32, height: f32) -> Rect {
     )
 }
 
+/// Height of a container panel in GUI pixels.
+///
+/// Vanilla's `GuiChest` sizes itself `114 + rows * 18`, so a six-row chest is
+/// 222 tall while the player inventory and the furnace panels stay at 166.
+pub fn container_panel_height(kind: Option<ContainerKind>) -> f32 {
+    match kind {
+        Some(ContainerKind::Chest { rows }) => 114.0 + rows as f32 * 18.0,
+        _ => INVENTORY_PANEL_H,
+    }
+}
+
+/// The panel rect for whatever window is open, centred on the screen.
+fn container_panel(kind: Option<ContainerKind>, scale: f32, width: f32, height: f32) -> Rect {
+    let panel_h = container_panel_height(kind);
+    Rect::new(
+        width / 2.0 - INVENTORY_PANEL_W * scale / 2.0,
+        height / 2.0 - panel_h * scale / 2.0,
+        INVENTORY_PANEL_W * scale,
+        panel_h * scale,
+    )
+}
+
 /// Top-left of a player-container slot inside the panel, in GUI pixels.
 ///
 /// Vanilla 1.8 layout: output at (144,36), 2x2 grid at (98/116, 18/36), armour
@@ -917,7 +939,8 @@ fn draw_stack(
 ///
 /// - Crafting table: output, nine grid cells, 27 storage, 9 hotbar (46 slots).
 /// - Furnace: input, fuel, output, then the same 36 player slots (39 slots).
-/// - Chest: 27 chest cells, then the same 36 player slots (63 slots).
+/// - Chest: `rows * 9` chest cells, then the same 36 player slots. The player
+///   section shifts down by the row count, exactly as `ContainerChest` does.
 pub fn window_slot_origin(slot: usize, kind: Option<ContainerKind>) -> Option<[f32; 2]> {
     match kind {
         Some(ContainerKind::Furnace) => Some(match slot {
@@ -927,14 +950,17 @@ pub fn window_slot_origin(slot: usize, kind: Option<ContainerKind>) -> Option<[f
             3..=38 => player_slot_origin(slot - 3)?,
             _ => return None,
         }),
-        Some(ContainerKind::Chest) => Some(match slot {
-            0..=26 => [
-                8.0 + (slot % 9) as f32 * 18.0,
-                18.0 + (slot / 9) as f32 * 18.0,
-            ],
-            27..=62 => player_slot_origin(slot - 27)?,
-            _ => return None,
-        }),
+        Some(ContainerKind::Chest { rows }) => {
+            let container = rows as usize * 9;
+            if slot < container {
+                Some([
+                    8.0 + (slot % 9) as f32 * 18.0,
+                    18.0 + (slot / 9) as f32 * 18.0,
+                ])
+            } else {
+                chest_player_slot_origin(slot - container, rows)
+            }
+        }
         _ => Some(match slot {
             0 => [124.0, 35.0],
             1..=9 => {
@@ -948,6 +974,22 @@ pub fn window_slot_origin(slot: usize, kind: Option<ContainerKind>) -> Option<[f
             _ => return None,
         }),
     }
+}
+
+/// Top-left of one of the 36 player slots in `GuiChest`.
+///
+/// `ContainerChest` places storage at `103 + (rows - 4) * 18` and the hotbar at
+/// `161 + (rows - 4) * 18`, i.e. `rows * 18 + 31` and `rows * 18 + 89`.
+fn chest_player_slot_origin(slot: usize, rows: u8) -> Option<[f32; 2]> {
+    let base = rows as f32 * 18.0;
+    Some(match slot {
+        0..=26 => [
+            8.0 + (slot % 9) as f32 * 18.0,
+            base + 31.0 + (slot / 9) as f32 * 18.0,
+        ],
+        27..=35 => [8.0 + (slot - 27) as f32 * 18.0, base + 89.0],
+        _ => return None,
+    })
 }
 
 /// Top-left of one of the 36 player slots: three storage rows then the hotbar.
@@ -970,7 +1012,7 @@ pub fn window_slot_rect(
     height: f32,
 ) -> Option<Rect> {
     let [x, y] = window_slot_origin(slot, kind)?;
-    let panel = inventory_panel(scale, width, height);
+    let panel = container_panel(kind, scale, width, height);
     Some(Rect::new(
         panel.x + x * scale,
         panel.y + y * scale,
@@ -1026,7 +1068,7 @@ pub fn draw_inventory(
     let s = |v: f32| v * scale;
     bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
 
-    let panel = inventory_panel(scale, width, height);
+    let panel = container_panel(hud.window_kind, scale, width, height);
 
     // A crafting table replaces the 2x2 half of the panel with its 3x3 grid;
     // the storage and hotbar below are the same slots in both layouts.
@@ -1038,12 +1080,12 @@ pub fn draw_inventory(
             window_slot_rect as fn(usize, Option<ContainerKind>, f32, f32, f32) -> Option<Rect>,
             match hud.window_kind {
                 Some(ContainerKind::Furnace) => "Furnace",
-                Some(ContainerKind::Chest) => "Chest",
+                Some(ContainerKind::Chest { .. }) => "Chest",
                 _ => "Crafting Table",
             },
             match hud.window_kind {
                 Some(ContainerKind::Furnace) => "Smelting",
-                Some(ContainerKind::Chest) => "Storage",
+                Some(ContainerKind::Chest { .. }) => "Storage",
                 _ => "Crafting",
             },
         ),
@@ -1062,16 +1104,19 @@ pub fn draw_inventory(
         Some(ContainerKind::Furnace) => {
             bg.sprite(sprites::FURNACE_PANEL, panel, TEXT);
         }
-        Some(ContainerKind::Chest) => {
-            let split = 72.0 * scale;
+        Some(ContainerKind::Chest { rows }) => {
+            // `GuiChest` blits the top at `(0, 0, 176, rows*18 + 17)` and the
+            // player section at `(0, 126, 176, 96)`, so the same `generic_54`
+            // sheet crops to any row count.
+            let top_h = rows as f32 * 18.0 + 17.0;
             bg.sprite(
-                sprites::CHEST_TOP,
-                Rect::new(panel.x, panel.y, panel.w, split),
+                sprites::CHEST_TOP.sub(0, 0, 176, top_h as u32),
+                Rect::new(panel.x, panel.y, panel.w, s(top_h)),
                 TEXT,
             );
             bg.sprite(
                 sprites::CHEST_BOTTOM,
-                Rect::new(panel.x, panel.y + split, panel.w, panel.h - split),
+                Rect::new(panel.x, panel.y + s(top_h), panel.w, s(96.0)),
                 TEXT,
             );
         }
@@ -2199,6 +2244,48 @@ mod tests {
                     && rect.y < other.y + other.h
                     && other.y < rect.y + rect.h;
                 assert!(!overlap, "crafting table slots overlap");
+            }
+            rects.push(rect);
+        }
+    }
+
+    #[test]
+    fn chest_slots_follow_the_row_count() {
+        // Vanilla `ContainerChest`: chest cells at `18 + row*18`, player
+        // storage at `rows*18 + 31`, hotbar at `rows*18 + 89`.
+        let six = Some(ContainerKind::Chest { rows: 6 });
+        assert_eq!(window_slot_origin(0, six), Some([8.0, 18.0]));
+        assert_eq!(window_slot_origin(8, six), Some([152.0, 18.0]));
+        assert_eq!(window_slot_origin(53, six), Some([152.0, 108.0]));
+        assert_eq!(window_slot_origin(54, six), Some([8.0, 139.0]));
+        assert_eq!(window_slot_origin(81, six), Some([8.0, 197.0]));
+        assert_eq!(window_slot_origin(89, six), Some([152.0, 197.0]));
+        assert_eq!(window_slot_origin(90, six), None);
+
+        // A three-row chest keeps the single-chest layout.
+        let three = Some(ContainerKind::Chest { rows: 3 });
+        assert_eq!(window_slot_origin(26, three), Some([152.0, 54.0]));
+        assert_eq!(window_slot_origin(27, three), Some([8.0, 85.0]));
+        assert_eq!(window_slot_origin(54, three), Some([8.0, 143.0]));
+
+        // The panel grows with the rows: `114 + rows * 18`.
+        assert_eq!(container_panel_height(six), 222.0);
+        assert_eq!(container_panel_height(three), 168.0);
+
+        let (width, height, scale) = (1280.0, 720.0, 3.0);
+        let panel = container_panel(six, scale, width, height);
+        let mut rects: Vec<Rect> = Vec::new();
+        for slot in 0..90 {
+            let rect = window_slot_rect(slot, six, scale, width, height).expect("slot exists");
+            assert!(rect.x >= panel.x && rect.y >= panel.y);
+            assert!(rect.x + rect.w <= panel.x + panel.w);
+            assert!(rect.y + rect.h <= panel.y + panel.h);
+            for other in &rects {
+                let overlap = rect.x < other.x + other.w
+                    && other.x < rect.x + rect.w
+                    && rect.y < other.y + other.h
+                    && other.y < rect.y + rect.h;
+                assert!(!overlap, "six-row chest slots overlap");
             }
             rects.push(rect);
         }

@@ -31,8 +31,25 @@ pub use skins::{SkinInfo, Skins};
 pub struct OpenWindowState {
     pub id: u8,
     pub kind: String,
+    /// Total slots the server announced in `S2D`.
+    ///
+    /// This is authoritative for a generic container: `rows * 9 + 36` for a
+    /// chest (the player's 36 slots sit below the container's), 46 for a
+    /// crafting table and 39 for a furnace. Derive the layout from this rather
+    /// than from `kind`, because a server can send any window size under a
+    /// fixed type string.
+    pub slot_count: u8,
     /// Slot contents as sent by `S30`; empty until the first resync.
     pub slots: Vec<Option<ItemStack>>,
+}
+
+impl OpenWindowState {
+    /// Rows of nine slots in the container section, derived from the announced
+    /// window size. Clamped to vanilla's `GuiChest` range.
+    pub fn container_rows(&self) -> u8 {
+        let container = self.slot_count.saturating_sub(36) as usize;
+        (container.div_ceil(9).clamp(1, 6)) as u8
+    }
 }
 
 /// The public fields carried by protocol-47's player-list packets.
@@ -628,6 +645,7 @@ impl GameClient {
                 self.open_window = Some(OpenWindowState {
                     id: window.window_id,
                     kind: window.kind.clone(),
+                    slot_count: window.slots,
                     slots: Vec::new(),
                 });
                 Ok(Event::WindowOpened {
@@ -1422,6 +1440,7 @@ mod tests {
         client.open_window = Some(OpenWindowState {
             id: 2,
             kind: "minecraft:chest".into(),
+            slot_count: 63,
             slots: Vec::new(),
         });
 
@@ -1451,6 +1470,35 @@ mod tests {
         assert_eq!(client.spawn_position, None);
         assert_eq!((client.world_age, client.time_of_day), (0, 0));
         assert!(client.open_window.is_none());
+    }
+
+    #[tokio::test]
+    async fn open_window_keeps_the_servers_slot_count() {
+        let (mut client, _peer) = test_game_client().await;
+
+        // Hypixel's Game Menu: a six-row chest, 54 container slots + 36 player.
+        let packet = play::open_window(7, "minecraft:chest", "{\"text\":\"Game Menu\"}", 90);
+        let event = client
+            .handle(Packet::new(play::clientbound::OPEN_WINDOW, packet.data))
+            .await
+            .unwrap();
+        assert_eq!(
+            event,
+            Event::WindowOpened {
+                window_id: 7,
+                kind: "minecraft:chest".into(),
+            }
+        );
+
+        let open = client.open_window.as_ref().unwrap();
+        assert_eq!(open.slot_count, 90);
+        assert_eq!(open.container_rows(), 6);
+
+        // A single chest and a crafting table both keep their announced count.
+        client.open_window.as_mut().unwrap().slot_count = 63;
+        assert_eq!(client.open_window.as_ref().unwrap().container_rows(), 3);
+        client.open_window.as_mut().unwrap().slot_count = 46;
+        assert_eq!(client.open_window.as_ref().unwrap().container_rows(), 2);
     }
 
     #[tokio::test]

@@ -14,7 +14,13 @@ const MAX_STACK: i16 = 64;
 pub enum ContainerKind {
     CraftingTable,
     Furnace,
-    Chest,
+    /// A generic server-driven container, drawn with `generic_54`: `rows` rows
+    /// of nine chest slots above the player's 36. Vanilla's `GuiChest` handles
+    /// one to six rows, and Hypixel's menus are all six-row chests that only
+    /// fill the first few rows.
+    Chest {
+        rows: u8,
+    },
 }
 
 /// Ticks a furnace needs per smelted item (10 s at 20 tps).

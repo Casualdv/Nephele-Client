@@ -21,7 +21,9 @@ use crate::ui::{self, Action, HudState, Screen};
 use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
 use nephele_client::mining::{Aim, Miner, MiningEvent};
 use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
-use nephele_client::{ContainerKind, Event, GameClient, LocalContainer, LocalFurnace, Vec3};
+use nephele_client::{
+    ContainerKind, Event, GameClient, LocalContainer, LocalFurnace, OpenWindowState, Vec3,
+};
 use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
@@ -275,10 +277,27 @@ fn open_local_chest(state: &mut Shared, pos: (i32, i32, i32)) {
     state.chests.entry(pos).or_insert_with(|| vec![None; 27]);
     state.window_slots = vec![None; 63];
     state.window_id = Some(1);
-    state.window_kind = Some(ContainerKind::Chest);
+    state.window_kind = Some(ContainerKind::Chest { rows: 3 });
     state.window_pos = Some(pos);
     state.window_open = true;
     sync_local_chest(state);
+}
+
+/// Map a server window's inventory type onto the panel the UI draws.
+///
+/// The row count comes from `OpenWindowState::container_rows`, which reads
+/// `S2D`'s own slot count rather than the type string: Hypixel sends
+/// `minecraft:chest` for every menu, from a one-row reward summary to the
+/// six-row Game Menu, so the string alone cannot size the panel.
+fn window_kind_for(open: &OpenWindowState) -> ContainerKind {
+    let name = open.kind.rsplit(':').next().unwrap_or(&open.kind);
+    match name {
+        "furnace" => ContainerKind::Furnace,
+        "crafting_table" => ContainerKind::CraftingTable,
+        _ => ContainerKind::Chest {
+            rows: open.container_rows(),
+        },
+    }
 }
 
 /// Where a furnace/chest window slot actually lives.
@@ -289,13 +308,24 @@ enum SlotStore {
 }
 
 fn simple_window_slot(index: usize, kind: ContainerKind) -> Option<SlotStore> {
-    Some(match (kind, index) {
-        (ContainerKind::Furnace, 0..=2) => SlotStore::Container(index),
-        (ContainerKind::Furnace, 3..=38) => SlotStore::Player(index - 3),
-        (ContainerKind::Chest, 0..=26) => SlotStore::Container(index),
-        (ContainerKind::Chest, 27..=62) => SlotStore::Player(index - 27),
-        _ => return None,
-    })
+    match kind {
+        ContainerKind::Furnace => match index {
+            0..=2 => Some(SlotStore::Container(index)),
+            3..=38 => Some(SlotStore::Player(index - 3)),
+            _ => None,
+        },
+        ContainerKind::Chest { rows } => {
+            let container = rows as usize * 9;
+            if index < container {
+                Some(SlotStore::Container(index))
+            } else if index < container + 36 {
+                Some(SlotStore::Player(index - container))
+            } else {
+                None
+            }
+        }
+        ContainerKind::CraftingTable => None,
+    }
 }
 
 /// One click inside a furnace or chest window.
@@ -309,15 +339,18 @@ fn click_local_simple_container(state: &mut Shared, index: usize, button: i8, sh
     let Some(store) = simple_window_slot(index, kind) else {
         return;
     };
-    let container_len = if kind == ContainerKind::Chest { 27 } else { 3 };
+    let container_len = match kind {
+        ContainerKind::Chest { rows } => rows as usize * 9,
+        _ => 3,
+    };
 
     // Read both sides out, so the click works the same on either.
     let mut container: Vec<Option<ItemStack>> = match kind {
-        ContainerKind::Chest => state
+        ContainerKind::Chest { .. } => state
             .chests
             .get(&pos)
             .cloned()
-            .unwrap_or_else(|| vec![None; 27]),
+            .unwrap_or_else(|| vec![None; container_len]),
         _ => {
             let furnace = state.furnaces.entry(pos).or_default();
             vec![furnace.input, furnace.fuel, furnace.output]
@@ -364,7 +397,7 @@ fn click_local_simple_container(state: &mut Shared, index: usize, button: i8, sh
     debug_assert_eq!(container.len(), container_len);
 
     match kind {
-        ContainerKind::Chest => {
+        ContainerKind::Chest { .. } => {
             state.chests.insert(pos, container);
         }
         _ => {
@@ -378,7 +411,7 @@ fn click_local_simple_container(state: &mut Shared, index: usize, button: i8, sh
     state.inventory = player;
 
     match kind {
-        ContainerKind::Chest => sync_local_chest(state),
+        ContainerKind::Chest { .. } => sync_local_chest(state),
         _ => sync_local_furnace(state),
     }
 }
@@ -1031,13 +1064,20 @@ async fn net_loop(
                     } else {
                         state.inventory.copy_from_slice(&client.inventory);
                     }
-                    state.window_id = client.open_window.as_ref().map(|open| open.id);
+                    let window = client.open_window.as_ref();
+                    state.window_id = window.map(|open| open.id);
                     state.window_open = state.window_id.is_some();
-                    state.window_slots = client
-                        .open_window
-                        .as_ref()
+                    state.window_slots = window
                         .map(|open| open.slots.clone())
                         .unwrap_or_default();
+                    // The panel layout comes from the server's announced slot
+                    // count, not the type string: Hypixel sends the same
+                    // `minecraft:chest` for a one-row summary and the six-row
+                    // Game Menu.
+                    state.window_kind = window.map(window_kind_for);
+                    if window.is_none() {
+                        state.window_pos = None;
+                    }
                 }
 
                 let mut batch = Vec::new();
@@ -2826,7 +2866,7 @@ impl LiveApp {
         if state.local {
             if matches!(
                 state.window_kind,
-                Some(ContainerKind::Furnace) | Some(ContainerKind::Chest)
+                Some(ContainerKind::Furnace) | Some(ContainerKind::Chest { .. })
             ) {
                 click_local_simple_container(&mut state, index, button, shift);
                 return;
@@ -3471,6 +3511,48 @@ fn hotbar_digit(code: KeyCode) -> Option<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(kind: &str, slot_count: u8) -> OpenWindowState {
+        OpenWindowState {
+            id: 1,
+            kind: kind.to_string(),
+            slot_count,
+            slots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn server_window_rows_come_from_the_announced_slot_count() {
+        // A chest window is `rows * 9 + 36`. Hypixel's six-row Game Menu
+        // announces 90, so the panel must not fall back to the three-row chest
+        // just because the type string is `minecraft:chest`.
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 90)),
+            ContainerKind::Chest { rows: 6 }
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 63)),
+            ContainerKind::Chest { rows: 3 }
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 45)),
+            ContainerKind::Chest { rows: 1 }
+        );
+        // The special panels keep their own layout.
+        assert_eq!(
+            window_kind_for(&window("minecraft:crafting_table", 46)),
+            ContainerKind::CraftingTable
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:furnace", 39)),
+            ContainerKind::Furnace
+        );
+        // A type we do not know still draws as a chest of the right height.
+        assert_eq!(
+            window_kind_for(&window("minecraft:dispenser", 63)),
+            ContainerKind::Chest { rows: 3 }
+        );
+    }
 
     fn local_state_for_test() -> Shared {
         Shared {
