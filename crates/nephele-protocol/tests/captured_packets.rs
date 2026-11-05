@@ -20,6 +20,21 @@ const UPDATE_HEALTH: &str = "41a000001440a00000";
 const HELD_ITEM_CHANGE: &str = "00";
 /// Play `0x3F` Plugin Message: channel `REGISTER`, payload `BungeeCord`.
 const PLUGIN_REGISTER: &str = "08524547495354455242756e676565436f7264";
+/// Play `0x3B` Scoreboard Objective: create `Prototype`, display `§e§lBED WARS`,
+/// type `integer` — straight out of a Hypixel lobby capture.
+const SCOREBOARD_OBJECTIVE: &str =
+    "0950726F746F74797065000EC2A765C2A76C424544205741525307696E7465676572";
+/// Play `0x3D` Display Scoreboard: sidebar (`1`) shows `Prototype`.
+const DISPLAY_SCOREBOARD: &str = "010950726F746F74797065";
+/// Play `0x3C` Update Score: entry `🍫`, action 0, objective `Prototype`, 14.
+const UPDATE_SCORE_TOP: &str = "04F09F8DAB000950726F746F747970650E";
+/// Play `0x3E` Teams: create `team_14`, display `§fteam_14`, white (15).
+const TEAM_CREATE: &str = "077465616D5F3134000AC2A7667465616D5F313400000306616C776179730F00";
+/// Play `0x3E` Teams: re-format `team_14` with prefix `§711/03/26  §8L2`
+/// and suffix `§85F`.
+const TEAM_UPDATE: &str = "077465616D5F3134020AC2A7667465616D5F313412C2A73731312F30332F32362020C2A7384C3205C2A73835460306616C776179730F";
+/// Play `0x3E` Teams: add `🍫` to `team_14`.
+const TEAM_ADD_MEMBER: &str = "077465616D5F3134030104F09F8DAB";
 fn spacer() -> Packet {
     let mut w = nephele_protocol::PacketWriter::new();
     w.write_string(&format!(r#"{{"text":"{}"}}"#, " ".repeat(256)))
@@ -157,4 +172,128 @@ async fn a_synthetic_chat_frame_does_not_desync_the_next_frame() {
     );
 
     writer.await.unwrap();
+}
+
+#[test]
+fn captured_scoreboard_objective_parses() {
+    let update = play::parse_scoreboard_objective(&packet(
+        play::clientbound::SCOREBOARD_OBJECTIVE,
+        SCOREBOARD_OBJECTIVE,
+    ))
+    .expect("captured objective");
+
+    assert_eq!(
+        update,
+        play::ObjectiveUpdate::Create {
+            name: "Prototype".into(),
+            display_name: "§e§lBED WARS".into(),
+            render_type: "integer".into(),
+        }
+    );
+}
+
+#[test]
+fn captured_display_scoreboard_parses() {
+    let display = play::parse_display_scoreboard(&packet(
+        play::clientbound::DISPLAY_SCOREBOARD,
+        DISPLAY_SCOREBOARD,
+    ))
+    .expect("captured display slot");
+
+    assert_eq!(display.position, play::scoreboard_slot::SIDEBAR);
+    assert_eq!(display.objective, "Prototype");
+}
+
+#[test]
+fn captured_update_score_parses_a_utf8_entry() {
+    let update =
+        play::parse_update_score(&packet(play::clientbound::UPDATE_SCORE, UPDATE_SCORE_TOP))
+            .expect("captured score");
+
+    assert_eq!(update.entry, "🍫");
+    assert_eq!(update.objective, "Prototype");
+    assert_eq!(update.value, Some(14));
+}
+
+#[test]
+fn captured_team_create_parses_exactly() {
+    let update =
+        play::parse_teams(&packet(play::clientbound::TEAMS, TEAM_CREATE)).expect("captured team");
+
+    assert_eq!(
+        update,
+        play::TeamUpdate::Create {
+            name: "team_14".into(),
+            info: play::TeamInfo {
+                display_name: "§fteam_14".into(),
+                prefix: String::new(),
+                suffix: String::new(),
+                friendly_flags: 3,
+                name_tag_visibility: "always".into(),
+                color: 15,
+            },
+            players: Vec::new(),
+        }
+    );
+}
+
+#[test]
+fn captured_team_update_and_membership_parse() {
+    let update =
+        play::parse_teams(&packet(play::clientbound::TEAMS, TEAM_UPDATE)).expect("team update");
+    let play::TeamUpdate::Update { name, info } = update else {
+        panic!("expected a team update, got {update:?}");
+    };
+    assert_eq!(name, "team_14");
+    assert_eq!(info.prefix, "§711/03/26  §8L2");
+    assert_eq!(info.suffix, "§85F");
+    assert_eq!(info.color, 15);
+
+    let added = play::parse_teams(&packet(play::clientbound::TEAMS, TEAM_ADD_MEMBER))
+        .expect("team membership");
+    assert_eq!(
+        added,
+        play::TeamUpdate::AddPlayers {
+            name: "team_14".into(),
+            players: vec!["🍫".into()],
+        }
+    );
+}
+
+#[test]
+fn attack_uses_the_vanilla_action_ordinal() {
+    let packet = play::attack_entity(300);
+    assert_eq!(packet.id, play::serverbound::USE_ENTITY);
+    // VarInt 300 = 0xAC 0x02, then ATTACK = 1, and nothing else: an attack has
+    // no trailing vector.
+    assert_eq!(packet.data, vec![0xAC, 0x02, 0x01]);
+    assert_eq!(
+        play::parse_use_entity(&packet).expect("parse attack"),
+        (300, play::use_entity::ATTACK, None)
+    );
+}
+
+#[test]
+fn interact_at_carries_the_relative_hit_vector() {
+    let packet = play::interact_entity_at(42, [0.25, 1.5, -0.75]);
+    assert_eq!(packet.id, play::serverbound::USE_ENTITY);
+    assert_eq!(packet.data.len(), 14, "id + action + three f32s");
+    assert_eq!(packet.data[1], play::use_entity::INTERACT_AT as u8);
+
+    let (id, action, target) = play::parse_use_entity(&packet).expect("parse interact-at");
+    assert_eq!((id, action), (42, play::use_entity::INTERACT_AT));
+    assert_eq!(target, Some([0.25, 1.5, -0.75]));
+    // A well-formed packet leaves no payload bytes unread.
+    assert_eq!(packet.consumed(), packet.data.len());
+}
+
+#[test]
+fn interact_without_a_target_has_no_vector() {
+    let packet = play::interact_entity(7);
+    assert_eq!(packet.id, play::serverbound::USE_ENTITY);
+    assert_eq!(packet.data, vec![7, play::use_entity::INTERACT as u8]);
+    assert_eq!(
+        play::parse_use_entity(&packet).expect("parse interact"),
+        (7, play::use_entity::INTERACT, None)
+    );
 }

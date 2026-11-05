@@ -10,6 +10,7 @@ pub mod maps;
 pub mod mining;
 pub mod physics;
 pub mod scene;
+pub mod scoreboard;
 pub mod skins;
 
 use std::collections::HashMap;
@@ -28,6 +29,7 @@ pub use entities::{Entities, Entity, EntityKind};
 pub use maps::{MapState, Maps};
 pub use mining::{Aim, Miner, MiningEvent};
 pub use scene::{EntityRender, EntityRenderKind, SceneView};
+pub use scoreboard::{Objective, Scoreboard, SidebarRow, Team};
 pub use skins::{SkinInfo, Skins};
 
 /// A container window the server opened (e.g. a crafting table).
@@ -169,6 +171,9 @@ pub enum Event {
     EntitiesRemoved(usize),
     /// The tab list (and therefore skins) changed.
     PlayerList,
+    /// A scoreboard objective, score, display slot or team changed. The new
+    /// state is readable from `GameClient::scoreboard`.
+    Scoreboard,
     /// A block entity update (`S35`) was parsed and retained.
     BlockEntityUpdated {
         x: i32,
@@ -308,6 +313,8 @@ pub struct GameClient {
     pub skins: Skins,
     /// Current protocol-47 tab-list rows, keyed by player UUID.
     pub player_list: HashMap<[u8; 16], TabListEntry>,
+    /// Objectives, scores, display slots and teams (`S3B`-`S3E`).
+    pub scoreboard: Scoreboard,
     /// Most recent update-tile-entity NBT, keyed by block position.
     pub block_entities: HashMap<(i32, i32, i32), play::BlockEntityUpdate>,
     /// Every map the server has sent picture data for, keyed by map id.
@@ -483,6 +490,7 @@ impl GameClient {
             entities: Entities::new(),
             skins: Skins::new(),
             player_list: HashMap::new(),
+            scoreboard: Scoreboard::new(),
             block_entities: HashMap::new(),
             maps: Maps::new(),
             entity_metadata: HashMap::new(),
@@ -598,6 +606,10 @@ impl GameClient {
                 // auto-answer lives in the connection so every caller (this
                 // client, the replay tooling) stays responsive. Writing a
                 // second response here would send the frame twice.
+                //
+                // Read the id anyway so the payload-consumption check sees the
+                // whole one-byte body consumed.
+                let _ = play::parse_keep_alive(packet)?;
                 Ok(Event::Packet(packet.id))
             }
             play::clientbound::RESOURCE_PACK_SEND => {
@@ -742,6 +754,9 @@ impl GameClient {
                 // coordinates: a Nether map must not reuse an overworld one.
                 self.maps.clear();
                 self.entity_metadata.clear();
+                // Vanilla builds a fresh `Scoreboard` for the new world; the
+                // server re-sends what it wants shown.
+                self.scoreboard.clear();
                 self.info.dimension = dimension;
                 self.info.gamemode = respawn.gamemode;
                 self.info.level_type = respawn.level_type;
@@ -1050,6 +1065,25 @@ impl GameClient {
                 self.apply_player_list_update(update);
                 Ok(Event::PlayerList)
             }
+            play::clientbound::SCOREBOARD_OBJECTIVE => {
+                self.scoreboard
+                    .apply_objective(play::parse_scoreboard_objective(packet)?);
+                Ok(Event::Scoreboard)
+            }
+            play::clientbound::UPDATE_SCORE => {
+                self.scoreboard
+                    .apply_score(play::parse_update_score(packet)?);
+                Ok(Event::Scoreboard)
+            }
+            play::clientbound::DISPLAY_SCOREBOARD => {
+                self.scoreboard
+                    .apply_display(play::parse_display_scoreboard(packet)?);
+                Ok(Event::Scoreboard)
+            }
+            play::clientbound::TEAMS => {
+                self.scoreboard.apply_team(play::parse_teams(packet)?);
+                Ok(Event::Scoreboard)
+            }
             play::clientbound::BLOCK_ENTITY_DATA => {
                 let update = play::parse_block_entity_update(packet)?;
                 let position = (update.x, update.y, update.z);
@@ -1300,11 +1334,42 @@ impl GameClient {
 
     /// Right-click without placing: `C08` with an empty held slot. Servers use
     /// this to open crafting tables, furnaces and chests.
+    /// Right-click `aim`: use the block (or empty hand) rather than place.
     pub async fn use_block(&mut self, aim: &Aim) -> Result<()> {
         let packet = play::block_placement(aim.x, aim.y, aim.z, aim.face, aim.cursor, None);
         self.connection.write_packet(&packet).await?;
         self.connection.write_packet(&play::swing_arm()).await?;
         Ok(())
+    }
+
+    /// Send `C02 Use Entity`.
+    ///
+    /// `action` is one of `play::use_entity::{INTERACT, ATTACK, INTERACT_AT}`;
+    /// `target` is required only for `INTERACT_AT`, where it is the click
+    /// position relative to the entity's own origin, exactly as vanilla sends
+    /// a right click on an entity.
+    pub async fn use_entity(
+        &mut self,
+        entity_id: i32,
+        action: i32,
+        target: Option<[f32; 3]>,
+    ) -> Result<()> {
+        let packet = play::use_entity(entity_id, action, target);
+        self.connection.write_packet(&packet).await
+    }
+
+    /// Left click an entity (`C02` action `ATTACK`), then swing.
+    pub async fn attack_entity(&mut self, entity_id: i32) -> Result<()> {
+        self.use_entity(entity_id, play::use_entity::ATTACK, None)
+            .await?;
+        self.connection.write_packet(&play::swing_arm()).await
+    }
+
+    /// Right click an entity (`C02` action `INTERACT_AT`).
+    pub async fn interact_entity_at(&mut self, entity_id: i32, target: [f32; 3]) -> Result<()> {
+        self.use_entity(entity_id, play::use_entity::INTERACT_AT, Some(target))
+            .await?;
+        self.connection.write_packet(&play::swing_arm()).await
     }
 
     /// Put `item` into a player-container slot (creative only). `slot` uses
@@ -1524,6 +1589,7 @@ mod tests {
             entities: Entities::new(),
             skins: Skins::new(),
             player_list: HashMap::new(),
+            scoreboard: Scoreboard::new(),
             block_entities: HashMap::new(),
             maps: Maps::new(),
             entity_metadata: HashMap::new(),
@@ -1691,6 +1757,100 @@ mod tests {
             }
         );
         assert_eq!(client.block_entities[&(-1, 70, 16)].action, 6);
+    }
+
+    #[tokio::test]
+    async fn scoreboard_packets_update_client_state() {
+        let (mut client, _peer) = test_game_client().await;
+
+        let mut objective = nephele_protocol::PacketWriter::new();
+        objective
+            .write_string("board")
+            .write_u8(0)
+            .write_string("§e§lTEST")
+            .write_string("integer");
+        assert_eq!(
+            client
+                .handle(Packet::new(
+                    play::clientbound::SCOREBOARD_OBJECTIVE,
+                    objective.into_bytes(),
+                ))
+                .await
+                .unwrap(),
+            Event::Scoreboard
+        );
+
+        let mut display = nephele_protocol::PacketWriter::new();
+        display
+            .write_u8(play::scoreboard_slot::SIDEBAR)
+            .write_string("board");
+        client
+            .handle(Packet::new(
+                play::clientbound::DISPLAY_SCOREBOARD,
+                display.into_bytes(),
+            ))
+            .await
+            .unwrap();
+
+        let mut team = nephele_protocol::PacketWriter::new();
+        team.write_string("red")
+            .write_u8(0)
+            .write_string("Red")
+            .write_string("§c[RED] ")
+            .write_string("")
+            .write_u8(3)
+            .write_string("always")
+            .write_i8(12)
+            .write_varint(1)
+            .write_string("Steve");
+        client
+            .handle(Packet::new(play::clientbound::TEAMS, team.into_bytes()))
+            .await
+            .unwrap();
+
+        let mut score = nephele_protocol::PacketWriter::new();
+        score
+            .write_string("Steve")
+            .write_varint(0)
+            .write_string("board")
+            .write_varint(5);
+        client
+            .handle(Packet::new(
+                play::clientbound::UPDATE_SCORE,
+                score.into_bytes(),
+            ))
+            .await
+            .unwrap();
+
+        let rows = client.scoreboard.sidebar_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text(), "§c[RED] Steve");
+        assert_eq!(rows[0].color, Some(12));
+        assert_eq!(client.scoreboard.prefix_for("Steve"), Some("§c[RED] "));
+    }
+
+    #[tokio::test]
+    async fn right_clicking_an_entity_sends_a_well_formed_use_entity() {
+        let (mut client, stream) = test_game_client_with_raw_peer().await;
+        let mut peer = Connection::from_stream(stream, nephele_protocol::State::Play);
+
+        client
+            .interact_entity_at(42, [0.25, 1.5, -0.75])
+            .await
+            .unwrap();
+
+        let packet = peer.read_packet().await.unwrap();
+        assert_eq!(packet.id, play::serverbound::USE_ENTITY);
+        let (id, action, target) = play::parse_use_entity(&packet).unwrap();
+        assert_eq!((id, action), (42, play::use_entity::INTERACT_AT));
+        assert_eq!(target, Some([0.25, 1.5, -0.75]));
+        assert_eq!(packet.consumed(), packet.data.len());
+
+        // The swing follows, as it does in vanilla's right-click handler.
+        assert_eq!(
+            peer.read_packet().await.unwrap().id,
+            play::serverbound::ANIMATION
+        );
     }
 
     #[tokio::test]

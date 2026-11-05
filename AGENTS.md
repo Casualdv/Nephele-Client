@@ -97,6 +97,7 @@ cargo run -p nephele-launcher                    # the launcher UI
 # development shortcuts (never the only way to reach a screen):
 $env:NEPHELE_SCREEN="servers"   # title|servers|connect|settings|creative|pause|local
 $env:NEPHELE_DATA_DIR="..."     # override the user data directory
+$env:NEPHELE_SCOREBOARD="1"     # print the resolved sidebar once a second
 ```
 
 CI runs fmt, clippy with `-D warnings`, tests, and the publish gate. **A commit that
@@ -343,6 +344,42 @@ nothing writes there any more.
 - Order matters: **Mojang join call happens before** the encryption response is sent.
 - `Connection::send_encryption_response` + `read_login_outcome`;
   `GameClient::join_online` runs the HTTP join on `spawn_blocking`.
+
+### Scoreboard and teams (`S3B`, `S3C`, `S3D`, `S3E`)
+
+`GameClient::scoreboard` is a port of vanilla's `Scoreboard`/`ScorePlayerTeam`:
+objectives, scores keyed `(objective, entry)`, the display-slot map (including slots
+3..=18), teams with prefix/suffix/colour/membership, and a resolver. Nothing renders
+it yet; `Event::Scoreboard` just says the state moved.
+
+- `sidebar_rows()` returns rows in **draw order** (highest score first, ties by name
+  ascending) after dropping `#`-prefixed entries and keeping the top 15 — the two
+  things vanilla's `GuiIngame.renderScoreboard` does that a naive sort misses.
+- Each row carries its team's `prefix`/`suffix`/`colour`; `text()` is
+  `formatPlayerName` (prefix + entry + suffix).
+- `team_for(entry)` tries an exact match and then a match with `§` codes stripped,
+  because servers (Hypixel included) put formatted names in team member lists while
+  callers ask about the plain name. `prefix_for`/`format_entry` sit on top.
+- Score removal with an empty objective name clears that entry from every objective.
+- Respawn clears the whole scoreboard, matching vanilla's fresh `Scoreboard` per world.
+- Captured fixture: `crates/nephele-client/tests/fixtures/hypixel_play_frames.bin`
+  (653 frames) is replayed by `tests/scoreboard_capture.rs`; it asserts the real
+  Hypixel lobby sidebar's 14 emoji rows, their order, scores and team colours.
+
+### `C02 Use Entity`
+
+`play::use_entity::{INTERACT, ATTACK, INTERACT_AT}` are **0, 1, 2** — vanilla's
+enum order, not "attack first". Builders: `attack_entity`, `interact_entity`,
+`interact_entity_at(id, target)`; `parse_use_entity` for the local server/tests.
+`GameClient::{use_entity, attack_entity, interact_entity_at}` send the packet and,
+for the two click helpers, the `C0A` swing that follows it.
+
+The multiplayer loop picks entities with `Entities::raycast` (view ray vs the same
+boxes vanilla uses: 0.6x1.8 players/mobs, small cube for items, one block for item
+frames). When an entity is nearer than the block hit it wins the pick: right click
+sends `INTERACT_AT` with the click point **relative to the entity's origin**, left
+click sends `ATTACK` (throttled to `ENTITY_ATTACK_INTERVAL` while held), and the
+block behind it is not mined.
 
 ---
 

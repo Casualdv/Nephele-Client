@@ -49,6 +49,8 @@ const PLAYER_STATE_SAVE_INTERVAL: Duration = Duration::from_secs(1);
 /// Vanilla's `PlayerControllerMP.getBlockReachDistance`.
 const REACH_CREATIVE: f64 = 5.0;
 const REACH_SURVIVAL: f64 = 4.5;
+/// Minimum gap between entity attacks while the left button is held.
+const ENTITY_ATTACK_INTERVAL: Duration = Duration::from_millis(250);
 /// Selection outline colour, matching vanilla's black wireframe.
 const OUTLINE_COLOR: [f32; 3] = [0.0, 0.0, 0.0];
 /// How long a status ping may take before the row is shown as offline.
@@ -848,6 +850,11 @@ async fn net_loop(
     }
 
     let mut miner = Miner::default();
+    let mut attack_cooldown = Instant::now();
+    // `NEPHELE_SCOREBOARD=1` dumps the resolved sidebar once a second, so a
+    // live lobby can be checked without a renderer.
+    let dump_scoreboard = std::env::var("NEPHELE_SCOREBOARD").is_ok();
+    let mut last_scoreboard_dump = Instant::now() - Duration::from_secs(1);
     let mut world_dirty = false;
     let mut sent_view_distance = shared.lock().unwrap().view_distance;
 
@@ -861,9 +868,27 @@ async fn net_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 let (position, yaw, pitch, on_ground) = step_player(&shared, &client.world);
+                if dump_scoreboard && last_scoreboard_dump.elapsed() >= Duration::from_secs(1) {
+                    last_scoreboard_dump = Instant::now();
+                    match client.scoreboard.sidebar() {
+                        Some(objective) => eprintln!(
+                            "[scoreboard] sidebar {:?} ({:?})",
+                            objective.display_name, objective.name
+                        ),
+                        None => eprintln!("[scoreboard] no sidebar objective"),
+                    }
+                    for row in client.scoreboard.sidebar_rows() {
+                        eprintln!(
+                            "[scoreboard] {:>3} {} team={:?} colour={:?}",
+                            row.score,
+                            row.text(),
+                            row.team,
+                            row.color
+                        );
+                    }
+                }
                 let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode, clicks) = {
-                    let mut state = shared.lock().unwrap();
-                    (
+                    let mut state = shared.lock().unwrap();                    (
                         state.attacking,
                         std::mem::take(&mut state.use_pressed),
                         state.pending_slot.take(),
@@ -938,7 +963,8 @@ async fn net_loop(
                 let eye = [position.x, position.y + EYE_HEIGHT, position.z];
                 let direction = look_direction(yaw, pitch);
                 let reach = if creative { REACH_CREATIVE } else { REACH_SURVIVAL };
-                let aim = raycast(&client.world, eye, direction, reach).map(|hit| Aim {
+                let block_hit = raycast(&client.world, eye, direction, reach);
+                let aim = block_hit.map(|hit| Aim {
                     x: hit.x,
                     y: hit.y,
                     z: hit.z,
@@ -949,8 +975,19 @@ async fn net_loop(
                         (hit.point[2] - hit.z as f64).clamp(0.0, 1.0) as f32,
                     ],
                 });
+                // A player in front of the crosshair wins over the block behind
+                // them, exactly as vanilla's object pick does.
+                let entity_hit = client.entities.raycast(eye, direction, reach);
+                let entity_in_front = match (&block_hit, &entity_hit) {
+                    (Some(block), Some(entity)) => block.distance > entity.distance,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                let entity_hit = entity_hit.filter(|_| entity_in_front);
 
-                for event in miner.tick(&client.world, aim, attacking, creative) {
+                // Aiming at an entity must not also mine the block behind it.
+                let mining_aim = if entity_in_front { None } else { aim };
+                for event in miner.tick(&client.world, mining_aim, attacking, creative) {
                     match event {
                         MiningEvent::Start(target) => {
                             client.dig(digging::START_DESTROY_BLOCK, &target).await
@@ -968,8 +1005,41 @@ async fn net_loop(
                     }
                 }
 
+                if attacking {
+                    if let Some(hit) = entity_hit {
+                        // Vanilla auto-attacks while the button is held, but
+                        // not twenty times a second.
+                        if attack_cooldown.elapsed() >= ENTITY_ATTACK_INTERVAL {
+                            attack_cooldown = Instant::now();
+                            client
+                                .attack_entity(hit.id)
+                                .await
+                                .map_err(|err| err.to_string())?;
+                        }
+                    }
+                } else {
+                    attack_cooldown = Instant::now();
+                }
+
                 if use_pressed {
-                    if let Some(target) = aim {
+                    if let Some(hit) = entity_hit {
+                        // Right click on an entity is `INTERACT_AT`, with the
+                        // click point relative to the entity's own origin.
+                        let origin = client
+                            .entities
+                            .get(hit.id)
+                            .map(|entity| entity.position)
+                            .unwrap_or_default();
+                        let target = [
+                            (hit.point[0] - origin[0]) as f32,
+                            (hit.point[1] - origin[1]) as f32,
+                            (hit.point[2] - origin[2]) as f32,
+                        ];
+                        client
+                            .interact_entity_at(hit.id, target)
+                            .await
+                            .map_err(|err| err.to_string())?;
+                    } else if let Some(target) = aim {
                         if !placement_hits_player(&target, [position.x, position.y, position.z]) {
                             let placeable = client
                                 .held_item()

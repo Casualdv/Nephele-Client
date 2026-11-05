@@ -45,6 +45,14 @@ pub mod clientbound {
     pub const BLOCK_ENTITY_DATA: i32 = 0x35;
     pub const PLAYER_LIST_ITEM: i32 = 0x38;
     pub const PLAYER_ABILITIES: i32 = 0x39;
+    /// `S3B`: scoreboard objective create/remove/display-name update.
+    pub const SCOREBOARD_OBJECTIVE: i32 = 0x3B;
+    /// `S3C`: one scoreboard score changed or was removed.
+    pub const UPDATE_SCORE: i32 = 0x3C;
+    /// `S3D`: which objective each display slot shows.
+    pub const DISPLAY_SCOREBOARD: i32 = 0x3D;
+    /// `S3E`: scoreboard teams, their formatting and their membership.
+    pub const TEAMS: i32 = 0x3E;
     pub const PLUGIN_MESSAGE: i32 = 0x3F;
     pub const DISCONNECT: i32 = 0x40;
     pub const SERVER_DIFFICULTY: i32 = 0x41;
@@ -56,6 +64,8 @@ pub mod clientbound {
 pub mod serverbound {
     pub const KEEP_ALIVE: i32 = 0x00;
     pub const CHAT_MESSAGE: i32 = 0x01;
+    /// `C02`: attack or interact with an entity.
+    pub const USE_ENTITY: i32 = 0x02;
     pub const PLAYER: i32 = 0x03;
     pub const PLAYER_POSITION: i32 = 0x04;
     pub const PLAYER_LOOK: i32 = 0x05;
@@ -1626,6 +1636,249 @@ pub fn parse_player_list_item(packet: &Packet) -> Result<PlayerListUpdate> {
         }
         _ => Ok(PlayerListUpdate::Other),
     }
+}
+
+/// Scoreboard display slots, matching vanilla's `S3D` position byte.
+pub mod scoreboard_slot {
+    /// The tab list's objective column.
+    pub const LIST: u8 = 0;
+    /// The right-hand sidebar.
+    pub const SIDEBAR: u8 = 1;
+    /// Under a player's name tag.
+    pub const BELOW_NAME: u8 = 2;
+}
+
+/// `S3B`: an objective was created, removed or had its display name updated.
+///
+/// Mode 2 carries the render type on the wire as well as the display name, so
+/// both are kept rather than assuming the type never changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectiveUpdate {
+    Create {
+        name: String,
+        display_name: String,
+        render_type: String,
+    },
+    Remove {
+        name: String,
+    },
+    UpdateDisplayName {
+        name: String,
+        display_name: String,
+        render_type: String,
+    },
+}
+
+pub fn parse_scoreboard_objective(packet: &Packet) -> Result<ObjectiveUpdate> {
+    let mut r = packet.reader();
+    let name = r.read_string()?;
+    let mode = r.read_u8()?;
+    match mode {
+        0 | 2 => {
+            let display_name = r.read_string()?;
+            let render_type = r.read_string()?;
+            if mode == 0 {
+                Ok(ObjectiveUpdate::Create {
+                    name,
+                    display_name,
+                    render_type,
+                })
+            } else {
+                Ok(ObjectiveUpdate::UpdateDisplayName {
+                    name,
+                    display_name,
+                    render_type,
+                })
+            }
+        }
+        1 => Ok(ObjectiveUpdate::Remove { name }),
+        other => Err(Error::Protocol(format!(
+            "unknown scoreboard objective mode {other}"
+        ))),
+    }
+}
+
+/// `S3C`: one scoreboard score was set or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreUpdate {
+    /// The score holder: a player name, or any string a server picks.
+    pub entry: String,
+    /// Empty means "every objective" when removing, matching vanilla.
+    pub objective: String,
+    /// `None` when the entry is removed from the objective.
+    pub value: Option<i32>,
+}
+
+pub fn parse_update_score(packet: &Packet) -> Result<ScoreUpdate> {
+    let mut r = packet.reader();
+    let entry = r.read_string()?;
+    let action = r.read_varint()?;
+    let objective = r.read_string()?;
+    match action {
+        0 => Ok(ScoreUpdate {
+            entry,
+            objective,
+            value: Some(r.read_varint()?),
+        }),
+        1 => Ok(ScoreUpdate {
+            entry,
+            objective,
+            value: None,
+        }),
+        other => Err(Error::Protocol(format!(
+            "unknown update-score action {other}"
+        ))),
+    }
+}
+
+/// `S3D`: the objective shown in one display slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayScoreboard {
+    /// `scoreboard_slot` value; vanilla also uses 3..=18 for team-coloured
+    /// sidebar slots, which are stored but not rendered here.
+    pub position: u8,
+    /// Empty clears the slot.
+    pub objective: String,
+}
+
+pub fn parse_display_scoreboard(packet: &Packet) -> Result<DisplayScoreboard> {
+    let mut r = packet.reader();
+    Ok(DisplayScoreboard {
+        position: r.read_u8()?,
+        objective: r.read_string()?,
+    })
+}
+
+/// The formatting fields every team mode 0/2 packet carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamInfo {
+    pub display_name: String,
+    pub prefix: String,
+    pub suffix: String,
+    /// Bit 0 = friendly fire allowed, bit 1 = see friendly invisibles.
+    pub friendly_flags: u8,
+    /// `always`, `hideForOtherTeams` or `hideForOwnTeam`.
+    pub name_tag_visibility: String,
+    /// Vanilla `EnumChatFormatting` id, 0..=15, or -1 for "no colour".
+    pub color: i8,
+}
+
+/// `S3E`: a team was created, removed, re-formatted or had members changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamUpdate {
+    Create {
+        name: String,
+        info: TeamInfo,
+        players: Vec<String>,
+    },
+    Remove {
+        name: String,
+    },
+    Update {
+        name: String,
+        info: TeamInfo,
+    },
+    AddPlayers {
+        name: String,
+        players: Vec<String>,
+    },
+    RemovePlayers {
+        name: String,
+        players: Vec<String>,
+    },
+}
+
+pub fn parse_teams(packet: &Packet) -> Result<TeamUpdate> {
+    let mut r = packet.reader();
+    let name = r.read_string()?;
+    let mode = r.read_u8()?;
+    let info = if mode == 0 || mode == 2 {
+        Some(TeamInfo {
+            display_name: r.read_string()?,
+            prefix: r.read_string()?,
+            suffix: r.read_string()?,
+            friendly_flags: r.read_u8()?,
+            name_tag_visibility: r.read_string()?,
+            color: r.read_i8()?,
+        })
+    } else {
+        None
+    };
+    let players = if mode == 0 || mode == 3 || mode == 4 {
+        let count = r.read_varint()?.max(0);
+        let mut players = Vec::with_capacity(count.min(64) as usize);
+        for _ in 0..count {
+            players.push(r.read_string()?);
+        }
+        Some(players)
+    } else {
+        None
+    };
+    match (mode, info, players) {
+        (0, Some(info), Some(players)) => Ok(TeamUpdate::Create {
+            name,
+            info,
+            players,
+        }),
+        (1, _, _) => Ok(TeamUpdate::Remove { name }),
+        (2, Some(info), _) => Ok(TeamUpdate::Update { name, info }),
+        (3, _, Some(players)) => Ok(TeamUpdate::AddPlayers { name, players }),
+        (4, _, Some(players)) => Ok(TeamUpdate::RemovePlayers { name, players }),
+        (other, _, _) => Err(Error::Protocol(format!("unknown teams mode {other}"))),
+    }
+}
+
+/// `C02 Use Entity` action ids, in vanilla's enum order.
+///
+/// Interact is 0, attack is 1, interact-at is 2. The order matters: a packet
+/// built from an "attack first" assumption makes a server treat a left click as
+/// a right click and vice versa.
+pub mod use_entity {
+    pub const INTERACT: i32 = 0;
+    pub const ATTACK: i32 = 1;
+    pub const INTERACT_AT: i32 = 2;
+}
+
+/// Build a `C02 Use Entity` packet.
+///
+/// The trailing vector exists only for `INTERACT_AT`, where vanilla sends the
+/// click position relative to the entity's own origin.
+pub fn use_entity(entity_id: i32, action: i32, target: Option<[f32; 3]>) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_varint(entity_id).write_varint(action);
+    if action == use_entity::INTERACT_AT {
+        let [x, y, z] = target.unwrap_or([0.0, 0.0, 0.0]);
+        w.write_f32(x).write_f32(y).write_f32(z);
+    }
+    Packet::new(serverbound::USE_ENTITY, w.into_bytes())
+}
+
+/// Left click on an entity.
+pub fn attack_entity(entity_id: i32) -> Packet {
+    use_entity(entity_id, use_entity::ATTACK, None)
+}
+
+/// Right click on an entity with nothing in hand.
+pub fn interact_entity(entity_id: i32) -> Packet {
+    use_entity(entity_id, use_entity::INTERACT, None)
+}
+
+/// Right click on an entity; `target` is relative to the entity's position.
+pub fn interact_entity_at(entity_id: i32, target: [f32; 3]) -> Packet {
+    use_entity(entity_id, use_entity::INTERACT_AT, Some(target))
+}
+
+/// Read a `C02` back, for tests and for a local server implementation.
+pub fn parse_use_entity(packet: &Packet) -> Result<(i32, i32, Option<[f32; 3]>)> {
+    let mut r = packet.reader();
+    let entity_id = r.read_varint()?;
+    let action = r.read_varint()?;
+    let target = if action == use_entity::INTERACT_AT {
+        Some([r.read_f32()?, r.read_f32()?, r.read_f32()?])
+    } else {
+        None
+    };
+    Ok((entity_id, action, target))
 }
 
 #[cfg(test)]
