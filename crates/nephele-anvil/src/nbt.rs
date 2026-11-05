@@ -4,7 +4,7 @@
 //! and, except inside lists and arrays, its name. Only reading is implemented;
 //! that is all a world save or a parity check needs.
 
-use std::collections::HashMap;
+use indexmap::IndexMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tag {
@@ -18,13 +18,16 @@ pub enum Tag {
     ByteArray(Vec<u8>),
     String(String),
     List(Vec<Tag>),
-    Compound(HashMap<String, Tag>),
+    /// An empty NBT list still records its element tag id. Keep that id so an
+    /// unknown empty list survives an edit/save round-trip byte-for-byte.
+    EmptyList(u8),
+    Compound(IndexMap<String, Tag>),
     IntArray(Vec<i32>),
     LongArray(Vec<i64>),
 }
 
 impl Tag {
-    pub fn as_compound(&self) -> Option<&HashMap<String, Tag>> {
+    pub fn as_compound(&self) -> Option<&IndexMap<String, Tag>> {
         match self {
             Tag::Compound(map) => Some(map),
             _ => None,
@@ -34,6 +37,7 @@ impl Tag {
     pub fn as_list(&self) -> Option<&[Tag]> {
         match self {
             Tag::List(items) => Some(items),
+            Tag::EmptyList(_) => Some(&[]),
             _ => None,
         }
     }
@@ -159,6 +163,10 @@ impl<'a> Reader<'a> {
                 }
                 let element = self.u8()?;
                 let length = self.i32()?.max(0) as usize;
+                if length == 0 {
+                    self.depth -= 1;
+                    return Ok(Tag::EmptyList(element));
+                }
                 let mut items = Vec::with_capacity(length.min(4096));
                 for _ in 0..length {
                     items.push(self.payload(element)?);
@@ -171,7 +179,7 @@ impl<'a> Reader<'a> {
                 if self.depth > MAX_DEPTH {
                     return Err(NbtError::TooDeep(MAX_DEPTH));
                 }
-                let mut map = HashMap::new();
+                let mut map = IndexMap::new();
                 loop {
                     let kind = self.u8()?;
                     if kind == 0 {
@@ -246,6 +254,7 @@ fn tag_id(tag: &Tag) -> u8 {
         Tag::ByteArray(_) => 7,
         Tag::String(_) => 8,
         Tag::List(_) => 9,
+        Tag::EmptyList(_) => 9,
         Tag::Compound(_) => 10,
         Tag::IntArray(_) => 11,
         Tag::LongArray(_) => 12,
@@ -297,6 +306,10 @@ fn write_payload(out: &mut Vec<u8>, tag: &Tag, depth: usize) -> Result<(), NbtEr
             for value in values {
                 write_payload(out, value, depth + 1)?;
             }
+        }
+        Tag::EmptyList(element_id) => {
+            out.push(*element_id);
+            write_length(out, 0)?;
         }
         Tag::Compound(values) => {
             for (name, value) in values {
@@ -376,7 +389,7 @@ mod tests {
 
     #[test]
     fn named_nbt_values_encode_and_parse_without_loss() {
-        let mut nested = HashMap::new();
+        let mut nested = IndexMap::new();
         nested.insert("byte".to_string(), Tag::Byte(-3));
         nested.insert("short".to_string(), Tag::Short(1234));
         nested.insert("long".to_string(), Tag::Long(9_876_543_210));
@@ -397,6 +410,15 @@ mod tests {
 
         assert_eq!(name, "root");
         assert_eq!(decoded, root);
+    }
+
+    #[test]
+    fn empty_list_element_type_is_preserved() {
+        let mut root = IndexMap::new();
+        root.insert("empty".into(), Tag::EmptyList(10));
+        let original = encode("", &Tag::Compound(root)).unwrap();
+        let (_, decoded) = parse(&original).unwrap();
+        assert_eq!(encode("", &decoded).unwrap(), original);
     }
 
     #[test]

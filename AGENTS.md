@@ -640,6 +640,25 @@ needs an interactive hand check. **Still missing:** eating, armour equip and
 damage reduction, hunger effects, XP orbs, furnace/chest block entities, and
 item icons for unmapped item ids.
 
+**M5 singleplayer saves (2026-11-04).** World storage is vanilla-shaped now:
+`nephele.dat` remains as a compatibility mirror, but `level.dat` is the source
+of truth and carries `Data.Player` (position, rotation, health, hunger, XP,
+hotbar slot, bed spawn, inventory) plus `Time`/`DayTime`/rain/thunder and the
+world spawn. `level.dat` is written through a temp file and a rename, with the
+previous complete file kept as `level.dat.bak`; a corrupt primary falls back to
+the backup on open. Region writes pack every live record into a replacement
+`.mca` and rename it into place, so a process killed mid-write leaves the old
+region intact; unmodified records keep their sector offset and timestamp.
+Unknown `level.dat` tags (gamerules, border settings, world-gen options) survive
+a save: verified against a real 1.8.9 server world, 35 unknown tags unchanged.
+The private 1.8.9 server opened a Nephele-created world, kept a gold block we
+placed, and advanced the saved clock/weather. Chunk streaming unloads columns
+beyond radius + 2 (saving dirty ones first), and autosave runs every 15 s and on
+quit. Day/night is the renderer's `Environment` shader; rain and lightning are
+CLI screen-space overlays, so the M1/M2 renderer stays untouched. **Not
+verified:** a ten-minute live walk with memory profiling, and a real
+vanilla-client (not just server) load of `Data.Player`.
+
 ---
 
 ## 13. Gotchas that have bitten this project
@@ -680,6 +699,26 @@ item icons for unmapped item ids.
 - `blocks.rs` is generated from Leafish's `legacy.rs` (MIT/Apache, attributed) — 1,374
   states / 228 ids. `name(id)` answers the **metadata-0 variant**, so `name(31)` is
   `"dead_bush"`. Use `VARIANTS` when metadata matters.
+
+**World saves (1.8.9)**
+
+- Singleplayer player data lives in `level.dat` at `Data.Player`, not in a
+  `playerdata/` file. `Pos` is feet position, `Rotation` is `[yaw, pitch]` in
+  vanilla degrees (yaw 0 = +Z, pitch positive = down), so the client converts
+  with `+180°` and a pitch sign flip.
+- Inventory `Slot` is 0–8 hotbar, 9–35 main, 100–103 armour (100 = boots). The
+  parser maps those onto the client's 36–44/9–35/5–8 container slots; anything
+  outside the mapping is preserved untouched so modded items survive a save.
+- An empty NBT list is written as element type `0` followed by a length of `0`.
+  That is what vanilla 1.8.9 writes and reads — do not "improve" it into a
+  missing length.
+- `level.dat` is gzipped NBT with a `Data` compound. Keep unknown tags inside
+  `Data` (and root fields outside it) in the `IndexMap`; dropping `GameRules`
+  or the border/world-gen tags corrupts worlds people care about.
+- The previous complete `level.dat` is `level.dat.bak`; `level.dat_old` is a
+  vanilla fallback. `read_level_document` tries all three before giving up.
+- Region saves are whole-file replacements (temp + rename), not in-place sector
+  edits: a crash must never leave a truncated `.mca`.
 
 **Tooling**
 

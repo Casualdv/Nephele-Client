@@ -9,3 +9,4 @@ description = "Anvil region and NBT reading, for world saves and parity checks a
 [dependencies]
 flate2 = { workspace = true }
 thiserror = { workspace = true }
+indexmap = { workspace = true }

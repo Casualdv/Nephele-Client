@@ -227,12 +227,12 @@ No audio exists yet.
 
 | Item | Size | Notes |
 |---|---|---|
-| Region file **writing** (`.mca`), `level.dat`, player data, session lock | L | We can only read anvil today. |
-| World creation screen (seed, name, mode, world type) | M | |
-| World list, rename, delete, backup | M | |
-| Autosave, save-on-quit, dirty chunk tracking | M | |
-| Chunk loading/unloading while walking | M | |
-| Time of day, weather, lightning | M | |
+| Region file **writing** (`.mca`), `level.dat`, player data, session lock | L | Done for 1.8.9: `level.dat` (`Data.Player`), atomic whole-region compaction with per-chunk timestamps, and a `.bak` of the previous `level.dat`. Verified by opening a Nephele world in the private 1.8.9 server, which kept a placed gold block. `session.lock` is not written. |
+| World creation screen (seed, name, mode, world type) | M | Name, seed and mode; world type is fixed to `default`. |
+| World list, rename, delete, backup | M | Rename/delete plus timestamped snapshot and restore from the world list. |
+| Autosave, save-on-quit, dirty chunk tracking | M | 15 s autosave, save on quit/disconnect, and save-before-unload for dirty columns. |
+| Chunk loading/unloading while walking | M | Radius + 2 unload (world and renderer); memory bound not yet measured over a ten-minute live walk. |
+| Time of day, weather, lightning | M | Persisted `Time`/`DayTime`/rain/thunder; day/night uses the renderer's `Environment` shader, with rain/lightning CLI overlays. |
 
 ### 10. Distribution and product
 
