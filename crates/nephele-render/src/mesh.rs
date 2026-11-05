@@ -2,8 +2,8 @@ use nephele_assets::{
     face_textures, is_transparent, item_texture_name, TextureArray, TintKind, MISSING_TEXTURE,
 };
 use nephele_world::shapes::{
-    block_shape, door_shape, fence_shape, is_door, is_fence, is_full_cube, is_pane, pane_shape,
-    FenceShape, PaneConnections, PaneShape,
+    bars_shape, block_shape, door_shape, fence_shape, is_door, is_fence, is_full_cube, is_pane,
+    pane_shape, FenceShape, PaneConnections, PaneShape,
 };
 use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World};
 
@@ -626,23 +626,20 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             let id = raw >> 4;
             let block_tint = tint_for_block(atlas, job, raw, local_x, local_z);
 
-            // Iron bars are zero-thickness planes through the block centre,
-            // not a 2-pixel box: squashing the 16px texture into a 2px box
-            // turns the bar pattern into a comb of spikes.
+            // Iron bars are two-pixel slabs (see `append_bars`), not a
+            // zero-thickness centre plane: a plane collapses to nothing
+            // edge-on and a line of them reads as a row of crossed cards.
             if id == 101 {
-                let connections = connections_at(job, local_x, y, local_z);
-                let light = job.light(local_x, y + 1, local_z) as f32 / 15.0;
+                let bx = (base_x + local_x) as f32;
+                let by = y as f32;
+                let bz = (base_z + local_z) as f32;
                 append_bars(
                     &mut mesh,
                     layers[2],
                     anims[2],
-                    light,
-                    [
-                        (base_x + local_x) as f32,
-                        y as f32,
-                        (base_z + local_z) as f32,
-                    ],
-                    connections,
+                    job.light(local_x, y + 1, local_z) as f32 / 15.0,
+                    [bx, by, bz],
+                    connections_at(job, local_x, y, local_z),
                 );
                 continue;
             }
@@ -992,12 +989,15 @@ fn append_quad(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-/// Blocks drawn as two crossed quads rather than a cube.
+/// Iron bars: two-pixel-thick slabs (`bars_shape`) with vanilla's UV slices on
+/// the thin faces.
 ///
-/// Iron bars: flat planes through the block centre carrying the full
-/// `iron_bars` texture, which is what makes them read as bars rather than as
-/// a textured post. Both windings are emitted so they are visible from either
-/// side without touching the pipeline's back-face culling.
+/// A zero-thickness centre plane looks right head-on but vanishes edge-on, so a
+/// run of bars reads as a row of crossed cards. A plain two-pixel box fixes the
+/// silhouette but squashes the whole 16-pixel bar texture into its thin faces,
+/// which reads as stripes of noise. Sampling the matching slice of the texture
+/// on each face gives both: a wall that is solid from every angle and a bar
+/// pattern that keeps its scale.
 fn append_bars(
     mesh: &mut MeshData,
     layer: u32,
@@ -1006,47 +1006,53 @@ fn append_bars(
     origin: [f32; 3],
     connections: PaneConnections,
 ) {
+    const THIN_LO: f32 = 7.0 / 16.0;
+    const THIN_HI: f32 = 9.0 / 16.0;
+    const THIN: (f32, f32) = (THIN_LO, THIN_HI);
     let anim = anim_word(animation);
     let [bx, by, bz] = origin;
-    let mut planes: Vec<[[f32; 3]; 4]> = Vec::with_capacity(2);
 
-    // A connection along X runs a plane at z = centre spanning the full block;
-    // a connection along Z runs one at x = centre.
-    if connections.west || connections.east {
-        planes.push([
-            [bx + 0.5, by, bz],
-            [bx + 0.5, by, bz + 1.0],
-            [bx + 0.5, by + 1.0, bz + 1.0],
-            [bx + 0.5, by + 1.0, bz],
-        ]);
-    }
-    if connections.north || connections.south {
-        planes.push([
-            [bx, by, bz + 0.5],
-            [bx + 1.0, by, bz + 0.5],
-            [bx + 1.0, by + 1.0, bz + 0.5],
-            [bx, by + 1.0, bz + 0.5],
-        ]);
-    }
-    if planes.is_empty() {
-        // An isolated bar keeps the vanilla 2-pixel-wide post plane.
-        planes.push([
-            [bx + 0.5, by, bz + 7.0 / 16.0],
-            [bx + 0.5, by, bz + 9.0 / 16.0],
-            [bx + 0.5, by + 1.0, bz + 9.0 / 16.0],
-            [bx + 0.5, by + 1.0, bz + 7.0 / 16.0],
-        ]);
-    }
+    for bar in bars_shape(connections).as_slice() {
+        let min = [
+            bx + bar.min[0] / 16.0,
+            by + bar.min[1] / 16.0,
+            bz + bar.min[2] / 16.0,
+        ];
+        let max = [
+            bx + bar.max[0] / 16.0,
+            by + bar.max[1] / 16.0,
+            bz + bar.max[2] / 16.0,
+        ];
+        // The arm runs along whichever horizontal axis is more than half a
+        // block long; that length is what the big faces should sample.
+        let span_x = bar.max[0] - bar.min[0] >= 8.0;
+        let span_z = bar.max[2] - bar.min[2] >= 8.0;
+        let arm_x = (bar.min[0] / 16.0, bar.max[0] / 16.0);
+        let arm_z = (bar.min[2] / 16.0, bar.max[2] / 16.0);
 
-    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-    for corners in planes {
-        for order in [[0usize, 1, 2, 3], [3, 2, 1, 0]] {
+        for face in &FACES {
+            // `face.uvs` maps u/v onto the unit face; scale that into the
+            // texture slice this particular face covers.
+            let (u, v) = if face.normal[1] != 0 {
+                (
+                    if span_x { arm_x } else { THIN },
+                    if span_z { arm_z } else { THIN },
+                )
+            } else if face.normal[0] != 0 {
+                (if span_z { arm_z } else { THIN }, (0.0, 1.0))
+            } else {
+                (if span_x { arm_x } else { THIN }, (0.0, 1.0))
+            };
             let base = mesh.vertices.len() as u32;
-            for index in order {
+            for (corner, uv) in face.corners.iter().zip(face.uvs.iter()) {
                 mesh.vertices.push(Vertex {
-                    position: corners[index],
-                    uv: uvs[index],
-                    shade: 1.0,
+                    position: [
+                        if corner[0] == 0.0 { min[0] } else { max[0] },
+                        if corner[1] == 0.0 { min[1] } else { max[1] },
+                        if corner[2] == 0.0 { min[2] } else { max[2] },
+                    ],
+                    uv: [u.0 + uv[0] * (u.1 - u.0), v.0 + uv[1] * (v.1 - v.0)],
+                    shade: face.shade,
                     layer,
                     anim,
                     light,
@@ -1899,18 +1905,22 @@ mod tests {
 
     #[test]
     fn fences_and_bars_build_arms_only_where_they_connect() {
-        // An isolated iron bar is the vanilla two-pixel post plane, not a box.
+        // An isolated iron bar is the vanilla two-pixel post, with real
+        // thickness in both horizontal axes.
         let mesh = single_block_mesh(BlockState::new(101, 0));
-        assert_eq!(mesh.vertices.len(), 8, "one plane drawn both ways");
         let (min, max) = bounds(&mesh.vertices);
-        assert_eq!(min[0], max[0], "the bar plane has no thickness");
-        assert!((min[2] - 7.0 / 16.0).abs() < 1.0e-6);
-        assert!((max[2] - 9.0 / 16.0).abs() < 1.0e-6);
+        assert!((min[0] - 7.0 / 16.0).abs() < 1.0e-5);
+        assert!((max[0] - 9.0 / 16.0).abs() < 1.0e-5);
+        assert!((min[2] - 7.0 / 16.0).abs() < 1.0e-5);
+        assert!((max[2] - 9.0 / 16.0).abs() < 1.0e-5);
 
-        // A bar against a wall grows a plane that reaches the wall.
+        // A north-south line of bars must be one continuous wall that is two
+        // pixels thick in x. A zero-thickness plane collapses to nothing
+        // edge-on, which is the "cross-plant" look this shape avoids.
         let mut column = ChunkColumn::empty(0, 0);
-        column.set_block(8, 40, 8, BlockState::new(101, 0));
-        column.set_block(9, 40, 8, BlockState::STONE);
+        for z in 8..=10 {
+            column.set_block(8, 40, z, BlockState::new(101, 0));
+        }
         let world = world_with(column.clone());
         let atlas = atlas();
         let mesh = build_column_mesh(&column, &world, &atlas);
@@ -1921,10 +1931,36 @@ mod tests {
             .copied()
             .filter(|vertex| vertex.layer == bar_layer)
             .collect();
+        assert!(!bars.is_empty());
+        assert!(
+            bars.iter().all(|vertex| {
+                vertex.position[0] >= 8.0 + 7.0 / 16.0 - 1.0e-5
+                    && vertex.position[0] <= 8.0 + 9.0 / 16.0 + 1.0e-5
+            }),
+            "a north-south bar line must stay inside one two-pixel slab"
+        );
         let (min, max) = bounds(&bars);
-        assert_eq!(max[0] - min[0], 0.0, "the bar is a plane at x = centre");
-        assert!((min[2] - 8.0).abs() < 1.0e-6);
-        assert!((max[2] - 9.0).abs() < 1.0e-6);
+        assert!((min[2] - 8.5).abs() < 1.0e-6);
+        assert!((max[2] - 10.5).abs() < 1.0e-6);
+
+        // A bar against a wall grows a slab that reaches the wall, running
+        // along the connection (east), so it stays two pixels thick in z.
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(8, 40, 8, BlockState::new(101, 0));
+        column.set_block(9, 40, 8, BlockState::STONE);
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas);
+        let bars: Vec<Vertex> = mesh
+            .vertices
+            .iter()
+            .copied()
+            .filter(|vertex| vertex.layer == bar_layer)
+            .collect();
+        let (min, max) = bounds(&bars);
+        assert!((min[0] - 8.5).abs() < 1.0e-6);
+        assert!((max[0] - 9.0).abs() < 1.0e-6);
+        assert!((min[2] - (8.0 + 7.0 / 16.0)).abs() < 1.0e-5);
+        assert!((max[2] - (8.0 + 9.0 / 16.0)).abs() < 1.0e-5);
 
         // A nether-brick fence against the same wall has rails.
         let mut column = ChunkColumn::empty(0, 0);

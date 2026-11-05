@@ -471,12 +471,13 @@ culling runs only when both states are full cubes, preserving the existing
 `is_transparent` rules without dropping the partially covered face beside a stair,
 pane or other small shape. Cross-plants stay on their separate crossed-quad path.
 
-- **Iron bars (101)** are zero-thickness centre planes carrying the full
-  `iron_bars` texture, matching vanilla's `bars_*` models. A 2-pixel box was the
-  old shape and squashed the 16px texture into a comb of spikes. A bar emits one
-  plane along each connected axis and falls back to vanilla's 2-pixel post plane
-  when isolated. Both windings are emitted, so the pipeline's back-face culling
-  never hides it.
+- **Iron bars (101)** are two-pixel-thick slabs, one per connected side
+  (`bars_shape`), with the matching slice of `iron_bars` sampled on their thin
+  faces so the texture never squashes into stripes. Vanilla's `bars_*` models
+  are zero-thickness planes plus separate rim boxes; a slab gives the same
+  silhouette from every angle. A zero-thickness centre plane was the first
+  attempt and vanished edge-on, so a run of bars read as a row of perpendicular
+  cards. An isolated bar is the vanilla two-pixel post.
 - **Fences (85, 113) and cobblestone walls (139)** get a 4px post plus two rails
   (y=6..9 and 12..15) on every connected side via `fence_shape`.
   **Glass/stained panes (102, 160)** keep the 2px arm boxes. All three resolve
