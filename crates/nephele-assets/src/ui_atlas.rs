@@ -79,11 +79,15 @@ pub mod sprites {
 
     pub const CROSSHAIR: SpriteRect = sheets::ICONS.sub(0, 0, 16, 16);
     pub const HEART_BACKGROUND: SpriteRect = sheets::ICONS.sub(16, 0, 9, 9);
-    pub const HEART_FULL: SpriteRect = sheets::ICONS.sub(54, 0, 9, 9);
-    pub const HEART_HALF: SpriteRect = sheets::ICONS.sub(63, 0, 9, 9);
+    pub const HEART_FULL: SpriteRect = sheets::ICONS.sub(52, 0, 9, 9);
+    pub const HEART_HALF: SpriteRect = sheets::ICONS.sub(61, 0, 9, 9);
     pub const FOOD_BACKGROUND: SpriteRect = sheets::ICONS.sub(16, 27, 9, 9);
     pub const FOOD_FULL: SpriteRect = sheets::ICONS.sub(52, 27, 9, 9);
     pub const FOOD_HALF: SpriteRect = sheets::ICONS.sub(61, 27, 9, 9);
+    /// Armour row: empty, half and full share the heart row's 16/25/34 layout.
+    pub const ARMOUR_BACKGROUND: SpriteRect = sheets::ICONS.sub(16, 9, 9, 9);
+    pub const ARMOUR_HALF: SpriteRect = sheets::ICONS.sub(25, 9, 9, 9);
+    pub const ARMOUR_FULL: SpriteRect = sheets::ICONS.sub(34, 9, 9, 9);
     pub const XP_BAR_BACKGROUND: SpriteRect = sheets::ICONS.sub(0, 64, 182, 5);
     pub const XP_BAR_FILL: SpriteRect = sheets::ICONS.sub(0, 69, 182, 5);
 
@@ -284,6 +288,48 @@ fn blit(dest: &mut RgbaImage, src: &RgbaImage, x: u32, y: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hud_sprites_sit_at_the_vanilla_sheet_offsets() {
+        // Absolute atlas coordinates: ICONS is blitted at (128, 0) and WIDGETS
+        // at (128, 256). GuiIngame's offsets are fixed, so pin them here; a
+        // 2-pixel slip is what made the hearts draw twice.
+        let icons = sheets::ICONS;
+        assert_eq!(icons.x, 128);
+        assert_eq!(icons.y, 0);
+        assert_eq!(
+            sprites::HEART_BACKGROUND,
+            SpriteRect::new(128 + 16, 0, 9, 9)
+        );
+        assert_eq!(sprites::HEART_FULL, SpriteRect::new(128 + 52, 0, 9, 9));
+        assert_eq!(sprites::HEART_HALF, SpriteRect::new(128 + 61, 0, 9, 9));
+        assert_eq!(
+            sprites::FOOD_BACKGROUND,
+            SpriteRect::new(128 + 16, 27, 9, 9)
+        );
+        assert_eq!(sprites::FOOD_FULL, SpriteRect::new(128 + 52, 27, 9, 9));
+        assert_eq!(sprites::FOOD_HALF, SpriteRect::new(128 + 61, 27, 9, 9));
+        assert_eq!(
+            sprites::ARMOUR_BACKGROUND,
+            SpriteRect::new(128 + 16, 9, 9, 9)
+        );
+        assert_eq!(sprites::ARMOUR_HALF, SpriteRect::new(128 + 25, 9, 9, 9));
+        assert_eq!(sprites::ARMOUR_FULL, SpriteRect::new(128 + 34, 9, 9, 9));
+        assert_eq!(sprites::XP_BAR_BACKGROUND, SpriteRect::new(128, 64, 182, 5));
+        assert_eq!(sprites::XP_BAR_FILL, SpriteRect::new(128, 69, 182, 5));
+        assert_eq!(sprites::HOTBAR, SpriteRect::new(128, 256, 182, 22));
+        assert_eq!(
+            sprites::HOTBAR_SELECTION,
+            SpriteRect::new(128, 256 + 22, 24, 22)
+        );
+    }
+
+    #[test]
+    fn hearts_and_food_come_from_different_rows() {
+        // The hunger row must not read the heart row: they are 27 pixels apart.
+        assert_eq!(sprites::HEART_FULL.y + 27, sprites::FOOD_FULL.y);
+        assert_ne!(sprites::HEART_FULL, sprites::FOOD_FULL);
+    }
 
     #[test]
     fn glyphs_tile_into_the_font_sheet() {

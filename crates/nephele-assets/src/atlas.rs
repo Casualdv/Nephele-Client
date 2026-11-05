@@ -15,6 +15,15 @@ pub const TILES_PER_ROW: u32 = 4;
 /// Width and height of one packed texture-array layer at mip level 0.
 pub const LAYER_SIZE: u32 = TILE_SIZE * TILES_PER_ROW;
 
+/// Highest mip level the packed block sampler may use.
+///
+/// Sixteen tiles share a 64×64 layer, so a tile is 4×4 texels at level 2 and
+/// its own texels still cover the whole face. From level 3 the tile is 2×2 and
+/// at level 4 it is a single texel, where a bilinear fetch at the face edge is
+/// half the neighbouring tile. The chain is still generated and uploaded in
+/// full; only sampling is capped.
+pub const BLOCK_LOD_MAX: f32 = 2.0;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AssetError {
     #[error("asset directory `{0}` does not exist")]
@@ -566,6 +575,29 @@ fn missing_texture() -> RgbaImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mip_levels_above_the_clamp_would_blend_neighbouring_tiles() {
+        // A bilinear fetch inside a packed tile reaches into the next tile when
+        // the sample lands in the outer half-texel of the face. The affected
+        // band is therefore 0.5 / texels_per_tile of the face on each side.
+        let band = |level: u32| 0.5 / ((TILE_SIZE >> level).max(1) as f32);
+
+        // At the clamp (level 2) a tile is 4x4 texels: only the outer 12.5% of
+        // the face can pick up a neighbour.
+        assert_eq!(BLOCK_LOD_MAX as u32, 2);
+        assert!((band(2) - 0.125).abs() < 1e-6);
+
+        // One level further the band doubles, and at level 4 a tile is a single
+        // texel, so half of every face is the neighbouring tile.
+        assert!((band(3) - 0.25).abs() < 1e-6);
+        assert!((band(4) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_clamp_still_leaves_four_texels_per_tile() {
+        assert_eq!(TILE_SIZE >> BLOCK_LOD_MAX as u32, 4);
+    }
 
     fn solid(color: Rgba<u8>) -> RgbaImage {
         RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, color)

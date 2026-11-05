@@ -201,6 +201,39 @@ fn hovered(pointer: Option<[f32; 2]>, rect: &Rect) -> bool {
     pointer.map(|[x, y]| rect.contains(x, y)).unwrap_or(false)
 }
 
+/// Armour points worn in the four armour slots, using vanilla's item values.
+///
+/// Slot 5..=8 of the player container are helmet, chestplate, leggings, boots;
+/// 20 points fills the ten-icon row.
+pub fn armour_points(inventory: &[Option<ItemStack>]) -> i32 {
+    (5..=8)
+        .filter_map(|slot| inventory.get(slot).copied().flatten())
+        .map(|item| match item.id {
+            298 => 1, // leather
+            299 => 3,
+            300 => 2,
+            301 => 1,
+            302 => 2, // chainmail
+            303 => 5,
+            304 => 4,
+            305 => 1,
+            306 => 2, // iron
+            307 => 6,
+            308 => 5,
+            309 => 2,
+            310 => 3, // diamond
+            311 => 8,
+            312 => 6,
+            313 => 3,
+            314 => 2, // gold
+            315 => 5,
+            316 => 3,
+            317 => 1,
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Draw the in-game HUD: crosshair, hotbar, health, food, XP and a debug line.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_hud(
@@ -235,22 +268,9 @@ pub fn draw_hud(
             .copied()
             .flatten()
         {
-            if let Some(state) = item.block_state() {
-                if let Some((top, side)) = icon_layers(BlockState::from_raw(state), textures) {
-                    icons.block_icon(item_rect.x, item_rect.y, item_rect.w, top, side, 1.0);
-                }
-            }
-            if item.count > 1 {
-                let label = item.count.to_string();
-                let text_w = UiBatch::text_width(&label, scale);
-                fg.text(
-                    &label,
-                    item_rect.x + item_rect.w + s(1.0) - text_w,
-                    item_rect.y + item_rect.h - s(7.0),
-                    scale,
-                    TEXT,
-                );
-            }
+            // Same path as the inventory, so tools and food get their sprites
+            // instead of only blocks getting an isometric icon.
+            draw_stack(fg, icons, item_rect, item, textures, scale);
         }
     }
 
@@ -281,6 +301,29 @@ pub fn draw_hud(
             continue;
         };
         bg.sprite(overlay, Rect::new(x, health_y, s(9.0), s(9.0)), TEXT);
+    }
+
+    // --- armour (the row above the hearts, only when something is worn) ----
+    let armour = armour_points(hud.inventory);
+    if armour > 0 {
+        let armour_y = health_y - s(10.0);
+        for i in 0..10 {
+            let x = left + i as f32 * s(8.0);
+            bg.sprite(
+                sprites::ARMOUR_BACKGROUND,
+                Rect::new(x, armour_y, s(9.0), s(9.0)),
+                TEXT,
+            );
+            let filled = armour - i * 2;
+            let overlay = if filled >= 2 {
+                sprites::ARMOUR_FULL
+            } else if filled > 0 {
+                sprites::ARMOUR_HALF
+            } else {
+                continue;
+            };
+            bg.sprite(overlay, Rect::new(x, armour_y, s(9.0), s(9.0)), TEXT);
+        }
     }
 
     // --- food (hunger), mirrored to the right ------------------------------
@@ -1983,6 +2026,54 @@ mod tests {
         let layer = textures.slot("item:stick").unwrap();
         assert_eq!(icons.vertices.len(), 4);
         assert!(icons.vertices.iter().all(|vertex| vertex.layer == layer));
+    }
+
+    #[test]
+    fn armour_points_use_vanilla_item_values() {
+        let mut inventory = vec![None; 45];
+        assert_eq!(armour_points(&inventory), 0);
+
+        // Full diamond: 3 + 8 + 6 + 3 = 20 points, a full row.
+        inventory[5] = Some(ItemStack::new(310, 1, 0));
+        inventory[6] = Some(ItemStack::new(311, 1, 0));
+        inventory[7] = Some(ItemStack::new(312, 1, 0));
+        inventory[8] = Some(ItemStack::new(313, 1, 0));
+        assert_eq!(armour_points(&inventory), 20);
+
+        // Iron chestplate + boots: 6 + 2 = 8 points.
+        inventory[5] = None;
+        inventory[6] = Some(ItemStack::new(307, 1, 0));
+        inventory[7] = None;
+        inventory[8] = Some(ItemStack::new(309, 1, 0));
+        assert_eq!(armour_points(&inventory), 8);
+    }
+
+    #[test]
+    fn hud_draws_the_armour_row_only_when_worn() {
+        let mut inventory = vec![None; 45];
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let mut icons = UiBatch::default();
+        let textures = TextureArray::from_tiles(vec![(
+            "missing".to_string(),
+            image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 255, 255])),
+        )]);
+        let hud = hud_state(&inventory);
+        draw_hud(
+            &mut bg, &mut fg, &mut icons, &hud, &textures, 2.0, 1280.0, 720.0,
+        );
+        let without = bg.vertices.len();
+
+        inventory[6] = Some(ItemStack::new(307, 1, 0));
+        let hud = hud_state(&inventory);
+        let mut bg2 = UiBatch::default();
+        draw_hud(
+            &mut bg2, &mut fg, &mut icons, &hud, &textures, 2.0, 1280.0, 720.0,
+        );
+        assert!(
+            bg2.vertices.len() > without,
+            "an iron chestplate must add armour icons"
+        );
     }
 
     fn hud_state<'a>(inventory: &'a [Option<ItemStack>]) -> HudState<'a> {

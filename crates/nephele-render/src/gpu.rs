@@ -261,7 +261,7 @@ impl Renderer {
             // Tiles share a layer, so stop before the 2×2/1×1 levels where
             // linear filtering would blend neighbouring sub-tiles. The full
             // 16→1 chain is still generated and uploaded.
-            lod_max_clamp: 2.0,
+            lod_max_clamp: nephele_assets::BLOCK_LOD_MAX,
             ..Default::default()
         });
 

@@ -3559,6 +3559,36 @@ mod tests {
     }
 
     #[test]
+    fn local_furnace_smelts_through_window_clicks() {
+        let mut state = local_state_for_test();
+        open_local_furnace(&mut state, (3, 64, 3));
+
+        // Window slot 3 is the first player slot: shift-click ore into the
+        // input, then planks into the fuel slot.
+        state.inventory[9] = Some(ItemStack::new(15, 1, 0));
+        click_local_simple_container(&mut state, 3, 0, true);
+        state.inventory[10] = Some(ItemStack::new(5, 1, 0));
+        click_local_simple_container(&mut state, 4, 0, true);
+
+        assert_eq!(state.window_slots[0], Some(ItemStack::new(15, 1, 0)));
+        assert_eq!(state.window_slots[1], Some(ItemStack::new(5, 1, 0)));
+
+        for _ in 0..200 {
+            if let Some(furnace) = state.furnaces.get_mut(&(3, 64, 3)) {
+                furnace.tick();
+            }
+        }
+        sync_local_furnace(&mut state);
+
+        assert_eq!(
+            state.window_slots[2],
+            Some(ItemStack::new(265, 1, 0)),
+            "the output slot shows the smelted ingot"
+        );
+        assert_eq!(state.window_slots[0], None);
+    }
+
+    #[test]
     fn local_crafting_table_opens_window_one_and_projects_its_slots() {
         let mut state = local_state_for_test();
         state.inventory[9] = Some(ItemStack::new(17, 2, 0));
