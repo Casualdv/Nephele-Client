@@ -133,7 +133,11 @@ pub struct ChunkColumn {
     /// One entry per column: one above its highest light-blocking block, cached
     /// by `generate_height_map`. `None` until a stage asks for it; the lookup
     /// falls back to scanning the column, so this is an optimisation, not state.
-    height_map: Option<Box<[u8; 256]>>,
+    ///
+    /// `u16`, not `u8`, because vanilla's map is an `int[256]` holding `y + 1`
+    /// for a top block at `y` — so a block on the world ceiling reports **256**,
+    /// which a byte cannot represent.
+    height_map: Option<Box<[u16; 256]>>,
     /// `Chunk.isTerrainPopulated`: whether this chunk's own population pass ran.
     terrain_populated: bool,
 }
@@ -259,12 +263,12 @@ impl ChunkColumn {
     /// nibbles themselves are deliberately left unwritten (see
     /// [`VanillaGenerator::provide_chunk`](crate::worldgen::VanillaGenerator::provide_chunk)).
     pub fn generate_height_map(&mut self) {
-        let mut map = Box::new([0u8; 256]);
+        let mut map = Box::new([0u16; 256]);
         for z in 0..16usize {
             for x in 0..16usize {
                 map[z * 16 + x] = self
                     .height_at(x, z)
-                    .map(|top| (top + 1).min(255) as u8)
+                    .map(|top| (top + 1) as u16)
                     .unwrap_or(0);
             }
         }
@@ -333,6 +337,19 @@ mod tests {
         assert_eq!(column.non_air_count(), 1);
         assert_eq!(column.get_block(0, 70, 0), BlockState::GRASS);
         assert_eq!(column.height_at(0, 0), Some(70));
+    }
+
+    #[test]
+    fn the_height_map_reports_one_above_a_block_on_the_world_ceiling() {
+        // Vanilla's `heightMap` is an `int[256]` holding `y + 1`, so a block on
+        // the ceiling must read back as 256 — not 0 (a wrapping byte) and not
+        // 255 (a clamped one).
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(0, 255, 0, BlockState::STONE);
+        assert_eq!(column.height_at(0, 0), Some(255));
+        assert_eq!(column.height_map_at(0, 0), 256);
+        column.generate_height_map();
+        assert_eq!(column.height_map_at(0, 0), 256);
     }
 
     #[test]
