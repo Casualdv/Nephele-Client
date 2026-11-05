@@ -599,8 +599,29 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
 
 ## 12. Milestones
 
-M0 bootstrap → **M1 worldgen + renderer** → M2 survival loop → M3 multiplayer polish →
-M4 PvP features → M5 performance → M6 release. Details in `Future.md`.
+**The M-numbers are retired** — they mean three different things in three
+places (`Future.md`'s milestones, the old session names, and the roadmap), and
+`M5` alone meant both "world saves" and "the product". Lanes are named now:
+
+| Lane | Owns | Branch | State |
+|---|---|---|---|
+| `render` | shapes, tinting, sky, fog | `render` | bars/fire/flowers left |
+| `biomes` | GenLayer parity (92.8%) | `biomes` | active, isolated |
+| `worldgen` | two-stage generation, caves, ores, flora, structures (phases W1–W5) | `w-worldgen` | not started |
+| `survival` | inventory, containers, HUD art | `survival` | 85%, HUD art left |
+| `net` | protocol, real servers, maps, frames, metadata | `net` | needs rebase, then merge |
+| `client-ui` | chat colours, settings, loading screen, modules | — | not started |
+| `saves` | `level.dat`, player data, region writing | `saves` | 90%, needs landing |
+| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 35% |
+| `perf` | startup, view distance, baseline gate | `perf` | done, needs merge |
+| `audio` | everything sound | — | 0%, unassigned |
+| `product` | launcher v2, updater, installer, legal | `saves` (WIP commit) | 25%, blocked on signing |
+
+Rules that hold across all of them: one worktree per lane (never edit the main
+checkout), its own `target/`, and `scripts/run_client.ps1 -Session <lane>` for
+in-game testing — two clients on one machine fight over the window and the
+single Microsoft account. `net`, `entities`, `survival` and `render` all touch
+`live.rs`, so no more than one of those should be mid-edit at a time.
 
 **M1 status (2026-11-03):** the shape table is visible through the mesher for
 slabs, stairs, fence posts, panes, doors and torches. Animated `.mcmeta`
