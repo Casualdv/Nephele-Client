@@ -229,7 +229,7 @@ Environment: **overworld, sea level 63**, infinite generation, biome map from th
 | Caves | done | 308 air/chunk below y=56 |
 | Ravines | done | 426 vs 435 reference (98%) |
 | Ores | done, wrong stage | 5–12% above reference (caves absent when measured) |
-| **Biome map** | **stuck** | **92.8%** |
+| **Biome map** | **done** | **0 / 160,000 blocks differ** (seed 12345, reference server world) |
 | Features | partial | flowers, grass, dead bush, cactus, oak-shape trees |
 
 **Every number above except the biome map was measured per chunk, which is a
@@ -247,12 +247,25 @@ inner area (roughly ±8 chunks): the outermost ring lacks its populated
 neighbours and is not expected to match.
 
 
-### The biome bug — where it stands
+### The biome bug — solved 2026-11-05
 
-The divergence is **downstream of Hills**, somewhere in
-`RareBiome → Zoom×4 (AddIsland, Shore) → Smooth → RiverMix`.
+**Root cause: `GenLayerHills` was reseeding its variance layer.** Vanilla keeps
+the hill-noise layer in a private field (`field_151628_d`), not in `parent`, so
+`GenLayer.initWorldGenSeed` never reaches it: the two `GenLayerZoom`s above it
+run with `worldGenSeed == 0` for the entire world. The Rust port called
+`set_world_seed` on it, which changed the `(noise - 2) % 29 == 0/1` tests in
+`GenLayerHills` (and therefore the hill/mutation choice) for roughly 1 cell in
+29. It looks like an obvious bug to fix, and fixing it breaks parity. Pinned by
+`hills_never_seeds_its_variance_layer`.
 
-**Corrected scale model** (an earlier revision of my notes was wrong; trust this):
+Measured on the structures-off reference world, 160,000 blocks (625 chunks):
+
+| | Mismatched |
+|---|---|
+| Before | 11,492 (92.82% match) — 3→131 ×5606, 19→133 ×3022, 133→5 ×1946 |
+| After | **0 (100%)** |
+
+**Scale model** (verified again by the stage trace):
 
 - `GenLayerBiome` → `BiomeEdge` → **Hills are 1:64**
 - RareBiome → 4× Zoom (AddIsland at k=0, Shore at k=1) → Smooth → RiverMix are **1:4**
@@ -260,10 +273,14 @@ The divergence is **downstream of Hills**, somewhere in
 
 `initChunkSeed` and `nextInt` are **verified byte-identical to vanilla** — four
 multiply-add steps alternating x/z, and `nextInt` advancing with
-`chunkSeed*M+A + worldGenSeed`. They are not the bug. Do not re-audit them.
+`chunkSeed*M+A + worldGenSeed`. They were never the bug. Do not re-audit them.
 
-Finding the remaining 7.2% requires changing the Rust and measuring against the
-reference world. Cell-by-cell oracle comparison is a trap (see §7).
+**How it was found, and how to find the next one:** compare stages, not final
+percentages. `dev.nephele.oracle.Trace` snapshots every layer inside one
+continuous generation and `debug_stage_trace` replays the same stack in Rust
+(see §7). The first differing stage was `hillNoiseZoom0` — 56 of 256 cells —
+while its input `riverInit` matched exactly, which localised the fault to the
+layer above the input rather than to any zoom arithmetic.
 
 ---
 
@@ -282,11 +299,36 @@ cd C:\Users\dariu\Desktop\Nephele-private\oracle
 Stages: `mixed river riverSmooth riverInit hills hillsOnly hillNoise hillZoom1
 riverChain biome biomeEdge base voronoi smoothed probe`.
 
-**Critical caveat: the oracle is only trustworthy at the final map.** Stage-level
-queries are corrupted by `IntCache` aliasing — Java's `hillsOnly` contradicts its own
-`hillNoise` in the same window. I proved this; it invalidated a whole round of
-"stages match" conclusions. Compare per-stage results against the **reference world**,
-never cell-by-cell between two oracle stages.
+**Caveat: `Stages` is only trustworthy at the final map.** Isolated stage
+queries are corrupted by `IntCache` aliasing — Java's `hillsOnly` contradicts its
+own `hillNoise` in the same window. I proved this; it invalidated a whole round
+of "stages match" conclusions. The mechanism: `getIntCache` hands out fixed
+256-int buffers for any request ≤ 256, and `resetIntCache` recycles them between
+queries, so a stage query can read another query's leftovers. Never compare two
+isolated `Stages` runs cell by cell.
+
+### Stage trace (the trustworthy stage comparison)
+
+`tools/Trace.java` + `trace.ps1` wrap every layer in a recorder and generate the
+whole stack **once**, copying each layer's output immediately, so no buffer is
+ever reused before it is read. It writes one file: magic `NEPHTRC1`, a record
+count, then per record `name, areaX, areaZ, w, h, length, i32[length]`.
+
+```powershell
+cd C:\Users\dariu\Desktop\Nephele-private\oracle
+.\trace.ps1                       # writes ..\parity\stage_trace.bin (81 stages)
+cd C:\Users\dariu\Desktop\np-m1b
+cargo test -p nephele-world --lib debug_stage_trace -- --ignored --nocapture
+```
+
+`debug_stage_trace` rebuilds the identical stack in Rust (`traced_stack`) and
+prints one line per stage: window, mismatches, and the first differing cell. The
+first `DIFF` is the answer — that is exactly how the Hills bug was found
+(`riverInit` matched, `hillNoiseZoom0` did not, so the fault was the seed
+propagation into the hill-noise branch, not any zoom arithmetic).
+
+Default window covers the whole structures-off reference area. Re-run
+`trace.ps1` after `build.ps1`, which deletes and regenerates `src/`.
 
 ### Reference world
 
@@ -606,7 +648,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | Lane | Owns | Branch | State |
 |---|---|---|---|
 | `render` | shapes, tinting, sky, fog | `render` | bars/fire/flowers left |
-| `biomes` | GenLayer parity (92.8%) | `biomes` | active, isolated |
+| `biomes` | GenLayer parity | `biomes` | **done** (100%, needs merge) |
 | `worldgen` | two-stage generation, caves, ores, flora, structures (phases W1–W5) | `w-worldgen` | not started |
 | `survival` | inventory, containers, HUD art | `survival` | 85%, HUD art left |
 | `net` | protocol, real servers, maps, frames, metadata | `net` | needs rebase, then merge |
@@ -627,8 +669,7 @@ single Microsoft account. `net`, `entities`, `survival` and `render` all touch
 slabs, stairs, fence posts, panes, doors and torches. Animated `.mcmeta`
 textures, mipmapped filtering, procedural sky/clouds/stars, per-biome fog,
 frustum + height-field occlusion culling, the per-frame upload budget and the
-damage vignette are in. Remaining M1 work is the 92.8% biome map and broader
-plant/terrain edge cases.
+damage vignette are in. Remaining M1 work is broader plant/terrain edge cases.
 
 **M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
 network block drops and pickup, survival inventory, container click protocol,
@@ -674,6 +715,12 @@ item icons for unmapped item ids.
   `[Biome; 40]` table.
 - Hills surface rule is three rules, not one: mutations get gravel when noise
   ∉ (−1..=2); stone appears above noise 1.0 unless the biome is Extreme Hills+ (34).
+- **`GenLayerHills` never seeds its variance layer, and that is correct.** Vanilla
+  keeps the hill-noise layer in `field_151628_d`, outside `parent`, so
+  `initWorldGenSeed` never reaches it and the two zooms above it run with
+  `worldGenSeed == 0` for the whole world. Seeding it changes the
+  `(noise - 2) % 29` tests and dropped the biome map from 100% to 92.8%. Pinned
+  by `hills_never_seeds_its_variance_layer`; do not "fix" it.
 
 **Blocks**
 
@@ -695,14 +742,13 @@ item icons for unmapped item ids.
 
 - Parity claims are **measured**, never asserted. Every number in §6 came from a run
   against the reference world.
-- Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
-  (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
-  with an ignored `debug_first_mismatch` helper for narrowing it.
-- **446 test cases across the workspace** (445 passed, 1 ignored, including two
-  doctests). `nephele-cli` has 65 passing tests; `nephele-assets` has 34;
-  `nephele-render` has 43 passing tests, including seven shape-meshing
-  regressions; `nephele-world` has 119 passing tests and one ignored. The six
-  real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,
+- Reference-world checks live in `genlayer.rs` and `worldgen.rs`;
+  `chunk_biomes_match_a_world_the_real_server_generated` passes and
+  `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
+- **523 test cases across the workspace** (517 passed, 6 ignored). `nephele-world`
+  carries the parity suite, including `debug_stage_trace` and
+  `debug_first_mismatch`. The six real-socket tests in
+  `crates/nephele-client/tests/join_mock.rs` cover status,
   compression, chat, joining/loading the mock world, drop pickup, and crafting
   planks through `C0E`.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
@@ -728,18 +774,19 @@ integrated Radeon is 7.41 ms at 1280×720 / view distance 8 with vsync off.
 
 **Open:**
 
-1. **M1b - biome parity, 92.8175%** (11,492 mismatches in 160,000 cells).
-   Negative results worth keeping: a +-1-block shift made it worse; bypassing
-   `RareBiome`, `AddIsland` or `Shore` changed nothing; bypassing `Smooth` or
-   `RiverMix` made it worse. That points at the 1:64 Hills output feeding the
-   1:4 zooms rather than at the zooms themselves. Measure against the reference
-   world, never stage-to-stage.
-2. **M2 - offline survival.** The exit criterion was played end to end offline: logs, planks, sticks, crafting table, then a wooden pickaxe with correct counts and no item loss. Remaining polish only: eating, armour effects, XP orbs, block entities, item-atlas wiring.
+1. **M2 - offline survival.** The exit criterion was played end to end offline: logs, planks, sticks, crafting table, then a wooden pickaxe with correct counts and no item loss. Remaining polish only: eating, armour effects, XP orbs, block entities, item-atlas wiring.
 
-3. **M3 - join a real server.** Dimension change, keepalive, tab list, and a
+2. **M3 - join a real server.** Dimension change, keepalive, tab list, and a
    shippable Azure app id.
-4. **M6 follow-up.** Attribute the startup frame spikes by stage, and report
+3. **M6 follow-up.** Attribute the startup frame spikes by stage, and report
    every measurement window instead of the best one.
+
+**Landed 2026-11-05: M1b - biome parity, 100%.** 0 of 160,000 reference blocks
+differ (was 11,492). The fault was `GenLayerHills` reseeding its variance layer —
+see §6. Negative results worth keeping: a ±1-block shift made it worse;
+bypassing `RareBiome`, `AddIsland` or `Shore` changed nothing; bypassing
+`Smooth` or `RiverMix` made it worse. That correctly pointed at the 1:64 Hills
+output. `GenLayerHills`/`GenLayerRareBiome` arithmetic itself was never wrong.
 
 ## 16. Working agreement
 

@@ -1296,7 +1296,11 @@ impl Layer for GenLayerHills {
 
     fn set_world_seed(&mut self, seed: i64) {
         self.parent.set_world_seed(seed);
-        self.hill_noise.set_world_seed(seed);
+        // `GenLayerHills` keeps its variance layer in a private field, not in
+        // `parent`, so vanilla's `initWorldGenSeed` never reaches it: the two
+        // zoom layers above the hill noise keep `worldGenSeed == 0` for the
+        // whole world. Seeding them here silently rewrites the 1:64 Hills map.
+        // Pinned by `debug_stage_trace`.
         self.seed.set_world_seed(seed);
     }
 }
@@ -1670,6 +1674,8 @@ impl BiomeLayers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     struct Constant(i32);
 
@@ -1786,6 +1792,39 @@ mod tests {
     fn add_snow_keeps_ocean_empty() {
         let mut layer = GenLayerAddSnow::new(2, Box::new(Constant(0)));
         assert!(layer.get_ints(0, 0, 8, 8).iter().all(|v| *v == 0));
+    }
+
+    /// `GenLayerHills` holds its variance layer outside `parent`, so vanilla's
+    /// `initWorldGenSeed` never reaches it and the two zooms above the hill
+    /// noise keep `worldGenSeed == 0`. That quirk decides 1 in 29 of the 1:64
+    /// cells, so seeding it "correctly" rewrites the whole biome map.
+    #[test]
+    fn hills_never_seeds_its_variance_layer() {
+        use std::cell::Cell;
+
+        struct SeedSpy(Rc<Cell<usize>>);
+
+        impl Layer for SeedSpy {
+            fn get_ints(&mut self, _x: i32, _z: i32, width: usize, height: usize) -> Vec<i32> {
+                vec![2; width * height]
+            }
+            fn set_world_seed(&mut self, _seed: i64) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let mut hills = GenLayerHills::new(
+            1000,
+            Box::new(Constant(1)),
+            Box::new(SeedSpy(Rc::clone(&calls))),
+        );
+        hills.set_world_seed(12345);
+        assert_eq!(
+            calls.get(),
+            0,
+            "vanilla's GenLayerHills never reseeds field_151628_d"
+        );
     }
 
     #[test]
@@ -2334,6 +2373,349 @@ mod tests {
         }
         for (offset, mismatches) in offsets.iter().zip(offset_mismatches) {
             println!("offset {offset:?}: mismatched {mismatches} of {total}");
+        }
+    }
+
+    /// One `getInts` call, captured by [`Rec`].
+    struct Snapshot {
+        name: String,
+        x: i32,
+        z: i32,
+        w: usize,
+        h: usize,
+        data: Vec<i32>,
+    }
+
+    /// Records every layer's output on the way back up the chain. Mirrors
+    /// `dev.nephele.oracle.Trace`'s `Rec` so the two traces line up call for
+    /// call: the oracle snapshots each layer inside one continuous generation,
+    /// which avoids the `IntCache` aliasing that makes isolated stage queries
+    /// contradict each other.
+    struct Rec {
+        name: &'static str,
+        inner: Box<dyn Layer>,
+        log: Rc<RefCell<Vec<Snapshot>>>,
+    }
+
+    impl Layer for Rec {
+        fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+            let out = self.inner.get_ints(area_x, area_z, width, height);
+            self.log.borrow_mut().push(Snapshot {
+                name: self.name.to_string(),
+                x: area_x,
+                z: area_z,
+                w: width,
+                h: height,
+                data: out.clone(),
+            });
+            out
+        }
+
+        fn set_world_seed(&mut self, seed: i64) {
+            self.inner.set_world_seed(seed);
+        }
+    }
+
+    fn rec(
+        name: &'static str,
+        inner: Box<dyn Layer>,
+        log: &Rc<RefCell<Vec<Snapshot>>>,
+    ) -> Box<dyn Layer> {
+        Box::new(Rec {
+            name,
+            inner,
+            log: Rc::clone(log),
+        })
+    }
+
+    /// The oracle's stack, rebuilt node for node with the same names (see
+    /// `Nephele-private/oracle/src/dev/nephele/oracle/Trace.java`).
+    fn traced_stack(log: &Rc<RefCell<Vec<Snapshot>>>) -> Box<dyn Layer> {
+        let island = rec("island", Box::new(GenLayerIsland::new(1)), log);
+        let fuzzy = rec(
+            "fuzzyZoom",
+            Box::new(GenLayerZoom::fuzzy(2000, island)),
+            log,
+        );
+        let add1 = rec("add1", Box::new(GenLayerAddIsland::new(1, fuzzy)), log);
+        let zoom2001 = rec("zoom2001", Box::new(GenLayerZoom::new(2001, add1)), log);
+        let add2 = rec("add2", Box::new(GenLayerAddIsland::new(2, zoom2001)), log);
+        let add3 = rec("add3", Box::new(GenLayerAddIsland::new(50, add2)), log);
+        let add4 = rec("add4", Box::new(GenLayerAddIsland::new(70, add3)), log);
+        let ocean = rec(
+            "removeOcean",
+            Box::new(GenLayerRemoveTooMuchOcean::new(2, add4)),
+            log,
+        );
+        let snow = rec("addSnow", Box::new(GenLayerAddSnow::new(2, ocean)), log);
+        let add5 = rec("add5", Box::new(GenLayerAddIsland::new(3, snow)), log);
+        let edge1 = rec(
+            "edgeCoolWarm",
+            Box::new(GenLayerEdge::new(2, add5, EdgeMode::CoolWarm)),
+            log,
+        );
+        let edge2 = rec(
+            "edgeHeatIce",
+            Box::new(GenLayerEdge::new(2, edge1, EdgeMode::HeatIce)),
+            log,
+        );
+        let edge3 = rec(
+            "edgeSpecial",
+            Box::new(GenLayerEdge::new(3, edge2, EdgeMode::Special)),
+            log,
+        );
+        let zoom2002 = rec("zoom2002", Box::new(GenLayerZoom::new(2002, edge3)), log);
+        let zoom2003 = rec("zoom2003", Box::new(GenLayerZoom::new(2003, zoom2002)), log);
+        let add6 = rec("add6", Box::new(GenLayerAddIsland::new(4, zoom2003)), log);
+        let mushroom = rec(
+            "mushroom",
+            Box::new(GenLayerAddMushroomIsland::new(5, add6)),
+            log,
+        );
+        let deep = rec(
+            "deepOcean",
+            Box::new(GenLayerDeepOcean::new(4, mushroom)),
+            log,
+        );
+
+        let base = SharedLayer::new(deep);
+        let river_init = SharedLayer::new(rec(
+            "riverInit",
+            Box::new(GenLayerRiverInit::new(100, base.boxed())),
+            log,
+        ));
+
+        let biome_source = rec(
+            "biomeSource",
+            Box::new(GenLayerBiome::new(200, base.boxed())),
+            log,
+        );
+        let bio_zoom0 = rec(
+            "bioZoom0",
+            Box::new(GenLayerZoom::new(1000, biome_source)),
+            log,
+        );
+        let bio_zoom1 = rec(
+            "bioZoom1",
+            Box::new(GenLayerZoom::new(1001, bio_zoom0)),
+            log,
+        );
+        let biome_edge = rec(
+            "biomeEdge",
+            Box::new(GenLayerBiomeEdge::new(1000, bio_zoom1)),
+            log,
+        );
+
+        let hill_noise0 = rec(
+            "hillNoiseZoom0",
+            Box::new(GenLayerZoom::new(1000, river_init.boxed())),
+            log,
+        );
+        let hill_noise1 = rec(
+            "hillNoiseZoom1",
+            Box::new(GenLayerZoom::new(1001, hill_noise0)),
+            log,
+        );
+        let hills = rec(
+            "hills",
+            Box::new(GenLayerHills::new(1000, biome_edge, hill_noise1)),
+            log,
+        );
+
+        let river_zoom0 = rec(
+            "riverZoom0",
+            Box::new(GenLayerZoom::new(1000, river_init.boxed())),
+            log,
+        );
+        let river_zoom1 = rec(
+            "riverZoom1",
+            Box::new(GenLayerZoom::new(1001, river_zoom0)),
+            log,
+        );
+        let river_zoom2 = rec(
+            "riverZoom2",
+            Box::new(GenLayerZoom::new(1000, river_zoom1)),
+            log,
+        );
+        let river_zoom3 = rec(
+            "riverZoom3",
+            Box::new(GenLayerZoom::new(1001, river_zoom2)),
+            log,
+        );
+        let river_zoom4 = rec(
+            "riverZoom4",
+            Box::new(GenLayerZoom::new(1002, river_zoom3)),
+            log,
+        );
+        let river_zoom5 = rec(
+            "riverZoom5",
+            Box::new(GenLayerZoom::new(1003, river_zoom4)),
+            log,
+        );
+        let river = rec("river", Box::new(GenLayerRiver::new(1, river_zoom5)), log);
+        let river_smooth = rec(
+            "riverSmooth",
+            Box::new(GenLayerSmooth::new(1000, river)),
+            log,
+        );
+
+        let rare = rec(
+            "rareBiome",
+            Box::new(GenLayerRareBiome::new(1001, hills)),
+            log,
+        );
+        let chain_zoom0 = rec("chainZoom0", Box::new(GenLayerZoom::new(1000, rare)), log);
+        let chain_add = rec(
+            "chainAddIsland",
+            Box::new(GenLayerAddIsland::new(3, chain_zoom0)),
+            log,
+        );
+        let chain_zoom1 = rec(
+            "chainZoom1",
+            Box::new(GenLayerZoom::new(1001, chain_add)),
+            log,
+        );
+        let chain_shore = rec(
+            "chainShore",
+            Box::new(GenLayerShore::new(1000, chain_zoom1)),
+            log,
+        );
+        let chain_zoom2 = rec(
+            "chainZoom2",
+            Box::new(GenLayerZoom::new(1002, chain_shore)),
+            log,
+        );
+        let chain_zoom3 = rec(
+            "chainZoom3",
+            Box::new(GenLayerZoom::new(1003, chain_zoom2)),
+            log,
+        );
+        let smooth = rec(
+            "smooth",
+            Box::new(GenLayerSmooth::new(1000, chain_zoom3)),
+            log,
+        );
+        let mixed = rec(
+            "riverMix",
+            Box::new(GenLayerRiverMix::new(100, smooth, river_smooth)),
+            log,
+        );
+        rec(
+            "voronoi",
+            Box::new(GenLayerVoronoiZoom::new(10, mixed)),
+            log,
+        )
+    }
+
+    fn read_trace(path: &std::path::Path) -> Vec<Snapshot> {
+        use std::io::Read;
+
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .expect("stage trace exists")
+            .read_to_end(&mut bytes)
+            .expect("stage trace reads");
+        assert_eq!(&bytes[..8], b"NEPHTRC1", "stage trace magic");
+        let mut cursor = 8usize;
+        let read_i32 = |cursor: &mut usize| {
+            let value = i32::from_be_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap());
+            *cursor += 4;
+            value
+        };
+        let count = read_i32(&mut cursor) as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name_len = read_i32(&mut cursor) as usize;
+            let name = String::from_utf8(bytes[cursor..cursor + name_len].to_vec()).unwrap();
+            cursor += name_len;
+            let x = read_i32(&mut cursor);
+            let z = read_i32(&mut cursor);
+            let w = read_i32(&mut cursor) as usize;
+            let h = read_i32(&mut cursor) as usize;
+            let len = read_i32(&mut cursor) as usize;
+            let mut data = Vec::with_capacity(len);
+            for _ in 0..len {
+                data.push(read_i32(&mut cursor));
+            }
+            out.push(Snapshot {
+                name,
+                x,
+                z,
+                w,
+                h,
+                data,
+            });
+        }
+        out
+    }
+
+    /// Reports which stage first diverges from the vanilla trace. Needs
+    /// `Nephele-private/parity/stage_trace.bin`, produced by
+    /// `dev.nephele.oracle.Trace <seed> -512 -512 512 1024 <out>`.
+    #[ignore = "diagnostic: stage-by-stage diff against the vanilla trace"]
+    #[test]
+    fn debug_stage_trace() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Nephele-private/parity/stage_trace.bin");
+        if !path.is_file() {
+            eprintln!("skipped: no stage trace at {}", path.display());
+            return;
+        }
+        let expected = read_trace(&path);
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut stack = traced_stack(&log);
+        stack.set_world_seed(12345);
+        stack.get_ints(-512, -512, 512, 1024);
+        let actual = log.borrow();
+
+        println!("records: oracle {} ours {}", expected.len(), actual.len());
+        let mut first_bad = true;
+        for (index, (want, got)) in expected.iter().zip(actual.iter()).enumerate() {
+            let same_window =
+                want.x == got.x && want.z == got.z && want.w == got.w && want.h == got.h;
+            let mut mismatches = 0usize;
+            let mut first_cell = None;
+            let cells = want.w * want.h;
+            if same_window && want.data.len() >= cells && got.data.len() >= cells {
+                for cell in 0..cells {
+                    if want.data[cell] != got.data[cell] {
+                        mismatches += 1;
+                        if first_cell.is_none() {
+                            first_cell = Some((
+                                cell % want.w,
+                                cell / want.w,
+                                want.data[cell],
+                                got.data[cell],
+                            ));
+                        }
+                    }
+                }
+            } else {
+                mismatches = want.data.len().max(got.data.len());
+            }
+            let mark = if mismatches == 0 { "ok  " } else { "DIFF" };
+            println!(
+                "{mark} #{index:>2} {:<14} want ({},{},{},{}) got ({},{},{},{}) diff {}/{} {:?}",
+                want.name,
+                want.x,
+                want.z,
+                want.w,
+                want.h,
+                got.x,
+                got.z,
+                got.w,
+                got.h,
+                mismatches,
+                want.data.len(),
+                first_cell
+            );
+            if mismatches > 0 && first_bad {
+                first_bad = false;
+                println!("^ first diverging stage");
+            }
         }
     }
 

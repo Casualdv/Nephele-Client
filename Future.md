@@ -88,8 +88,9 @@ a per-frame upload budget, damage vignette, launcher, CI, verified-resource
 preparation. Performance bar: 143 fps / p99 7.41 ms on the integrated AMD
 Radeon at 1280×720, view distance 8, vsync off (`NEPHELE_PERF=1`).
 
-Measured parity against a world the real 1.8.9 server generated: **92.8%** of
-biome cells, **96%** of surface heights, **98.8%** of surface block types.
+Measured parity against a world the real 1.8.9 server generated: **100%** of
+biome cells (0 / 160,000 blocks, seed 12345), **96%** of surface heights,
+**98.8%** of surface block types.
 
 ---
 
@@ -250,7 +251,7 @@ No audio exists yet.
 
 | Item | Size | Notes |
 |---|---|---|
-| Java oracle parity harness (`Nephele-private/oracle`) | exists | Extend per feature: terrain, blocks, biome overrides. |
+| Java oracle parity harness (`Nephele-private/oracle`) | exists | Extend per feature: terrain, blocks, biome overrides. Stage-by-stage tracing landed 2026-11-05 (`trace.ps1` + `debug_stage_trace`). |
 | Reference worlds for regression tests | exists | Seed 12345, structures off. |
 | Performance benchmark on low-end hardware | M | Define the bar: 60 fps, Intel HD 4000-class. |
 | Automated multiplayer smoke test against a real server | M | |
@@ -262,7 +263,7 @@ No audio exists yet.
 **M0 — Foundations (done).** Protocol, rendering, movement, worldgen height
 field, launcher, CI.
 
-**M1 - A world worth walking in.** *Rendering done:* mesa, caves, ores, flora, shape-aware meshing (slabs, stairs, fences, panes that connect, doors, torches), smooth lighting with ambient occlusion, animated textures, mipmapped filtering, procedural sky with sun/moon/stars/clouds and per-biome fog, frustum + height-field occlusion culling, a per-frame upload budget and damage vignette. *Still open:* biome-map parity, currently 92.8175% against the reference world - the world is right at scale and wrong in patches. *Exit:* singleplayer world looks like Minecraft from above and from underground.
+**M1 - A world worth walking in.** *Rendering done:* mesa, caves, ores, flora, shape-aware meshing (slabs, stairs, fences, panes that connect, doors, torches), smooth lighting with ambient occlusion, animated textures, mipmapped filtering, procedural sky with sun/moon/stars/clouds and per-biome fog, frustum + height-field occlusion culling, a per-frame upload budget and damage vignette. *Biome map done 2026-11-05:* 100% against the reference world (was 92.8%). *Still open:* terrain/flora edge cases. *Exit:* singleplayer world looks like Minecraft from above and from underground.
 
 **M2 - Survival loop.** *Exit criterion met offline.* A recorded play-through punched logs, made planks, sticks and a crafting table through the 2x2 grid, placed the table, opened the 3x3 window and crafted a wooden pickaxe - correct counts, no item loss. The block atlas now loads every `textures/blocks` PNG, packs sixteen tiles per layer (488 tiles in 31 layers) and reports unresolved names at boot, so the device-limit clip is gone; mipmaps survive because each tile is downsampled before its level is packed. Remaining polish, none of it blocking the exit: eating, armour effects, XP orbs, block entities, real GUI art and item-icon coverage.
 
