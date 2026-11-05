@@ -1,11 +1,13 @@
 //! The complete vanilla chunk pipeline: biome layers, then the density
 //! height field, then the per-biome surface pass.
 //!
-//! Generation is per chunk and independent of the order chunks are asked for,
-//! which is what a client needs — unlike vanilla, whose shared `Random` makes
-//! earlier chunks influence later ones. The only thing that diverges from
-//! vanilla as a result is the exact depth of the filler layer and the
-//! roughness of the bedrock, since those come from that stream.
+//! Generation here is per chunk and independent of request order. That is
+//! correct for `provideChunk` only: vanilla reseeds before surface generation,
+//! so the surface pass genuinely does not depend on earlier chunks. It is not
+//! correct for decoration — ores, lakes, dungeons, flora and structures live in
+//! a separate population stage that shares blocks with neighbouring chunks and
+//! cannot be produced one chunk at a time. See AGENTS.md section 6 before adding
+//! any feature generator here.
 
 use crate::chunk::ChunkColumn;
 use crate::genlayer::BiomeLayers;

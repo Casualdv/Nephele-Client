@@ -187,6 +187,36 @@ primer (base terrain density)
   → features (decoration)
 ```
 
+**That single-pass model cannot reach block parity.** Vanilla splits it in two,
+and the split is load-bearing (source-verified against MCP 1.8.9):
+
+- **`provideChunk`**: base terrain → biome surface → caves → ravines →
+  structure-start discovery (mineshaft, village, stronghold, scattered feature,
+  ocean monument — layouts cached here) → chunk construction, biome storage,
+  skylight. Surface and bedrock reseed from the chunk seed, so they do **not**
+  depend on request order.
+- **`populate`**: structure pieces → water lake → lava lake → 8 dungeon attempts
+  → `BiomeDecorator` (**ores first**, then underwater sand/clay/gravel, trees,
+  big mushrooms, flowers, grass, dead bushes, lilies, mushrooms, reeds, cacti,
+  springs) → animal spawns → ice/snow.
+
+Consequences we have not implemented:
+
+- **Ore placement belongs to the population pass**, not `provideChunk`; it uses
+  the population seed and `+8` offsets, so per-chunk ore generation can never
+  match.
+- Population is a **2×2 rule**: owner `(x,z)` runs only once `(x,z)`,
+  `(x+1,z)`, `(x,z+1)`, `(x+1,z+1)` exist, and eligibility is checked in the
+  order `(x,z)`, `(x-1,z)`, `(x,z-1)`, `(x-1,z-1)`. Writes cross the boundary.
+- The decorating biome is sampled at `(chunkX*16+16, chunkZ*16+16)`.
+- Population seed: two `nextLong()` draws, each converted `n/2*2+1`, then
+  `(x*first + z*second) XOR seed`. Cave/ravine seeding uses a **17×17** source
+  neighbourhood with **unforced** multipliers `(sx*A) XOR (sz*B) XOR seed`.
+- Structure grids use `regionX*341873128712 + regionZ*132897987541 + seed + salt`
+  (village 10387312, scattered 14357617, monument 10387313) with floor division
+  for negative regions.
+
+
 Environment: **overworld, sea level 63**, infinite generation, biome map from the
 1.8 `GenLayer` stack.
 
@@ -198,9 +228,20 @@ Environment: **overworld, sea level 63**, infinite generation, biome map from th
 | Surface blocks | done | 98.8% match (1.2% mismatch) |
 | Caves | done | 308 air/chunk below y=56 |
 | Ravines | done | 426 vs 435 reference (98%) |
-| Ores | done | 5–12% above reference (caves were absent when measured) |
+| Ores | done, wrong stage | 5–12% above reference (caves absent when measured) |
 | **Biome map** | **stuck** | **92.8%** |
 | Features | partial | flowers, grass, dead bush, cactus, oak-shape trees |
+
+**Every number above except the biome map was measured per chunk, which is a
+different pipeline than vanilla's.** Treat them as "our implementation is close"
+rather than parity until the population pass exists and they are re-measured on
+a populated world.
+
+**The oracle cannot settle this yet.** `parity/server` is seed 12345 with
+structures *off*, and the oracle emits surface heights, not block arrays. A
+second reference world (same seed, DEFAULT, structures on) plus a 65,536-state
+per-chunk export is the prerequisite for any block-level claim.
+
 
 ### The biome bug — where it stands
 
