@@ -67,6 +67,16 @@ pub enum EntityKind {
     Mob { kind: u8 },
     /// A dropped item stack (`S0E` with object type 2).
     Item { id: i16, meta: i16 },
+    /// An item frame (`S0E` with object type 71). `direction` is the face it is
+    /// attached to: 0 down, 1 up, 2 north, 3 south, 4 west, 5 east.
+    ItemFrame { direction: u8 },
+}
+
+/// The mutable part of an item frame: the framed stack and its 45° rotation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ItemFrameState {
+    pub item: Option<ItemStack>,
+    pub rotation: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +103,8 @@ pub struct Entity {
     /// Last `S0B` animation id (0 = arm swing) and how many ticks it lasts.
     pub animation: u8,
     pub animation_ticks: u8,
+    /// Item-frame contents, when this entity is a frame.
+    pub item_frame: Option<ItemFrameState>,
 }
 
 impl Entity {
@@ -113,6 +125,7 @@ impl Entity {
             equipment: [None; equipment_slot::COUNT],
             animation: 0,
             animation_ticks: 0,
+            item_frame: None,
         }
     }
 
@@ -198,6 +211,16 @@ impl Entity {
             (3, EntityMetadataValue::Byte(visible)) => self.metadata.name_visible = *visible != 0,
             (4, EntityMetadataValue::Byte(silent)) => self.metadata.silent = *silent != 0,
             (6, EntityMetadataValue::Float(health)) => self.metadata.health = health.max(0.0),
+            (8, EntityMetadataValue::Slot(item)) => {
+                if let Some(frame) = &mut self.item_frame {
+                    frame.item = *item;
+                }
+            }
+            (9, EntityMetadataValue::Byte(rotation)) => {
+                if let Some(frame) = &mut self.item_frame {
+                    frame.rotation = (*rotation).clamp(0, 7) as u8;
+                }
+            }
             _ => {}
         }
     }
@@ -340,6 +363,20 @@ impl Entities {
                 self.tick,
             ),
         );
+    }
+
+    /// Track an item frame (`S0E`, object type 71).
+    pub fn spawn_item_frame(&mut self, id: i32, direction: u8, position: [f64; 3]) {
+        let mut entity = Entity::new(
+            id,
+            EntityKind::ItemFrame { direction },
+            position,
+            0.0,
+            0.0,
+            self.tick,
+        );
+        entity.item_frame = Some(ItemFrameState::default());
+        self.map.insert(id, entity);
     }
 
     /// Apply one `S1C Entity Metadata` update.
@@ -577,6 +614,28 @@ mod tests {
             entity.equipment[equipment_slot::HELMET as usize],
             Some(ItemStack::new(310, 1, 0))
         );
+    }
+
+    #[test]
+    fn item_frame_metadata_sets_the_framed_stack_and_rotation() {
+        let mut entities = Entities::new();
+        entities.spawn_item_frame(42, 2, [8.0, 65.0, 5.0]);
+        let update = EntityMetadataUpdate {
+            entity_id: 42,
+            values: vec![
+                (
+                    8,
+                    EntityMetadataValue::Slot(Some(ItemStack::new(358, 1, 0).with_map(7))),
+                ),
+                (9, EntityMetadataValue::Byte(5)),
+            ],
+        };
+        entities.apply_metadata(&update);
+        let frame = entities.get(42).unwrap();
+        assert!(matches!(frame.kind, EntityKind::ItemFrame { direction: 2 }));
+        let state = frame.item_frame.as_ref().unwrap();
+        assert_eq!(state.item.unwrap().map_id, Some(7));
+        assert_eq!(state.rotation, 5);
     }
 
     #[test]

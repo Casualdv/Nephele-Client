@@ -48,10 +48,12 @@ impl SkinLoader {
                         rx.recv()
                     };
                     let Ok(hash) = hash else { break };
-                    if let Some(image) = download(&hash) {
-                        if result_tx.send((hash, image)).is_err() {
-                            break;
-                        }
+                    // Offline (or a hash that is no longer on the CDN) still
+                    // needs a distinct, recognisable skin; a lobby of identical
+                    // stand-in Steves is not a useful render test.
+                    let image = download(&hash).unwrap_or_else(|| synthetic_skin(&hash));
+                    if result_tx.send((hash, image)).is_err() {
+                        break;
                     }
                 })
                 .expect("spawn skin worker");
@@ -91,6 +93,72 @@ fn download(hash: &str) -> Option<RgbaImage> {
     std::io::Read::read_to_end(&mut response.into_reader(), &mut bytes).ok()?;
     let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
     Some(normalise(decoded))
+}
+
+/// A deterministic Steve-shaped skin for a hash we could not download. The
+/// shirt and trousers are tinted by the hash, so every bot in a lobby reads as
+/// a different player even without network access.
+pub fn synthetic_skin(hash: &str) -> RgbaImage {
+    let mut image = nephele_assets::default_skin();
+    let mut seed: u32 = 2_166_136_261;
+    for byte in hash.bytes() {
+        seed = seed.wrapping_mul(16_777_619) ^ u32::from(byte);
+    }
+    let hue = seed % 360;
+    let shirt = hsv(hue, 0.65, 0.85);
+    let pants = hsv((hue + 150) % 360, 0.55, 0.65);
+    let fill = |image: &mut RgbaImage, x0: u32, y0: u32, x1: u32, y1: u32, colour: [u8; 4]| {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                image.put_pixel(x, y, image::Rgba(colour));
+            }
+        }
+    };
+    fill(&mut image, 16, 16, 40, 32, shirt);
+    fill(&mut image, 40, 16, 56, 24, shirt);
+    fill(&mut image, 32, 48, 48, 56, shirt);
+    fill(&mut image, 0, 16, 16, 24, pants);
+    fill(&mut image, 16, 48, 32, 56, pants);
+    // A slightly darker second layer so the jacket/sleeves/trousers are
+    // visibly a layer rather than an invisible copy of the base.
+    let jacket = shade(shirt, 0.55);
+    let trouser_layer = shade(pants, 0.55);
+    fill(&mut image, 16, 32, 40, 48, jacket);
+    fill(&mut image, 40, 32, 56, 48, jacket);
+    fill(&mut image, 48, 48, 64, 64, jacket);
+    fill(&mut image, 0, 32, 16, 48, trouser_layer);
+    fill(&mut image, 0, 48, 16, 64, trouser_layer);
+    image
+}
+
+fn shade(colour: [u8; 4], factor: f32) -> [u8; 4] {
+    [
+        (colour[0] as f32 * factor).min(255.0) as u8,
+        (colour[1] as f32 * factor).min(255.0) as u8,
+        (colour[2] as f32 * factor).min(255.0) as u8,
+        colour[3],
+    ]
+}
+
+fn hsv(hue: u32, saturation: f32, value: f32) -> [u8; 4] {
+    let h = (hue % 360) as f32 / 60.0;
+    let c = value * saturation;
+    let x = c * (1.0 - ((h % 2.0) - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = value - c;
+    [
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+        255,
+    ]
 }
 
 /// Pad or crop to the canonical 64×64 skin so UV maths never has to special-case
@@ -143,6 +211,19 @@ mod tests {
         assert_eq!(out.dimensions(), (64, 64));
         // Copied into the left-leg slot at (16,48).
         assert_eq!(*out.get_pixel(16, 48), image::Rgba([10, 20, 30, 255]));
+    }
+
+    #[test]
+    fn synthetic_skins_differ_by_hash_and_keep_the_face() {
+        let a = synthetic_skin("aaaaaaaa");
+        let b = synthetic_skin("bbbbbbbb");
+        assert_eq!(a.dimensions(), (64, 64));
+        assert_ne!(a.get_pixel(20, 20), b.get_pixel(20, 20));
+        // The face is still skin-coloured, not tinted by the shirt.
+        assert_eq!(
+            *a.get_pixel(10, 10),
+            *nephele_assets::default_skin().get_pixel(10, 10)
+        );
     }
 
     #[test]

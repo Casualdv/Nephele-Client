@@ -41,6 +41,11 @@ impl<'a> PacketReader<'a> {
         slice
     }
 
+    /// The unread bytes without advancing the reader.
+    pub fn rest(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
+    }
+
     pub fn into_remaining(self) -> &'a [u8] {
         &self.buf[self.pos..]
     }

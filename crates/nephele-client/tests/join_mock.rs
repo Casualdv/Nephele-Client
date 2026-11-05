@@ -128,6 +128,57 @@ async fn status_ping_reports_protocol_47() {
     assert!(status.description.contains("Nephele mock server"));
 }
 
+/// The lobby demo: bots with names/skins and a framed map with real pixels.
+#[tokio::test]
+async fn the_lobby_has_players_and_a_framed_map() {
+    let server = MockServer::start(MockConfig {
+        radius: 1,
+        greeting: false,
+        bots: true,
+        ..MockConfig::default()
+    })
+    .await
+    .unwrap();
+    let mut client = GameClient::join(&address_of(&server), "Visitor")
+        .await
+        .unwrap();
+    client
+        .pump(Duration::from_millis(1400), Duration::from_millis(50))
+        .await
+        .unwrap();
+
+    let players: Vec<_> = client
+        .entities
+        .iter()
+        .filter(|entity| matches!(entity.kind, EntityKind::Player { .. }))
+        .collect();
+    assert!(
+        players.len() >= nephele_mock::BOT_COUNT,
+        "expected the lobby bots, got {} players",
+        players.len()
+    );
+    assert!(players.iter().any(|entity| entity.shows_name()));
+    // Half the bots are slim, so both arm layouts are exercised.
+    assert!(client.skins.iter().any(|(_, info)| info.slim));
+    assert!(client.skins.iter().any(|(_, info)| !info.slim));
+
+    let frame = client
+        .entities
+        .iter()
+        .find(|entity| matches!(entity.kind, EntityKind::ItemFrame { .. }))
+        .expect("the mock spawns a framed map");
+    let state = frame.item_frame.as_ref().expect("item frame state");
+    let item = state.item.expect("the frame contains an item");
+    assert_eq!(item.id, 358, "a filled map item");
+    let map_id = item.map_id.expect("the map item carries its id");
+    assert!(
+        client.maps.get(map_id).is_some(),
+        "map {map_id} should have received S34 pixels"
+    );
+
+    client.disconnect().await;
+}
+
 /// The whole survival drop chain against a real socket: break a block, watch
 /// the item entity arrive, then watch it be collected into the hotbar.
 #[tokio::test]

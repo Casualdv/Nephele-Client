@@ -293,14 +293,101 @@ async fn send_join_sequence(
         let bots = make_bots(player_y as f64);
         send_bot_player_list(connection, &bots).await?;
         send_bot_spawns(connection, &bots).await?;
+        send_bot_equipment(connection, &bots).await?;
+        send_bot_crouch(connection, &bots).await?;
+        send_lobby_map(connection, player_y as f64).await?;
     }
     Ok(columns)
 }
 
-/// One unverified account's textures property, as a real tab-list entry carries.
-/// The hash is intentionally not a real skin: the client should fall back to its
-/// built-in skin when the download fails.
-const BOT_TEXTURES: &str = "eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvNmVwaGVsZSI6IiJ9fX0=";
+/// One framed map in the lobby. The mock sends real `S34` pixels and a frame
+/// whose metadata carries a map item, so the renderer path is exercised end to
+/// end without a real server.
+async fn send_lobby_map(connection: &mut Connection, feet_y: f64) -> Result<()> {
+    const MAP_ID: i32 = 7;
+    let mut colors = Vec::with_capacity(128 * 128);
+    for y in 0..128 {
+        for x in 0..128 {
+            let index = ((x / 4 + y / 4) % 63 + 1) as u8;
+            colors.push(index);
+        }
+    }
+    connection
+        .write_packet(&play::map_chunk(MAP_ID, 0, 0, 0, 128, 128, &colors))
+        .await?;
+
+    let frame_id = 1_000;
+    connection
+        .write_packet(&play::spawn_object(
+            frame_id,
+            play::OBJECT_TYPE_ITEM_FRAME,
+            [8.5, feet_y + 2.0, 7.0],
+            0.0,
+            0.0,
+            3,
+            [0.0; 3],
+        ))
+        .await?;
+
+    let mut w = PacketWriter::new();
+    w.write_varint(frame_id);
+    // Metadata index 8, type 5 (slot): the framed map item.
+    w.write_u8((5 << 5) | 8);
+    play::write_slot(
+        &mut w,
+        Some(&play::ItemStack::new(358, 1, 0).with_map(MAP_ID)),
+    );
+    // Metadata index 9, type 0 (byte): rotation.
+    w.write_u8(9);
+    w.write_i8(0);
+    w.write_u8(0x7F);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_METADATA,
+            w.into_bytes(),
+        ))
+        .await
+}
+
+/// One bot's textures property. The hashes are deliberately not real skins:
+/// the client downloads what it can and falls back to a hash-tinted synthetic
+/// skin, so every bot in the lobby looks different even offline.
+fn bot_textures(index: usize) -> String {
+    let hash = format!("{:016x}", 0xabcdef00u64 + index as u64);
+    let model = if index % 2 == 0 {
+        ",\"metadata\":{\"model\":\"slim\"}"
+    } else {
+        ""
+    };
+    let json = format!(
+        "{{\"textures\":{{\"SKIN\":{{\"url\":\"http://textures.minecraft.net/texture/{hash}\"{model}}}}}}}"
+    );
+    base64_encode(json.as_bytes())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 /// Fake players the mock server spawns and walks around, so entity tracking,
 /// interpolation and the humanoid renderer can be exercised without a server.
@@ -361,12 +448,12 @@ fn bot_position(bot: &MockBot, angle: f64) -> (f64, f64) {
 async fn send_bot_player_list(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
     let mut w = PacketWriter::new();
     w.write_varint(0).write_varint(bots.len() as i32);
-    for bot in bots {
+    for (index, bot) in bots.iter().enumerate() {
         w.write_uuid(&bot.uuid)
             .write_string(bot.name)
             .write_varint(1)
             .write_string("textures")
-            .write_string(BOT_TEXTURES)
+            .write_string(&bot_textures(index))
             .write_bool(false)
             .write_varint(1)
             .write_varint(30)
@@ -458,6 +545,44 @@ async fn send_bot_spawns(connection: &mut Connection, bots: &[MockBot]) -> Resul
     Ok(())
 }
 
+/// One bot in full iron and another holding a map, so equipment and held items
+/// are visible in the lobby demo.
+async fn send_bot_equipment(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
+    let Some(iron) = bots.get(5) else {
+        return Ok(());
+    };
+    for (slot, item) in [
+        (play::equipment_slot::HELD, 276),
+        (play::equipment_slot::HELMET, 306),
+        (play::equipment_slot::CHESTPLATE, 307),
+        (play::equipment_slot::LEGGINGS, 308),
+        (play::equipment_slot::BOOTS, 309),
+    ] {
+        let mut w = PacketWriter::new();
+        w.write_varint(iron.entity_id).write_i16(slot);
+        play::write_slot(&mut w, Some(&play::ItemStack::new(item, 1, 0)));
+        connection
+            .write_packet(&Packet::new(
+                play::clientbound::ENTITY_EQUIPMENT,
+                w.into_bytes(),
+            ))
+            .await?;
+    }
+    if let Some(map_bot) = bots.get(6) {
+        let mut w = PacketWriter::new();
+        w.write_varint(map_bot.entity_id)
+            .write_i16(play::equipment_slot::HELD);
+        play::write_slot(&mut w, Some(&play::ItemStack::new(358, 1, 0).with_map(7)));
+        connection
+            .write_packet(&Packet::new(
+                play::clientbound::ENTITY_EQUIPMENT,
+                w.into_bytes(),
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
 /// Walk the bots around their circles and turn their heads to face the player.
 async fn send_bot_tick(connection: &mut Connection, bots: &[MockBot], tick: u64) -> Result<()> {
     let step = 0.06;
@@ -475,11 +600,44 @@ async fn send_bot_tick(connection: &mut Connection, bots: &[MockBot], tick: u64)
         )
         .await?;
         // Look back towards the player at (8.5, 8.5).
+        // Minecraft yaw 0 faces +Z and grows towards -X, so this is the
+        // direction from the bot back to the player.
         let to_player = (8.5 - x, 8.5 - z);
-        let facing = to_player.1.atan2(to_player.0).to_degrees() as f32 + 90.0;
+        let facing = (-to_player.0).atan2(to_player.1).to_degrees() as f32;
         send_bot_head(connection, bot.entity_id, facing.rem_euclid(360.0)).await?;
     }
+    if let Some(bot) = bots.get(3) {
+        send_bot_swing(connection, bot.entity_id).await?;
+    }
     Ok(())
+}
+
+/// `S0B` animation id 0: swing the main arm.
+async fn send_bot_swing(connection: &mut Connection, id: i32) -> Result<()> {
+    let mut w = PacketWriter::new();
+    w.write_varint(id).write_u8(0);
+    connection
+        .write_packet(&Packet::new(play::clientbound::ANIMATION, w.into_bytes()))
+        .await
+}
+
+/// Crouch one bot so the crouch offset is exercised in the lobby.
+async fn send_bot_crouch(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
+    let Some(bot) = bots.get(2) else {
+        return Ok(());
+    };
+    let mut w = PacketWriter::new();
+    w.write_varint(bot.entity_id);
+    // Index 0, type 0 (byte): crouched.
+    w.write_u8(0);
+    w.write_i8(0x02);
+    w.write_u8(0x7F);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_METADATA,
+            w.into_bytes(),
+        ))
+        .await
 }
 
 /// Tell the client one block changed (`S23`).

@@ -23,15 +23,16 @@ use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
 use nephele_audio::AudioEngine;
 use nephele_client::mining::{Aim, Miner, MiningEvent};
 use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
-use nephele_client::{BlockEntity, BlockEntityKind, Event, GameClient, LocalContainer, Vec3};
+use nephele_client::{BlockEntity, BlockEntityKind, Event, GameClient, LocalContainer, Maps, Vec3};
 use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
 use nephele_render::{
-    append_block_entity, append_hand, block_outline, break_overlay_texture, build_break_overlay,
-    build_entities, build_hand_item, build_item_mesh, build_particle_mesh, BlockEntityDraw,
-    BlockEntityModel, Camera, ColumnMeshJob, EntityDraw, HandDraw, HandItem, ItemDraw, LineMesh,
-    MeshData, Renderer, UiBatch,
+    append_block_entity, append_hand, append_hand_map, append_item_frame, block_outline,
+    break_overlay_texture, build_break_overlay, build_entities, build_hand_item, build_hand_sprite,
+    build_item_mesh, build_particle_mesh, humanoid_hand, BlockEntityDraw, BlockEntityModel, Camera,
+    ColumnMeshJob, EntityDraw, HandDraw, HandItem, ItemDraw, ItemFrameDraw, LineMesh, MeshData,
+    Rect, Renderer, UiBatch,
 };
 use nephele_world::save::{self, WorldMetadata, WorldMode, WorldSave};
 use nephele_world::{raycast, BlockState, ChunkColumn, ChunkCoord, World};
@@ -84,8 +85,10 @@ enum NetMsg {
     Particles(Vec<play::ParticleSpawn>),
     /// Server-triggered positional sounds.
     Sound(play::SoundEffect),
-    /// Tab-list skin hashes (uuid, texture hash).
-    Skins(Vec<([u8; 16], String)>),
+    /// Tab-list skin hashes (uuid, texture hash, slim model).
+    Skins(Vec<([u8; 16], String, bool)>),
+    /// Map pixels arrived for one map id.
+    Map(nephele_client::MapData),
     Error(String),
 }
 
@@ -118,7 +121,12 @@ struct EntitySnapshot {
     show_name: bool,
     health: f32,
     flags: u8,
-    equipment: [Option<ItemStack>; play::equipment_slot::COUNT],
+    /// Held item, taken from the equipment slot for the hand renderer.
+    held_item: Option<ItemStack>,
+    /// Boots, leggings, chestplate, helmet.
+    armor: [Option<ItemStack>; 4],
+    /// `(direction, rotation, framed item)` for an item frame.
+    item_frame: Option<(u8, u8, Option<ItemStack>)>,
     velocity: [f64; 3],
     animation: u8,
     animation_ticks: u8,
@@ -130,11 +138,27 @@ impl EntitySnapshot {
             nephele_client::EntityKind::Player { uuid, .. } => (true, *uuid, 0),
             nephele_client::EntityKind::Mob { kind } => (false, [0; 16], *kind),
             nephele_client::EntityKind::Item { .. } => (false, [0; 16], 0),
+            nephele_client::EntityKind::ItemFrame { .. } => (false, [0; 16], 0),
         };
         let item = match entity.kind {
             nephele_client::EntityKind::Item { id, meta } => Some((id, meta)),
             _ => None,
         };
+        let direction = match entity.kind {
+            nephele_client::EntityKind::ItemFrame { direction } => direction,
+            _ => 0,
+        };
+        let item_frame = entity
+            .item_frame
+            .as_ref()
+            .map(|frame| (direction, frame.rotation, frame.item));
+        let held_item = entity.equipment[play::equipment_slot::HELD as usize];
+        let armor = [
+            entity.equipment[play::equipment_slot::BOOTS as usize],
+            entity.equipment[play::equipment_slot::LEGGINGS as usize],
+            entity.equipment[play::equipment_slot::CHESTPLATE as usize],
+            entity.equipment[play::equipment_slot::HELMET as usize],
+        ];
         Self {
             id: entity.id,
             player,
@@ -152,7 +176,9 @@ impl EntitySnapshot {
             show_name: entity.shows_name(),
             health: entity.health(),
             flags: entity.metadata.flags,
-            equipment: entity.equipment,
+            held_item,
+            armor,
+            item_frame,
             velocity: entity.velocity,
             animation: entity.animation,
             animation_ticks: entity.animation_ticks,
@@ -476,7 +502,9 @@ impl LocalMob {
             show_name: false,
             health: self.health,
             flags: 0,
-            equipment: [None; play::equipment_slot::COUNT],
+            held_item: None,
+            armor: [None; 4],
+            item_frame: None,
             velocity: self.velocity,
             animation: 0,
             animation_ticks: 0,
@@ -1273,16 +1301,19 @@ async fn net_loop(
                         let _ = tx.send(NetMsg::Sound(sound));
                     }
                     Ok(Event::PlayerList) => {
-                        let skins: Vec<([u8; 16], String)> = client
+                        let skins: Vec<([u8; 16], String, bool)> = client
                             .skins
                             .iter()
                             .filter_map(|(uuid, info)| {
-                                info.hash.clone().map(|hash| (*uuid, hash))
+                                info.hash.clone().map(|hash| (*uuid, hash, info.slim))
                             })
                             .collect();
                         if !skins.is_empty() {
                             let _ = tx.send(NetMsg::Skins(skins));
                         }
+                    }
+                    Ok(Event::MapUpdated(map)) => {
+                        let _ = tx.send(NetMsg::Map(map));
                     }
                     Ok(_) => {}
                     Err(err) => return Err(err.to_string()),
@@ -1351,12 +1382,18 @@ struct LiveApp {
     /// Packed player skins and the atlas slot each player occupies.
     skin_atlas: SkinAtlas,
     skin_slots: std::collections::HashMap<[u8; 16], u32>,
+    /// Whether each player's skin uses the slim arm layout.
+    skin_slim: std::collections::HashMap<[u8; 16], bool>,
+    /// Map pixels and the atlas slot each map id occupies.
+    maps: Maps,
+    map_slots: std::collections::HashMap<i32, u32>,
     mob_slots: std::collections::HashMap<u8, u32>,
     sign_slot: u32,
     chest_slot: u32,
     banner_slot: u32,
     beacon_beam_slot: u32,
     book_slot: u32,
+    item_frame_slot: u32,
     skin_loader: SkinLoader,
     /// Per-phase frame timings, printed once a second under `NEPHELE_PROFILE=1`.
     profile: bool,
@@ -1479,12 +1516,16 @@ impl LiveApp {
             audio,
             skin_atlas: SkinAtlas::new(),
             skin_slots: std::collections::HashMap::new(),
+            skin_slim: std::collections::HashMap::new(),
+            maps: Maps::new(),
+            map_slots: std::collections::HashMap::new(),
             mob_slots: std::collections::HashMap::new(),
             sign_slot: SkinAtlas::DEFAULT_SLOT,
             chest_slot: SkinAtlas::DEFAULT_SLOT,
             banner_slot: SkinAtlas::DEFAULT_SLOT,
             beacon_beam_slot: SkinAtlas::DEFAULT_SLOT,
             book_slot: SkinAtlas::DEFAULT_SLOT,
+            item_frame_slot: SkinAtlas::DEFAULT_SLOT,
             skin_loader: SkinLoader::new(),
             profile: std::env::var("NEPHELE_PROFILE").is_ok(),
             prof_ui: 0.0,
@@ -1656,7 +1697,7 @@ impl LiveApp {
         // still all-transparent (and every humanoid is discarded) until the
         // first real skin downloads.
         let skin_upload_start = Instant::now();
-        renderer.set_skins(&self.skin_atlas);
+        renderer.set_skins(&mut self.skin_atlas);
         perf::record_stage_span("texture_atlas_upload", skin_upload_start, Instant::now());
         self.renderer = Some(renderer);
         self.load_entity_textures();
@@ -1722,19 +1763,42 @@ impl LiveApp {
         }
     }
 
-    /// Apply any skins that finished downloading since the last frame.
+    /// Apply any skins that finished downloading since the last frame, and
+    /// drain the atlas upload budget. Calling this every frame guarantees a
+    /// burst larger than the budget still finishes over the next few frames.
     fn update_skins(&mut self) {
-        let mut updated = false;
         while let Some((hash, image)) = self.skin_loader.try_recv() {
             if let Some(slot) = self.skin_atlas.slot_of(&hash) {
                 self.skin_atlas.set_skin(slot, &image);
-                updated = true;
             }
         }
-        if updated {
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_skins(&self.skin_atlas);
-            }
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_skins(&mut self.skin_atlas);
+        }
+    }
+
+    /// Reserve an atlas slot for a map id, filling it with the server's pixels
+    /// or the generated placeholder. The slot upload is budgeted by
+    /// `Renderer::set_skins`, so a burst of maps does not block a frame.
+    fn ensure_map_slot(&mut self, id: i32) -> u32 {
+        if let Some(slot) = self.map_slots.get(&id) {
+            return *slot;
+        }
+        let slot = self.skin_atlas.assign(&format!("map:{id}"));
+        self.map_slots.insert(id, slot);
+        self.upload_map(id, slot);
+        slot
+    }
+
+    fn upload_map(&mut self, id: i32, slot: u32) {
+        let data = self.maps.ensure(id).clone();
+        let size = nephele_client::MAP_SIZE as u32;
+        let Some(image) = image::RgbaImage::from_raw(size, size, data.to_rgba()) else {
+            return;
+        };
+        self.skin_atlas.set_map(slot, &image);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_skins(&mut self.skin_atlas);
         }
     }
 
@@ -1802,13 +1866,26 @@ impl LiveApp {
                 "banner" => self.banner_slot = slot,
                 "beacon_beam" => self.beacon_beam_slot = slot,
                 "book" => self.book_slot = slot,
+                "item_frame" => self.item_frame_slot = slot,
                 _ => {}
             }
             changed = true;
         }
+        // 1.8 has no entity/itemframe.png; the frame is the block texture.
+        let frame_path = textures_root.join("blocks/itemframe_background.png");
+        if let Ok(image) = image::open(&frame_path) {
+            let slot = self
+                .skin_atlas
+                .slot_of("item_frame")
+                .unwrap_or_else(|| self.skin_atlas.assign("item_frame"));
+            self.skin_atlas
+                .set_skin(slot, &crate::skins::normalise(image.to_rgba8()));
+            self.item_frame_slot = slot;
+            changed = true;
+        }
         if changed {
             if let Some(renderer) = self.renderer.as_mut() {
-                renderer.set_skins(&self.skin_atlas);
+                renderer.set_skins(&mut self.skin_atlas);
             }
         }
     }
@@ -1822,8 +1899,38 @@ impl LiveApp {
             return;
         };
         let alpha = view.alpha;
+
+        // Reserve every map slot before borrowing the entity list. The upload
+        // itself is budgeted by the renderer, so a lobby full of maps still
+        // spreads across frames instead of stalling one.
+        let mut map_ids = std::collections::HashSet::new();
+        for entity in &self.entities {
+            if let Some(id) = entity.held_item.and_then(|item| item.map_id) {
+                map_ids.insert(id);
+            }
+            if let Some((_, _, Some(item))) = entity.item_frame {
+                if let Some(id) = item.map_id {
+                    map_ids.insert(id);
+                }
+            }
+        }
+        if let Some(id) = view
+            .inventory
+            .get(play::HOTBAR_FIRST_SLOT + view.held_slot.max(0) as usize)
+            .copied()
+            .flatten()
+            .and_then(|item| item.map_id)
+        {
+            map_ids.insert(id);
+        }
+        for id in map_ids {
+            self.ensure_map_slot(id);
+        }
+
         let mut draws = Vec::with_capacity(self.entities.len());
         let mut items = Vec::new();
+        let mut hand_items: Vec<HandItem> = Vec::new();
+        let mut item_frames: Vec<ItemFrameDraw> = Vec::new();
         for entity in &self.entities {
             let x = entity.prev[0] + (entity.position[0] - entity.prev[0]) * alpha;
             let y = entity.prev[1] + (entity.position[1] - entity.prev[1]) * alpha;
@@ -1834,6 +1941,28 @@ impl LiveApp {
                     position: [x as f32, y as f32, z as f32],
                     item,
                     meta,
+                });
+                continue;
+            }
+
+            if let Some((direction, rotation, framed)) = entity.item_frame {
+                let map_id = framed.and_then(|item| item.map_id);
+                let (item_slot, item_tint) = match map_id {
+                    Some(id) => (self.map_slots.get(&id).copied(), [1.0; 4]),
+                    None => (
+                        None,
+                        framed
+                            .map(|item| frame_item_tint(item.id))
+                            .unwrap_or([1.0; 4]),
+                    ),
+                };
+                item_frames.push(ItemFrameDraw {
+                    position: [x as f32, y as f32, z as f32],
+                    direction,
+                    rotation,
+                    frame_slot: self.item_frame_slot,
+                    item_slot,
+                    item_tint,
                 });
                 continue;
             }
@@ -1897,21 +2026,50 @@ impl LiveApp {
             }
             draw.invisible = entity.flags & 0x20 != 0;
             draw.crouch = entity.flags & 0x02 != 0;
+            draw.slim = entity.player && self.skin_slim.get(&entity.uuid).copied().unwrap_or(false);
+            draw.arm_swing = if entity.animation == 0 && entity.animation_ticks > 0 {
+                (8 - entity.animation_ticks) as f32 / 8.0
+            } else {
+                0.0
+            };
+            draw.armor = entity
+                .armor
+                .map(|item| item.and_then(|item| armor_tint(item.id)));
 
-            if let Some(held) = entity.equipment[play::equipment_slot::HELD as usize]
-                .and_then(|item| item.block_state())
-            {
-                let state = nephele_world::BlockState::from_raw(held);
-                items.push(ItemDraw {
-                    position: [x as f32 + 0.35, y as f32 + 0.9, z as f32 + 0.35],
-                    item: state.id() as i16,
-                    meta: state.meta() as i16,
-                });
+            if let Some(held) = entity.held_item {
+                if let Some(id) = held.map_id {
+                    draw.held_map_slot = self.map_slots.get(&id).copied();
+                } else {
+                    let pose = humanoid_hand(&draw);
+                    let (item, meta) = held
+                        .block_state()
+                        .map(|raw| {
+                            let state = nephele_world::BlockState::from_raw(raw);
+                            (state.id() as i16, state.meta() as i16)
+                        })
+                        .unwrap_or((held.id, held.damage));
+                    hand_items.push(HandItem {
+                        item,
+                        meta,
+                        centre: [
+                            pose.palm[0] + pose.forward[0] * 0.12,
+                            pose.palm[1] + pose.forward[1] * 0.12,
+                            pose.palm[2] + pose.forward[2] * 0.12,
+                        ],
+                        right: pose.right,
+                        up: pose.up,
+                        forward: pose.forward,
+                        size: 0.36,
+                    });
+                }
             }
             draws.push(draw);
         }
 
         let mut entity_mesh = build_entities(&draws);
+        for frame in &item_frames {
+            append_item_frame(&mut entity_mesh, frame);
+        }
         for block in &self.block_entities {
             let (model, slot, tint) = match &block.kind {
                 BlockEntityKind::Sign { .. } => (BlockEntityModel::Sign, self.sign_slot, [1.0; 4]),
@@ -1945,6 +2103,13 @@ impl LiveApp {
         }
 
         let mut item_mesh = build_item_mesh(&items, &textures, self.time);
+        for hand in &hand_items {
+            if (1..256).contains(&hand.item) {
+                item_mesh.append(build_hand_item(hand, &textures));
+            } else {
+                item_mesh.append(build_hand_sprite(hand, &textures));
+            }
+        }
         if self.screen == Screen::Game {
             // The first-person arm is built in camera space and placed in the
             // world, so it lands in the same depth-tested pass as everything else.
@@ -1971,20 +2136,39 @@ impl LiveApp {
                 .get(play::HOTBAR_FIRST_SLOT + view.held_slot.max(0) as usize)
                 .copied()
                 .flatten();
-            if let Some(state) = held.and_then(|item| item.block_state()) {
-                let state = nephele_world::BlockState::from_raw(state);
-                item_mesh.append(build_hand_item(
-                    &HandItem {
-                        item: state.id() as i16,
-                        meta: state.meta() as i16,
-                        centre: pose.palm,
-                        right: pose.right,
-                        up: pose.up,
-                        forward: pose.forward,
-                        size: 0.36,
-                    },
-                    &textures,
-                ));
+            if let Some(held) = held {
+                if let Some(id) = held.map_id {
+                    if let Some(slot) = self.map_slots.get(&id).copied() {
+                        append_hand_map(&mut entity_mesh, &pose, slot, 0.35);
+                    }
+                } else if let Some(state) = held.block_state() {
+                    let state = nephele_world::BlockState::from_raw(state);
+                    item_mesh.append(build_hand_item(
+                        &HandItem {
+                            item: state.id() as i16,
+                            meta: state.meta() as i16,
+                            centre: pose.palm,
+                            right: pose.right,
+                            up: pose.up,
+                            forward: pose.forward,
+                            size: 0.36,
+                        },
+                        &textures,
+                    ));
+                } else {
+                    item_mesh.append(build_hand_sprite(
+                        &HandItem {
+                            item: held.id,
+                            meta: held.damage,
+                            centre: pose.palm,
+                            right: pose.right,
+                            up: pose.up,
+                            forward: pose.forward,
+                            size: 0.35,
+                        },
+                        &textures,
+                    ));
+                }
             }
         }
         item_mesh.append(build_particle_mesh(
@@ -2047,13 +2231,20 @@ impl LiveApp {
                     }
                 }
                 Ok(NetMsg::Skins(skins)) => {
-                    for (uuid, hash) in skins {
+                    for (uuid, hash, slim) in skins {
+                        self.skin_slim.insert(uuid, slim);
                         // Reserve a slot on first sight and start the download.
                         self.skin_slots.entry(uuid).or_insert_with(|| {
                             self.skin_loader.request(&hash);
                             self.skin_atlas.assign(&hash)
                         });
                     }
+                }
+                Ok(NetMsg::Map(map)) => {
+                    let id = map.id;
+                    self.maps.insert(map);
+                    let slot = self.ensure_map_slot(id);
+                    self.upload_map(id, slot);
                 }
                 Ok(NetMsg::Error(err)) => {
                     eprintln!("network error: {err}");
@@ -2574,11 +2765,11 @@ impl LiveApp {
     fn draw_entity_labels(&mut self, view: &FrameView, scale: f32, width: f32, height: f32) {
         let matrix = view.camera.view_projection();
         for entity in &self.entities {
-            if entity.item.is_some() || entity.flags & 0x20 != 0 {
+            if entity.item.is_some() || entity.item_frame.is_some() || entity.flags & 0x20 != 0 {
                 continue;
             }
             let x = entity.position[0] as f32;
-            let y = entity.position[1] as f32 + if entity.player { 2.0 } else { 1.7 };
+            let y = entity.position[1] as f32 + if entity.player { 2.05 } else { 1.75 };
             let z = entity.position[2] as f32;
             let clip = matrix * glam::Vec4::new(x, y, z, 1.0);
             if clip.w <= 0.1 {
@@ -2591,14 +2782,34 @@ impl LiveApp {
             let screen_x = (ndc.x * 0.5 + 0.5) * width;
             let screen_y = (1.0 - (ndc.y * 0.5 + 0.5)) * height;
             let distance = view.camera.position.distance(glam::Vec3::new(x, y, z));
-            let local_scale = scale * (1.0 - (distance / 48.0).clamp(0.0, 0.55));
+            // Vanilla keeps the tag readable at range instead of letting it
+            // shrink into the background. 14 blocks is roughly the point where
+            // a 0.025-scale tag reaches one GUI pixel per texel.
+            let local_scale = scale * (14.0 / distance.max(1.0)).clamp(0.55, 1.5);
             let label = if entity.show_name && !entity.name.is_empty() {
-                format!("{}\n{} HP", entity.name, entity.health.ceil() as i32)
+                if entity.player {
+                    entity.name.clone()
+                } else {
+                    format!("{}\n{} HP", entity.name, entity.health.ceil() as i32)
+                }
             } else if !entity.player {
                 format!("{} HP", entity.health.ceil() as i32)
             } else {
                 continue;
             };
+            let lines = label.lines().count().max(1) as f32;
+            let text_width = UiBatch::text_width(&label, local_scale);
+            let line_height = 9.0 * local_scale;
+            let padding = 2.0 * local_scale;
+            self.ui_bg.rect(
+                Rect::new(
+                    screen_x - text_width / 2.0 - padding,
+                    screen_y - padding * 0.5,
+                    text_width + padding * 2.0,
+                    lines * line_height + padding,
+                ),
+                [0.0, 0.0, 0.0, 0.45],
+            );
             self.ui_fg
                 .text_centered(&label, screen_x, screen_y, local_scale, [1.0; 4]);
         }
@@ -3793,6 +4004,35 @@ fn lerp_degrees(previous: f32, current: f32, alpha: f64) -> f32 {
 }
 
 /// Flat colour for a mob, so unspecified mobs are at least distinguishable.
+/// Armour material tint by item id. The exact layer textures are not loaded
+/// yet, so a solid tinted shell is used; the silhouette and slot are correct.
+fn armor_tint(item: i16) -> Option<[f32; 4]> {
+    let color = match item {
+        298..=301 => [0.55, 0.36, 0.22, 0.6], // leather
+        302..=305 => [0.62, 0.62, 0.62, 0.6], // chain
+        306..=309 => [0.55, 0.55, 0.58, 0.6], // iron
+        310..=313 => [0.32, 0.78, 0.78, 0.6], // diamond
+        314..=317 => [0.95, 0.80, 0.25, 0.6], // gold
+        _ => return None,
+    };
+    Some(color)
+}
+
+/// A flat colour for a framed non-map item. Maps use their real pixels; this
+/// keeps a framed sword or block from rendering as an invisible quad.
+fn frame_item_tint(item: i16) -> [f32; 4] {
+    if let Some(color) = armor_tint(item) {
+        return color;
+    }
+    let hash = item.unsigned_abs() as u32;
+    [
+        0.35 + (hash % 7) as f32 * 0.08,
+        0.35 + ((hash / 7) % 7) as f32 * 0.08,
+        0.35 + ((hash / 49) % 7) as f32 * 0.08,
+        1.0,
+    ]
+}
+
 fn mob_tint(kind: u8) -> [f32; 4] {
     match kind {
         // Zombie / skeleton / creeper / spider / pig.

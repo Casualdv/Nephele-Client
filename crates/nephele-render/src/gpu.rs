@@ -136,8 +136,6 @@ pub struct Renderer {
     entity_pipeline: wgpu::RenderPipeline,
     entity_bind_group: wgpu::BindGroup,
     skin_texture: wgpu::Texture,
-    /// Atlas version already uploaded, so skins only re-upload when they change.
-    skin_version: u64,
     entity_vertices: wgpu::Buffer,
     entity_indices: wgpu::Buffer,
     entity_vertex_capacity: wgpu::BufferAddress,
@@ -836,7 +834,6 @@ impl Renderer {
             entity_pipeline,
             entity_bind_group,
             skin_texture,
-            skin_version: 0,
             entity_vertices,
             entity_indices,
             entity_vertex_capacity,
@@ -959,32 +956,36 @@ impl Renderer {
         self.chunks.len()
     }
 
-    /// Push the packed skin atlas to the GPU. No-op when nothing changed.
-    pub fn set_skins(&mut self, atlas: &SkinAtlas) {
-        if atlas.version() == self.skin_version {
-            return;
+    /// Push slots that changed since the last call to the GPU.
+    ///
+    /// Uploads are per-slot sub-rectangles with a small per-frame budget, so a
+    /// burst of maps or a dozen joining players never turns into one large
+    /// blocking texture copy. Slots left over are picked up next frame.
+    pub fn set_skins(&mut self, atlas: &mut SkinAtlas) {
+        const UPLOAD_BUDGET: usize = 4;
+        let size = nephele_assets::SLOT_SIZE;
+        for slot in atlas.take_dirty(UPLOAD_BUDGET) {
+            let (x, y, _) = SkinAtlas::slot_rect(slot);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.skin_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                atlas.slot_pixels(slot),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * nephele_assets::ATLAS_SIZE),
+                    rows_per_image: Some(size),
+                },
+                wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
-        self.skin_version = atlas.version();
-        let size = nephele_assets::ATLAS_SIZE;
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.skin_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            atlas.pixels(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * size),
-                rows_per_image: Some(size),
-            },
-            wgpu::Extent3d {
-                width: size,
-                height: size,
-                depth_or_array_layers: 1,
-            },
-        );
     }
 
     /// Replace every entity's geometry. Entities are few, so the whole buffer is

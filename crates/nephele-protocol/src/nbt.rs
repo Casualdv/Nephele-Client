@@ -77,6 +77,16 @@ impl Tag {
 
 /// Read one named root tag from `data` (the form used by `S35`).
 pub fn parse_named_tag(data: &[u8]) -> Result<(String, Tag)> {
+    let (name, tag, _) = parse_named_tag_prefix(data)?;
+    Ok((name, tag))
+}
+
+/// Read one named root tag and report how many bytes it consumed.
+///
+/// Item slots can carry NBT followed by more fields (the placement packet puts
+/// the cursor position after the held stack), so the caller must consume only
+/// the tag and leave the rest of the packet alone.
+pub fn parse_named_tag_prefix(data: &[u8]) -> Result<(String, Tag, usize)> {
     let mut reader = NbtReader {
         data,
         pos: 0,
@@ -84,11 +94,11 @@ pub fn parse_named_tag(data: &[u8]) -> Result<(String, Tag)> {
     };
     let kind = reader.u8()?;
     if kind == TAG_END {
-        return Ok((String::new(), Tag::End));
+        return Ok((String::new(), Tag::End, reader.pos));
     }
     let name = reader.string()?;
     let tag = reader.payload(kind)?;
-    Ok((name, tag))
+    Ok((name, tag, reader.pos))
 }
 
 struct NbtReader<'a> {

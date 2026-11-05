@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::nbt::Tag;
 use crate::packet::Packet;
 use crate::packets::status::flatten_chat;
 use crate::write::PacketWriter;
@@ -39,6 +40,10 @@ pub mod clientbound {
     pub const MAP_CHUNK_BULK: i32 = 0x26;
     pub const SOUND_EFFECT: i32 = 0x29;
     pub const PARTICLE: i32 = 0x2A;
+    /// `S33` map columns (a rectangular patch of a map).
+    pub const MAP_COLUMNS: i32 = 0x33;
+    /// `S34` map chunk (a rectangle plus a scale).
+    pub const MAP_CHUNK: i32 = 0x34;
     pub const SET_SLOT: i32 = 0x2F;
     pub const OPEN_WINDOW: i32 = 0x2D;
     pub const CLOSE_WINDOW: i32 = 0x2E;
@@ -116,6 +121,8 @@ pub struct ItemStack {
     pub id: i16,
     pub count: i8,
     pub damage: i16,
+    /// `NBT.map` for map items (id 358), used to look up map pixels.
+    pub map_id: Option<i32>,
 }
 
 impl ItemStack {
@@ -123,7 +130,17 @@ impl ItemStack {
     pub const EMPTY_ID: i16 = -1;
 
     pub const fn new(id: i16, count: i8, damage: i16) -> Self {
-        Self { id, count, damage }
+        Self {
+            id,
+            count,
+            damage,
+            map_id: None,
+        }
+    }
+
+    pub const fn with_map(mut self, map_id: i32) -> Self {
+        self.map_id = Some(map_id);
+        self
     }
 
     /// Block items share their id with the block, so `1` is stone, `4` is
@@ -156,11 +173,44 @@ pub fn write_slot<'a>(
             writer
                 .write_i16(item.id)
                 .write_i8(item.count)
-                .write_i16(item.damage)
-                // No NBT alongside the stack.
-                .write_u8(0)
+                .write_i16(item.damage);
+            match item.map_id {
+                Some(map_id) => {
+                    // Root compound with no name, one `map` int, then TAG_End.
+                    writer
+                        .write_u8(10)
+                        .write_u16(0)
+                        .write_u8(3)
+                        .write_u16(3)
+                        .write_bytes(b"map")
+                        .write_i32(map_id)
+                        .write_u8(0)
+                }
+                None => writer.write_u8(0),
+            }
         }
     }
+}
+
+/// `S34` map chunk writer, used by the mock server and tests.
+pub fn map_chunk(
+    map_id: i32,
+    scale: i8,
+    x: i32,
+    z: i32,
+    columns: u8,
+    rows: u8,
+    colors: &[u8],
+) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_varint(map_id)
+        .write_i8(scale)
+        .write_varint(columns as i32);
+    if columns > 0 {
+        w.write_varint(rows as i32).write_varint(x).write_varint(z);
+    }
+    w.write_byte_array(colors);
+    Packet::new(clientbound::MAP_CHUNK, w.into_bytes())
 }
 
 /// Read a slot, skipping any NBT.
@@ -171,8 +221,22 @@ pub fn parse_slot(reader: &mut crate::read::PacketReader<'_>) -> Result<Option<I
     }
     let count = reader.read_i8()?;
     let damage = reader.read_i16()?;
-    crate::nbt::skip_named_tag(reader)?;
-    Ok(Some(ItemStack { id, count, damage }))
+    // The slot's NBT is a single named root tag. Map items carry `map: <id>`.
+    // Only the tag is consumed: placement packets put the cursor after it.
+    let rest = reader.rest();
+    let map_id = if rest.is_empty() {
+        None
+    } else {
+        let (_, tag, consumed) = crate::nbt::parse_named_tag_prefix(rest)?;
+        reader.take(consumed)?;
+        tag.get("map").and_then(Tag::as_int)
+    };
+    Ok(Some(ItemStack {
+        id,
+        count,
+        damage,
+        map_id,
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -541,6 +605,93 @@ pub fn parse_sound_effect(packet: &Packet) -> Result<SoundEffect> {
         z,
         volume,
         pitch,
+    })
+}
+
+/// `S34 Map Chunk`: a rectangle of a map plus its scale.
+///
+/// This is the interface M3's map parsing should target. The client already
+/// accepts both this and [`MapColumns`]; until a server sends one, the renderer
+/// falls back to a generated placeholder so a framed map is never blank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapChunk {
+    pub map_id: i32,
+    pub scale: i8,
+    pub columns: u8,
+    pub rows: u8,
+    pub x: i32,
+    pub z: i32,
+    /// `columns * rows` colour indices, row-major.
+    pub colors: Vec<u8>,
+}
+
+/// `S33 Map Columns`: a rectangle of a map without a scale field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapColumns {
+    pub map_id: i32,
+    pub columns: u8,
+    pub rows: u8,
+    pub x: u8,
+    pub z: u8,
+    pub colors: Vec<u8>,
+}
+
+pub fn parse_map_chunk(packet: &Packet) -> Result<MapChunk> {
+    let mut r = packet.reader();
+    let map_id = r.read_varint()?;
+    let scale = r.read_i8()?;
+    let columns = r.read_varint()?.clamp(0, 128) as u8;
+    let rows = if columns == 0 {
+        0
+    } else {
+        r.read_varint()?.clamp(0, 128) as u8
+    };
+    let (x, z) = if columns == 0 {
+        (0, 0)
+    } else {
+        (r.read_varint()?, r.read_varint()?)
+    };
+    let colors = r.read_byte_array()?;
+    let expected = columns as usize * rows as usize;
+    if colors.len() != expected {
+        return Err(Error::Protocol(format!(
+            "map chunk {map_id} has {} colours for {columns}x{rows}",
+            colors.len()
+        )));
+    }
+    Ok(MapChunk {
+        map_id,
+        scale,
+        columns,
+        rows,
+        x,
+        z,
+        colors,
+    })
+}
+
+pub fn parse_map_columns(packet: &Packet) -> Result<MapColumns> {
+    let mut r = packet.reader();
+    let map_id = r.read_varint()?;
+    let columns = r.read_u8()?.min(128);
+    let rows = r.read_u8()?.min(128);
+    let x = r.read_u8()?;
+    let z = r.read_u8()?;
+    let colors = r.read_byte_array()?;
+    let expected = columns as usize * rows as usize;
+    if colors.len() != expected {
+        return Err(Error::Protocol(format!(
+            "map columns {map_id} has {} colours for {columns}x{rows}",
+            colors.len()
+        )));
+    }
+    Ok(MapColumns {
+        map_id,
+        columns,
+        rows,
+        x,
+        z,
+        colors,
     })
 }
 
@@ -1217,6 +1368,8 @@ pub fn parse_entity(packet: &Packet) -> Result<i32> {
 
 /// The object type used for a dropped item stack.
 pub const OBJECT_TYPE_ITEM: u8 = 2;
+/// Item frames are objects, not mobs, in 1.8. The object `data` is the facing.
+pub const OBJECT_TYPE_ITEM_FRAME: u8 = 71;
 
 /// `S0E`: a non-living object. Dropped items are the only kind the client
 /// tracks; the rest are parsed so the wire format stays honest.
@@ -1832,6 +1985,72 @@ mod tests {
         assert_eq!(ItemStack::new(4, 1, 0).block_state(), Some(4 << 4));
         assert_eq!(ItemStack::new(5, 1, 3).block_state(), Some((5 << 4) | 3));
         assert_eq!(ItemStack::new(276, 1, 0).block_state(), None);
+    }
+}
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    #[test]
+    fn a_map_chunk_round_trips_its_rectangle() {
+        let packet = map_chunk(7, 2, 3, 4, 2, 2, &[1, 2, 3, 4]);
+        let chunk = parse_map_chunk(&packet).expect("map chunk");
+        assert_eq!(chunk.map_id, 7);
+        assert_eq!(chunk.scale, 2);
+        assert_eq!((chunk.columns, chunk.rows), (2, 2));
+        assert_eq!((chunk.x, chunk.z), (3, 4));
+        assert_eq!(chunk.colors, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn map_columns_use_byte_offsets() {
+        let mut w = PacketWriter::new();
+        w.write_varint(9)
+            .write_u8(1)
+            .write_u8(1)
+            .write_u8(10)
+            .write_u8(20)
+            .write_byte_array(&[5]);
+        let columns = parse_map_columns(&Packet::new(clientbound::MAP_COLUMNS, w.into_bytes()))
+            .expect("map columns");
+        assert_eq!(columns.map_id, 9);
+        assert_eq!((columns.x, columns.z), (10, 20));
+        assert_eq!(columns.colors, vec![5]);
+    }
+
+    #[test]
+    fn a_map_slot_keeps_its_nbt_and_trailing_fields() {
+        let mut w = PacketWriter::new();
+        write_slot(&mut w, Some(&ItemStack::new(358, 1, 0).with_map(12)));
+        w.write_u8(0xAA).write_u8(0xBB);
+        let packet = Packet::new(0, w.into_bytes());
+        let mut r = packet.reader();
+        let slot = parse_slot(&mut r).expect("slot").expect("item");
+        assert_eq!(slot.id, 358);
+        assert_eq!(slot.map_id, Some(12));
+        // The placement packet's cursor bytes follow the slot and must survive.
+        assert_eq!(r.read_u8().unwrap(), 0xAA);
+        assert_eq!(r.read_u8().unwrap(), 0xBB);
+    }
+
+    #[test]
+    fn item_frame_metadata_carries_item_and_rotation() {
+        let mut w = PacketWriter::new();
+        w.write_varint(1000);
+        w.write_u8((5 << 5) | 8);
+        write_slot(&mut w, Some(&ItemStack::new(358, 1, 0).with_map(7)));
+        w.write_u8(9);
+        w.write_i8(3);
+        w.write_u8(0x7F);
+        let update =
+            parse_entity_metadata(&Packet::new(clientbound::ENTITY_METADATA, w.into_bytes()))
+                .expect("metadata");
+        assert!(matches!(
+            update.get(8),
+            Some(EntityMetadataValue::Slot(Some(item))) if item.map_id == Some(7)
+        ));
+        assert!(matches!(update.get(9), Some(EntityMetadataValue::Byte(3))));
     }
 }
 

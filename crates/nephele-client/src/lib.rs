@@ -7,6 +7,7 @@
 pub mod block_entities;
 pub mod container;
 pub mod entities;
+pub mod maps;
 pub mod mining;
 pub mod physics;
 pub mod skins;
@@ -25,6 +26,7 @@ use nephele_world::{
 pub use block_entities::{BannerPattern, BlockEntity, BlockEntityKind};
 pub use container::LocalContainer;
 pub use entities::{Entities, Entity, EntityKind, EntityMetadata};
+pub use maps::{MapData, Maps, MAP_SIZE};
 pub use mining::{Aim, Miner, MiningEvent};
 pub use skins::{SkinInfo, Skins};
 
@@ -176,6 +178,8 @@ pub enum Event {
     Particles(Vec<play::ParticleSpawn>),
     /// A server-triggered positional sound (`S29`).
     SoundEffect(play::SoundEffect),
+    /// A map's pixels changed (`S33` / `S34`).
+    MapUpdated(MapData),
     /// The server announced its brand on `MC|Brand`.
     ServerBrand(String),
     /// An unhandled server plugin channel was received.
@@ -260,6 +264,8 @@ pub struct GameClient {
     pub skins: Skins,
     /// Current protocol-47 tab-list rows, keyed by player UUID.
     pub player_list: HashMap<[u8; 16], TabListEntry>,
+    /// Map item pixels keyed by map id, fed by `S33` / `S34`.
+    pub maps: Maps,
     /// Most recent update-tile-entity NBT, keyed by block position.
     pub block_entities: HashMap<(i32, i32, i32), play::BlockEntityUpdate>,
     /// Decoded block entities for rendering, keyed by block position.
@@ -424,6 +430,7 @@ impl GameClient {
             entities: Entities::new(),
             skins: Skins::new(),
             player_list: HashMap::new(),
+            maps: Maps::new(),
             block_entities: HashMap::new(),
             block_entity_views: HashMap::new(),
             server_brand: None,
@@ -580,6 +587,7 @@ impl GameClient {
                 let respawn = play::parse_respawn(&packet)?;
                 self.world.set_dimension(respawn.dimension);
                 self.entities.clear();
+                self.maps.clear();
                 self.block_entities.clear();
                 self.block_entity_views.clear();
                 self.info.dimension = respawn.dimension;
@@ -745,6 +753,17 @@ impl GameClient {
             }
             play::clientbound::SPAWN_OBJECT => {
                 let object = play::parse_spawn_object(&packet)?;
+                if object.kind == play::OBJECT_TYPE_ITEM_FRAME {
+                    self.entities.spawn_item_frame(
+                        object.entity_id,
+                        object.data.clamp(0, 5) as u8,
+                        [object.x, object.y, object.z],
+                    );
+                    return Ok(Event::EntitySpawned {
+                        entity_id: object.entity_id,
+                        name: String::new(),
+                    });
+                }
                 if object.kind != play::OBJECT_TYPE_ITEM {
                     // Arrows, falling blocks, boats, ... are not drawn yet, but
                     // parsing them keeps the packet stream understood.
@@ -854,6 +873,16 @@ impl GameClient {
             play::clientbound::SOUND_EFFECT => {
                 let sound = play::parse_sound_effect(&packet)?;
                 Ok(Event::SoundEffect(sound))
+            }
+            play::clientbound::MAP_CHUNK => {
+                let chunk = play::parse_map_chunk(&packet)?;
+                let map = self.maps.apply_chunk(&chunk).clone();
+                Ok(Event::MapUpdated(map))
+            }
+            play::clientbound::MAP_COLUMNS => {
+                let columns = play::parse_map_columns(&packet)?;
+                let map = self.maps.apply_columns(&columns).clone();
+                Ok(Event::MapUpdated(map))
             }
             play::clientbound::PLAYER_LIST_ITEM => {
                 let update = play::parse_player_list_item(&packet)?;
@@ -1264,6 +1293,7 @@ mod tests {
             entities: Entities::new(),
             skins: Skins::new(),
             player_list: HashMap::new(),
+            maps: Maps::new(),
             block_entities: HashMap::new(),
             block_entity_views: HashMap::new(),
             server_brand: None,

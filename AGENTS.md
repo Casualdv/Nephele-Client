@@ -397,6 +397,50 @@ the entity pipeline, which is bound to the skin atlas — via
   preparation. `Renderer::new` requests the adapter's actual
   `max_texture_array_layers` instead of wgpu's 256 default.
 
+### Lobby rendering: skins, nametags, item frames and maps (2026-11-05)
+
+- Player skins come from the base64 `textures` property; `SkinInfo` now carries
+  the `metadata.model` flag and the renderer builds 3px **slim** arms at
+  `(44,16)`/`(36,48)` instead of Steve's 4px arms. The hat/jacket/sleeve/pants
+  unwrap is a second layer, inflated 0.5px and sampling the overlay half of the
+  skin. The default/stand-in skin leaves those overlay regions transparent; a
+  skin that does not paint them must not become an opaque grey shell.
+- Nametags are screen-space labels projected from above the head. They have a
+  translucent black background, scale by distance (`14/d`, clamped 0.55..1.5)
+  and players show only their name (mobs also show HP).
+- `S0E Spawn Object` type 71 becomes `EntityKind::ItemFrame { direction }`.
+  Metadata index 8 is the framed stack, index 9 the 45-degree rotation.
+  `nephele-render::append_item_frame` draws the wooden frame texture
+  (`textures/blocks/itemframe_background.png`, 16x16) and the item flat in
+  front, rotated by metadata. Non-map items use a tinted placeholder; maps use
+  the real pixels.
+- `ItemStack` now keeps the NBT `map` id (`map_id`). `parse_slot` consumes only
+  the NBT tag, not the rest of the packet - placement packets put the cursor
+  after the held stack. `play::write_slot` writes the same NBT for the mock.
+- **Map interface:** `nephele-client::maps::{Maps, MapData, MAP_SIZE}` is the
+  seam for M3. `S34 Map Chunk` and `S33 Map Columns` parse into `play::MapChunk`
+  / `play::MapColumns`; `GameClient.maps` merges them and emits
+  `Event::MapUpdated(MapData)`. If no pixels arrive, `MapData::placeholder`
+  supplies a deterministic picture, so a framed map is never blank. The CLI
+  assigns one `SkinAtlas` slot per map id (`map:<id>`) and uploads it as a
+  sub-rectangle. `Renderer::set_skins` drains at most four dirty slots per
+  frame, so a burst of maps/skins cannot stall one frame.
+- `SkinAtlas` is now 8x8 slots (2048x2048) with a solid-white slot 1 for tinted
+  armour. Skins/maps start at slot 2. The per-slot dirty list is what makes the
+  budgeted upload work; do not go back to whole-atlas uploads.
+- `nephele-render::humanoid_hand` exposes the main-hand pose; the CLI attaches
+  held blocks/tools (`build_hand_item` / `build_hand_sprite`) and held maps
+  (`append_hand_map`). Armour is a tinted shell per equipment slot; the helmet
+  skips its +Z face so the player's face stays visible.
+- The mock lobby (`nephele mock-server --bots`) exercises the whole path: eight
+  named bots (alternating classic/slim, hash-tinted fallback skins), iron armour
+  and a held sword on one, a held map on another, a crouched bot, a swinging
+  bot, and a real `S34` framed map. The real-socket test
+  `the_lobby_has_players_and_a_framed_map` pins the client half.
+- Known limits: armour uses material tints, not the armour layer textures;
+  framed non-map items are flat tints; map parsing is the pinned interface but
+  has only been exercised against the mock, not a live M3 server.
+
 ### Audio (2026-11-03)
 
 - `nephele-audio` decodes Ogg Vorbis with Symphonia and mixes through cpal.
@@ -573,8 +617,15 @@ the planned M2 close-out.
 
 **M6 depth (2026-11-03):** mob models/metadata, particles, block-entity
 geometry, positional audio and a night singleplayer mob loop are in. Still
-partial: armour rendering, chest/furnace GUIs, block-entity interaction, music
-and records, and deeper mob combat/AI. The prepared asset output version is 2.
+partial: chest/furnace GUIs, block-entity interaction, music and records, and
+deeper mob combat/AI. The prepared asset output version is 2.
+
+**Lobby pass (2026-11-05):** classic/slim skins with the second layer, nametags
+with backgrounds and distance scaling, held blocks/tools/maps, tinted armour
+shells, item frames with rotation, and `S33`/`S34` map pixels (with a
+placeholder fallback) are in. `nephele mock-server --bots` is the end-to-end
+lobby demo. Still open: real armour layer textures, framed non-map item icons,
+and exercising the map interface against a live M3 server.
 
 **M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
 network block drops and pickup, survival inventory, container click protocol,
