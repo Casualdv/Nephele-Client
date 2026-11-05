@@ -9,6 +9,7 @@
 //! Velocities are stored in blocks per second (`vx`, `vy`, `vz`) so callers can
 //! reason in real units; the tick maths converts at the boundary.
 
+use nephele_world::block::ids as block_ids;
 use nephele_world::shapes::{block_shape, has_collision};
 use nephele_world::World;
 
@@ -27,6 +28,10 @@ pub const FLY_SPRINT_SPEED: f64 = 21.8;
 const MOVEMENT_SPEED: f64 = 0.1;
 /// Default block slipperiness; friction is `slipperiness * 0.91`.
 const SLIPPERINESS: f64 = 0.6;
+/// `BlockSlime.slipperiness` (1.8): 0.8, so you keep sliding on a pad.
+const SLIME_SLIPPERINESS: f64 = 0.8;
+/// `BlockIce.slipperiness` (1.8), shared by packed ice.
+const ICE_SLIPPERINESS: f64 = 0.98;
 /// `jumpMovementFactor`: the much smaller acceleration available in the air.
 const AIR_ACCEL: f64 = 0.02;
 /// 0.08 blocks/tick of gravity.
@@ -191,7 +196,7 @@ impl PlayerState {
         let mut vy = self.vy * dt;
         let mut vz = self.vz * dt;
 
-        let ground_friction = SLIPPERINESS * 0.91;
+        let ground_friction = self.ground_slipperiness(world) * 0.91;
         let ai_speed = MOVEMENT_SPEED
             * if input.sneak {
                 0.3
@@ -227,8 +232,18 @@ impl PlayerState {
         }
 
         self.on_ground = false;
+        let falling = vy < 0.0;
         if self.move_axis(world, 1, vy) {
-            vy = 0.0;
+            if falling && !input.sneak && self.standing_on_slime(world) {
+                // `BlockSlime.onLanded` (1.8): motion is reflected with the
+                // speed it arrived at, so a pad throws you as high as you fell
+                // instead of stopping you dead. Sneaking opts out, which is how
+                // vanilla lets you get off a pad without bouncing.
+                vy = -vy;
+                self.on_ground = false;
+            } else {
+                vy = 0.0;
+            }
         }
         let grounded = self.on_ground;
 
@@ -346,6 +361,48 @@ impl PlayerState {
         self.y = free;
         self.on_ground = true;
         true
+    }
+
+    /// `Block.slipperiness` for the block the player is standing on.
+    ///
+    /// Vanilla 1.8 makes slime and ice slippery, which is what turns a slime
+    /// pad into a launch instead of a wall of friction. Anything else uses the
+    /// default 0.6.
+    fn ground_slipperiness(&self, world: &World) -> f64 {
+        let layer = (self.y - 0.05).floor() as i32;
+        let min_x = self.x - WIDTH / 2.0 + EPS;
+        let max_x = self.x + WIDTH / 2.0 - EPS;
+        let min_z = self.z - WIDTH / 2.0 + EPS;
+        let max_z = self.z + WIDTH / 2.0 - EPS;
+        let mut slipperiness: f64 = SLIPPERINESS;
+        for block_x in (min_x.floor() as i32)..=(max_x.floor() as i32) {
+            for block_z in (min_z.floor() as i32)..=(max_z.floor() as i32) {
+                let candidate = match world.get_block(block_x, layer, block_z).id() {
+                    block_ids::SLIME => SLIME_SLIPPERINESS,
+                    block_ids::ICE | block_ids::PACKED_ICE => ICE_SLIPPERINESS,
+                    _ => SLIPPERINESS,
+                };
+                slipperiness = slipperiness.max(candidate);
+            }
+        }
+        slipperiness
+    }
+
+    /// Whether any block directly under the player's feet is slime.
+    fn standing_on_slime(&self, world: &World) -> bool {
+        let layer = (self.y - 0.05).floor() as i32;
+        let min_x = self.x - WIDTH / 2.0 + EPS;
+        let max_x = self.x + WIDTH / 2.0 - EPS;
+        let min_z = self.z - WIDTH / 2.0 + EPS;
+        let max_z = self.z + WIDTH / 2.0 - EPS;
+        for block_x in (min_x.floor() as i32)..=(max_x.floor() as i32) {
+            for block_z in (min_z.floor() as i32)..=(max_z.floor() as i32) {
+                if world.get_block(block_x, layer, block_z).id() == block_ids::SLIME {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The largest part of `delta` that still leaves ground under the player.
@@ -467,13 +524,18 @@ mod tests {
 
     /// A 5x5-chunk stone plane, so long walks don't run off the edge.
     fn flat_world(floor_y: usize) -> World {
+        floor_of(block_ids::STONE, floor_y)
+    }
+
+    /// A 5x5-chunk plane of one block id, for surface-friction and bounce tests.
+    fn floor_of(id: u16, floor_y: usize) -> World {
         let mut world = World::new(0);
         for cx in -2..=2 {
             for cz in -2..=2 {
                 let mut column = ChunkColumn::empty(cx, cz);
                 for x in 0..16 {
                     for z in 0..16 {
-                        column.set_block(x, floor_y, z, BlockState::STONE);
+                        column.set_block(x, floor_y, z, BlockState::new(id, 0));
                     }
                 }
                 world.insert(column);
@@ -805,6 +867,66 @@ mod tests {
     fn eye_height_is_above_the_feet() {
         let player = PlayerState::at(1.0, 2.0, 3.0);
         assert_eq!(player.eye(), [1.0, 2.0 + EYE_HEIGHT, 3.0]);
+    }
+
+    #[test]
+    fn landing_on_a_slime_pad_bounces_back_up() {
+        // A 3x3 pad is what Hypixel's lobby actually has; one block is enough
+        // for the physics, but the model is the same.
+        let world = floor_of(block_ids::SLIME, 64);
+        let mut player = PlayerState::at(8.5, 69.5, 8.5);
+        player.on_ground = false;
+
+        let mut bounced = false;
+        let mut apex: f64 = 0.0;
+        for _ in 0..80 {
+            player.step(0.05, &Input::default(), 0.0, &world);
+            if player.vy > 1.0 {
+                bounced = true;
+            }
+            if bounced {
+                apex = apex.max(player.y);
+            }
+        }
+
+        assert!(bounced, "the pad did not reflect the fall");
+        // 1.8 reflects the landing speed, so the ballpark is the fall height.
+        // The per-tick 0.98 damping in this integrator bites hardest on the
+        // way up, which is why it is not an exact return.
+        assert!(apex > 67.0, "bounce only reached {apex}");
+    }
+
+    #[test]
+    fn a_stone_floor_stops_a_fall_instead_of_bouncing() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 69.5, 8.5);
+        player.on_ground = false;
+
+        run_ticks(&mut player, &Input::default(), 40, &world);
+
+        assert!(player.on_ground);
+        assert!((player.y - 65.0).abs() < 1e-3, "y = {}", player.y);
+        // A resting player still reports one tick of gravity on the wire
+        // (vanilla sends the same), so the check is "not moving upward".
+        assert!(player.vy <= 0.0);
+    }
+
+    #[test]
+    fn slime_and_ice_have_their_own_slipperiness() {
+        let slime = PlayerState::at(8.5, 65.0, 8.5);
+        assert_eq!(
+            slime.ground_slipperiness(&floor_of(block_ids::SLIME, 64)),
+            SLIME_SLIPPERINESS
+        );
+
+        let ice = PlayerState::at(8.5, 65.0, 8.5);
+        assert_eq!(
+            ice.ground_slipperiness(&floor_of(block_ids::ICE, 64)),
+            ICE_SLIPPERINESS
+        );
+
+        let stone = PlayerState::at(8.5, 65.0, 8.5);
+        assert_eq!(stone.ground_slipperiness(&flat_world(64)), SLIPPERINESS);
     }
 
     #[test]

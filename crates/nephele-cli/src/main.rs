@@ -257,6 +257,14 @@ fn run_auth(client_id: Option<String>, out: Option<PathBuf>, legacy: bool) -> Ex
 
     let client_id = client_id
         .or_else(|| std::env::var("NEPHELE_CLIENT_ID").ok())
+        // Re-authenticating after a session expires is the common case; the
+        // cached session already records which app registration it used, so
+        // that should not need to be retyped.
+        .or_else(|| {
+            nephele_auth::StoredSession::load(&session_path())
+                .ok()
+                .map(|stored| stored.client_id)
+        })
         .unwrap_or_default();
 
     if client_id.trim().is_empty() {

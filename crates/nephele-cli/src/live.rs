@@ -120,17 +120,21 @@ struct EntitySnapshot {
 }
 
 impl EntitySnapshot {
-    fn from_entity(entity: &nephele_client::Entity) -> Self {
+    fn from_entity(entity: &nephele_client::Entity) -> Option<Self> {
         let (player, uuid, kind) = match &entity.kind {
             nephele_client::EntityKind::Player { uuid, .. } => (true, *uuid, 0),
             nephele_client::EntityKind::Mob { kind } => (false, [0; 16], *kind),
             nephele_client::EntityKind::Item { .. } => (false, [0; 16], 0),
+            // Item frames are parsed and tracked for the renderer that will
+            // consume them; nothing draws them yet, so they stay out of the
+            // snapshot rather than showing up as a tinted box.
+            nephele_client::EntityKind::ItemFrame { .. } => return None,
         };
         let item = match entity.kind {
             nephele_client::EntityKind::Item { id, meta } => Some((id, meta)),
             _ => None,
         };
-        Self {
+        Some(Self {
             player,
             uuid,
             prev: entity.prev,
@@ -142,7 +146,7 @@ impl EntitySnapshot {
             pitch: entity.pitch,
             kind,
             item,
-        }
+        })
     }
 }
 
@@ -997,7 +1001,7 @@ async fn net_loop(
                 let snapshot: Vec<EntitySnapshot> = client
                     .entities
                     .iter()
-                    .map(EntitySnapshot::from_entity)
+                    .filter_map(EntitySnapshot::from_entity)
                     .collect();
                 if std::mem::take(&mut shared.lock().unwrap().pending_respawn) {
                     client.respawn().await.map_err(|err| err.to_string())?;

@@ -6,8 +6,10 @@
 
 pub mod container;
 pub mod entities;
+pub mod maps;
 pub mod mining;
 pub mod physics;
+pub mod scene;
 pub mod skins;
 
 use std::collections::HashMap;
@@ -23,7 +25,9 @@ use nephele_world::{
 
 pub use container::LocalContainer;
 pub use entities::{Entities, Entity, EntityKind};
+pub use maps::{MapState, Maps};
 pub use mining::{Aim, Miner, MiningEvent};
+pub use scene::{EntityRender, EntityRenderKind, SceneView};
 pub use skins::{SkinInfo, Skins};
 
 /// A container window the server opened (e.g. a crafting table).
@@ -183,6 +187,11 @@ pub enum Event {
     PluginMessage {
         channel: String,
     },
+    /// A map's picture or markers were updated (`S34`). A framed map is looked
+    /// up by the item's damage value; `map_id` is the id in the packet.
+    MapUpdated {
+        map_id: i32,
+    },
     /// Any other packet; carries its id so callers can log/trace.
     Packet(i32),
     Skipped(i32),
@@ -301,6 +310,11 @@ pub struct GameClient {
     pub player_list: HashMap<[u8; 16], TabListEntry>,
     /// Most recent update-tile-entity NBT, keyed by block position.
     pub block_entities: HashMap<(i32, i32, i32), play::BlockEntityUpdate>,
+    /// Every map the server has sent picture data for, keyed by map id.
+    pub maps: Maps,
+    /// Last metadata seen per entity, so a renderer can read block states, held
+    /// items and rotations without re-parsing packets.
+    pub entity_metadata: HashMap<i32, play::EntityMetadata>,
     /// The server's advertised `MC|Brand`, when it sends one.
     pub server_brand: Option<String>,
     view_distance: u8,
@@ -470,6 +484,8 @@ impl GameClient {
             skins: Skins::new(),
             player_list: HashMap::new(),
             block_entities: HashMap::new(),
+            maps: Maps::new(),
+            entity_metadata: HashMap::new(),
             server_brand: None,
             view_distance: VIEW_DISTANCE,
             packets_received: 0,
@@ -724,6 +740,10 @@ impl GameClient {
                 self.world.set_dimension(dimension);
                 self.entities.clear();
                 self.block_entities.clear();
+                // Map ids and frame entity ids are per-world, like chunk
+                // coordinates: a Nether map must not reuse an overworld one.
+                self.maps.clear();
+                self.entity_metadata.clear();
                 self.info.dimension = dimension;
                 self.info.gamemode = respawn.gamemode;
                 self.info.level_type = respawn.level_type;
@@ -909,6 +929,19 @@ impl GameClient {
             }
             play::clientbound::SPAWN_OBJECT => {
                 let object = play::parse_spawn_object(packet)?;
+                if object.kind == play::OBJECT_TYPE_ITEM_FRAME {
+                    // The frame's `data` field is its facing; the framed stack
+                    // and rotation arrive later on `S1C`.
+                    self.entities.spawn_item_frame(
+                        object.entity_id,
+                        object.data as u8,
+                        [object.x, object.y, object.z],
+                    );
+                    return Ok(Event::EntitySpawned {
+                        entity_id: object.entity_id,
+                        name: String::new(),
+                    });
+                }
                 if object.kind != play::OBJECT_TYPE_ITEM {
                     // Arrows, falling blocks, boats, ... are not drawn yet, but
                     // parsing them keeps the packet stream understood.
@@ -990,18 +1023,29 @@ impl GameClient {
             play::clientbound::DESTROY_ENTITIES => {
                 let ids = play::parse_destroy_entities(packet)?;
                 self.entities.despawn_all(&ids);
+                for id in &ids {
+                    self.entity_metadata.remove(id);
+                }
                 Ok(Event::EntitiesRemoved(ids.len()))
             }
             play::clientbound::ENTITY => {
-                // Keep-alive; the entity is still alive but nothing to update.
-                let _ = play::parse_entity(packet)?;
+                // Keep-alive; the entity is still alive, and its metadata
+                // trailer is sometimes the only place a change shows up.
+                let (entity_id, metadata) = play::parse_entity(packet)?;
+                self.apply_entity_metadata(entity_id, metadata);
                 Ok(Event::Packet(packet.id))
             }
             play::clientbound::ENTITY_METADATA => {
-                // Nothing is rendered from metadata yet, but it has to be
-                // walked so the packet is fully consumed.
-                play::parse_entity_metadata(packet)?;
+                let (entity_id, metadata) = play::parse_entity_metadata(packet)?;
+                self.apply_entity_metadata(entity_id, metadata);
                 Ok(Event::Packet(packet.id))
+            }
+            play::clientbound::MAP => {
+                let update = play::parse_map_update(packet)?;
+                self.maps.apply(&update);
+                Ok(Event::MapUpdated {
+                    map_id: update.map_id,
+                })
             }
             play::clientbound::PLAYER_LIST_ITEM => {
                 let update = play::parse_player_list_item(packet)?;
@@ -1057,6 +1101,36 @@ impl GameClient {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Read-only view of everything a renderer draws this frame.
+    ///
+    /// Borrowed, so calling it per frame costs nothing and the renderer never
+    /// takes ownership of game state.
+    pub fn scene(&self) -> SceneView<'_> {
+        SceneView::new(&self.entities, &self.maps, &self.entity_metadata)
+    }
+
+    /// Keep the last metadata seen for an entity, and fold the two entries an
+    /// item frame uses into its entity record.
+    ///
+    /// Index 8 is the framed stack and index 9 is its rotation in 45-degree
+    /// steps; both are item-frame-specific (`EntityItemFrame.entityInit`), but
+    /// storing the whole map means a renderer can read block states, held items
+    /// and rotations for anything else too.
+    fn apply_entity_metadata(&mut self, entity_id: i32, metadata: play::EntityMetadata) {
+        let item = match metadata.get(&8) {
+            Some(play::MetadataValue::Slot(stack)) => Some(*stack),
+            _ => None,
+        };
+        let rotation = match metadata.get(&9) {
+            Some(play::MetadataValue::Byte(value)) => Some(*value as u8),
+            _ => None,
+        };
+        if item.is_some() || rotation.is_some() {
+            self.entities.set_item_frame(entity_id, item, rotation);
+        }
+        self.entity_metadata.insert(entity_id, metadata);
     }
 
     fn apply_player_list_update(&mut self, update: play::PlayerListUpdate) {
@@ -1453,6 +1527,8 @@ mod tests {
             skins: Skins::new(),
             player_list: HashMap::new(),
             block_entities: HashMap::new(),
+            maps: Maps::new(),
+            entity_metadata: HashMap::new(),
             server_brand: None,
             view_distance: VIEW_DISTANCE,
             packets_received: 0,
@@ -1652,21 +1728,343 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires NEPHELE_REPLAY pointing to a private decoded play capture"]
     async fn replays_a_captured_hypixel_session_frame_by_frame() {
-        use tokio::io::AsyncWriteExt;
+        let frames = std::fs::read(std::env::var_os("NEPHELE_REPLAY").expect("NEPHELE_REPLAY"))
+            .expect("read private capture");
+        let (mut client, peer) = test_game_client_with_raw_peer().await;
+        let expected = capture_frame_count(&frames);
+        let handled = replay_capture(&mut client, peer, frames).await;
+
+        assert_eq!(handled, expected, "frame count");
+        assert_eq!(
+            client.payload_mismatches, 0,
+            "a parser under-read its payload in the capture"
+        );
+
+        // `NEPHELE_SCAN=1` turns the replay into a map dump around the player:
+        // finding a launch pad in a captured lobby without walking every lane by
+        // hand. Diagnostic only, so it stays off by default.
+        if std::env::var_os("NEPHELE_SCAN").is_some() {
+            scan_for_launch_pads(&client);
+        }
+    }
+
+    /// A framed map, rebuilt from a captured Hypixel session.
+    ///
+    /// The main lobby never spawns item frames (four directional sweeps, ~1700
+    /// packets, every `S0E` was an armour stand), so this takes the real
+    /// captured spawn-object packet's id, position and angles and replays it as
+    /// the item-frame object type, then sends the frame's metadata the way
+    /// `EntityTrackerEntry` does. The map id is the filled map's damage value.
+    #[tokio::test]
+    #[ignore = "requires NEPHELE_REPLAY pointing to a private decoded play capture"]
+    async fn a_framed_map_replica_from_captured_bytes_arrives_intact() {
+        let frames = std::fs::read(std::env::var_os("NEPHELE_REPLAY").expect("NEPHELE_REPLAY"))
+            .expect("read private capture");
+        let (mut client, peer) = test_game_client_with_raw_peer().await;
+        let captured_spawn = first_capture_payload(&frames, play::clientbound::SPAWN_OBJECT)
+            .expect("the capture has a spawn-object packet");
+        let captured_metadata = first_capture_payload(&frames, play::clientbound::ENTITY_METADATA)
+            .expect("the capture has a metadata packet");
+        replay_capture(&mut client, peer, frames).await;
+
+        // Replaying the real metadata proves the S1C parser understands
+        // Hypixel's bytes before anything is rebuilt.
+        assert!(
+            !client.entity_metadata.is_empty(),
+            "no entity metadata was retained from the capture"
+        );
+
+        let source = play::parse_spawn_object(&Packet::new(
+            play::clientbound::SPAWN_OBJECT,
+            captured_spawn,
+        ))
+        .expect("captured spawn object");
+
+        // Same packet, item-frame object type, captured position and angles.
+        let frame_id = source.entity_id;
+        client
+            .handle(play::spawn_object(
+                frame_id,
+                play::OBJECT_TYPE_ITEM_FRAME,
+                [source.x, source.y, source.z],
+                source.pitch,
+                source.yaw,
+                3, // facing east
+                [0.0; 3],
+            ))
+            .await
+            .expect("framed-map replica spawn");
+
+        // The framed stack and its rotation, in the captured packet's entity
+        // metadata shape (index 8 slot, index 9 byte).
+        let map_id: i16 = 91;
+        let mut meta = nephele_protocol::PacketWriter::new();
+        meta.write_varint(frame_id)
+            .write_u8(5 << 5 | 8)
+            .write_i16(play::ITEM_FILLED_MAP)
+            .write_i8(1)
+            .write_i16(map_id)
+            .write_u8(0)
+            .write_u8(9)
+            .write_i8(3)
+            .write_u8(0x7F);
+        client
+            .handle(Packet::new(
+                play::clientbound::ENTITY_METADATA,
+                meta.into_bytes(),
+            ))
+            .await
+            .expect("framed-map metadata");
+
+        // The captured metadata packet's entity id is reused to prove the
+        // metadata path keys on the id the server uses.
+        let (captured_entity, _) = play::parse_entity_metadata(&Packet::new(
+            play::clientbound::ENTITY_METADATA,
+            captured_metadata,
+        ))
+        .expect("captured metadata");
+        assert!(
+            client.entity_metadata.contains_key(&captured_entity)
+                || client.entity_metadata.contains_key(&frame_id),
+            "metadata keyed by the wrong entity"
+        );
+
+        let EntityKind::ItemFrame {
+            direction,
+            item,
+            rotation,
+        } = &client.entities.get(frame_id).expect("frame").kind
+        else {
+            panic!("the replica did not spawn an item frame");
+        };
+        assert_eq!(*direction, 3);
+        assert_eq!(
+            *item,
+            Some(ItemStack::new(play::ITEM_FILLED_MAP, 1, map_id))
+        );
+        assert_eq!(*rotation, 3);
+        eprintln!(
+            "framed map replica: entity {frame_id} at ({:.1}, {:.1}, {:.1}), map id {map_id}, rotation {rotation}",
+            source.x, source.y, source.z
+        );
+    }
+
+    /// Drive `/hub` and prove the session is rebuilt, not carried over.
+    ///
+    /// Hypixel answers a lobby transfer either with `S07 Respawn` (a dimension
+    /// change inside one server) or by dropping the connection so the client
+    /// reconnects. Both have to end with no chunk, entity, map or metadata state
+    /// from the previous lobby, which is what this watches.
+    #[tokio::test]
+    #[ignore = "requires a cached Microsoft session and a live Hypixel lobby"]
+    async fn hub_transfer_rebuilds_the_session() {
+        let app_data = std::env::var_os("APPDATA").expect("APPDATA is set on Windows");
+        let session_path = std::path::PathBuf::from(app_data)
+            .join("Nephele")
+            .join("auth.json");
+        let stored = nephele_auth::StoredSession::load(&session_path).expect("cached session");
+        let address = ServerAddress::parse("mc.hypixel.net").unwrap();
+        let mut client = GameClient::join_online(&address, &stored.session())
+            .await
+            .expect("online join");
+
+        let settle = tokio::time::Instant::now() + Duration::from_secs(40);
+        while tokio::time::Instant::now() < settle
+            && (!client.spawned || client.world.loaded_chunks() == 0)
+        {
+            let _ = client.tick(Duration::from_millis(200)).await.expect("join");
+        }
+        let chunks_before = client.world.loaded_chunks();
+        assert!(chunks_before > 0, "no terrain before the transfer");
+
+        // Plant a sentinel map so a leak is visible, then ask for a transfer.
+        client
+            .maps
+            .apply(&nephele_protocol::packets::play::MapUpdate {
+                map_id: 4242,
+                scale: 0,
+                icons: Vec::new(),
+                columns: 1,
+                rows: 1,
+                start_x: 0,
+                start_y: 0,
+                colors: vec![9],
+            });
+        client.send_chat("/hub").await.expect("send /hub");
+
+        let mut respawned = false;
+        let mut disconnected = None;
+        let mut chunks_after_reset = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        while tokio::time::Instant::now() < deadline {
+            match client.tick(Duration::from_millis(500)).await {
+                Ok(Event::Respawn { dimension }) => {
+                    respawned = true;
+                    eprintln!("hub: respawn into dimension {dimension}");
+                    assert!(
+                        client.maps.is_empty(),
+                        "a dimension change kept the previous lobby's maps"
+                    );
+                    assert!(client.world.loaded_chunks() == 0, "chunks survived respawn");
+                    chunks_after_reset = Some(0);
+                }
+                Ok(Event::Chat(line)) => eprintln!("hub: {line}"),
+                Ok(_) => {}
+                Err(Error::Disconnected(reason)) => {
+                    eprintln!("hub: disconnected: {reason}");
+                    disconnected = Some(reason);
+                    break;
+                }
+                Err(err) => panic!("/hub drive failed: {err}"),
+            }
+            if respawned {
+                break;
+            }
+        }
+
+        // Either path leaves nothing behind: the client is reset, and a fresh
+        // connection starts from an empty world.
+        assert!(
+            respawned || disconnected.is_some(),
+            "neither a respawn nor a disconnect arrived; /hub was ignored"
+        );
+        if respawned {
+            assert_eq!(chunks_after_reset, Some(0));
+        } else {
+            // A dropped connection is exactly the reconnect path the UI takes.
+            assert_eq!(client.payload_mismatches, 0);
+        }
+
+        let mut fresh = {
+            // The first session must be closed before a second join: Hypixel
+            // kicks the newer connection when the old one is still online.
+            client.disconnect().await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            GameClient::join_online(&address, &stored.session())
+                .await
+                .expect("reconnect after /hub")
+        };
+        assert_eq!(fresh.world.loaded_chunks(), 0, "reconnect leaked chunks");
+        assert!(fresh.maps.is_empty(), "reconnect leaked maps");
+        assert!(fresh.entities.is_empty(), "reconnect leaked entities");
+        fresh.disconnect().await;
+        eprintln!(
+            "hub: before {chunks_before} chunks, respawned={respawned}, disconnected={}",
+            disconnected.is_some()
+        );
+    }
+
+    /// First packet with `id` in a capture, as a payload.
+    fn first_capture_payload(frames: &[u8], wanted: i32) -> Option<Vec<u8>> {
+        let mut cursor = 0usize;
+        while cursor < frames.len() {
+            let (length, prefix) = capture_frame_length(&frames[cursor..]);
+            let start = cursor + prefix;
+            let end = start + length;
+            if end > frames.len() {
+                break;
+            }
+            if let Ok(packet) = Packet::from_payload(&frames[start..end]) {
+                if packet.id == wanted {
+                    return Some(packet.data.clone());
+                }
+                cursor = end;
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
+    /// Bounce off the real lobby launch pad, using the terrain in a capture.
+    ///
+    /// The Hypixel main lobby's pad is a 3x3 slime block platform, so 1.8's
+    /// `BlockSlime.onLanded` is what launches you — not a server velocity
+    /// packet. Replaying the capture gives this test the pad's actual position
+    /// and the blocks around it instead of a hand-built mock.
+    #[tokio::test]
+    #[ignore = "requires NEPHELE_REPLAY pointing to a private decoded play capture"]
+    async fn a_captured_lobby_slime_pad_bounces_the_player() {
+        use crate::physics::PlayerState;
 
         let frames = std::fs::read(std::env::var_os("NEPHELE_REPLAY").expect("NEPHELE_REPLAY"))
             .expect("read private capture");
         let (mut client, peer) = test_game_client_with_raw_peer().await;
+        replay_capture(&mut client, peer, frames).await;
 
-        let mut expected = 0usize;
+        let mut pads = Vec::new();
+        for (coord, _) in client.world.iter() {
+            for x in coord.x * 16..coord.x * 16 + 16 {
+                for z in coord.z * 16..coord.z * 16 + 16 {
+                    for y in 0..255 {
+                        if client.world.get_block(x, y, z).id() == 165 {
+                            pads.push((x, y, z));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!pads.is_empty(), "the capture has no slime blocks");
+
+        let count = pads.len() as f64;
+        let cx = pads.iter().map(|p| p.0 as f64 + 0.5).sum::<f64>() / count;
+        let cz = pads.iter().map(|p| p.2 as f64 + 0.5).sum::<f64>() / count;
+        let pad_top = pads
+            .iter()
+            .map(|p| p.1 as f64 + 1.0)
+            .fold(f64::MIN, f64::max);
+        eprintln!(
+            "pad: {} slime blocks around ({cx:.1}, {pad_top:.0}, {cz:.1})",
+            pads.len()
+        );
+
+        let mut player = PlayerState::at(cx, pad_top + 4.0, cz);
+        player.on_ground = false;
+
+        let mut bounced = false;
+        let mut apex: f64 = 0.0;
+        for _ in 0..80 {
+            player.step(0.05, &crate::physics::Input::default(), 0.0, &client.world);
+            if player.vy > 1.0 {
+                bounced = true;
+            }
+            if bounced {
+                apex = apex.max(player.y);
+            }
+        }
+
+        assert!(bounced, "the captured pad did not reflect the fall");
+        assert!(
+            apex > pad_top + 1.0,
+            "bounce reached {apex:.2}, pad top is {pad_top:.2}"
+        );
+    }
+
+    /// Number of frames in a `NEPHELE_TRACE_RAW` capture.
+    fn capture_frame_count(frames: &[u8]) -> usize {
         let mut cursor = 0usize;
+        let mut count = 0usize;
         while cursor < frames.len() {
             let (length, prefix) = capture_frame_length(&frames[cursor..]);
             cursor += prefix + length;
             assert!(cursor <= frames.len(), "capture ends inside a frame");
-            expected += 1;
+            count += 1;
         }
+        count
+    }
 
+    /// Feed a captured play stream through the client in awkward chunks.
+    ///
+    /// Returns the number of frames handled. Every parse has to succeed, so a
+    /// desync shows up here as a panic naming the packet it broke on.
+    async fn replay_capture(
+        client: &mut GameClient,
+        peer: tokio::net::TcpStream,
+        frames: Vec<u8>,
+    ) -> usize {
+        use tokio::io::AsyncWriteExt;
+
+        let expected = capture_frame_count(&frames);
         let writer = tokio::spawn(async move {
             let mut peer = peer;
             for (index, chunk) in frames.chunks(53).enumerate() {
@@ -1692,12 +2090,50 @@ mod tests {
         // client's keep-alive replies fail.
         let mut peer = writer.await.expect("writer task");
         peer.shutdown().await.ok();
+        handled
+    }
 
-        assert_eq!(handled, expected, "frame count");
-        assert_eq!(
-            client.payload_mismatches, 0,
-            "a parser under-read its payload in the capture"
+    /// Print every plate/slime/piston/redstone block near the captured player.
+    fn scan_for_launch_pads(client: &GameClient) {
+        const INTERESTING: [u16; 13] = [
+            29, 33, 34, 36, // pistons
+            41, 152, // gold, redstone
+            70, 72, 147, 148, // pressure plates
+            131, 132, // tripwire
+            165, // slime
+        ];
+        let px = client.position.x.floor() as i32;
+        let py = client.position.y.floor() as i32;
+        let pz = client.position.z.floor() as i32;
+        const RADIUS: i32 = 48;
+
+        eprintln!(
+            "scan: {} chunks loaded, player at ({px}, {py}, {pz})",
+            client.world.loaded_chunks()
         );
+        let mut found: Vec<(u16, u8, i32, i32, i32)> = Vec::new();
+        for x in px - RADIUS..=px + RADIUS {
+            for z in pz - RADIUS..=pz + RADIUS {
+                for y in (py - 8).max(0)..=(py + 32).min(255) {
+                    let state = client.world.get_block(x, y, z);
+                    if INTERESTING.contains(&state.id()) {
+                        found.push((state.id(), state.meta(), x, y, z));
+                    }
+                }
+            }
+        }
+        found.sort_by_key(|&(id, _, x, y, z)| (id, y, x, z));
+        eprintln!("scan: {} interactive candidates", found.len());
+        for (id, meta, x, y, z) in &found {
+            // Height above the block below, so a plate sitting on a block is
+            // obvious rather than "id 147 in mid-air".
+            let below = client.world.get_block(*x, *y - 1, *z);
+            eprintln!(
+                "scan: id={id} meta={meta} at ({x}, {y}, {z}) on id={} meta={}",
+                below.id(),
+                below.meta()
+            );
+        }
     }
 
     /// Length prefix of one frame in a `NEPHELE_TRACE_RAW` capture.
@@ -1747,6 +2183,118 @@ mod tests {
             assert_eq!(reader.read_varint().unwrap(), expected);
             assert_eq!(reader.remaining(), 0);
         }
+    }
+
+    /// An item frame exists only as `S0E`(71) + two metadata entries; the map
+    /// id is the filled map's damage value in 1.8, which is what ties the frame
+    /// to the `S34` picture with the same id.
+    #[tokio::test]
+    async fn an_item_frame_keeps_its_item_rotation_and_map_id() {
+        let (mut client, _peer) = test_game_client().await;
+
+        let mut spawn = nephele_protocol::PacketWriter::new();
+        spawn
+            .write_varint(55)
+            .write_u8(play::OBJECT_TYPE_ITEM_FRAME)
+            .write_i32(32 * 10)
+            .write_i32(32 * 64)
+            .write_i32(32 * 3)
+            .write_u8(0)
+            .write_u8(0)
+            .write_i32(1) // facing west; frames always carry a zero velocity
+            .write_i16(0)
+            .write_i16(0)
+            .write_i16(0);
+        client
+            .handle(Packet::new(
+                play::clientbound::SPAWN_OBJECT,
+                spawn.into_bytes(),
+            ))
+            .await
+            .expect("spawn frame");
+
+        assert!(matches!(
+            client.entities.get(55).expect("frame").kind,
+            EntityKind::ItemFrame {
+                direction: 1,
+                item: None,
+                rotation: 0
+            }
+        ));
+
+        let mut meta = nephele_protocol::PacketWriter::new();
+        meta.write_varint(55)
+            .write_u8(5 << 5 | 8) // slot: filled map, damage is the map id
+            .write_i16(play::ITEM_FILLED_MAP)
+            .write_i8(1)
+            .write_i16(91)
+            .write_u8(0)
+            .write_u8(9) // rotation
+            .write_i8(2)
+            .write_u8(0x7F);
+        client
+            .handle(Packet::new(
+                play::clientbound::ENTITY_METADATA,
+                meta.into_bytes(),
+            ))
+            .await
+            .expect("frame metadata");
+
+        match &client.entities.get(55).unwrap().kind {
+            EntityKind::ItemFrame { item, rotation, .. } => {
+                assert_eq!(*item, Some(ItemStack::new(play::ITEM_FILLED_MAP, 1, 91)));
+                assert_eq!(*rotation, 2);
+            }
+            other => panic!("not a frame: {other:?}"),
+        }
+        // The whole metadata map is retained for the renderer, not just the
+        // frame fields.
+        assert!(client.entity_metadata[&55].contains_key(&8));
+
+        // Emptying the frame is a real update, not a no-op.
+        let mut cleared = nephele_protocol::PacketWriter::new();
+        cleared
+            .write_varint(55)
+            .write_u8(5 << 5 | 8)
+            .write_i16(ItemStack::EMPTY_ID)
+            .write_u8(0x7F);
+        client
+            .handle(Packet::new(
+                play::clientbound::ENTITY_METADATA,
+                cleared.into_bytes(),
+            ))
+            .await
+            .expect("clear frame");
+        match &client.entities.get(55).unwrap().kind {
+            EntityKind::ItemFrame { item, .. } => assert_eq!(*item, None),
+            other => panic!("not a frame: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn map_patches_reach_the_store_through_the_packet_handler() {
+        let (mut client, _peer) = test_game_client().await;
+
+        let mut packet = nephele_protocol::PacketWriter::new();
+        packet
+            .write_varint(44)
+            .write_u8(1)
+            .write_varint(0)
+            .write_u8(1) // one column
+            .write_u8(1) // one row
+            .write_u8(2) // start x
+            .write_u8(3) // start y
+            .write_varint(1)
+            .write_u8(7);
+        let event = client
+            .handle(Packet::new(play::clientbound::MAP, packet.into_bytes()))
+            .await
+            .expect("map");
+        assert_eq!(event, Event::MapUpdated { map_id: 44 });
+
+        let map = client.maps.get(44).expect("map state");
+        assert_eq!(map.color_at(2, 3), Some(7));
+        assert_eq!(map.patches, 1);
     }
 
     #[tokio::test]
@@ -2137,6 +2685,156 @@ mod tests {
             .send_move(walked, client.yaw, client.pitch, true)
             .await
             .expect("movement update");
+        client.disconnect().await;
+    }
+
+    /// Drive a real walking, jumping player against a live server.
+    ///
+    /// This is the acceptance run for movement: twenty seconds of forward
+    /// motion with periodic jumps, sending one movement packet per tick, while
+    /// watching for `S08` corrections. A server only sends one when it disagrees
+    /// with where the client says it is, so a large one is exactly the
+    /// rubber-band a player would feel.
+    #[tokio::test]
+    #[ignore = "requires a cached Microsoft session and a live Hypixel lobby"]
+    async fn walks_and_jumps_on_a_live_server_without_rubber_banding() {
+        use crate::physics::{Input, PlayerState};
+
+        let app_data = std::env::var_os("APPDATA").expect("APPDATA is set on Windows");
+        let session_path = std::path::PathBuf::from(app_data)
+            .join("Nephele")
+            .join("auth.json");
+        let stored = nephele_auth::StoredSession::load(&session_path).expect("cached session");
+        let address = ServerAddress::parse("mc.hypixel.net").unwrap();
+        let mut client = GameClient::join_online(&address, &stored.session())
+            .await
+            .expect("online join");
+
+        // Wait for a spawn and the terrain under it.
+        let settle = tokio::time::Instant::now() + Duration::from_secs(40);
+        while tokio::time::Instant::now() < settle
+            && (!client.spawned || client.world.loaded_chunks() == 0)
+        {
+            let _ = client.tick(Duration::from_millis(200)).await.expect("join");
+        }
+        assert!(client.spawned, "never spawned");
+        assert!(client.world.loaded_chunks() > 0, "no terrain");
+
+        // Face +X by default (`forward` is `(sin yaw, -cos yaw)`); the
+        // direction is overridable so a capture run can explore the lobby.
+        let yaw = std::env::var("NEPHELE_WALK_YAW_DEGREES")
+            .ok()
+            .and_then(|value| value.parse::<f32>().ok())
+            .unwrap_or(90.0)
+            .to_radians();
+        let walk_seconds = std::env::var("NEPHELE_WALK_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(20);
+        let mut player = PlayerState::at(client.position.x, client.position.y, client.position.z);
+        player.on_ground = true;
+
+        let mut corrections = 0usize;
+        let mut worst_correction = 0.0f64;
+        let mut jumps = 0usize;
+        let mut ran = 0u32;
+        let start = (player.x, player.z);
+        // A rubber-band pins you to the same spot: the server repeats the same
+        // correction position instead of letting you travel. Counting those is
+        // meaningful even though a single correction's distance also includes
+        // the round-trip latency (the client keeps walking while it arrives).
+        let mut last_correction: Option<(f64, f64, u32)> = None;
+        let mut pinned = 0usize;
+
+        let end = tokio::time::Instant::now() + Duration::from_secs(walk_seconds);
+        let mut next_tick = tokio::time::Instant::now();
+        while tokio::time::Instant::now() < end {
+            next_tick += Duration::from_millis(50);
+            let jump = player.on_ground && ran % 20 == 0;
+            let input = Input {
+                forward: 1.0,
+                jump,
+                ..Input::default()
+            };
+            player.step(0.05, &input, yaw, &client.world);
+            if jump {
+                jumps += 1;
+            }
+            ran += 1;
+
+            client
+                .send_movement_tick(
+                    Vec3::new(player.x, player.y, player.z),
+                    yaw,
+                    0.0,
+                    player.on_ground,
+                )
+                .await
+                .expect("movement packet");
+
+            // Drain whatever arrived since the last tick, without blocking.
+            loop {
+                match client.tick(Duration::from_millis(1)).await {
+                    Ok(Event::Idle) => break,
+                    Ok(Event::Position { position, .. }) => {
+                        let dx = position.x - player.x;
+                        let dy = position.y - player.y;
+                        let dz = position.z - player.z;
+                        let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+                        if distance > 2.0 {
+                            corrections += 1;
+                            worst_correction = worst_correction.max(distance);
+                            eprintln!(
+                                "correction {corrections} at tick {ran}: {distance:.1} blocks, client ({:.1}, {:.1}, {:.1}) -> server ({:.1}, {:.1}, {:.1})",
+                                player.x, player.y, player.z, position.x, position.y, position.z
+                            );
+                            if let Some((lx, lz, ltick)) = last_correction {
+                                let pinned_here = (position.x - lx).hypot(position.z - lz) < 0.25;
+                                if pinned_here && ran - ltick <= 10 {
+                                    pinned += 1;
+                                }
+                            }
+                            last_correction = Some((position.x, position.z, ran));
+                        }
+                        // The live client teleports its body to the server's
+                        // position on the spot; a test that ignored the
+                        // correction would drift away and then count its own
+                        // drift as the server's fault.
+                        player.x = position.x;
+                        player.y = position.y;
+                        player.z = position.z;
+                        player.vx = 0.0;
+                        player.vy = 0.0;
+                        player.vz = 0.0;
+                    }
+                    Ok(Event::Velocity { vx, vy, vz }) => {
+                        // A launch pad or knockback: adopt it immediately.
+                        player.set_velocity(vx, vy, vz);
+                    }
+                    Ok(_) => {}
+                    Err(err) => panic!("disconnected while walking: {err}"),
+                }
+            }
+
+            if let Some(delay) = next_tick.checked_duration_since(tokio::time::Instant::now()) {
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        eprintln!(
+            "walk finished: {} ticks, {} jumps, {} corrections (worst {:.1} blocks), {} pinned, ended at ({:.1}, {:.1}, {:.1})",
+            ran, jumps, corrections, worst_correction, pinned, player.x, player.y, player.z
+        );
+        let advanced = (player.x - start.0).hypot(player.z - start.1);
+        // Being rubber-banded means being held in place: you cannot walk 40
+        // blocks while the server keeps pulling you back to spawn.
+        let expected = walk_seconds as f64 * 0.5;
+        assert!(
+            advanced > expected,
+            "only advanced {advanced:.1} blocks in {walk_seconds} s; the server is holding us back"
+        );
+        assert_eq!(pinned, 0, "the server kept correcting us to the same spot");
+        assert_eq!(client.payload_mismatches, 0);
         client.disconnect().await;
     }
 }

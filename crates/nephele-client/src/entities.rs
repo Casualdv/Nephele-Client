@@ -19,6 +19,17 @@ pub enum EntityKind {
     Mob { kind: u8 },
     /// A dropped item stack (`S0E` with object type 2).
     Item { id: i16, meta: i16 },
+    /// An item frame (`S0E` with object type 71). The framed stack and its
+    /// rotation only exist as `S1C` metadata, so they start empty.
+    ///
+    /// `direction` is the spawn packet's `data` field: 0 = down, 1 = up,
+    /// 2 = north, 3 = south, 4 = west, 5 = east.
+    ItemFrame {
+        direction: u8,
+        item: Option<nephele_protocol::packets::play::ItemStack>,
+        /// Rotation in 45-degree steps, 0..=7 (vanilla's `getRotation`).
+        rotation: u8,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +232,58 @@ impl Entities {
                 self.tick,
             ),
         );
+    }
+
+    /// Track an item frame (`S0E`, object type 71).
+    ///
+    /// The frame's `data` field is `EnumFacing.getHorizontalIndex()`
+    /// (0 = south, 1 = west, 2 = north, 3 = east), which maps straight onto
+    /// vanilla yaw in 90-degree steps.
+    pub fn spawn_item_frame(&mut self, id: i32, direction: u8, position: [f64; 3]) {
+        let yaw = (direction & 3) as f32 * 90.0;
+        self.map.insert(
+            id,
+            Entity::new(
+                id,
+                EntityKind::ItemFrame {
+                    direction: direction & 3,
+                    item: None,
+                    rotation: 0,
+                },
+                position,
+                yaw,
+                0.0,
+                self.tick,
+            ),
+        );
+    }
+
+    /// Apply the two metadata entries an item frame uses: index 8 is the framed
+    /// stack and index 9 is its rotation. Anything else is ignored.
+    pub fn set_item_frame(
+        &mut self,
+        id: i32,
+        item: Option<Option<nephele_protocol::packets::play::ItemStack>>,
+        rotation: Option<u8>,
+    ) {
+        let Some(entity) = self.map.get_mut(&id) else {
+            return;
+        };
+        let EntityKind::ItemFrame {
+            item: framed,
+            rotation: current,
+            ..
+        } = &mut entity.kind
+        else {
+            return;
+        };
+        // `Some(None)` is a real update: the frame was emptied.
+        if let Some(item) = item {
+            *framed = item;
+        }
+        if let Some(rotation) = rotation {
+            *current = rotation & 7;
+        }
     }
 
     pub fn relative_move(&mut self, id: i32, dx: f64, dy: f64, dz: f64) {

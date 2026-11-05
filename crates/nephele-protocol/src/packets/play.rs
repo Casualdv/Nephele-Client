@@ -40,6 +40,8 @@ pub mod clientbound {
     pub const CLOSE_WINDOW: i32 = 0x2E;
     pub const WINDOW_ITEMS: i32 = 0x30;
     pub const CONFIRM_TRANSACTION: i32 = 0x32;
+    /// `S34`: map column data (a framed or held map's colours and markers).
+    pub const MAP: i32 = 0x34;
     pub const BLOCK_ENTITY_DATA: i32 = 0x35;
     pub const PLAYER_LIST_ITEM: i32 = 0x38;
     pub const PLAYER_ABILITIES: i32 = 0x39;
@@ -1071,67 +1073,298 @@ pub fn parse_destroy_entities(packet: &Packet) -> Result<Vec<i32>> {
 }
 
 /// `S14`: entity is still alive. Protocol 47 still appends a metadata trailer.
-pub fn parse_entity(packet: &Packet) -> Result<i32> {
+pub fn parse_entity(packet: &Packet) -> Result<(i32, EntityMetadata)> {
     let mut r = packet.reader();
     let entity_id = r.read_varint()?;
-    skip_entity_metadata(&mut r)?;
-    Ok(entity_id)
+    let metadata = parse_metadata(&mut r)?;
+    Ok((entity_id, metadata))
 }
 
 /// `S1C`: a metadata-only update for an existing entity.
-pub fn parse_entity_metadata(packet: &Packet) -> Result<i32> {
+pub fn parse_entity_metadata(packet: &Packet) -> Result<(i32, EntityMetadata)> {
     let mut r = packet.reader();
     let entity_id = r.read_varint()?;
-    skip_entity_metadata(&mut r)?;
-    Ok(entity_id)
+    let metadata = parse_metadata(&mut r)?;
+    Ok((entity_id, metadata))
 }
 
-/// Skip the `EntityMetadata` trailer.
+/// One entity metadata entry's value.
+///
+/// 1.8 has eight value types, distinguished by the top three bits of the entry
+/// header. Everything is kept rather than skipped: block states (an `Int`),
+/// held/framed items (`Slot`) and rotations (`Rotation`) are exactly what a
+/// renderer needs, and an item frame is *only* metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataValue {
+    Byte(i8),
+    Short(i16),
+    Int(i32),
+    Float(f32),
+    String(String),
+    /// An item stack, or `None` for an empty slot.
+    Slot(Option<ItemStack>),
+    /// `x`, `y`, `z` in block coordinates.
+    Position([i32; 3]),
+    /// `pitch`, `yaw`, `roll` in degrees.
+    Rotation([f32; 3]),
+}
+
+/// Entity metadata, keyed by the vanilla data-watcher index.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EntityMetadata(std::collections::BTreeMap<u8, MetadataValue>);
+
+impl EntityMetadata {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl std::ops::Deref for EntityMetadata {
+    type Target = std::collections::BTreeMap<u8, MetadataValue>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for EntityMetadata {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl FromIterator<(u8, MetadataValue)> for EntityMetadata {
+    fn from_iter<I: IntoIterator<Item = (u8, MetadataValue)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+/// Vanilla 1.8 data-watcher indices that carry meaning beyond the wire type.
+///
+/// These are shared by every entity: `0`/`1` are the generic flags and air
+/// ticks, `2` is the custom name, `10` is the skin flags byte (cape, jacket,
+/// sleeves, pants, hat), `16` is the carried block for mobs that hold one, and
+/// `8`/`9` are the item frame's framed stack and rotation.
+pub mod metadata_index {
+    pub const FLAGS: u8 = 0;
+    pub const AIR: u8 = 1;
+    pub const CUSTOM_NAME: u8 = 2;
+    pub const ITEM: u8 = 8;
+    pub const ITEM_ROTATION: u8 = 9;
+    pub const SKIN_FLAGS: u8 = 10;
+    pub const BLOCK_STATE: u8 = 16;
+}
+
+impl EntityMetadata {
+    pub fn byte(&self, index: u8) -> Option<i8> {
+        match self.get(&index) {
+            Some(MetadataValue::Byte(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn short(&self, index: u8) -> Option<i16> {
+        match self.get(&index) {
+            Some(MetadataValue::Short(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn int(&self, index: u8) -> Option<i32> {
+        match self.get(&index) {
+            Some(MetadataValue::Int(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn float(&self, index: u8) -> Option<f32> {
+        match self.get(&index) {
+            Some(MetadataValue::Float(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn string(&self, index: u8) -> Option<&str> {
+        match self.get(&index) {
+            Some(MetadataValue::String(value)) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The slot at `index`, `Some(None)` when the slot exists but is empty.
+    pub fn slot(&self, index: u8) -> Option<Option<ItemStack>> {
+        match self.get(&index) {
+            Some(MetadataValue::Slot(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn rotation(&self, index: u8) -> Option<[f32; 3]> {
+        match self.get(&index) {
+            Some(MetadataValue::Rotation(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Skin flags: `0x01` cape, `0x02` jacket, `0x04` left sleeve,
+    /// `0x08` right sleeve, `0x10` left pant leg, `0x20` right pant leg,
+    /// `0x40` hat.
+    pub fn skin_flags(&self) -> Option<u8> {
+        self.byte(metadata_index::SKIN_FLAGS)
+            .map(|value| value as u8)
+    }
+
+    /// A carried block state (`id << 4 | meta`), for mobs that hold one.
+    pub fn block_state(&self) -> Option<u16> {
+        self.int(metadata_index::BLOCK_STATE)
+            .map(|value| (value as u16) & 0x0FFF)
+    }
+
+    /// The item frame's framed stack, if this metadata came from a frame.
+    pub fn framed_item(&self) -> Option<Option<ItemStack>> {
+        self.slot(metadata_index::ITEM)
+    }
+
+    /// The item frame's rotation in 45-degree steps, 0..7.
+    pub fn item_rotation(&self) -> Option<u8> {
+        self.byte(metadata_index::ITEM_ROTATION)
+            .map(|value| value as u8 & 7)
+    }
+}
+
+/// Read the `EntityMetadata` trailer into keyed values.
 ///
 /// Each entry is `(type << 5) | index`, terminated by `0x7F`. Values are fixed
 /// width except strings and slots; a slot may carry a full NBT tree. There is
 /// no index bounds check because vanilla accepts arbitrary indices.
-pub fn skip_entity_metadata(reader: &mut crate::read::PacketReader<'_>) -> Result<()> {
+pub fn parse_metadata(reader: &mut crate::read::PacketReader<'_>) -> Result<EntityMetadata> {
+    let mut entries = EntityMetadata::new();
     loop {
         let header = reader.read_u8()?;
         if header == 0x7F {
-            return Ok(());
+            return Ok(entries);
         }
-        match header >> 5 {
-            0 => {
-                reader.read_u8()?;
-            }
-            1 => {
-                reader.read_u16()?;
-            }
-            2 => {
-                reader.read_i32()?;
-            }
-            3 => {
-                reader.read_f32()?;
-            }
-            4 => {
-                reader.read_string()?;
-            }
-            5 => {
-                parse_slot(reader)?;
-            }
-            6 => {
-                reader.read_i32()?;
-                reader.read_i32()?;
-                reader.read_i32()?;
-            }
-            _ => {
-                reader.read_f32()?;
-                reader.read_f32()?;
-                reader.read_f32()?;
-            }
-        }
+        let index = header & 0x1F;
+        let value = match header >> 5 {
+            0 => MetadataValue::Byte(reader.read_i8()?),
+            1 => MetadataValue::Short(reader.read_i16()?),
+            2 => MetadataValue::Int(reader.read_i32()?),
+            3 => MetadataValue::Float(reader.read_f32()?),
+            4 => MetadataValue::String(reader.read_string()?),
+            5 => MetadataValue::Slot(parse_slot(reader)?),
+            6 => MetadataValue::Position([
+                reader.read_i32()?,
+                reader.read_i32()?,
+                reader.read_i32()?,
+            ]),
+            _ => MetadataValue::Rotation([
+                reader.read_f32()?,
+                reader.read_f32()?,
+                reader.read_f32()?,
+            ]),
+        };
+        entries.insert(index, value);
     }
+}
+
+/// Skip the `EntityMetadata` trailer, discarding the values.
+pub fn skip_entity_metadata(reader: &mut crate::read::PacketReader<'_>) -> Result<()> {
+    parse_metadata(reader).map(|_| ())
 }
 
 /// The object type used for a dropped item stack.
 pub const OBJECT_TYPE_ITEM: u8 = 2;
+/// The object type used for an item frame (`EntityItemFrame`).
+pub const OBJECT_TYPE_ITEM_FRAME: u8 = 71;
+/// Item id of a filled map. Its damage value *is* the map id in 1.8
+/// (`ItemMap.getMapData` keys off `stack.getMetadata()`), which is what ties a
+/// framed map to the [`MapUpdate`] for the same id.
+pub const ITEM_FILLED_MAP: i16 = 358;
+
+/// One marker drawn on a map: another player or a decoration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MapIcon {
+    /// Icon kind (0 = white arrow, 1..=10 = coloured arrows, ...).
+    pub kind: u8,
+    /// Rotation in 16ths of a turn.
+    pub direction: u8,
+    pub x: i8,
+    pub z: i8,
+}
+
+/// `S34`: a patch of a map's 128x128 colour grid, plus its markers.
+///
+/// The server only sends the rectangle that changed: `columns`x`rows` colours
+/// starting at `(start_x, start_y)` in the map's own 128x128 space. A packet
+/// with `columns == 0` carries markers only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MapUpdate {
+    pub map_id: i32,
+    /// Map scale, 0..4. Colour indexes are not scaled; this only affects how
+    /// many blocks one pixel covers.
+    pub scale: u8,
+    pub icons: Vec<MapIcon>,
+    pub columns: u8,
+    pub rows: u8,
+    pub start_x: u8,
+    pub start_y: u8,
+    /// `columns * rows` colour indexes, row-major within the patch.
+    pub colors: Vec<u8>,
+}
+
+impl MapUpdate {
+    /// Width of a full map's colour grid in 1.8.
+    pub const SIZE: usize = 128;
+}
+
+pub fn parse_map_update(packet: &Packet) -> Result<MapUpdate> {
+    let mut r = packet.reader();
+    let map_id = r.read_varint()?;
+    let scale = r.read_u8()?;
+    let icon_count = r.read_varint()?.clamp(0, 1024);
+    let mut icons = Vec::with_capacity(icon_count as usize);
+    for _ in 0..icon_count {
+        // One byte packs the icon kind in the high nibble and its rotation in
+        // the low nibble (`Vec4b`'s packed form).
+        let packed = r.read_u8()?;
+        icons.push(MapIcon {
+            kind: packed >> 4,
+            direction: packed & 0x0F,
+            x: r.read_i8()?,
+            z: r.read_i8()?,
+        });
+    }
+
+    let columns = r.read_u8()?;
+    let mut rows = 0;
+    let (mut start_x, mut start_y) = (0, 0);
+    let mut colors = Vec::new();
+    if columns > 0 {
+        rows = r.read_u8()?;
+        start_x = r.read_u8()?;
+        start_y = r.read_u8()?;
+        let length = r.read_varint()?.max(0) as usize;
+        let expected = columns as usize * rows as usize;
+        // A malformed length must not let the patch wrap off the grid; the
+        // trailing bytes belong to the next packet's frame otherwise.
+        if length != expected {
+            return Err(Error::Protocol(format!(
+                "map {map_id} patch is {length} bytes, {columns}x{rows} needs {expected}"
+            )));
+        }
+        colors.extend_from_slice(r.take(expected)?);
+    }
+
+    Ok(MapUpdate {
+        map_id,
+        scale,
+        icons,
+        columns,
+        rows,
+        start_x,
+        start_y,
+        colors,
+    })
+}
 
 /// `S0E`: a non-living object. Dropped items are the only kind the client
 /// tracks; the rest are parsed so the wire format stays honest.
@@ -1858,6 +2091,158 @@ mod entity_tests {
         let mob = parse_spawn_mob(&packet).expect("spawn mob");
         assert_eq!(mob.entity_id, 9);
         assert_eq!(packet.consumed(), packet.data.len());
+    }
+
+    #[test]
+    fn metadata_keeps_slots_block_states_and_rotations() {
+        let mut w = PacketWriter::new();
+        w.write_varint(17)
+            // Index 8, slot: filled map, damage 34 is the map id in 1.8.
+            .write_u8(5 << 5 | 8)
+            .write_i16(ITEM_FILLED_MAP)
+            .write_i8(1)
+            .write_i16(34)
+            .write_u8(0)
+            // Index 9, byte: rotation 3 (135 degrees).
+            .write_u8(9)
+            .write_i8(3)
+            // Index 16, int: a block state (stone, meta 0 => 1 << 4).
+            .write_u8(2 << 5 | 16)
+            .write_i32(1 << 4)
+            .write_u8(0x7F);
+
+        let packet = Packet::new(clientbound::ENTITY_METADATA, w.into_bytes());
+        let (entity_id, metadata) = parse_entity_metadata(&packet).expect("metadata");
+        assert_eq!(entity_id, 17);
+        assert_eq!(
+            metadata.get(&8),
+            Some(&MetadataValue::Slot(Some(ItemStack::new(
+                ITEM_FILLED_MAP,
+                1,
+                34
+            ))))
+        );
+        assert_eq!(metadata.get(&9), Some(&MetadataValue::Byte(3)));
+        assert_eq!(metadata.get(&16), Some(&MetadataValue::Int(16)));
+        assert_eq!(packet.consumed(), packet.data.len());
+    }
+
+    #[test]
+    fn an_empty_frame_slot_parses_as_no_item() {
+        let mut w = PacketWriter::new();
+        w.write_varint(4)
+            .write_u8(5 << 5 | 8)
+            .write_i16(ItemStack::EMPTY_ID)
+            .write_u8(0x7F);
+
+        let (_, metadata) =
+            parse_entity_metadata(&Packet::new(clientbound::ENTITY_METADATA, w.into_bytes()))
+                .expect("metadata");
+        assert_eq!(metadata.get(&8), Some(&MetadataValue::Slot(None)));
+    }
+
+    #[test]
+    fn metadata_accessors_cover_skin_flags_block_states_and_rotations() {
+        let mut w = PacketWriter::new();
+        w.write_varint(5)
+            .write_u8(10) // index 10, byte: skin flags
+            .write_i8(0b0010_0011)
+            .write_u8(2 << 5 | 16) // index 16, int: carried block state
+            .write_i32((35 << 4) | 6)
+            .write_u8(7 << 5 | 17) // index 17, rotation vector
+            .write_f32(12.5)
+            .write_f32(180.0)
+            .write_f32(-3.0)
+            .write_u8(0x7F);
+
+        let (_, metadata) =
+            parse_entity_metadata(&Packet::new(clientbound::ENTITY_METADATA, w.into_bytes()))
+                .expect("metadata");
+
+        assert_eq!(metadata.skin_flags(), Some(0b0010_0011));
+        // `id << 4 | meta`, i.e. yellow wool.
+        assert_eq!(metadata.block_state(), Some((35 << 4) | 6));
+        assert_eq!(metadata.rotation(17), Some([12.5, 180.0, -3.0]));
+        assert_eq!(metadata.byte(10), Some(0b0010_0011));
+    }
+
+    #[test]
+    fn map_update_parses_markers_and_a_patch() {
+        let mut w = PacketWriter::new();
+        w.write_varint(12) // map id
+            .write_u8(2) // scale
+            .write_varint(2) // two markers
+            .write_u8((1 << 4) | 4) // white pointer, rotation 4
+            .write_i8(10)
+            .write_i8(-3)
+            .write_u8((5 << 4) | 6) // red pointer, rotation 6
+            .write_i8(-8)
+            .write_i8(7)
+            .write_u8(2) // two columns
+            .write_u8(1) // one row
+            .write_u8(30) // start x
+            .write_u8(64) // start z (y in map space)
+            .write_varint(2) // two colour bytes
+            .write_u8(0x11)
+            .write_u8(0x22);
+
+        let packet = Packet::new(clientbound::MAP, w.into_bytes());
+        let update = parse_map_update(&packet).expect("map");
+        assert_eq!(update.map_id, 12);
+        assert_eq!(update.scale, 2);
+        assert_eq!(update.icons.len(), 2);
+        assert_eq!(
+            update.icons[0],
+            MapIcon {
+                kind: 1,
+                direction: 4,
+                x: 10,
+                z: -3
+            }
+        );
+        assert_eq!(
+            update.icons[1],
+            MapIcon {
+                kind: 5,
+                direction: 6,
+                x: -8,
+                z: 7
+            }
+        );
+        assert_eq!((update.columns, update.rows), (2, 1));
+        assert_eq!((update.start_x, update.start_y), (30, 64));
+        assert_eq!(update.colors, vec![0x11, 0x22]);
+        assert_eq!(packet.consumed(), packet.data.len());
+    }
+
+    #[test]
+    fn a_marker_only_map_update_has_no_patch() {
+        let mut w = PacketWriter::new();
+        w.write_varint(3).write_u8(0).write_varint(0).write_u8(0); // no columns
+        let update = parse_map_update(&Packet::new(clientbound::MAP, w.into_bytes())).expect("map");
+        assert_eq!(update.map_id, 3);
+        assert!(update.icons.is_empty());
+        assert_eq!(update.columns, 0);
+        assert!(update.colors.is_empty());
+    }
+
+    #[test]
+    fn a_map_patch_whose_length_disagrees_with_its_size_is_rejected() {
+        let mut w = PacketWriter::new();
+        w.write_varint(1)
+            .write_u8(0)
+            .write_varint(0)
+            .write_u8(4) // four columns
+            .write_u8(4) // four rows => 16 bytes
+            .write_u8(0)
+            .write_u8(0)
+            .write_varint(3) // but only three sent
+            .write_u8(1)
+            .write_u8(2)
+            .write_u8(3);
+        let err = parse_map_update(&Packet::new(clientbound::MAP, w.into_bytes()))
+            .expect_err("short patch must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
     }
 
     #[test]
