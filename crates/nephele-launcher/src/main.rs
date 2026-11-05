@@ -166,10 +166,7 @@ impl Launcher {
             Ok(renderer) => renderer,
             Err(err) => return self.fail(event_loop, err),
         };
-        renderer.set_mesh(&MeshData {
-            vertices: Vec::new(),
-            indices: Vec::new(),
-        });
+        renderer.set_mesh(&MeshData::default());
         self.camera.set_aspect(size.width, size.height);
 
         self.renderer = Some(renderer);

@@ -1126,10 +1126,47 @@ impl Renderer {
         }
         queue.write_buffer(&chunk.indices, 0, bytemuck::cast_slice(&mesh.indices));
 
+        chunk.transparent_index_count = mesh.transparent_indices.len() as u32;
+        if !mesh.transparent_vertices.is_empty() {
+            let vertex_bytes =
+                std::mem::size_of_val(mesh.transparent_vertices.as_slice()) as wgpu::BufferAddress;
+            if vertex_bytes > chunk.transparent_vertex_capacity {
+                chunk.transparent_vertex_capacity = allocate_size(vertex_bytes);
+                chunk.transparent_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("chunk transparent vertices"),
+                    size: chunk.transparent_vertex_capacity,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(
+                &chunk.transparent_vertices,
+                0,
+                bytemuck::cast_slice(&mesh.transparent_vertices),
+            );
+
+            let index_bytes =
+                std::mem::size_of_val(mesh.transparent_indices.as_slice()) as wgpu::BufferAddress;
+            if index_bytes > chunk.transparent_index_capacity {
+                chunk.transparent_index_capacity = allocate_size(index_bytes);
+                chunk.transparent_indices = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("chunk transparent indices"),
+                    size: chunk.transparent_index_capacity,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(
+                &chunk.transparent_indices,
+                0,
+                bytemuck::cast_slice(&mesh.transparent_indices),
+            );
+        }
+
         let mut cull_min = [f32::INFINITY; 3];
         let mut cull_max = [f32::NEG_INFINITY; 3];
         let mut block_heights = [0.0f32; 256];
-        for vertex in &mesh.vertices {
+        for vertex in mesh.vertices.iter().chain(&mesh.transparent_vertices) {
             for axis in 0..3 {
                 cull_min[axis] = cull_min[axis].min(vertex.position[axis]);
                 cull_max[axis] = cull_max[axis].max(vertex.position[axis]);
@@ -1139,7 +1176,7 @@ impl Renderer {
             let cell = z * 16 + x;
             block_heights[cell] = block_heights[cell].max(vertex.position[1]);
         }
-        if mesh.vertices.is_empty() {
+        if mesh.vertices.is_empty() && mesh.transparent_vertices.is_empty() {
             cull_min = min;
             cull_max = max;
         }
@@ -1566,7 +1603,9 @@ impl Renderer {
                     .chunks
                     .iter()
                     .filter(|(&key, chunk)| {
-                        if chunk.index_count == 0 || !frustum.intersects(chunk.min, chunk.max) {
+                        if (chunk.index_count == 0 && chunk.transparent_index_count == 0)
+                            || !frustum.intersects(chunk.min, chunk.max)
+                        {
                             return false;
                         }
                         if use_occlusion
@@ -1597,6 +1636,25 @@ impl Renderer {
                     pass.draw_indexed(0..chunk.index_count, 0, 0..1);
                 }
                 self.drawn_chunks = visible.len();
+
+                // Fire's crossed quads are blended in the same pipeline; they
+                // draw after the solid faces so their alpha mixes with terrain.
+                for (key, _) in &visible {
+                    let Some(chunk) = self.chunks.get(key) else {
+                        continue;
+                    };
+                    if chunk.transparent_index_count == 0 {
+                        continue;
+                    }
+                    pass.set_pipeline(&self.pipeline);
+                    pass.set_bind_group(0, &self.bind_group, &[]);
+                    pass.set_vertex_buffer(0, chunk.transparent_vertices.slice(..));
+                    pass.set_index_buffer(
+                        chunk.transparent_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..chunk.transparent_index_count, 0, 0..1);
+                }
             }
 
             // Dropped items are ordinary block-textured cubes, so they share
@@ -2221,6 +2279,12 @@ struct ChunkBuffers {
     vertex_capacity: wgpu::BufferAddress,
     index_capacity: wgpu::BufferAddress,
     index_count: u32,
+    /// Crossed, blended geometry (fire) drawn right after the opaque faces.
+    transparent_vertices: wgpu::Buffer,
+    transparent_indices: wgpu::Buffer,
+    transparent_vertex_capacity: wgpu::BufferAddress,
+    transparent_index_capacity: wgpu::BufferAddress,
+    transparent_index_count: u32,
     min: [f32; 3],
     max: [f32; 3],
     /// Maximum solid height in each 4×4 block cell of the column.
@@ -2245,6 +2309,21 @@ impl ChunkBuffers {
             vertex_capacity: 4096,
             index_capacity: 4096,
             index_count: 0,
+            transparent_vertices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk transparent vertices"),
+                size: 4096,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            transparent_indices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk transparent indices"),
+                size: 4096,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            transparent_vertex_capacity: 4096,
+            transparent_index_capacity: 4096,
+            transparent_index_count: 0,
             min: [0.0; 3],
             max: [0.0; 3],
             occluder: [0.0; 16],

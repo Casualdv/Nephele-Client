@@ -598,6 +598,7 @@ pub fn is_transparent(id: u16) -> bool {
             | ids::LEAVES
             | ids::GLASS
             | 31   // tall grass
+            | 51   // fire (crossed, cutout/blended quads)
             | 78   // snow layer
             | 95   // stained glass
             | 101  // iron bars
