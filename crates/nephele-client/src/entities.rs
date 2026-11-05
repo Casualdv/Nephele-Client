@@ -59,6 +59,63 @@ impl EntityMetadata {
     }
 }
 
+/// The plate drawn above an entity's head.
+///
+/// Only `name` is filled today: it is the server's `custom_name` when there is
+/// one, and the player-list name otherwise. `prefix` (team colours) and `ping`
+/// are the slots the `net` branch fills once it parses them; they live here so
+/// the plate layout does not have to change when that lands.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Nametag {
+    /// Team prefix, e.g. `[RED] `. Empty until team data lands.
+    pub prefix: String,
+    /// `custom_name`, or the player-list name for a real player.
+    pub name: String,
+    /// Latency in milliseconds. `None` until the net branch supplies it.
+    pub ping: Option<u16>,
+}
+
+impl Nametag {
+    /// The plate as it is drawn. Multi-line custom names keep their line
+    /// breaks, which is how ASCII-art holograms are authored. `§` formatting
+    /// codes are dropped: the UI draws one colour per plate today. The net
+    /// branch maps them to colours and this method grows a colour-aware
+    /// variant then.
+    pub fn plate(&self) -> String {
+        let mut text = String::with_capacity(self.prefix.len() + self.name.len() + 8);
+        text.push_str(&self.prefix);
+        text.push_str(&strip_formatting(&self.name));
+        if let Some(ping) = self.ping {
+            text.push(' ');
+            text.push_str(&ping.to_string());
+            text.push_str("ms");
+        }
+        text
+    }
+}
+
+/// Remove vanilla `§` formatting codes (`§6`, `§l`, ...), leaving the text.
+fn strip_formatting(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '§' {
+            chars.next();
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The entity under the crosshair, as returned by [`Entities::pick`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityPick {
+    pub id: i32,
+    /// Distance from the eye, in blocks.
+    pub distance: f32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntityKind {
     /// A real player: `S0C`, or a player-shaped mob (`MOB_TYPE_PLAYER`).
@@ -75,6 +132,15 @@ pub enum EntityKind {
         item: Option<ItemStack>,
         /// Rotation in 45-degree steps, 0..=7.
         rotation: u8,
+    },
+    /// An armour stand (`S0E` with object type 78). Status flags and the head
+    /// pose arrive as metadata; an invisible marker stand is a hologram whose
+    /// only visible part is its `custom_name`.
+    ArmorStand {
+        small: bool,
+        /// Marker stands have no hitbox and are what holograms are built from.
+        marker: bool,
+        show_arms: bool,
     },
 }
 
@@ -180,11 +246,89 @@ impl Entity {
     /// Whether a nametag should be drawn. Players always show their name;
     /// mobs only when the server marks the custom name visible.
     pub fn shows_name(&self) -> bool {
-        if self.metadata.custom_name.is_empty() {
-            matches!(self.kind, EntityKind::Player { .. })
-        } else {
-            self.metadata.name_visible
+        self.nametag().is_some()
+    }
+
+    /// The plate to draw above this entity, or `None` when nothing should be
+    /// shown.
+    ///
+    /// Vanilla hides an invisible entity's plate, but an armour stand is the
+    /// exception: a hologram *is* its name, so an invisible marker stand still
+    /// draws its label. That is the whole "CLICK TO PLAY" trick.
+    pub fn nametag(&self) -> Option<Nametag> {
+        if self.invisible() && !self.is_armor_stand() {
+            return None;
         }
+        if self.metadata.custom_name.is_empty() {
+            let EntityKind::Player { name, .. } = &self.kind else {
+                return None;
+            };
+            return (!name.is_empty()).then(|| Nametag {
+                name: name.clone(),
+                ..Nametag::default()
+            });
+        }
+        self.metadata.name_visible.then(|| Nametag {
+            name: self.metadata.custom_name.clone(),
+            ..Nametag::default()
+        })
+    }
+
+    /// Whether the plate should also carry a health line. Players read their
+    /// own health off the HUD, so only other living entities get one.
+    pub fn shows_health(&self) -> bool {
+        !self.is_armor_stand() && !matches!(self.kind, EntityKind::Player { .. })
+    }
+
+    /// Height above the feet at which the plate is centred.
+    pub fn label_height(&self) -> f32 {
+        match &self.kind {
+            EntityKind::Player { .. } => 2.05,
+            EntityKind::ArmorStand { small, .. } => {
+                if *small {
+                    0.8
+                } else {
+                    1.55
+                }
+            }
+            _ => 1.75,
+        }
+    }
+
+    /// Axis-aligned bounds around the body, used for crosshair picking.
+    /// Returns `(min, max)` in world space.
+    pub fn bounds(&self) -> ([f64; 3], [f64; 3]) {
+        let (half_width, height) = match &self.kind {
+            EntityKind::Player { .. } => (0.32, 1.8),
+            EntityKind::ArmorStand { small, .. } => {
+                if *small {
+                    (0.25, 0.99)
+                } else {
+                    (0.25, 1.99)
+                }
+            }
+            EntityKind::Mob { kind } => match kind {
+                50 => (0.32, 1.7),
+                52 | 59 => (0.7, 0.9),
+                55 | 62 => (0.51, 0.51),
+                65 => (0.25, 0.45),
+                90..=92 | 95 | 96 => (0.45, 0.85),
+                _ => (0.32, 1.8),
+            },
+            EntityKind::Item { .. } => (0.13, 0.25),
+            EntityKind::ItemFrame { .. } => (0.13, 0.13),
+        };
+        let [x, y, z] = self.position;
+        (
+            [x - half_width, y, z - half_width],
+            [x + half_width, y + height, z + half_width],
+        )
+    }
+
+    /// Whether this entity is an armour stand. Marker stands are invisible in
+    /// vanilla but still pickable as holograms here.
+    pub fn is_armor_stand(&self) -> bool {
+        matches!(self.kind, EntityKind::ArmorStand { .. })
     }
 
     pub fn health(&self) -> f32 {
@@ -206,6 +350,13 @@ impl Entity {
             (2, EntityMetadataValue::String(name)) => self.metadata.custom_name.clone_from(name),
             (3, EntityMetadataValue::Byte(visible)) => self.metadata.name_visible = *visible != 0,
             (4, EntityMetadataValue::Byte(silent)) => self.metadata.silent = *silent != 0,
+            // Index 6 is health for a living entity, but this server also uses
+            // it for head yaw: a byte is a 1/256 turn, a `Rotation` is degrees.
+            // A `Float` is health, as in vanilla.
+            (6, EntityMetadataValue::Byte(turn)) => {
+                self.head_yaw = *turn as f32 * (360.0 / 256.0);
+            }
+            (6, EntityMetadataValue::Rotation([_, yaw, _])) => self.head_yaw = *yaw,
             (6, EntityMetadataValue::Float(health)) => self.metadata.health = health.max(0.0),
             (8, EntityMetadataValue::Slot(item)) => {
                 if let EntityKind::ItemFrame { item: framed, .. } = &mut self.kind {
@@ -220,6 +371,23 @@ impl Entity {
                     *current = (*rotation).clamp(0, 7) as u8;
                 }
             }
+            // Armour-stand status: 0x01 small, 0x04 show arms, 0x08 no base
+            // plate, 0x10 marker.
+            (10, EntityMetadataValue::Byte(status)) => {
+                if let EntityKind::ArmorStand {
+                    small,
+                    marker,
+                    show_arms,
+                } = &mut self.kind
+                {
+                    let status = *status as u8;
+                    *small = status & 0x01 != 0;
+                    *show_arms = status & 0x04 != 0;
+                    *marker = status & 0x10 != 0;
+                }
+            }
+            // The 1.8 armour-stand head pose, in degrees.
+            (11, EntityMetadataValue::Rotation([_, yaw, _])) => self.head_yaw = *yaw,
             _ => {}
         }
     }
@@ -241,6 +409,36 @@ fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// Distance along a unit `direction` from `origin` to the near face of an
+/// axis-aligned box, using the slab method. `None` when the ray misses or the
+/// box is entirely behind the origin.
+fn ray_box(origin: [f64; 3], direction: [f64; 3], min: [f64; 3], max: [f64; 3]) -> Option<f64> {
+    let mut near = f64::NEG_INFINITY;
+    let mut far = f64::INFINITY;
+    for axis in 0..3 {
+        let o = origin[axis];
+        let d = direction[axis];
+        if d.abs() < 1e-9 {
+            if o < min[axis] || o > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let inverse = 1.0 / d;
+        let mut t1 = (min[axis] - o) * inverse;
+        let mut t2 = (max[axis] - o) * inverse;
+        if t1 > t2 {
+            std::mem::swap(&mut t1, &mut t2);
+        }
+        near = near.max(t1);
+        far = far.min(t2);
+        if near > far {
+            return None;
+        }
+    }
+    (far >= 0.0).then(|| near.max(0.0))
 }
 
 pub fn wrap_degrees(degrees: f32) -> f32 {
@@ -408,6 +606,59 @@ impl Entities {
         if let Some(rotation) = rotation {
             *current = rotation & 7;
         }
+    }
+
+    /// Track an armour stand (`S0E`, object type 78). The status flags and the
+    /// head pose arrive as metadata afterwards, so it starts as a normal stand.
+    pub fn spawn_armor_stand(&mut self, id: i32, position: [f64; 3]) {
+        self.map.insert(
+            id,
+            Entity::new(
+                id,
+                EntityKind::ArmorStand {
+                    small: false,
+                    marker: false,
+                    show_arms: false,
+                },
+                position,
+                0.0,
+                0.0,
+                self.tick,
+            ),
+        );
+    }
+
+    /// The closest entity along `direction` from `eye`, within `max_distance`.
+    ///
+    /// This is the entity half of the crosshair: block raycasts answer "which
+    /// block", and this answers "which player, mob or hologram". Invisible
+    /// non-hologram entities are skipped, matching what the renderer draws.
+    pub fn pick(
+        &self,
+        eye: [f64; 3],
+        direction: [f64; 3],
+        max_distance: f64,
+    ) -> Option<EntityPick> {
+        let mut best: Option<EntityPick> = None;
+        for entity in self.map.values() {
+            if entity.invisible() && !entity.is_armor_stand() {
+                continue;
+            }
+            let (min, max) = entity.bounds();
+            let Some(distance) = ray_box(eye, direction, min, max) else {
+                continue;
+            };
+            if distance > max_distance {
+                continue;
+            }
+            if best.is_none_or(|pick| distance < pick.distance as f64) {
+                best = Some(EntityPick {
+                    id: entity.id,
+                    distance: distance as f32,
+                });
+            }
+        }
+        best
     }
 
     /// Apply one `S1C Entity Metadata` update.
@@ -639,7 +890,8 @@ mod tests {
         assert!(entity.crouched());
         assert!(entity.invisible());
         assert_eq!(entity.name(), "Bob");
-        assert!(entity.shows_name());
+        // Vanilla hides an invisible mob's plate; only holograms keep theirs.
+        assert!(!entity.shows_name());
         assert_eq!(entity.health(), 7.0);
         assert_eq!(
             entity.equipment[equipment_slot::HELMET as usize],
@@ -683,5 +935,135 @@ mod tests {
         entities.spawn_player(2, [0; 16], "b".into(), [2.0, 0.0, 0.0], 0.0, 0.0);
         assert_eq!(entities.nearest([1.9, 0.0, 0.0], 5.0).unwrap().id, 2);
         assert!(entities.nearest([40.0, 0.0, 0.0], 5.0).is_none());
+    }
+
+    #[test]
+    fn metadata_index_six_can_carry_head_yaw_without_moving_the_body() {
+        let mut entities = Entities::new();
+        entities.spawn_player(3, [0; 16], "Steve".into(), [0.0; 3], 0.0, 0.0);
+        entities.apply_metadata(&EntityMetadataUpdate {
+            entity_id: 3,
+            values: vec![(6, EntityMetadataValue::Byte(64))],
+        });
+        let entity = entities.get(3).unwrap();
+        // 64/256 of a turn is a right angle.
+        assert!((entity.head_yaw - 90.0).abs() < 1e-4);
+        assert_eq!(entity.yaw, 0.0);
+
+        // A `Rotation` at the same index is already in degrees.
+        entities.apply_metadata(&EntityMetadataUpdate {
+            entity_id: 3,
+            values: vec![(6, EntityMetadataValue::Rotation([0.0, 135.0, 0.0]))],
+        });
+        assert!((entities.get(3).unwrap().head_yaw - 135.0).abs() < 1e-4);
+
+        // `Float` stays health, as in vanilla.
+        entities.apply_metadata(&EntityMetadataUpdate {
+            entity_id: 3,
+            values: vec![(6, EntityMetadataValue::Float(12.0))],
+        });
+        assert_eq!(entities.get(3).unwrap().health(), 12.0);
+    }
+
+    #[test]
+    fn an_invisible_marker_armour_stand_still_draws_its_plate() {
+        let mut entities = Entities::new();
+        entities.spawn_armor_stand(11, [0.0, 64.0, 0.0]);
+        entities.apply_metadata(&EntityMetadataUpdate {
+            entity_id: 11,
+            values: vec![
+                (0, EntityMetadataValue::Byte(0x20)),
+                (
+                    2,
+                    EntityMetadataValue::String("§6§lCLICK TO PLAY\n§7§oJoin a game".into()),
+                ),
+                (3, EntityMetadataValue::Byte(1)),
+                (10, EntityMetadataValue::Byte(0x10 | 0x01)),
+                (11, EntityMetadataValue::Rotation([0.0, 90.0, 0.0])),
+            ],
+        });
+
+        let entity = entities.get(11).unwrap();
+        assert!(entity.invisible());
+        assert!(entity.is_armor_stand());
+        assert_eq!(entity.head_yaw, 90.0);
+        let EntityKind::ArmorStand {
+            small,
+            marker,
+            show_arms,
+        } = entity.kind
+        else {
+            panic!("expected an armour stand");
+        };
+        assert!(small);
+        assert!(marker);
+        assert!(!show_arms);
+
+        let tag = entity.nametag().expect("holograms keep their plate");
+        assert_eq!(tag.plate(), "CLICK TO PLAY\nJoin a game");
+    }
+
+    #[test]
+    fn an_invisible_player_hides_its_plate() {
+        let mut entities = Entities::new();
+        entities.spawn_player(12, [0; 16], "Steve".into(), [0.0; 3], 0.0, 0.0);
+        assert!(entities.get(12).unwrap().nametag().is_some());
+        entities.apply_metadata(&EntityMetadataUpdate {
+            entity_id: 12,
+            values: vec![(0, EntityMetadataValue::Byte(0x20))],
+        });
+        assert!(entities.get(12).unwrap().nametag().is_none());
+    }
+
+    #[test]
+    fn the_plate_keeps_team_and_ping_slots_ready() {
+        let tag = Nametag {
+            prefix: "[RED] ".into(),
+            name: "Steve".into(),
+            ping: Some(42),
+        };
+        assert_eq!(tag.plate(), "[RED] Steve 42ms");
+    }
+
+    #[test]
+    fn pick_returns_the_closest_visible_entity_along_the_crosshair() {
+        let mut entities = Entities::new();
+        entities.spawn_player(1, [0; 16], "a".into(), [0.0, 0.0, 3.0], 0.0, 0.0);
+        entities.spawn_player(2, [0; 16], "b".into(), [0.0, 0.0, 6.0], 0.0, 0.0);
+        let pick = entities
+            .pick([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], 8.0)
+            .expect("something in front");
+        assert_eq!(pick.id, 1);
+        assert!((pick.distance - 2.68).abs() < 0.05);
+
+        // Out of range misses entirely.
+        assert!(entities
+            .pick([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], 2.0)
+            .is_none());
+
+        // An invisible player is not clickable, but an invisible hologram is.
+        entities.apply_metadata(&EntityMetadataUpdate {
+            entity_id: 1,
+            values: vec![(0, EntityMetadataValue::Byte(0x20))],
+        });
+        assert_eq!(
+            entities
+                .pick([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], 8.0)
+                .unwrap()
+                .id,
+            2
+        );
+        entities.spawn_armor_stand(3, [0.0, 0.0, 1.0]);
+        entities.apply_metadata(&EntityMetadataUpdate {
+            entity_id: 3,
+            values: vec![(0, EntityMetadataValue::Byte(0x20))],
+        });
+        assert_eq!(
+            entities
+                .pick([0.0, 1.0, 0.0], [0.0, 0.0, 1.0], 8.0)
+                .unwrap()
+                .id,
+            3
+        );
     }
 }

@@ -162,6 +162,30 @@ async fn the_lobby_has_players_and_a_framed_map() {
     assert!(client.skins.iter().any(|(_, info)| info.slim));
     assert!(client.skins.iter().any(|(_, info)| !info.slim));
 
+    // Bot 0 takes its head yaw from metadata index 6, not `S19`, so its head
+    // tracks somewhere other than its body.
+    let metadata_head = client.entities.get(2).expect("bot 0");
+    assert!(
+        (metadata_head.head_yaw - metadata_head.yaw).abs() > 1.0,
+        "metadata head yaw should differ from the body yaw"
+    );
+
+    // The hologram is an invisible marker armour stand: only its plate shows.
+    let hologram = client
+        .entities
+        .iter()
+        .find(|entity| entity.is_armor_stand())
+        .expect("the mock spawns a hologram");
+    assert!(hologram.invisible(), "the hologram body is invisible");
+    let EntityKind::ArmorStand { marker, .. } = hologram.kind else {
+        panic!("expected an armour stand");
+    };
+    assert!(marker);
+    let plate = hologram
+        .nametag()
+        .expect("an invisible armour stand keeps its plate");
+    assert_eq!(plate.plate(), "CLICK TO PLAY\nJoin a game");
+
     let frame = client
         .entities
         .iter()

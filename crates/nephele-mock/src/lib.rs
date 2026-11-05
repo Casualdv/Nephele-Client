@@ -296,8 +296,51 @@ async fn send_join_sequence(
         send_bot_equipment(connection, &bots).await?;
         send_bot_crouch(connection, &bots).await?;
         send_lobby_map(connection, player_y as f64).await?;
+        send_lobby_hologram(connection, player_y as f64).await?;
     }
     Ok(columns)
+}
+
+/// An invisible marker armour stand whose `custom_name` is the only thing the
+/// client draws: the classic lobby hologram. `§` codes are stripped by the
+/// client today, so the words still have to read on their own.
+async fn send_lobby_hologram(connection: &mut Connection, feet_y: f64) -> Result<()> {
+    const HOLOGRAM_ID: i32 = 1_001;
+    connection
+        .write_packet(&play::spawn_object(
+            HOLOGRAM_ID,
+            play::OBJECT_TYPE_ARMOR_STAND,
+            [6.0, feet_y, 5.0],
+            0.0,
+            0.0,
+            0,
+            [0.0; 3],
+        ))
+        .await?;
+
+    let mut w = PacketWriter::new();
+    w.write_varint(HOLOGRAM_ID);
+    // Index 0, type 0 (byte): invisible.
+    w.write_u8(0).write_i8(0x20);
+    // Index 2, type 4 (string): the plate itself.
+    w.write_u8((4 << 5) | 2)
+        .write_string("§6§lCLICK TO PLAY\n§7§oJoin a game");
+    // Index 3, type 0 (byte): name visible.
+    w.write_u8(3).write_i8(1);
+    // Index 10, type 0 (byte): marker stand, no base plate.
+    w.write_u8(10).write_i8(0x10 | 0x08);
+    // Index 11, type 7 (rotation): head pose.
+    w.write_u8((7 << 5) | 11)
+        .write_f32(0.0)
+        .write_f32(0.0)
+        .write_f32(0.0);
+    w.write_u8(0x7F);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_METADATA,
+            w.into_bytes(),
+        ))
+        .await
 }
 
 /// One framed map in the lobby. The mock does not send `S34` pixels: map
@@ -528,6 +571,22 @@ async fn send_bot_head(connection: &mut Connection, id: i32, yaw: f32) -> Result
         .await
 }
 
+/// Metadata index 6, type 0 (byte): a 1/256 head yaw. This exercises the head
+/// path that does not go through `S19`, so both have to agree.
+async fn send_bot_head_metadata(connection: &mut Connection, id: i32, yaw: f32) -> Result<()> {
+    let mut w = PacketWriter::new();
+    w.write_varint(id);
+    w.write_u8(6);
+    w.write_i8(((yaw / 360.0) * 256.0) as u8 as i8);
+    w.write_u8(0x7F);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_METADATA,
+            w.into_bytes(),
+        ))
+        .await
+}
+
 async fn send_bot_spawns(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
     for bot in bots {
         let (x, z) = bot_position(bot, bot.phase);
@@ -583,7 +642,7 @@ async fn send_bot_equipment(connection: &mut Connection, bots: &[MockBot]) -> Re
 /// Walk the bots around their circles and turn their heads to face the player.
 async fn send_bot_tick(connection: &mut Connection, bots: &[MockBot], tick: u64) -> Result<()> {
     let step = 0.06;
-    for bot in bots {
+    for (index, bot) in bots.iter().enumerate() {
         let angle = bot.phase + step * tick as f64;
         let (x, z) = bot_position(bot, angle);
         let (px, pz) = bot_position(bot, angle - step);
@@ -601,7 +660,14 @@ async fn send_bot_tick(connection: &mut Connection, bots: &[MockBot], tick: u64)
         // direction from the bot back to the player.
         let to_player = (8.5 - x, 8.5 - z);
         let facing = (-to_player.0).atan2(to_player.1).to_degrees() as f32;
-        send_bot_head(connection, bot.entity_id, facing.rem_euclid(360.0)).await?;
+        let facing = facing.rem_euclid(360.0);
+        // One bot takes its head yaw from metadata index 6 instead of `S19`,
+        // so the two head paths are both covered by the lobby.
+        if index == 0 {
+            send_bot_head_metadata(connection, bot.entity_id, facing).await?;
+        } else {
+            send_bot_head(connection, bot.entity_id, facing).await?;
+        }
     }
     if let Some(bot) = bots.get(3) {
         send_bot_swing(connection, bot.entity_id).await?;

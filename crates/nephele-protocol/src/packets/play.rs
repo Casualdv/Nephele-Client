@@ -1263,6 +1263,9 @@ pub fn parse_entity(packet: &Packet) -> Result<i32> {
 pub const OBJECT_TYPE_ITEM: u8 = 2;
 /// Item frames are objects, not mobs, in 1.8. The object `data` is the facing.
 pub const OBJECT_TYPE_ITEM_FRAME: u8 = 71;
+/// Armour stands are objects too. Their pose and status arrive as metadata,
+/// and an **invisible marker** stand is the usual lobby hologram.
+pub const OBJECT_TYPE_ARMOR_STAND: u8 = 78;
 
 /// `S0E`: a non-living object. Dropped items are the only kind the client
 /// tracks; the rest are parsed so the wire format stays honest.

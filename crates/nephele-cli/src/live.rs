@@ -119,8 +119,15 @@ struct EntitySnapshot {
     kind: u8,
     /// Item id and metadata for a dropped stack, `None` for players and mobs.
     item: Option<(i16, i16)>,
-    name: String,
-    show_name: bool,
+    /// The plate to draw, with the team/ping slots already in place.
+    nametag: Option<nephele_client::Nametag>,
+    /// Height above the feet at which the plate is centred.
+    label_height: f32,
+    /// Whether the plate carries a health line under the name.
+    show_health: bool,
+    /// Armour stands only contribute their plate; the body is a hologram
+    /// anchor and is not drawn.
+    armor_stand: bool,
     health: f32,
     flags: u8,
     /// Held item, taken from the equipment slot for the hand renderer.
@@ -141,6 +148,7 @@ impl EntitySnapshot {
             nephele_client::EntityKind::Mob { kind } => (false, [0; 16], *kind),
             nephele_client::EntityKind::Item { .. } => (false, [0; 16], 0),
             nephele_client::EntityKind::ItemFrame { .. } => (false, [0; 16], 0),
+            nephele_client::EntityKind::ArmorStand { .. } => (false, [0; 16], 0),
         };
         let item = match entity.kind {
             nephele_client::EntityKind::Item { id, meta } => Some((id, meta)),
@@ -174,8 +182,10 @@ impl EntitySnapshot {
             pitch: entity.pitch,
             kind,
             item,
-            name: entity.name().to_string(),
-            show_name: entity.shows_name(),
+            nametag: entity.nametag(),
+            label_height: entity.label_height(),
+            show_health: entity.shows_health(),
+            armor_stand: entity.is_armor_stand(),
             health: entity.health(),
             flags: entity.metadata.flags,
             held_item,
@@ -207,6 +217,8 @@ struct Shared {
     pending_respawn: bool,
     /// Written by the network thread, read by the renderer.
     aim: Option<Aim>,
+    /// The entity under the crosshair, when nothing blocks it sooner.
+    entity_target: Option<nephele_client::EntityPick>,
     break_stage: Option<u8>,
     held_slot: i16,
     creative: bool,
@@ -384,6 +396,7 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         pending_slot: None,
         pending_respawn: false,
         aim: None,
+        entity_target: None,
         break_stage: None,
         held_slot: 0,
         creative: false,
@@ -500,8 +513,10 @@ impl LocalMob {
             pitch: 0.0,
             kind: self.kind,
             item: None,
-            name: String::new(),
-            show_name: false,
+            nametag: Some(nephele_client::Nametag::default()),
+            label_height: 1.75,
+            show_health: true,
+            armor_stand: false,
             health: self.health,
             flags: 0,
             held_item: None,
@@ -1015,6 +1030,7 @@ fn local_loop(
             }
             last_health = state.health;
             state.aim = aim;
+            state.entity_target = None;
             state.break_stage = miner.stage();
             state.chunks = world.loaded_chunks();
         }
@@ -1150,7 +1166,14 @@ async fn net_loop(
                 let eye = [position.x, position.y + EYE_HEIGHT, position.z];
                 let direction = look_direction(yaw, pitch);
                 let reach = if creative { REACH_CREATIVE } else { REACH_SURVIVAL };
-                let aim = raycast(&client.world, eye, direction, reach).map(|hit| Aim {
+                let hit = raycast(&client.world, eye, direction, reach);
+                let block_distance = hit.as_ref().map(|hit| {
+                    let dx = hit.point[0] - eye[0];
+                    let dy = hit.point[1] - eye[1];
+                    let dz = hit.point[2] - eye[2];
+                    (dx * dx + dy * dy + dz * dz).sqrt()
+                });
+                let aim = hit.map(|hit| Aim {
                     x: hit.x,
                     y: hit.y,
                     z: hit.z,
@@ -1160,6 +1183,11 @@ async fn net_loop(
                         (hit.point[1] - hit.y as f64).clamp(0.0, 1.0) as f32,
                         (hit.point[2] - hit.z as f64).clamp(0.0, 1.0) as f32,
                     ],
+                });
+                // The entity half of the crosshair. Blocks still win, so a
+                // clickable entity is only exposed when no block is nearer.
+                let entity_target = client.pick_entity(eye, direction, reach).filter(|pick| {
+                    block_distance.is_none_or(|block| block >= pick.distance as f64)
                 });
 
                 for event in miner.tick(&client.world, aim, attacking, creative) {
@@ -1226,6 +1254,7 @@ async fn net_loop(
                 {
                     let mut state = shared.lock().unwrap();
                     state.aim = aim;
+                    state.entity_target = entity_target;
                     state.break_stage = miner.stage();
                     state.held_slot = client.held_slot;
                     state.health = client.health;
@@ -1339,6 +1368,8 @@ struct FrameView {
     status: String,
     error: Option<String>,
     aim: Option<Aim>,
+    /// Entity under the crosshair, ready for client-ui to click.
+    entity_target: Option<nephele_client::EntityPick>,
     stage: Option<u8>,
     held_slot: i16,
     creative: bool,
@@ -1971,6 +2002,12 @@ impl LiveApp {
                 continue;
             }
 
+            // Armour stands have no model here. An invisible marker stand is a
+            // hologram: its plate is the whole entity, so draw nothing else.
+            if entity.armor_stand {
+                continue;
+            }
+
             let yaw = lerp_degrees(entity.prev_yaw, entity.yaw, alpha);
             let head_yaw = lerp_degrees(entity.prev_head_yaw, entity.head_yaw, alpha);
             let mut draw = if entity.player {
@@ -2357,6 +2394,7 @@ impl LiveApp {
                 status: state.status.clone(),
                 error: state.error.take(),
                 aim: state.aim,
+                entity_target: state.entity_target,
                 stage: state.break_stage,
                 held_slot: state.held_slot,
                 creative: state.creative,
@@ -2517,17 +2555,24 @@ impl LiveApp {
         if self.title_timer >= 0.4 {
             let fps = self.frames as f32 / self.title_timer;
             self.last_fps = fps;
-            let target = match view.aim {
-                Some(aim) => format!(
-                    "{} {} {} {}",
-                    aim.x,
-                    aim.y,
-                    aim.z,
-                    nephele_world::Face::from_protocol_id(aim.face)
-                        .map(|face| face.name())
-                        .unwrap_or("?")
-                ),
-                None => "-".to_string(),
+            let target = match (view.aim, view.entity_target) {
+                (Some(aim), entity) => {
+                    let block = format!(
+                        "{} {} {} {}",
+                        aim.x,
+                        aim.y,
+                        aim.z,
+                        nephele_world::Face::from_protocol_id(aim.face)
+                            .map(|face| face.name())
+                            .unwrap_or("?")
+                    );
+                    match entity {
+                        Some(pick) => format!("{block} ent {}", pick.id),
+                        None => block,
+                    }
+                }
+                (None, Some(pick)) => format!("ent {} {:.1}", pick.id, pick.distance),
+                (None, None) => "-".to_string(),
             };
             if self.profile {
                 let frames = self.prof_frames.max(1) as f32;
@@ -2768,11 +2813,16 @@ impl LiveApp {
     fn draw_entity_labels(&mut self, view: &FrameView, scale: f32, width: f32, height: f32) {
         let matrix = view.camera.view_projection();
         for entity in &self.entities {
-            if entity.item.is_some() || entity.item_frame.is_some() || entity.flags & 0x20 != 0 {
+            if entity.item.is_some() || entity.item_frame.is_some() {
                 continue;
             }
+            // Invisible players and mobs hide their plate; an armour stand
+            // keeps it, because the plate *is* the hologram.
+            let Some(tag) = &entity.nametag else {
+                continue;
+            };
             let x = entity.position[0] as f32;
-            let y = entity.position[1] as f32 + if entity.player { 2.05 } else { 1.75 };
+            let y = entity.position[1] as f32 + entity.label_height;
             let z = entity.position[2] as f32;
             let clip = matrix * glam::Vec4::new(x, y, z, 1.0);
             if clip.w <= 0.1 {
@@ -2789,17 +2839,15 @@ impl LiveApp {
             // shrink into the background. 14 blocks is roughly the point where
             // a 0.025-scale tag reaches one GUI pixel per texel.
             let local_scale = scale * (14.0 / distance.max(1.0)).clamp(0.55, 1.5);
-            let label = if entity.show_name && !entity.name.is_empty() {
-                if entity.player {
-                    entity.name.clone()
-                } else {
-                    format!("{}\n{} HP", entity.name, entity.health.ceil() as i32)
-                }
-            } else if !entity.player {
-                format!("{} HP", entity.health.ceil() as i32)
-            } else {
-                continue;
+            let plate = tag.plate();
+            let label = match (entity.show_health, plate.is_empty()) {
+                (true, false) => format!("{plate}\n{} HP", entity.health.ceil() as i32),
+                (true, true) => format!("{} HP", entity.health.ceil() as i32),
+                (false, _) => plate,
             };
+            if label.is_empty() {
+                continue;
+            }
             let lines = label.lines().count().max(1) as f32;
             let text_width = UiBatch::text_width(&label, local_scale);
             let line_height = 9.0 * local_scale;
@@ -4163,6 +4211,7 @@ mod tests {
             pending_slot: None,
             pending_respawn: false,
             aim: None,
+            entity_target: None,
             break_stage: None,
             held_slot: 0,
             creative: false,

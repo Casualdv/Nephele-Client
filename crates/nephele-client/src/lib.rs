@@ -25,7 +25,7 @@ use nephele_world::{
 
 pub use block_entities::{BannerPattern, BlockEntity, BlockEntityKind};
 pub use container::LocalContainer;
-pub use entities::{Entities, Entity, EntityKind, EntityMetadata};
+pub use entities::{Entities, Entity, EntityKind, EntityMetadata, EntityPick, Nametag};
 pub use maps::{MapState, Maps};
 pub use mining::{Aim, Miner, MiningEvent};
 pub use skins::{SkinInfo, Skins};
@@ -767,6 +767,14 @@ impl GameClient {
                         name: String::new(),
                     });
                 }
+                if object.kind == play::OBJECT_TYPE_ARMOR_STAND {
+                    self.entities
+                        .spawn_armor_stand(object.entity_id, [object.x, object.y, object.z]);
+                    return Ok(Event::EntitySpawned {
+                        entity_id: object.entity_id,
+                        name: String::new(),
+                    });
+                }
                 if object.kind != play::OBJECT_TYPE_ITEM {
                     // Arrows, falling blocks, boats, ... are not drawn yet, but
                     // parsing them keeps the packet stream understood.
@@ -980,6 +988,18 @@ impl GameClient {
     pub fn held_item(&self) -> Option<ItemStack> {
         let slot = play::HOTBAR_FIRST_SLOT + self.held_slot.max(0) as usize;
         self.inventory.get(slot).copied().flatten()
+    }
+
+    /// The entity under the crosshair along `direction` from `eye`, for the
+    /// UI to click. Blocks still win: callers should only use this when their
+    /// block raycast found nothing nearer than the returned distance.
+    pub fn pick_entity(
+        &self,
+        eye: [f64; 3],
+        direction: [f64; 3],
+        max_distance: f64,
+    ) -> Option<EntityPick> {
+        self.entities.pick(eye, direction, max_distance)
     }
 
     /// Ask the server to select a hotbar slot. The server confirms with `S09`.

@@ -407,13 +407,33 @@ the entity pipeline, which is bound to the skin atlas — via
   skin that does not paint them must not become an opaque grey shell.
 - Nametags are screen-space labels projected from above the head. They have a
   translucent black background, scale by distance (`14/d`, clamped 0.55..1.5)
-  and players show only their name (mobs also show HP).
+  and players show only their name (mobs also show HP). The plate is built by
+  `Entity::nametag()` -> `Nametag { prefix, name, ping }`; `plate()` strips `§`
+  codes today, and the `prefix`/`ping` slots are where the `net` branch adds
+  team colours and latency. Vanilla's rule holds: an invisible player or mob
+  hides its plate, but an invisible **armour stand** keeps it.
+- Head yaw is interpolated separately from body yaw (`prev_head_yaw`/`head_yaw`
+  in `Entity`, `EntitySnapshot` and the draw path). It arrives via `S19`, via
+  metadata index 6 as either a byte (1/256 turn) or a `Rotation` in degrees, or
+  via index 11 for armour stands. Index 6 `Float` is still health.
 - `S0E Spawn Object` type 71 becomes `EntityKind::ItemFrame { direction }`.
   Metadata index 8 is the framed stack, index 9 the 45-degree rotation.
   `nephele-render::append_item_frame` draws the wooden frame texture
   (`textures/blocks/itemframe_background.png`, 16x16) and the item flat in
   front, rotated by metadata. Non-map items use a tinted placeholder; maps use
   the real pixels.
+- `S0E Spawn Object` type **78** becomes `EntityKind::ArmorStand`. Metadata
+  index 10 carries the status flags (0x01 small, 0x04 show arms, 0x08 no base
+  plate, 0x10 marker) and index 11 the head pose. The lobby hologram is an
+  invisible marker stand whose `custom_name` is the whole entity: the renderer
+  skips the body and draws only the plate, which is why `§6§lCLICK TO PLAY`
+  still reads after formatting codes are stripped.
+- `Entities::pick(eye, direction, reach)` ray-tests each entity's axis-aligned
+  bounds and returns `EntityPick { id, distance }`. `GameClient::pick_entity`
+  exposes it; the CLI stores the result on `Shared`/`FrameView` as
+  `entity_target`, shows it in the debug title (`ent <id>`), and only exposes
+  it when the block raycast has no nearer hit. Invisible non-hologram entities
+  are skipped.
 - In 1.8 a **filled map's damage value is its map id**. `ItemStack` stays the
   simple id/count/damage triple; there is no NBT `map` parsing on this branch.
 - **Map interface (N owns the wire parsing):** `nephele-client::maps::{Maps,
@@ -435,12 +455,17 @@ the entity pipeline, which is bound to the skin atlas — via
 - The mock lobby (`nephele mock-server --bots`) exercises the whole path: eight
   named bots (alternating classic/slim, hash-tinted fallback skins), iron armour
   and a held sword on one, a held map on another, a crouched bot, a swinging
-  bot, and a framed map item. The real-socket test
-  `the_lobby_has_players_and_a_framed_map` pins the frame/item half and checks
-  the placeholder is a picture.
+  bot, a framed map item, and an invisible marker armour-stand hologram
+  (`§6§lCLICK TO PLAY\n§7§oJoin a game`). Bot 0 takes its head yaw from
+  metadata index 6 while the others use `S19`, so both head paths are covered.
+  The real-socket test `the_lobby_has_players_and_a_framed_map` pins the frame,
+  the placeholder picture, the hologram plate and the metadata head yaw.
 - Known limits: armour uses material tints, not the armour layer textures;
   framed non-map items are flat tints; the map seam has only been exercised
-  against the mock and the placeholder, not a live N parser.
+  against the mock and the placeholder, not a live N parser. Team prefixes and
+  ping numbers stay empty until the `net` branch parses them. A *visible*
+  armour stand is skipped like an invisible one, since there is no stand model
+  yet; only its plate would differ.
 
 ### Audio (2026-11-03)
 
