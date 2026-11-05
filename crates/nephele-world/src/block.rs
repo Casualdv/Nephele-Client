@@ -87,6 +87,27 @@ impl BlockState {
     pub const COBBLESTONE: BlockState = BlockState::new(ids::COBBLESTONE, 0);
 }
 
+/// `Block.getMaterial().isLiquid()` — `MaterialLiquid`, i.e. water and lava in
+/// both their flowing and stationary forms (ids 8..=11).
+pub fn is_liquid(state: BlockState) -> bool {
+    matches!(state.id(), 8..=11)
+}
+
+/// `Block.isReplaceable(world, pos)`.
+///
+/// 1.8.9 only overrides the default `false` in six places, and worldgen asks
+/// this constantly (can a tree trunk go here, may a lake fill this). The
+/// overrides are air, dead bush, tall grass, double plant, vine, and a
+/// single-layer snow cover.
+pub fn is_replaceable(state: BlockState) -> bool {
+    match state.id() {
+        0 | 31 | 32 | 106 | 175 => true,
+        // `BlockSnow.isReplaceable`: only the one-layer state.
+        78 => state.meta() == 0,
+        _ => false,
+    }
+}
+
 /// Hardness of `id`, copied from 1.8.9's block registrations (`Block.setHardness`).
 ///
 /// `UNBREAKABLE` means "cannot be broken at all"; `0.0` breaks instantly.

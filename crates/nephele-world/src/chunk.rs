@@ -130,6 +130,12 @@ pub struct ChunkColumn {
     sections: Vec<Option<Section>>,
     biomes: Option<Vec<u8>>,
     non_air: u32,
+    /// One entry per column: one above its highest light-blocking block, cached
+    /// by `generate_height_map`. `None` until a stage asks for it; the lookup
+    /// falls back to scanning the column, so this is an optimisation, not state.
+    height_map: Option<Box<[u8; 256]>>,
+    /// `Chunk.isTerrainPopulated`: whether this chunk's own population pass ran.
+    terrain_populated: bool,
 }
 
 impl ChunkColumn {
@@ -140,6 +146,8 @@ impl ChunkColumn {
             sections: vec![None; SECTION_COUNT],
             biomes: None,
             non_air: 0,
+            height_map: None,
+            terrain_populated: false,
         }
     }
 
@@ -156,6 +164,8 @@ impl ChunkColumn {
             sections,
             biomes: None,
             non_air,
+            height_map: None,
+            terrain_populated: false,
         }
     }
 
@@ -236,6 +246,49 @@ impl ChunkColumn {
         (0..SECTION_COUNT * SECTION_DIM)
             .rev()
             .find(|&y| !self.get_block(x, y, z).is_air())
+    }
+
+    /// `Chunk.generateSkylightMap`'s height pass: for every column, one above the
+    /// highest block whose light opacity is non-zero.
+    ///
+    /// Vanilla asks `Block.getLightOpacity`, which is 255 for an opaque full cube,
+    /// 3 for water and ice, 1 for leaves and web, and 0 for air, snow layers and
+    /// carpet. This crate carries no opacity table, so the predicate here is "not
+    /// air". That agrees with vanilla for every block `provide_chunk` can emit —
+    /// snow layers and carpets only ever arrive with population — and the sky-light
+    /// nibbles themselves are deliberately left unwritten (see
+    /// [`VanillaGenerator::provide_chunk`](crate::worldgen::VanillaGenerator::provide_chunk)).
+    pub fn generate_height_map(&mut self) {
+        let mut map = Box::new([0u8; 256]);
+        for z in 0..16usize {
+            for x in 0..16usize {
+                map[z * 16 + x] = self
+                    .height_at(x, z)
+                    .map(|top| (top + 1).min(255) as u8)
+                    .unwrap_or(0);
+            }
+        }
+        self.height_map = Some(map);
+    }
+
+    /// `World.getHeight(x, z)` for a chunk-local column: one above the highest
+    /// block that is not air.
+    ///
+    /// Reads the cached map when `generate_height_map` has run, and scans the
+    /// column otherwise, so a chunk decoded from the network answers this too.
+    pub fn height_map_at(&self, x: usize, z: usize) -> i32 {
+        match &self.height_map {
+            Some(map) => i32::from(map[z * 16 + x]),
+            None => self.height_at(x, z).map(|top| top as i32 + 1).unwrap_or(0),
+        }
+    }
+
+    pub fn is_terrain_populated(&self) -> bool {
+        self.terrain_populated
+    }
+
+    pub fn set_terrain_populated(&mut self, populated: bool) {
+        self.terrain_populated = populated;
     }
 }
 
