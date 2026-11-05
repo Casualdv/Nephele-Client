@@ -2,7 +2,8 @@ use nephele_assets::{
     face_textures, is_transparent, item_texture_name, TextureArray, MISSING_TEXTURE,
 };
 use nephele_world::shapes::{
-    block_shape, door_shape, is_door, is_full_cube, is_pane, pane_shape, PaneConnections, PaneShape,
+    block_shape, door_shape, fence_shape, is_door, is_fence, is_full_cube, is_pane, pane_shape,
+    FenceShape, PaneConnections, PaneShape,
 };
 use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World};
 
@@ -46,11 +47,15 @@ impl Vertex {
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    /// Blended geometry (fire), drawn after the opaque pass with no depth
+    /// writes. Keeping it separate is what lets it use a second pipeline.
+    pub transparent_vertices: Vec<Vertex>,
+    pub transparent_indices: Vec<u32>,
 }
 
 impl MeshData {
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.indices.is_empty() && self.transparent_indices.is_empty()
     }
 
     pub fn append(&mut self, other: MeshData) {
@@ -58,6 +63,11 @@ impl MeshData {
         self.vertices.extend(other.vertices);
         self.indices
             .extend(other.indices.into_iter().map(|i| i + base));
+
+        let base = self.transparent_vertices.len() as u32;
+        self.transparent_vertices.extend(other.transparent_vertices);
+        self.transparent_indices
+            .extend(other.transparent_indices.into_iter().map(|i| i + base));
     }
 }
 
@@ -565,6 +575,38 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             let y = section_y + local_y;
             let id = raw >> 4;
 
+            // Iron bars are zero-thickness planes through the block centre,
+            // not a 2-pixel box: squashing the 16px texture into a 2px box
+            // turns the bar pattern into a comb of spikes.
+            if id == 101 {
+                let connections = connections_at(job, local_x, y, local_z);
+                let light = job.light(local_x, y + 1, local_z) as f32 / 15.0;
+                append_bars(
+                    &mut mesh,
+                    layers[2],
+                    anims[2],
+                    light,
+                    [
+                        (base_x + local_x) as f32,
+                        y as f32,
+                        (base_z + local_z) as f32,
+                    ],
+                    connections,
+                );
+                continue;
+            }
+
+            // Fire is two crossed, animated quads (fire_layer_0 and
+            // fire_layer_1) that must blend rather than cut out, so it goes
+            // into the transparent mesh.
+            if id == 51 {
+                let bx = (base_x + local_x) as f32;
+                let by = y as f32;
+                let bz = (base_z + local_z) as f32;
+                append_fire(&mut mesh, atlas, [bx, by, bz], local_x, y, local_z, job);
+                continue;
+            }
+
             // Plants are two crossed quads, not a cube. Rendering them as
             // cubes is what makes flowers and grass look like solid boxes.
             if is_cross_plant(id) {
@@ -620,8 +662,11 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             }
             let meta = (raw & 0x0f) as u8;
             let pane_boxes = is_pane(id).then(|| pane_shape_for_block(job, local_x, y, local_z));
+            let fence_boxes = is_fence(id).then(|| fence_shape_for_block(job, local_x, y, local_z));
             let shape = if let Some(pane) = pane_boxes.as_ref() {
                 pane.as_slice()
+            } else if let Some(fence) = fence_boxes.as_ref() {
+                fence.as_slice()
             } else if is_door(id) {
                 door_shape_for_block(job, id, meta, local_x, y, local_z)
             } else {
@@ -695,17 +740,25 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
 }
 
 fn pane_shape_for_block(job: &ColumnMeshJob, x: i32, y: i32, z: i32) -> PaneShape {
-    pane_shape(PaneConnections {
+    pane_shape(connections_at(job, x, y, z))
+}
+
+fn fence_shape_for_block(job: &ColumnMeshJob, x: i32, y: i32, z: i32) -> FenceShape {
+    fence_shape(connections_at(job, x, y, z))
+}
+
+fn connections_at(job: &ColumnMeshJob, x: i32, y: i32, z: i32) -> PaneConnections {
+    PaneConnections {
         west: pane_connects(job.block(x - 1, y, z)),
         east: pane_connects(job.block(x + 1, y, z)),
         north: pane_connects(job.block(x, y, z - 1)),
         south: pane_connects(job.block(x, y, z + 1)),
-    })
+    }
 }
 
 fn pane_connects(raw: u16) -> bool {
     let id = raw >> 4;
-    is_pane(id) || is_full_cube(block_shape(id, (raw & 0x0f) as u8))
+    is_pane(id) || is_fence(id) || is_full_cube(block_shape(id, (raw & 0x0f) as u8))
 }
 
 fn door_shape_for_block(
@@ -882,6 +935,133 @@ fn append_quad(
 
 /// Blocks drawn as two crossed quads rather than a cube.
 ///
+/// Iron bars: flat planes through the block centre carrying the full
+/// `iron_bars` texture, which is what makes them read as bars rather than as
+/// a textured post. Both windings are emitted so they are visible from either
+/// side without touching the pipeline's back-face culling.
+fn append_bars(
+    mesh: &mut MeshData,
+    layer: u32,
+    anim: u32,
+    light: f32,
+    origin: [f32; 3],
+    connections: PaneConnections,
+) {
+    let [bx, by, bz] = origin;
+    let mut planes: Vec<[[f32; 3]; 4]> = Vec::with_capacity(2);
+
+    // A connection along X runs a plane at z = centre spanning the full block;
+    // a connection along Z runs one at x = centre.
+    if connections.west || connections.east {
+        planes.push([
+            [bx + 0.5, by, bz],
+            [bx + 0.5, by, bz + 1.0],
+            [bx + 0.5, by + 1.0, bz + 1.0],
+            [bx + 0.5, by + 1.0, bz],
+        ]);
+    }
+    if connections.north || connections.south {
+        planes.push([
+            [bx, by, bz + 0.5],
+            [bx + 1.0, by, bz + 0.5],
+            [bx + 1.0, by + 1.0, bz + 0.5],
+            [bx, by + 1.0, bz + 0.5],
+        ]);
+    }
+    if planes.is_empty() {
+        // An isolated bar keeps the vanilla 2-pixel-wide post plane.
+        planes.push([
+            [bx + 0.5, by, bz + 7.0 / 16.0],
+            [bx + 0.5, by, bz + 9.0 / 16.0],
+            [bx + 0.5, by + 1.0, bz + 9.0 / 16.0],
+            [bx + 0.5, by + 1.0, bz + 7.0 / 16.0],
+        ]);
+    }
+
+    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+    for corners in planes {
+        for order in [[0usize, 1, 2, 3], [3, 2, 1, 0]] {
+            let base = mesh.vertices.len() as u32;
+            for index in order {
+                mesh.vertices.push(Vertex {
+                    position: corners[index],
+                    uv: uvs[index],
+                    shade: 1.0,
+                    layer,
+                    anim,
+                    light,
+                });
+            }
+            mesh.indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+}
+
+/// Fire: two crossed planes, each drawn from both sides, alternating the two
+/// `.mcmeta` layers so the flames keep moving even in a static frame.
+fn append_fire(
+    mesh: &mut MeshData,
+    atlas: &TextureArray,
+    origin: [f32; 3],
+    local_x: i32,
+    y: i32,
+    local_z: i32,
+    job: &ColumnMeshJob,
+) {
+    let layers = [
+        atlas.slot_or_missing("fire_layer_0"),
+        atlas.slot_or_missing("fire_layer_1"),
+    ];
+    let anims = [
+        atlas.animation("fire_layer_0").unwrap_or(NO_ANIMATION),
+        atlas.animation("fire_layer_1").unwrap_or(NO_ANIMATION),
+    ];
+    let light = (job.light(local_x, y + 1, local_z) as f32 / 15.0).max(0.85);
+    let [bx, by, bz] = origin;
+    let quads = [
+        [
+            [bx, by, bz],
+            [bx + 1.0, by, bz + 1.0],
+            [bx + 1.0, by + 1.0, bz + 1.0],
+            [bx, by + 1.0, bz],
+        ],
+        [
+            [bx + 1.0, by, bz],
+            [bx, by, bz + 1.0],
+            [bx, by + 1.0, bz + 1.0],
+            [bx + 1.0, by + 1.0, bz],
+        ],
+    ];
+    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+
+    for (plane, quad) in quads.into_iter().enumerate() {
+        for (side, order) in [[0usize, 1, 2, 3], [3, 2, 1, 0]].into_iter().enumerate() {
+            let layer = layers[(plane + side) % 2];
+            let anim = anims[(plane + side) % 2];
+            let base = mesh.transparent_vertices.len() as u32;
+            for index in order {
+                mesh.transparent_vertices.push(Vertex {
+                    position: quad[index],
+                    uv: uvs[index],
+                    shade: 1.0,
+                    layer,
+                    anim,
+                    light,
+                });
+            }
+            mesh.transparent_indices.extend_from_slice(&[
+                base,
+                base + 1,
+                base + 2,
+                base,
+                base + 2,
+                base + 3,
+            ]);
+        }
+    }
+}
+
 /// Saplings, grass, flowers, mushrooms, crops, sugar cane and the double
 /// plants. Everything else keeps the cube path.
 fn is_cross_plant(id: u16) -> bool {
@@ -1157,7 +1337,7 @@ mod tests {
 
     #[test]
     fn isolated_pane_mesh_uses_the_centre_post() {
-        let mesh = single_block_mesh(BlockState::new(101, 0));
+        let mesh = single_block_mesh(BlockState::new(102, 0));
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(
             bounds(&mesh.vertices),
@@ -1509,6 +1689,108 @@ mod tests {
         }
         assert_eq!(quads, 4, "expected two crossed quads drawn both ways");
     }
+
+    #[test]
+    fn fire_is_two_crossed_quads_with_both_animated_layers() {
+        let atlas = nephele_assets::TextureArray::from_tiles(vec![
+            (
+                "fire_layer_0".to_string(),
+                RgbaImage::from_pixel(16, 16, image::Rgba([250, 120, 30, 255])),
+            ),
+            (
+                "fire_layer_1".to_string(),
+                RgbaImage::from_pixel(16, 16, image::Rgba([255, 200, 60, 255])),
+            ),
+        ]);
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::new(51, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas);
+
+        assert!(
+            mesh.vertices.is_empty(),
+            "fire must not enter the cube path"
+        );
+        assert_eq!(mesh.transparent_vertices.len(), 16);
+        assert_eq!(mesh.transparent_indices.len(), 24);
+        let mut slots: Vec<u32> = mesh
+            .transparent_vertices
+            .iter()
+            .map(|vertex| vertex.layer)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), 2, "both fire layers must be used");
+        assert_eq!(
+            bounds(&mesh.transparent_vertices),
+            ([3.0, 64.0, 3.0], [4.0, 65.0, 4.0])
+        );
+    }
+
+    #[test]
+    fn fire_does_not_hide_the_face_of_its_neighbour() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::STONE);
+        column.set_block(3, 65, 3, BlockState::new(51, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+        // The fire sits above the stone; the stone's top face must survive.
+        let mut top_faces = 0;
+        for window in mesh.indices.chunks(6) {
+            let positions: Vec<[f32; 3]> = window
+                .iter()
+                .map(|index| mesh.vertices[*index as usize].position)
+                .collect();
+            if positions.iter().all(|p| p[1] == 65.0) {
+                top_faces += 1;
+            }
+        }
+        assert!(top_faces >= 1, "the fire must not cull the block below it");
+    }
+
+    #[test]
+    fn fences_and_bars_build_arms_only_where_they_connect() {
+        // An isolated iron bar is the vanilla two-pixel post plane, not a box.
+        let mesh = single_block_mesh(BlockState::new(101, 0));
+        assert_eq!(mesh.vertices.len(), 8, "one plane drawn both ways");
+        let (min, max) = bounds(&mesh.vertices);
+        assert_eq!(min[0], max[0], "the bar plane has no thickness");
+        assert!((min[2] - 7.0 / 16.0).abs() < 1.0e-6);
+        assert!((max[2] - 9.0 / 16.0).abs() < 1.0e-6);
+
+        // A bar against a wall grows a plane that reaches the wall.
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(8, 40, 8, BlockState::new(101, 0));
+        column.set_block(9, 40, 8, BlockState::STONE);
+        let world = world_with(column.clone());
+        let atlas = atlas();
+        let mesh = build_column_mesh(&column, &world, &atlas);
+        let bar_layer = atlas.slot_or_missing("iron_bars");
+        let bars: Vec<Vertex> = mesh
+            .vertices
+            .iter()
+            .copied()
+            .filter(|vertex| vertex.layer == bar_layer)
+            .collect();
+        let (min, max) = bounds(&bars);
+        assert_eq!(max[0] - min[0], 0.0, "the bar is a plane at x = centre");
+        assert!((min[2] - 8.0).abs() < 1.0e-6);
+        assert!((max[2] - 9.0).abs() < 1.0e-6);
+
+        // A nether-brick fence against the same wall has rails.
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(8, 40, 8, BlockState::new(113, 0));
+        column.set_block(9, 40, 8, BlockState::STONE);
+        let world = world_with(column.clone());
+        let job = ColumnMeshJob::from_column(&column, &world);
+        let shape = fence_shape_for_block(&job, 8, 40, 8);
+        assert_eq!(shape.as_slice().len(), 3, "post plus two east rails");
+        assert!(shape
+            .as_slice()
+            .iter()
+            .any(|part| part.min == [10.0, 6.0, 6.0] && part.max == [16.0, 9.0, 10.0]));
+    }
+
     #[test]
     fn mesh_job_snapshot_matches_live_world() {
         let mut column = ChunkColumn::empty(0, 0);

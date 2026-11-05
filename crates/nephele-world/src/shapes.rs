@@ -48,8 +48,49 @@ const STAIRS: [[ShapeBox; 2]; 4] = [
     ],
 ];
 
-/// A fence post; the rails get added once connected-texture state exists.
+/// A fence post; the rails are added by `fence_shape` when it connects.
 const FENCE: &[ShapeBox] = &[b([6.0, 0.0, 6.0], [10.0, 16.0, 10.0])];
+
+/// Fence post plus the two rails on each connected side. The rails are the
+/// vanilla heights (6..9 and 12..15), so a fence line reads as rails rather
+/// than a solid wall of planks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FenceShape {
+    boxes: [ShapeBox; 9],
+    len: usize,
+}
+
+impl FenceShape {
+    pub fn as_slice(&self) -> &[ShapeBox] {
+        &self.boxes[..self.len]
+    }
+}
+
+pub fn fence_shape(connections: PaneConnections) -> FenceShape {
+    let mut boxes = [b([6.0, 0.0, 6.0], [10.0, 16.0, 10.0]); 9];
+    let mut len = 1;
+    let mut rail = |min: [f32; 3], max: [f32; 3]| {
+        boxes[len] = b(min, max);
+        len += 1;
+    };
+    if connections.west {
+        rail([0.0, 6.0, 6.0], [6.0, 9.0, 10.0]);
+        rail([0.0, 12.0, 6.0], [6.0, 15.0, 10.0]);
+    }
+    if connections.east {
+        rail([10.0, 6.0, 6.0], [16.0, 9.0, 10.0]);
+        rail([10.0, 12.0, 6.0], [16.0, 15.0, 10.0]);
+    }
+    if connections.north {
+        rail([6.0, 6.0, 0.0], [10.0, 9.0, 6.0]);
+        rail([6.0, 12.0, 0.0], [10.0, 15.0, 6.0]);
+    }
+    if connections.south {
+        rail([6.0, 6.0, 10.0], [10.0, 9.0, 16.0]);
+        rail([6.0, 12.0, 10.0], [10.0, 15.0, 16.0]);
+    }
+    FenceShape { boxes, len }
+}
 
 /// The centre post of an unconnected pane.
 const PANE_POST: ShapeBox = b([7.0, 0.0, 7.0], [9.0, 16.0, 9.0]);
@@ -114,6 +155,11 @@ pub fn pane_shape(connections: PaneConnections) -> PaneShape {
 
 pub const fn is_pane(id: u16) -> bool {
     matches!(id, 101 | 102 | 160)
+}
+
+/// Wooden and nether-brick fences share the post-and-rails geometry.
+pub const fn is_fence(id: u16) -> bool {
+    matches!(id, 85 | 113 | 139)
 }
 
 pub const fn is_door(id: u16) -> bool {
@@ -212,7 +258,7 @@ pub fn toggle_door_open(world: &mut World, x: i32, y: i32, z: i32) -> bool {
 /// The boxes making up `id`/`meta`. Unknown blocks are a single full cube.
 pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
     match id {
-        44 | 126 | 182 => {
+        44 | 126 | 182 | 205 => {
             if meta & 8 != 0 {
                 SLAB_TOP
             } else {
@@ -221,10 +267,10 @@ pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
         }
         // Stairs: wood, cobble, brick, stone brick, nether brick, quartz,
         // sandstone, red sandstone, purpur.
-        53 | 67 | 108 | 109 | 114 | 128 | 134 | 135 | 136 | 156 | 163 | 164 | 180 => {
+        53 | 67 | 108 | 109 | 114 | 128 | 134 | 135 | 136 | 156 | 163 | 164 | 180 | 203 => {
             &STAIRS[(meta & 3) as usize]
         }
-        85 | 113 => FENCE,
+        85 | 113 | 139 => FENCE,
         101 | 102 | 160 => PANE,
         id if is_door(id) => {
             if meta & 8 != 0 {
@@ -234,6 +280,9 @@ pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
             }
         }
         50 => TORCH,
+        // Fire is drawn as crossed, animated quads by the mesher; it must not
+        // masquerade as a full cube to its neighbours.
+        51 => EMPTY,
         // Air and blocks with no model yet.
         0 => EMPTY,
         _ => FULL,
@@ -287,6 +336,37 @@ mod tests {
                 .iter()
                 .all(|b| b.min.iter().zip(b.max.iter()).all(|(a, b)| a <= b)));
         }
+    }
+
+    #[test]
+    fn fences_get_rails_only_where_they_connect() {
+        let isolated = fence_shape(PaneConnections::default());
+        assert_eq!(
+            isolated.as_slice(),
+            &[b([6.0, 0.0, 6.0], [10.0, 16.0, 10.0])]
+        );
+
+        let east = fence_shape(PaneConnections {
+            east: true,
+            ..PaneConnections::default()
+        });
+        assert_eq!(east.as_slice().len(), 3);
+        assert!(east
+            .as_slice()
+            .iter()
+            .any(|part| part.min == [10.0, 6.0, 6.0] && part.max == [16.0, 9.0, 10.0]));
+        assert!(east
+            .as_slice()
+            .iter()
+            .any(|part| part.min == [10.0, 12.0, 6.0] && part.max == [16.0, 15.0, 10.0]));
+
+        let all = fence_shape(PaneConnections {
+            west: true,
+            east: true,
+            north: true,
+            south: true,
+        });
+        assert_eq!(all.as_slice().len(), 9);
     }
 
     #[test]
