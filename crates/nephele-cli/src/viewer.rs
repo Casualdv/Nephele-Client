@@ -161,9 +161,13 @@ impl Viewer {
         let seed = self.options.seed;
         let mut generator = VanillaGenerator::new(seed);
         self.world = World::new(0);
+        // Two stages, as vanilla: `provide_chunk` per chunk, then the population
+        // pass once a chunk's 2x2 neighbourhood exists. Population places nothing
+        // yet (see AGENTS.md §6), but the order is the real one.
         for cx in -self.options.radius..=self.options.radius {
             for cz in -self.options.radius..=self.options.radius {
-                self.world.insert(generator.column(cx, cz));
+                self.world.insert(generator.provide_chunk(cx, cz));
+                generator.populate(&mut self.world, cx, cz);
             }
         }
         let mesh = build_world_mesh(&self.world, &textures);

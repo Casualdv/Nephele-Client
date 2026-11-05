@@ -98,9 +98,10 @@ view distance 8, vsync off, with a committed baseline that fails the build on
 regression.
 
 Measured parity against a world the real 1.8.9 server generated: **100%** of
-biome cells (0 / 160,000, seed 12345, 625 chunks — every GenLayer stage diff 0),
-**96%** of surface heights, **98.8%** of surface block types.
-
+biome cells (0 / 160,000, seed 12345, 625 chunks), **96%** of surface heights,
+**98.8%** of surface block types. Block by block the overworld is **93.95%**
+identical across 18.9M blocks; of the 1.15M differences, **96.2%** are blocks only
+the unported population pass can place.
 ---
 
 ## Pillars
@@ -126,13 +127,14 @@ biome cells (0 / 160,000, seed 12345, 625 chunks — every GenLayer stage diff 0
 
 | Item | Size | Notes |
 |---|---|---|
+| **Two-stage pipeline (`provideChunk` + `populate`) + `GenWorld` shim** | L | **Done 2026-11-05:** terrain → surface → caves → ravines → structure-start discovery → height map, then a `populate` driver with vanilla's 2×2 eligibility rule. `populate_owner` still calls an empty `decorate` stub. |
 | **Mesa** stratified hardened clay | M | The last missing biome override. |
-| Caves (`MapGenCaves`) and ravines | L | Needed before the world feels real underground. |
-| Ores + granite/diorite/andesite, dirt/gravel/clay pockets | M | |
-| Trees (6 species + large variants), flowers, tall grass, cacti, sugar cane, lily pads, pumpkins, melons | L | |
-| Lakes (water/lava), dungeons, spawners | M | |
-| Snow and ice, podzol, vines, sand patches | S | |
-| Structures: villages, mineshafts, strongholds, temples, witch huts, monuments | XL | |
+| Caves (`MapGenCaves`) and ravines | L | **Implemented** in `provide_chunk`; shape shows up as the buried part of the block diff (18,235 blocks). |
+| Ores + granite/diorite/andesite, dirt/gravel/clay pockets | M | **Population stage, not wired.** `ores.rs` still exists but is no longer called: its seed and `+8` offsets only make sense inside `populate`. |
+| Trees (6 species + large variants), flowers, tall grass, cacti, sugar cane, lily pads, pumpkins, melons | L | Same stage problem: `features.rs` has a first pass (flowers, grass, dead bush, cactus, oak-shaped trees) but is not called from the pipeline. |
+| Lakes (water/lava), dungeons, spawners | M | Population stage; not ported. |
+| Snow and ice, podzol, vines, sand patches | S | Population stage; not ported. Snow and ice appear only where the surface pass puts them. |
+| Structures: villages, mineshafts, strongholds, temples, witch huts, monuments | XL | Structure **start discovery** and caching (village/scattered/monument grids, mineshaft, stronghold) is in `provide_chunk`; no pieces are placed yet. |
 | World types: superflat, large biomes, amplified, customized JSON | M | |
 | Nether and End generation, portals | XL | Out of scope for a PvP client v1. |
 | Chunk generation on worker threads, streamed around the player | M | Singleplayer only; servers send chunks. |
@@ -262,8 +264,9 @@ positionally (attenuation to 16 blocks, stereo panning).
 
 | Item | Size | Notes |
 |---|---|---|
-| Java oracle parity harness (`Nephele-private/oracle`) | exists | Extend per feature: terrain, blocks, biome overrides. Stage-by-stage tracing landed 2026-11-05 (`trace.ps1` + `debug_stage_trace`). |
-| Reference worlds for regression tests | exists | Seed 12345, structures off. |
+| Java oracle parity harness (`Nephele-private/oracle`) | exists | Extend per feature: terrain, blocks, biome overrides. |
+| Reference worlds for regression tests | exists | Seed 12345; `server` (structures off) and `server-random` (structures on, 625 chunks). |
+| Block-level diff harness | exists | `parity/blocks-random.bin.gz` + `crates/nephele-world/tests/block_parity.rs`; diffs the inner ±8 chunks and attributes every mismatch to terrain / shared / population. |
 | Performance benchmark on low-end hardware | M | Define the bar: 60 fps, Intel HD 4000-class. |
 | Automated multiplayer smoke test against a real server | M | |
 

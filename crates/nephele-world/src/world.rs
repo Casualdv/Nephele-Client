@@ -77,6 +77,10 @@ impl World {
         self.chunks.get(&coord)
     }
 
+    pub fn get_mut(&mut self, coord: ChunkCoord) -> Option<&mut ChunkColumn> {
+        self.chunks.get_mut(&coord)
+    }
+
     pub fn contains(&self, coord: ChunkCoord) -> bool {
         self.chunks.contains_key(&coord)
     }
