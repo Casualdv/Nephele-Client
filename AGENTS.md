@@ -237,10 +237,14 @@ different pipeline than vanilla's.** Treat them as "our implementation is close"
 rather than parity until the population pass exists and they are re-measured on
 a populated world.
 
-**The oracle cannot settle this yet.** `parity/server` is seed 12345 with
-structures *off*, and the oracle emits surface heights, not block arrays. A
-second reference world (same seed, DEFAULT, structures on) plus a 65,536-state
-per-chunk export is the prerequisite for any block-level claim.
+**The oracle cannot settle this yet.** The second reference world now exists at
+`Nephele-private/parity/server-random` (level `random`, seed 12345, DEFAULT,
+empty generator settings, **structures on**, 625 chunks / 25×25 from spawn).
+`parity/server` stays as-is for the structures-off comparison. Neither answers a
+block-level question yet: the oracle emits surface heights, not block arrays, so
+a 65,536-state per-chunk export is still the prerequisite. Compare only the
+inner area (roughly ±8 chunks): the outermost ring lacks its populated
+neighbours and is not expected to match.
 
 
 ### The biome bug — where it stands
