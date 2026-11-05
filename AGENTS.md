@@ -649,7 +649,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 
 | Lane | Owns | Branch | State |
 |---|---|---|---|
-| `render` | shapes, tinting, sky, fog | `render` | bars/fire/flowers left |
+| `render` | shapes, tinting, sky, fog | `render-shapes` | bars/fire/plants/tint landed, needs merge |
 | `biomes` | GenLayer parity (92.8%) | `biomes` | active, isolated |
 | `worldgen` | two-stage generation, caves, ores, flora, structures (phases W1–W5) | `w-worldgen` | not started |
 | `survival` | inventory, containers, HUD art | `survival` | 85%, HUD art left |
