@@ -48,6 +48,7 @@ pub mod ids {
     pub const PLANKS: u16 = 5;
     pub const BEDROCK: u16 = 7;
     pub const WATER: u16 = 9;
+    pub const FLOWING_LAVA: u16 = 10;
     pub const LAVA: u16 = 11;
     pub const SAND: u16 = 12;
     pub const GRAVEL: u16 = 13;
@@ -71,6 +72,16 @@ pub mod ids {
     pub const LAPIS_ORE: u16 = 21;
     pub const DIAMOND_ORE: u16 = 56;
     pub const REDSTONE_ORE: u16 = 73;
+    // The Nether and the End.
+    pub const BROWN_MUSHROOM: u16 = 39;
+    pub const RED_MUSHROOM: u16 = 40;
+    pub const OBSIDIAN: u16 = 49;
+    pub const FIRE: u16 = 51;
+    pub const NETHERRACK: u16 = 87;
+    pub const SOUL_SAND: u16 = 88;
+    pub const GLOWSTONE: u16 = 89;
+    pub const END_STONE: u16 = 121;
+    pub const QUARTZ_ORE: u16 = 153;
 }
 
 impl BlockState {
@@ -87,6 +98,18 @@ impl BlockState {
     pub const GLASS: BlockState = BlockState::new(ids::GLASS, 0);
     pub const PLANKS: BlockState = BlockState::new(ids::PLANKS, 0);
     pub const COBBLESTONE: BlockState = BlockState::new(ids::COBBLESTONE, 0);
+    pub const NETHERRACK: BlockState = BlockState::new(ids::NETHERRACK, 0);
+    pub const SOUL_SAND: BlockState = BlockState::new(ids::SOUL_SAND, 0);
+    pub const GLOWSTONE: BlockState = BlockState::new(ids::GLOWSTONE, 0);
+    pub const LAVA: BlockState = BlockState::new(ids::LAVA, 0);
+    pub const FLOWING_LAVA: BlockState = BlockState::new(ids::FLOWING_LAVA, 0);
+    pub const GRAVEL: BlockState = BlockState::new(ids::GRAVEL, 0);
+    pub const OBSIDIAN: BlockState = BlockState::new(ids::OBSIDIAN, 0);
+    pub const END_STONE: BlockState = BlockState::new(ids::END_STONE, 0);
+    pub const QUARTZ_ORE: BlockState = BlockState::new(ids::QUARTZ_ORE, 0);
+    pub const FIRE: BlockState = BlockState::new(ids::FIRE, 0);
+    pub const BROWN_MUSHROOM: BlockState = BlockState::new(ids::BROWN_MUSHROOM, 0);
+    pub const RED_MUSHROOM: BlockState = BlockState::new(ids::RED_MUSHROOM, 0);
 }
 
 /// `Block.getMaterial().isLiquid()` — `MaterialLiquid`, i.e. water and lava in

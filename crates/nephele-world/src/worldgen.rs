@@ -175,20 +175,9 @@ impl VanillaGenerator {
         chunk_x: i32,
         chunk_z: i32,
     ) -> Vec<ChunkCoord> {
-        let mut ran = Vec::with_capacity(1);
-        for (offset_x, offset_z) in QUADRANTS {
-            let (owner_x, owner_z) = (chunk_x + offset_x, chunk_z + offset_z);
-            if world.is_terrain_populated(owner_x, owner_z)
-                || !can_populate(world, owner_x, owner_z)
-            {
-                continue;
-            }
-            // `ChunkProviderServer.populate` marks the chunk before decorating it.
-            world.set_terrain_populated(owner_x, owner_z, true);
+        populate_owners(world, chunk_x, chunk_z, |world, owner_x, owner_z| {
             self.populate_owner(world, owner_x, owner_z);
-            ran.push(ChunkCoord::new(owner_x, owner_z));
-        }
-        ran
+        })
     }
 
     /// `ChunkProviderGenerate.populate`: one owner chunk's decoration pass.
@@ -303,11 +292,42 @@ impl VanillaGenerator {
 
 /// `Chunk.populateChunk`'s eligibility test: the owner plus the three chunks that
 /// complete its 2×2 square.
-fn can_populate<W: GenWorld>(world: &W, chunk_x: i32, chunk_z: i32) -> bool {
+pub fn can_populate<W: GenWorld>(world: &W, chunk_x: i32, chunk_z: i32) -> bool {
     world.has_chunk(chunk_x, chunk_z)
         && world.has_chunk(chunk_x + 1, chunk_z)
         && world.has_chunk(chunk_x, chunk_z + 1)
         && world.has_chunk(chunk_x + 1, chunk_z + 1)
+}
+
+/// `Chunk.populateChunk`'s driver, shared by all three dimensions.
+///
+/// Owners are visited `(x,z)`, `(x-1,z)`, `(x,z-1)`, `(x-1,z-1)`; each runs once,
+/// guarded by the 2×2 rule. `run` is the dimension's own decoration pass. The
+/// caller is responsible for the provider-specific `Random` state: the nether
+/// draws from whatever its last `provide_chunk` left behind, so this must be
+/// called immediately after that chunk was generated.
+pub fn populate_owners<W, F>(
+    world: &mut W,
+    chunk_x: i32,
+    chunk_z: i32,
+    mut run: F,
+) -> Vec<ChunkCoord>
+where
+    W: GenWorld,
+    F: FnMut(&mut W, i32, i32),
+{
+    let mut ran = Vec::with_capacity(1);
+    for (offset_x, offset_z) in QUADRANTS {
+        let (owner_x, owner_z) = (chunk_x + offset_x, chunk_z + offset_z);
+        if world.is_terrain_populated(owner_x, owner_z) || !can_populate(world, owner_x, owner_z) {
+            continue;
+        }
+        // `ChunkProviderServer.populate` marks the chunk before decorating it.
+        world.set_terrain_populated(owner_x, owner_z, true);
+        run(world, owner_x, owner_z);
+        ran.push(ChunkCoord::new(owner_x, owner_z));
+    }
+    ran
 }
 
 /// `provideChunk`'s reseed: `(long)x * 341873128712L + (long)z * 132897987541L`.

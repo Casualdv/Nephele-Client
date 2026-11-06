@@ -24,6 +24,7 @@ use nephele_client::GameClient;
 use nephele_mock::{MockConfig, MockServer};
 use nephele_protocol::packets::play;
 use nephele_protocol::{Connection, Error, LoginOutcome, NextState, Result, ServerAddress};
+use nephele_world::Dimension;
 
 #[derive(Parser)]
 #[command(
@@ -149,6 +150,9 @@ enum Command {
         /// World seed
         #[arg(long, default_value_t = 0)]
         seed: i64,
+        /// Dimension to generate: overworld, nether or end
+        #[arg(long, default_value = "overworld")]
+        dimension: String,
     },
 }
 
@@ -207,13 +211,24 @@ fn main() -> ExitCode {
             assets_dir,
             speed,
             seed,
+            dimension,
         } => {
             let assets_dir = assets_dir.unwrap_or_else(default_assets_dir);
+            let dimension = match Dimension::parse(&dimension) {
+                Some(dimension) => dimension,
+                None => {
+                    eprintln!(
+                        "error: unknown dimension \"{dimension}\" (use overworld, nether or end)"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
             match viewer::run(viewer::ViewerOptions {
                 radius,
                 assets_dir,
                 speed,
                 seed,
+                dimension,
             }) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(err) => {

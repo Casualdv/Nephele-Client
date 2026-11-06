@@ -26,6 +26,15 @@ impl JavaRandom {
         }
     }
 
+    /// `Random.setSeed`: re-key the generator without building a new value.
+    ///
+    /// Vanilla's chunk providers reuse one `Random` and reseed it per chunk
+    /// (`provideChunk`), then keep drawing from it in `populate`; the Nether and
+    /// the End depend on that stream, so the port needs the same operation.
+    pub fn set_seed(&mut self, seed: i64) {
+        self.seed = ((seed as u64) ^ MULTIPLIER) & MASK;
+    }
+
     fn next(&mut self, bits: u32) -> u32 {
         self.seed = self.seed.wrapping_mul(MULTIPLIER).wrapping_add(ADDEND) & MASK;
         (self.seed >> (48 - bits)) as u32
