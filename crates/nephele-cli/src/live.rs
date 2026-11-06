@@ -142,7 +142,10 @@ struct EntitySnapshot {
 }
 
 impl EntitySnapshot {
-    fn from_entity(entity: &nephele_client::Entity) -> Self {
+    fn from_entity(
+        entity: &nephele_client::Entity,
+        nametag: Option<nephele_client::Nametag>,
+    ) -> Self {
         let (player, uuid, kind) = match &entity.kind {
             nephele_client::EntityKind::Player { uuid, .. } => (true, *uuid, 0),
             nephele_client::EntityKind::Mob { kind } => (false, [0; 16], *kind),
@@ -182,7 +185,7 @@ impl EntitySnapshot {
             pitch: entity.pitch,
             kind,
             item,
-            nametag: entity.nametag(),
+            nametag,
             label_height: entity.label_height(),
             show_health: entity.shows_health(),
             armor_stand: entity.is_armor_stand(),
@@ -1241,7 +1244,7 @@ async fn net_loop(
                 let snapshot: Vec<EntitySnapshot> = client
                     .entities
                     .iter()
-                    .map(EntitySnapshot::from_entity)
+                    .map(|entity| EntitySnapshot::from_entity(entity, client.nametag(entity)))
                     .collect();
                 if std::mem::take(&mut shared.lock().unwrap().pending_respawn) {
                     client.respawn().await.map_err(|err| err.to_string())?;

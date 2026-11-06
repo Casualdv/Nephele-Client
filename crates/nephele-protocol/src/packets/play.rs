@@ -49,6 +49,14 @@ pub mod clientbound {
     pub const BLOCK_ENTITY_DATA: i32 = 0x35;
     pub const PLAYER_LIST_ITEM: i32 = 0x38;
     pub const PLAYER_ABILITIES: i32 = 0x39;
+    /// `S3B`: scoreboard objective create/remove/display-name update.
+    pub const SCOREBOARD_OBJECTIVE: i32 = 0x3B;
+    /// `S3C`: one scoreboard score changed or was removed.
+    pub const UPDATE_SCORE: i32 = 0x3C;
+    /// `S3D`: which objective each display slot shows.
+    pub const DISPLAY_SCOREBOARD: i32 = 0x3D;
+    /// `S3E`: scoreboard teams, their formatting and their membership.
+    pub const TEAMS: i32 = 0x3E;
     pub const PLUGIN_MESSAGE: i32 = 0x3F;
     pub const DISCONNECT: i32 = 0x40;
     pub const SERVER_DIFFICULTY: i32 = 0x41;
@@ -561,10 +569,9 @@ pub struct MapIcon {
 
 /// `S34`: a patch of a map's 128x128 colour grid, plus its markers.
 ///
-/// This is N's pinned map type. The client does **not** decode `S34` itself;
-/// N's parser fills this and calls `Maps::apply`. Until that lands,
-/// [`nephele_client::MapState::placeholder`] keeps a framed map showing a
-/// picture.
+/// The server only sends the rectangle that changed: `columns`x`rows` colours
+/// starting at `(start_x, start_y)` in the map's own 128x128 space. A packet
+/// with `columns == 0` carries markers only.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MapUpdate {
     pub map_id: i32,
@@ -585,8 +592,246 @@ impl MapUpdate {
     pub const SIZE: usize = 128;
 }
 
-// `S34` wire decoding is N's work. The client consumes `MapUpdate` through
-// `Maps::apply`; the types above are the interface, not a second parser.
+/// Parse `S34 Map Chunk`.
+pub fn parse_map_update(packet: &Packet) -> Result<MapUpdate> {
+    let mut r = packet.reader();
+    let map_id = r.read_varint()?;
+    let scale = r.read_u8()?;
+    let icon_count = r.read_varint()?.clamp(0, 1024);
+    let mut icons = Vec::with_capacity(icon_count as usize);
+    for _ in 0..icon_count {
+        // One byte packs the icon kind in the high nibble and its rotation in
+        // the low nibble (`Vec4b`'s packed form).
+        let packed = r.read_u8()?;
+        icons.push(MapIcon {
+            kind: packed >> 4,
+            direction: packed & 0x0F,
+            x: r.read_i8()?,
+            z: r.read_i8()?,
+        });
+    }
+
+    let columns = r.read_u8()?;
+    let mut rows = 0;
+    let (mut start_x, mut start_y) = (0, 0);
+    let mut colors = Vec::new();
+    if columns > 0 {
+        rows = r.read_u8()?;
+        start_x = r.read_u8()?;
+        start_y = r.read_u8()?;
+        let length = r.read_varint()?.max(0) as usize;
+        let expected = columns as usize * rows as usize;
+        // A malformed length must not let the patch wrap off the grid; the
+        // trailing bytes belong to the next packet's frame otherwise.
+        if length != expected {
+            return Err(Error::Protocol(format!(
+                "map {map_id} patch is {length} bytes, {columns}x{rows} needs {expected}"
+            )));
+        }
+        colors.extend_from_slice(r.take(expected)?);
+    }
+
+    Ok(MapUpdate {
+        map_id,
+        scale,
+        icons,
+        columns,
+        rows,
+        start_x,
+        start_y,
+        colors,
+    })
+}
+
+/// Scoreboard display slots, matching vanilla's `S3D` position byte.
+pub mod scoreboard_slot {
+    /// The tab list's objective column.
+    pub const LIST: u8 = 0;
+    /// The right-hand sidebar.
+    pub const SIDEBAR: u8 = 1;
+    /// Under a player's name tag.
+    pub const BELOW_NAME: u8 = 2;
+}
+
+/// `S3B`: an objective was created, removed or had its display name updated.
+///
+/// Mode 2 carries the render type on the wire as well as the display name, so
+/// both are kept rather than assuming the type never changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectiveUpdate {
+    Create {
+        name: String,
+        display_name: String,
+        render_type: String,
+    },
+    Remove {
+        name: String,
+    },
+    UpdateDisplayName {
+        name: String,
+        display_name: String,
+        render_type: String,
+    },
+}
+
+pub fn parse_scoreboard_objective(packet: &Packet) -> Result<ObjectiveUpdate> {
+    let mut r = packet.reader();
+    let name = r.read_string()?;
+    let mode = r.read_u8()?;
+    match mode {
+        0 | 2 => {
+            let display_name = r.read_string()?;
+            let render_type = r.read_string()?;
+            if mode == 0 {
+                Ok(ObjectiveUpdate::Create {
+                    name,
+                    display_name,
+                    render_type,
+                })
+            } else {
+                Ok(ObjectiveUpdate::UpdateDisplayName {
+                    name,
+                    display_name,
+                    render_type,
+                })
+            }
+        }
+        1 => Ok(ObjectiveUpdate::Remove { name }),
+        other => Err(Error::Protocol(format!(
+            "unknown scoreboard objective mode {other}"
+        ))),
+    }
+}
+
+/// `S3C`: one scoreboard score was set or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreUpdate {
+    /// The score holder: a player name, or any string a server picks.
+    pub entry: String,
+    /// Empty means "every objective" when removing, matching vanilla.
+    pub objective: String,
+    /// `None` when the entry is removed from the objective.
+    pub value: Option<i32>,
+}
+
+pub fn parse_update_score(packet: &Packet) -> Result<ScoreUpdate> {
+    let mut r = packet.reader();
+    let entry = r.read_string()?;
+    let action = r.read_varint()?;
+    let objective = r.read_string()?;
+    match action {
+        0 => Ok(ScoreUpdate {
+            entry,
+            objective,
+            value: Some(r.read_varint()?),
+        }),
+        1 => Ok(ScoreUpdate {
+            entry,
+            objective,
+            value: None,
+        }),
+        other => Err(Error::Protocol(format!(
+            "unknown update-score action {other}"
+        ))),
+    }
+}
+
+/// `S3D`: the objective shown in one display slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayScoreboard {
+    /// `scoreboard_slot` value; vanilla also uses 3..=18 for team-coloured
+    /// sidebar slots, which are stored but not rendered here.
+    pub position: u8,
+    /// Empty clears the slot.
+    pub objective: String,
+}
+
+pub fn parse_display_scoreboard(packet: &Packet) -> Result<DisplayScoreboard> {
+    let mut r = packet.reader();
+    Ok(DisplayScoreboard {
+        position: r.read_u8()?,
+        objective: r.read_string()?,
+    })
+}
+
+/// The formatting fields every team mode 0/2 packet carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamInfo {
+    pub display_name: String,
+    pub prefix: String,
+    pub suffix: String,
+    /// Bit 0 = friendly fire allowed, bit 1 = see friendly invisibles.
+    pub friendly_flags: u8,
+    /// `always`, `hideForOtherTeams` or `hideForOwnTeam`.
+    pub name_tag_visibility: String,
+    /// Vanilla `EnumChatFormatting` id, 0..=15, or -1 for "no colour".
+    pub color: i8,
+}
+
+/// `S3E`: a team was created, removed, re-formatted or had members changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamUpdate {
+    Create {
+        name: String,
+        info: TeamInfo,
+        players: Vec<String>,
+    },
+    Remove {
+        name: String,
+    },
+    Update {
+        name: String,
+        info: TeamInfo,
+    },
+    AddPlayers {
+        name: String,
+        players: Vec<String>,
+    },
+    RemovePlayers {
+        name: String,
+        players: Vec<String>,
+    },
+}
+
+pub fn parse_teams(packet: &Packet) -> Result<TeamUpdate> {
+    let mut r = packet.reader();
+    let name = r.read_string()?;
+    let mode = r.read_u8()?;
+    let info = if mode == 0 || mode == 2 {
+        Some(TeamInfo {
+            display_name: r.read_string()?,
+            prefix: r.read_string()?,
+            suffix: r.read_string()?,
+            friendly_flags: r.read_u8()?,
+            name_tag_visibility: r.read_string()?,
+            color: r.read_i8()?,
+        })
+    } else {
+        None
+    };
+    let players = if mode == 0 || mode == 3 || mode == 4 {
+        let count = r.read_varint()?.max(0);
+        let mut players = Vec::with_capacity(count.min(64) as usize);
+        for _ in 0..count {
+            players.push(r.read_string()?);
+        }
+        Some(players)
+    } else {
+        None
+    };
+    match (mode, info, players) {
+        (0, Some(info), Some(players)) => Ok(TeamUpdate::Create {
+            name,
+            info,
+            players,
+        }),
+        (1, _, _) => Ok(TeamUpdate::Remove { name }),
+        (2, Some(info), _) => Ok(TeamUpdate::Update { name, info }),
+        (3, _, Some(players)) => Ok(TeamUpdate::AddPlayers { name, players }),
+        (4, _, Some(players)) => Ok(TeamUpdate::RemovePlayers { name, players }),
+        (other, _, _) => Err(Error::Protocol(format!("unknown teams mode {other}"))),
+    }
+}
 
 pub fn keep_alive_response(id: i32) -> Packet {
     let mut w = PacketWriter::new();
@@ -1907,6 +2152,113 @@ mod map_tests {
                 if item.id == ITEM_FILLED_MAP && item.damage == 7
         ));
         assert!(matches!(update.get(9), Some(EntityMetadataValue::Byte(3))));
+    }
+
+    #[test]
+    fn a_map_patch_parses_markers_and_colours() {
+        let mut w = PacketWriter::new();
+        w.write_varint(12)
+            .write_u8(2)
+            .write_varint(1)
+            .write_u8((1 << 4) | 4)
+            .write_i8(10)
+            .write_i8(-3)
+            .write_u8(2)
+            .write_u8(2)
+            .write_u8(4)
+            .write_u8(5)
+            .write_byte_array(&[1, 2, 3, 4]);
+        let update = parse_map_update(&Packet::new(clientbound::MAP, w.into_bytes())).expect("map");
+        assert_eq!(update.map_id, 12);
+        assert_eq!(update.scale, 2);
+        assert_eq!(
+            update.icons,
+            [MapIcon {
+                kind: 1,
+                direction: 4,
+                x: 10,
+                z: -3,
+            }]
+        );
+        assert_eq!(
+            (update.columns, update.rows, update.start_x, update.start_y),
+            (2, 2, 4, 5)
+        );
+        assert_eq!(update.colors, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_map_patch_with_the_wrong_length_is_rejected() {
+        let mut w = PacketWriter::new();
+        w.write_varint(3)
+            .write_u8(0)
+            .write_varint(0)
+            .write_u8(2)
+            .write_u8(2)
+            .write_u8(0)
+            .write_u8(0)
+            .write_byte_array(&[1, 2]);
+        let err = parse_map_update(&Packet::new(clientbound::MAP, w.into_bytes()))
+            .expect_err("short patch must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod scoreboard_wire_tests {
+    use super::*;
+
+    #[test]
+    fn a_team_create_parses_prefix_suffix_and_members() {
+        let mut w = PacketWriter::new();
+        w.write_string("red")
+            .write_u8(0)
+            .write_string("Red")
+            .write_string("§c[RED] ")
+            .write_string(" §7[R]")
+            .write_u8(3)
+            .write_string("always")
+            .write_i8(12)
+            .write_varint(2)
+            .write_string("Steve")
+            .write_string("Alex");
+        let update = parse_teams(&Packet::new(clientbound::TEAMS, w.into_bytes())).expect("team");
+        let TeamUpdate::Create {
+            name,
+            info,
+            players,
+        } = update
+        else {
+            panic!("expected a team create");
+        };
+        assert_eq!(name, "red");
+        assert_eq!(info.prefix, "§c[RED] ");
+        assert_eq!(info.suffix, " §7[R]");
+        assert_eq!(info.name_tag_visibility, "always");
+        assert_eq!(info.color, 12);
+        assert_eq!(players, ["Steve", "Alex"]);
+    }
+
+    #[test]
+    fn a_score_update_parses_set_and_remove() {
+        let mut w = PacketWriter::new();
+        w.write_string("Steve")
+            .write_varint(0)
+            .write_string("board")
+            .write_varint(7);
+        let set =
+            parse_update_score(&Packet::new(clientbound::UPDATE_SCORE, w.into_bytes())).unwrap();
+        assert_eq!(set.entry, "Steve");
+        assert_eq!(set.objective, "board");
+        assert_eq!(set.value, Some(7));
+
+        let mut w = PacketWriter::new();
+        w.write_string("Steve")
+            .write_varint(1)
+            .write_string("board");
+        let remove =
+            parse_update_score(&Packet::new(clientbound::UPDATE_SCORE, w.into_bytes())).unwrap();
+        assert_eq!(remove.value, None);
     }
 }
 

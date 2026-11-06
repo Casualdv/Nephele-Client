@@ -292,11 +292,17 @@ async fn send_join_sequence(
     if config.bots {
         let bots = make_bots(player_y as f64);
         send_bot_player_list(connection, &bots).await?;
+        send_lobby_teams(connection, &bots).await?;
         send_bot_spawns(connection, &bots).await?;
         send_bot_equipment(connection, &bots).await?;
         send_bot_crouch(connection, &bots).await?;
         send_lobby_map(connection, player_y as f64).await?;
         send_lobby_hologram(connection, player_y as f64).await?;
+        // One bot reports latency, so the nametag plate exercises the ping
+        // half of the tab list. Grumm is fully visible in the lobby shot.
+        if let Some(bot) = bots.get(7) {
+            send_bot_ping(connection, bot, 83).await?;
+        }
     }
     Ok(columns)
 }
@@ -343,9 +349,8 @@ async fn send_lobby_hologram(connection: &mut Connection, feet_y: f64) -> Result
         .await
 }
 
-/// One framed map in the lobby. The mock does not send `S34` pixels: map
-/// parsing belongs to N, so the client's placeholder fallback is what proves
-/// the frame renders a picture until that lands.
+/// One framed map in the lobby, with real `S34` pixels so the frame exercises
+/// the same cached-picture path a live server uses.
 async fn send_lobby_map(connection: &mut Connection, feet_y: f64) -> Result<()> {
     const MAP_ID: i32 = 7;
     let frame_id = 1_000;
@@ -383,6 +388,65 @@ async fn send_lobby_map(connection: &mut Connection, feet_y: f64) -> Result<()> 
             play::clientbound::ENTITY_METADATA,
             w.into_bytes(),
         ))
+        .await?;
+
+    send_lobby_map_pixels(connection, MAP_ID).await
+}
+
+/// A 128x128 "arena" picture: sky, sun, grass, a pond, a path and a bed. It is
+/// deliberately different from `MapState::placeholder` so a screenshot proves
+/// the pixels came over `S34` rather than from the fallback.
+fn lobby_map_colors() -> Vec<u8> {
+    const SIZE: usize = play::MapUpdate::SIZE;
+    let mut colors = vec![51u8; SIZE * SIZE]; // sky
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let index = y * SIZE + x;
+            if x < 3 || y < 3 || x >= SIZE - 3 || y >= SIZE - 3 {
+                colors[index] = 41; // brown border
+                continue;
+            }
+            if y >= 70 {
+                colors[index] = 5; // grass
+            }
+            let dx = x as i32 - 30;
+            let dy = (y as i32 - 96) / 2;
+            if dx * dx + dy * dy < 22 * 22 {
+                colors[index] = 49; // pond
+            }
+            if (60..68).contains(&x) && y >= 70 {
+                colors[index] = 42; // path
+            }
+            let sx = x as i32 - 100;
+            let sy = y as i32 - 20;
+            if sx * sx + sy * sy < 10 * 10 {
+                colors[index] = 59; // sun
+            }
+            if (78..110).contains(&x) && (78..98).contains(&y) {
+                colors[index] = if x >= 100 { 35 } else { 18 }; // bed + pillow
+            }
+            if (78..110).contains(&x) && (96..100).contains(&y) {
+                colors[index] = 42; // bed frame
+            }
+        }
+    }
+    colors
+}
+
+/// `S34` for a full 128x128 map. One patch, no markers.
+async fn send_lobby_map_pixels(connection: &mut Connection, map_id: i32) -> Result<()> {
+    let colors = lobby_map_colors();
+    let mut w = PacketWriter::new();
+    w.write_varint(map_id)
+        .write_u8(0) // scale
+        .write_varint(0) // no markers
+        .write_u8(play::MapUpdate::SIZE as u8)
+        .write_u8(play::MapUpdate::SIZE as u8)
+        .write_u8(0)
+        .write_u8(0)
+        .write_byte_array(&colors);
+    connection
+        .write_packet(&Packet::new(play::clientbound::MAP, w.into_bytes()))
         .await
 }
 
@@ -493,7 +557,8 @@ async fn send_bot_player_list(connection: &mut Connection, bots: &[MockBot]) -> 
             .write_string(&bot_textures(index))
             .write_bool(false)
             .write_varint(1)
-            .write_varint(30)
+            // 0 = no measurement yet; one bot gets a real ping below.
+            .write_varint(0)
             .write_bool(false);
     }
     connection
@@ -502,6 +567,54 @@ async fn send_bot_player_list(connection: &mut Connection, bots: &[MockBot]) -> 
             w.into_bytes(),
         ))
         .await
+}
+
+/// `S38` action 2: report one bot's latency.
+async fn send_bot_ping(connection: &mut Connection, bot: &MockBot, ping: i32) -> Result<()> {
+    let mut w = PacketWriter::new();
+    w.write_varint(2)
+        .write_varint(1)
+        .write_uuid(&bot.uuid)
+        .write_varint(ping);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::PLAYER_LIST_ITEM,
+            w.into_bytes(),
+        ))
+        .await
+}
+
+/// `S3E` mode 0: put the bots on two teams with a prefix and a suffix, so the
+/// nametag plate shows both halves of the team formatting.
+async fn send_lobby_teams(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
+    for (name, display, prefix, suffix, color, first) in [
+        ("red", "Red", "§c[RED] ", " §7[R]", 12i8, 0usize),
+        ("blue", "Blue", "§9[BLU] ", " §7[B]", 11i8, 1usize),
+    ] {
+        let players: Vec<&str> = bots
+            .iter()
+            .skip(first)
+            .step_by(2)
+            .map(|bot| bot.name)
+            .collect();
+        let mut w = PacketWriter::new();
+        w.write_string(name)
+            .write_u8(0)
+            .write_string(display)
+            .write_string(prefix)
+            .write_string(suffix)
+            .write_u8(0)
+            .write_string("always")
+            .write_i8(color)
+            .write_varint(players.len() as i32);
+        for player in players {
+            w.write_string(player);
+        }
+        connection
+            .write_packet(&Packet::new(play::clientbound::TEAMS, w.into_bytes()))
+            .await?;
+    }
+    Ok(())
 }
 
 /// `S0C` spawn player.
@@ -601,7 +714,7 @@ async fn send_bot_spawns(connection: &mut Connection, bots: &[MockBot]) -> Resul
 /// One bot in full iron and another holding a map, so equipment and held items
 /// are visible in the lobby demo.
 async fn send_bot_equipment(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
-    let Some(iron) = bots.get(5) else {
+    let Some(iron) = bots.get(7) else {
         return Ok(());
     };
     for (slot, item) in [

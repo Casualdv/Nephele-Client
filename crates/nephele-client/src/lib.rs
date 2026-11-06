@@ -10,6 +10,7 @@ pub mod entities;
 pub mod maps;
 pub mod mining;
 pub mod physics;
+pub mod scoreboard;
 pub mod skins;
 
 use std::collections::HashMap;
@@ -28,6 +29,7 @@ pub use container::LocalContainer;
 pub use entities::{Entities, Entity, EntityKind, EntityMetadata, EntityPick, Nametag};
 pub use maps::{MapState, Maps};
 pub use mining::{Aim, Miner, MiningEvent};
+pub use scoreboard::{Objective, Scoreboard, SidebarRow, Team};
 pub use skins::{SkinInfo, Skins};
 
 /// A container window the server opened (e.g. a crafting table).
@@ -183,6 +185,9 @@ pub enum Event {
     MapUpdated {
         map_id: i32,
     },
+    /// A scoreboard objective, score, display slot or team changed. The new
+    /// state is readable from `GameClient::scoreboard`.
+    Scoreboard,
     /// The server announced its brand on `MC|Brand`.
     ServerBrand(String),
     /// An unhandled server plugin channel was received.
@@ -269,6 +274,8 @@ pub struct GameClient {
     pub player_list: HashMap<[u8; 16], TabListEntry>,
     /// Map item pixels keyed by map id, fed by `S33` / `S34`.
     pub maps: Maps,
+    /// Objectives, scores, display slots and teams (`S3B`-`S3E`).
+    pub scoreboard: Scoreboard,
     /// Most recent update-tile-entity NBT, keyed by block position.
     pub block_entities: HashMap<(i32, i32, i32), play::BlockEntityUpdate>,
     /// Decoded block entities for rendering, keyed by block position.
@@ -434,6 +441,7 @@ impl GameClient {
             skins: Skins::new(),
             player_list: HashMap::new(),
             maps: Maps::new(),
+            scoreboard: Scoreboard::new(),
             block_entities: HashMap::new(),
             block_entity_views: HashMap::new(),
             server_brand: None,
@@ -591,6 +599,7 @@ impl GameClient {
                 self.world.set_dimension(respawn.dimension);
                 self.entities.clear();
                 self.maps.clear();
+                self.scoreboard.clear();
                 self.block_entities.clear();
                 self.block_entity_views.clear();
                 self.info.dimension = respawn.dimension;
@@ -885,10 +894,36 @@ impl GameClient {
                 let sound = play::parse_sound_effect(&packet)?;
                 Ok(Event::SoundEffect(sound))
             }
+            play::clientbound::MAP => {
+                let update = play::parse_map_update(&packet)?;
+                self.maps.apply(&update);
+                Ok(Event::MapUpdated {
+                    map_id: update.map_id,
+                })
+            }
             play::clientbound::PLAYER_LIST_ITEM => {
                 let update = play::parse_player_list_item(&packet)?;
                 self.apply_player_list_update(update);
                 Ok(Event::PlayerList)
+            }
+            play::clientbound::SCOREBOARD_OBJECTIVE => {
+                self.scoreboard
+                    .apply_objective(play::parse_scoreboard_objective(&packet)?);
+                Ok(Event::Scoreboard)
+            }
+            play::clientbound::UPDATE_SCORE => {
+                self.scoreboard
+                    .apply_score(play::parse_update_score(&packet)?);
+                Ok(Event::Scoreboard)
+            }
+            play::clientbound::DISPLAY_SCOREBOARD => {
+                self.scoreboard
+                    .apply_display(play::parse_display_scoreboard(&packet)?);
+                Ok(Event::Scoreboard)
+            }
+            play::clientbound::TEAMS => {
+                self.scoreboard.apply_team(play::parse_teams(&packet)?);
+                Ok(Event::Scoreboard)
             }
             play::clientbound::BLOCK_ENTITY_DATA => {
                 let update = play::parse_block_entity_update(&packet)?;
@@ -988,6 +1023,44 @@ impl GameClient {
     pub fn held_item(&self) -> Option<ItemStack> {
         let slot = play::HOTBAR_FIRST_SLOT + self.held_slot.max(0) as usize;
         self.inventory.get(slot).copied().flatten()
+    }
+
+    /// The plate to draw above `entity`, with the team prefix/suffix and the
+    /// tab-list ping that only the client-level state knows about.
+    ///
+    /// [`Entity::nametag`] decides whether a plate exists at all (custom-name
+    /// visibility, invisibility, holograms); this only decorates it. Team
+    /// name-tag visibility is honoured the way vanilla's
+    /// `RenderManager.canRenderName` does, relative to the local player's team.
+    pub fn nametag(&self, entity: &Entity) -> Option<Nametag> {
+        let mut tag = entity.nametag()?;
+        let EntityKind::Player { name, uuid } = &entity.kind else {
+            return Some(tag);
+        };
+        if let Some(team) = self.scoreboard.team_for(name) {
+            if !self.can_see_name_tag(team) {
+                return None;
+            }
+            tag.prefix.clone_from(&team.prefix);
+            tag.suffix.clone_from(&team.suffix);
+        }
+        if let Some(entry) = self.player_list.get(uuid) {
+            // 0 means "no measurement yet" on most servers.
+            if entry.ping > 0 {
+                tag.ping = Some(entry.ping.min(u16::MAX as i32) as u16);
+            }
+        }
+        Some(tag)
+    }
+
+    fn can_see_name_tag(&self, team: &Team) -> bool {
+        let viewer = self.scoreboard.team_name_for(&self.info.username);
+        let same_team = viewer.is_some_and(|viewer| viewer == team.name);
+        match team.name_tag_visibility.as_str() {
+            "hideForOtherTeams" => !same_team,
+            "hideForOwnTeam" => same_team,
+            _ => true,
+        }
     }
 
     /// The entity under the crosshair along `direction` from `eye`, for the
@@ -1307,6 +1380,7 @@ mod tests {
             skins: Skins::new(),
             player_list: HashMap::new(),
             maps: Maps::new(),
+            scoreboard: Scoreboard::new(),
             block_entities: HashMap::new(),
             block_entity_views: HashMap::new(),
             server_brand: None,

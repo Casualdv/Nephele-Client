@@ -67,11 +67,13 @@ impl EntityMetadata {
 /// the plate layout does not have to change when that lands.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Nametag {
-    /// Team prefix, e.g. `[RED] `. Empty until team data lands.
+    /// Team prefix, e.g. `[RED] `.
     pub prefix: String,
     /// `custom_name`, or the player-list name for a real player.
     pub name: String,
-    /// Latency in milliseconds. `None` until the net branch supplies it.
+    /// Team suffix, e.g. ` [MVP]`.
+    pub suffix: String,
+    /// Latency in milliseconds, when the tab list has reported one.
     pub ping: Option<u16>,
 }
 
@@ -79,12 +81,14 @@ impl Nametag {
     /// The plate as it is drawn. Multi-line custom names keep their line
     /// breaks, which is how ASCII-art holograms are authored. `§` formatting
     /// codes are dropped: the UI draws one colour per plate today. The net
-    /// branch maps them to colours and this method grows a colour-aware
-    /// variant then.
+    /// branch supplies the codes and a colour-aware variant can replace this
+    /// once the label renderer carries per-span colours.
     pub fn plate(&self) -> String {
-        let mut text = String::with_capacity(self.prefix.len() + self.name.len() + 8);
-        text.push_str(&self.prefix);
+        let mut text =
+            String::with_capacity(self.prefix.len() + self.name.len() + self.suffix.len() + 8);
+        text.push_str(&strip_formatting(&self.prefix));
         text.push_str(&strip_formatting(&self.name));
+        text.push_str(&strip_formatting(&self.suffix));
         if let Some(ping) = self.ping {
             text.push(' ');
             text.push_str(&ping.to_string());
@@ -1018,11 +1022,14 @@ mod tests {
     #[test]
     fn the_plate_keeps_team_and_ping_slots_ready() {
         let tag = Nametag {
-            prefix: "[RED] ".into(),
+            prefix: "§c[RED] ".into(),
             name: "Steve".into(),
+            suffix: " §7[R]".into(),
             ping: Some(42),
         };
-        assert_eq!(tag.plate(), "[RED] Steve 42ms");
+        // Formatting codes are stripped until the label renderer carries
+        // per-span colours.
+        assert_eq!(tag.plate(), "[RED] Steve [R] 42ms");
     }
 
     #[test]

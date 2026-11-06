@@ -199,13 +199,36 @@ async fn the_lobby_has_players_and_a_framed_map() {
     assert_eq!(*rotation, 0);
     // A filled map's damage value is its map id in 1.8.
     let map_id = item.damage as i32;
-    // N's parser has not supplied pixels here; the stub fallback must still be
-    // a real picture rather than a blank square.
     let map = client.maps.ensure(map_id);
+    assert!(
+        map.patches > 0,
+        "the mock sends S34 pixels, not just the placeholder"
+    );
+    // The mock draws a brown border, so (0, 0) is the border colour rather
+    // than the placeholder's sky.
+    assert_eq!(map.color_at(0, 0), Some(41));
+    assert_eq!(map.color_at(100, 20), Some(59), "the sun");
     let distinct: std::collections::HashSet<_> = map.colors.iter().collect();
     assert!(
         distinct.len() > 4,
-        "map {map_id} placeholder should be a picture, not one flat colour"
+        "map {map_id} should be a picture, not one flat colour"
+    );
+
+    // Team formatting and tab-list ping decorate the plate, and the team's
+    // `always` visibility leaves it on screen.
+    let grumm = players
+        .iter()
+        .find(|entity| matches!(&entity.kind, EntityKind::Player { name, .. } if name == "Grumm"))
+        .expect("Grumm is in the lobby");
+    let tag = client.nametag(grumm).expect("Grumm's plate is visible");
+    assert_eq!(tag.plate(), "[BLU] Grumm [B] 83ms");
+    let botto = players
+        .iter()
+        .find(|entity| matches!(&entity.kind, EntityKind::Player { name, .. } if name == "Botto"))
+        .expect("Botto is in the lobby");
+    assert_eq!(
+        client.nametag(botto).expect("Botto's plate").prefix,
+        "§c[RED] "
     );
 
     client.disconnect().await;

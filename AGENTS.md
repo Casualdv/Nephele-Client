@@ -397,7 +397,7 @@ the entity pipeline, which is bound to the skin atlas — via
   preparation. `Renderer::new` requests the adapter's actual
   `max_texture_array_layers` instead of wgpu's 256 default.
 
-### Lobby rendering: skins, nametags, item frames and maps (2026-11-05)
+### Lobby rendering: skins, nametags, item frames and maps (2026-11-06)
 
 - Player skins come from the base64 `textures` property; `SkinInfo` now carries
   the `metadata.model` flag and the renderer builds 3px **slim** arms at
@@ -406,12 +406,16 @@ the entity pipeline, which is bound to the skin atlas — via
   skin. The default/stand-in skin leaves those overlay regions transparent; a
   skin that does not paint them must not become an opaque grey shell.
 - Nametags are screen-space labels projected from above the head. They have a
-  translucent black background, scale by distance (`14/d`, clamped 0.55..1.5)
-  and players show only their name (mobs also show HP). The plate is built by
-  `Entity::nametag()` -> `Nametag { prefix, name, ping }`; `plate()` strips `§`
-  codes today, and the `prefix`/`ping` slots are where the `net` branch adds
-  team colours and latency. Vanilla's rule holds: an invisible player or mob
-  hides its plate, but an invisible **armour stand** keeps it.
+  translucent black background and scale by distance (`14/d`, clamped 0.55..1.5).
+  The plate is `Nametag { prefix, name, suffix, ping }`; `plate()` strips `§`
+  codes because the label renderer draws one colour per plate. `GameClient::nametag`
+  fills the team prefix/suffix from `Scoreboard` (`S3B`-`S3E`) and the ping from
+  the `S38` tab list (0 means "no measurement" and is omitted). Vanilla's rules
+  hold: a custom name is hidden when metadata index 3 says not visible, an
+  invisible player or mob hides its plate, and an invisible **armour stand**
+  keeps it. Team `name_tag_visibility` (`always`, `hideForOtherTeams`,
+  `hideForOwnTeam`) is resolved relative to the local player's team, matching
+  `RenderManager.canRenderName`.
 - Head yaw is interpolated separately from body yaw (`prev_head_yaw`/`head_yaw`
   in `Entity`, `EntitySnapshot` and the draw path). It arrives via `S19`, via
   metadata index 6 as either a byte (1/256 turn) or a `Rotation` in degrees, or
@@ -421,7 +425,7 @@ the entity pipeline, which is bound to the skin atlas — via
   `nephele-render::append_item_frame` draws the wooden frame texture
   (`textures/blocks/itemframe_background.png`, 16x16) and the item flat in
   front, rotated by metadata. Non-map items use a tinted placeholder; maps use
-  the real pixels.
+  the cached 128x128 picture.
 - `S0E Spawn Object` type **78** becomes `EntityKind::ArmorStand`. Metadata
   index 10 carries the status flags (0x01 small, 0x04 show arms, 0x08 no base
   plate, 0x10 marker) and index 11 the head pose. The lobby hologram is an
@@ -435,16 +439,19 @@ the entity pipeline, which is bound to the skin atlas — via
   it when the block raycast has no nearer hit. Invisible non-hologram entities
   are skipped.
 - In 1.8 a **filled map's damage value is its map id**. `ItemStack` stays the
-  simple id/count/damage triple; there is no NBT `map` parsing on this branch.
-- **Map interface (N owns the wire parsing):** `nephele-client::maps::{Maps,
-  MapState}` plus `play::MapUpdate` / `play::MapIcon` are the pinned seam. This
-  client deliberately does **not** decode `S34`; N's parser fills a `MapUpdate`
-  and calls `Maps::apply`, and the client emits `Event::MapUpdated { map_id }`.
-  `GameClient.maps` stores the result. `MapState::placeholder` supplies a
-  deterministic picture, so a framed map is never blank until N lands. The CLI
-  assigns one `SkinAtlas` slot per map id (`map:<id>`) and uploads it as a
-  sub-rectangle. `Renderer::set_skins` drains at most four dirty slots per
-  frame, so a burst of maps/skins cannot stall one frame.
+  simple id/count/damage triple; there is no NBT `map` parsing.
+- **Map data (`S34`)** is parsed by `play::parse_map_update` into a `MapUpdate`
+  patch and merged by `Maps::apply`, which clips out-of-range rectangles and
+  keeps marker-only packets from wiping the picture. The client emits
+  `Event::MapUpdated { map_id }`; `GameClient.maps` stores the result. A map
+  with no `S34` data yet falls back to `MapState::placeholder`, so a framed map
+  is never blank. The CLI assigns one `SkinAtlas` slot per map id (`map:<id>`)
+  and uploads it as a sub-rectangle. `Renderer::set_skins` drains at most four
+  dirty slots per frame, so a burst of maps/skins cannot stall one frame.
+- **Scoreboard and teams (`S3B`-`S3E`)** live in `nephele-client::scoreboard`.
+  `Scoreboard` keeps objectives, scores, display slots and teams; `team_for`
+  matches both exact and `§`-stripped player names, and `prefix_for`/`suffix_for`
+  are what the nametag uses. Respawn clears it, as vanilla builds a fresh board.
 - `SkinAtlas` is now 8x8 slots (2048x2048) with a solid-white slot 1 for tinted
   armour. Skins/maps start at slot 2. The per-slot dirty list is what makes the
   budgeted upload work; do not go back to whole-atlas uploads.
@@ -455,17 +462,18 @@ the entity pipeline, which is bound to the skin atlas — via
 - The mock lobby (`nephele mock-server --bots`) exercises the whole path: eight
   named bots (alternating classic/slim, hash-tinted fallback skins), iron armour
   and a held sword on one, a held map on another, a crouched bot, a swinging
-  bot, a framed map item, and an invisible marker armour-stand hologram
+  bot, a framed map with real `S34` pixels, two scoreboard teams with prefix and
+  suffix, a latency update, and an invisible marker armour-stand hologram
   (`§6§lCLICK TO PLAY\n§7§oJoin a game`). Bot 0 takes its head yaw from
   metadata index 6 while the others use `S19`, so both head paths are covered.
   The real-socket test `the_lobby_has_players_and_a_framed_map` pins the frame,
-  the placeholder picture, the hologram plate and the metadata head yaw.
+  the `S34` pixels, the team/ping plate, the hologram plate and the metadata
+  head yaw.
 - Known limits: armour uses material tints, not the armour layer textures;
-  framed non-map items are flat tints; the map seam has only been exercised
-  against the mock and the placeholder, not a live N parser. Team prefixes and
-  ping numbers stay empty until the `net` branch parses them. A *visible*
-  armour stand is skipped like an invisible one, since there is no stand model
-  yet; only its plate would differ.
+  framed non-map items are flat tints; the map palette is derived from the 16
+  base colours rather than copied from Mojang's table. A *visible* armour stand
+  is skipped like an invisible one, since there is no stand model yet; only its
+  plate would differ.
 
 ### Audio (2026-11-03)
 
