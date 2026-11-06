@@ -299,8 +299,8 @@ async fn send_join_sequence(
         send_lobby_map(connection, player_y as f64).await?;
         send_lobby_hologram(connection, player_y as f64).await?;
         // One bot reports latency, so the nametag plate exercises the ping
-        // half of the tab list. Grumm is fully visible in the lobby shot.
-        if let Some(bot) = bots.get(7) {
+        // half of the tab list. Jeb's tag is fully visible in the lobby shot.
+        if let Some(bot) = bots.get(5) {
             send_bot_ping(connection, bot, 83).await?;
         }
     }
@@ -713,26 +713,39 @@ async fn send_bot_spawns(connection: &mut Connection, bots: &[MockBot]) -> Resul
 
 /// One bot in full iron and another holding a map, so equipment and held items
 /// are visible in the lobby demo.
+/// `S04` one equipment slot.
+async fn send_bot_equipment_slot(
+    connection: &mut Connection,
+    id: i32,
+    slot: i16,
+    item: i16,
+) -> Result<()> {
+    let mut w = PacketWriter::new();
+    w.write_varint(id).write_i16(slot);
+    play::write_slot(&mut w, Some(&play::ItemStack::new(item, 1, 0)));
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_EQUIPMENT,
+            w.into_bytes(),
+        ))
+        .await
+}
+
+/// Equipment for the lobby demo: Jeb holds a sword, Grumm wears full iron and
+/// Dinnerbone holds a map.
 async fn send_bot_equipment(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
-    let Some(iron) = bots.get(7) else {
-        return Ok(());
-    };
-    for (slot, item) in [
-        (play::equipment_slot::HELD, 276),
-        (play::equipment_slot::HELMET, 306),
-        (play::equipment_slot::CHESTPLATE, 307),
-        (play::equipment_slot::LEGGINGS, 308),
-        (play::equipment_slot::BOOTS, 309),
-    ] {
-        let mut w = PacketWriter::new();
-        w.write_varint(iron.entity_id).write_i16(slot);
-        play::write_slot(&mut w, Some(&play::ItemStack::new(item, 1, 0)));
-        connection
-            .write_packet(&Packet::new(
-                play::clientbound::ENTITY_EQUIPMENT,
-                w.into_bytes(),
-            ))
-            .await?;
+    if let Some(jeb) = bots.get(5) {
+        send_bot_equipment_slot(connection, jeb.entity_id, play::equipment_slot::HELD, 276).await?;
+    }
+    if let Some(iron) = bots.get(7) {
+        for (slot, item) in [
+            (play::equipment_slot::HELMET, 306),
+            (play::equipment_slot::CHESTPLATE, 307),
+            (play::equipment_slot::LEGGINGS, 308),
+            (play::equipment_slot::BOOTS, 309),
+        ] {
+            send_bot_equipment_slot(connection, iron.entity_id, slot, item).await?;
+        }
     }
     if let Some(map_bot) = bots.get(6) {
         let mut w = PacketWriter::new();

@@ -407,15 +407,16 @@ the entity pipeline, which is bound to the skin atlas — via
   skin that does not paint them must not become an opaque grey shell.
 - Nametags are screen-space labels projected from above the head. They have a
   translucent black background and scale by distance (`14/d`, clamped 0.55..1.5).
-  The plate is `Nametag { prefix, name, suffix, ping }`; `plate()` strips `§`
-  codes because the label renderer draws one colour per plate. `GameClient::nametag`
-  fills the team prefix/suffix from `Scoreboard` (`S3B`-`S3E`) and the ping from
-  the `S38` tab list (0 means "no measurement" and is omitted). Vanilla's rules
-  hold: a custom name is hidden when metadata index 3 says not visible, an
-  invisible player or mob hides its plate, and an invisible **armour stand**
-  keeps it. Team `name_tag_visibility` (`always`, `hideForOtherTeams`,
-  `hideForOwnTeam`) is resolved relative to the local player's team, matching
-  `RenderManager.canRenderName`.
+  The plate is `Nametag { prefix, name, suffix, ping }`; `raw_plate()` keeps the
+  `§` codes and the CLI parses them into coloured runs (`§0`-`§f`, `§r`; style
+  codes are ignored), while `plate()` is the plain-text form for tests.
+  `GameClient::nametag` fills the team prefix/suffix from `Scoreboard`
+  (`S3B`-`S3E`) and the ping from the `S38` tab list (0 means "no measurement"
+  and is omitted). Vanilla's rules hold: a custom name is hidden when metadata
+  index 3 says not visible, an invisible player or mob hides its plate, and an
+  invisible **armour stand** keeps it. Team `name_tag_visibility` (`always`,
+  `hideForOtherTeams`, `hideForOwnTeam`) is resolved relative to the local
+  player's team, matching `RenderManager.canRenderName`.
 - Head yaw is interpolated separately from body yaw (`prev_head_yaw`/`head_yaw`
   in `Entity`, `EntitySnapshot` and the draw path). It arrives via `S19`, via
   metadata index 6 as either a byte (1/256 turn) or a `Rotation` in degrees, or

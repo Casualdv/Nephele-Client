@@ -78,23 +78,27 @@ pub struct Nametag {
 }
 
 impl Nametag {
-    /// The plate as it is drawn. Multi-line custom names keep their line
-    /// breaks, which is how ASCII-art holograms are authored. `§` formatting
-    /// codes are dropped: the UI draws one colour per plate today. The net
-    /// branch supplies the codes and a colour-aware variant can replace this
-    /// once the label renderer carries per-span colours.
-    pub fn plate(&self) -> String {
+    /// The plate with its `§` formatting codes intact, ready for a renderer
+    /// that understands colour runs. Multi-line custom names keep their line
+    /// breaks, which is how ASCII-art holograms are authored.
+    pub fn raw_plate(&self) -> String {
         let mut text =
-            String::with_capacity(self.prefix.len() + self.name.len() + self.suffix.len() + 8);
-        text.push_str(&strip_formatting(&self.prefix));
-        text.push_str(&strip_formatting(&self.name));
-        text.push_str(&strip_formatting(&self.suffix));
+            String::with_capacity(self.prefix.len() + self.name.len() + self.suffix.len() + 16);
+        text.push_str(&self.prefix);
+        text.push_str(&self.name);
+        text.push_str(&self.suffix);
         if let Some(ping) = self.ping {
-            text.push(' ');
+            text.push_str(" §7");
             text.push_str(&ping.to_string());
             text.push_str("ms");
         }
         text
+    }
+
+    /// The plate as plain text. `§` formatting codes are dropped, which is
+    /// useful for tests and for any caller that cannot draw colour runs.
+    pub fn plate(&self) -> String {
+        strip_formatting(&self.raw_plate())
     }
 }
 

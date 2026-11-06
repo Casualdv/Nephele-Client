@@ -216,12 +216,25 @@ async fn the_lobby_has_players_and_a_framed_map() {
 
     // Team formatting and tab-list ping decorate the plate, and the team's
     // `always` visibility leaves it on screen.
+    let jeb = players
+        .iter()
+        .find(|entity| matches!(&entity.kind, EntityKind::Player { name, .. } if name == "Jeb"))
+        .expect("Jeb is in the lobby");
+    let tag = client.nametag(jeb).expect("Jeb's plate is visible");
+    assert_eq!(tag.plate(), "[BLU] Jeb [B] 83ms");
+    assert_eq!(
+        jeb.equipment[play::equipment_slot::HELD as usize].map(|item| item.id),
+        Some(276),
+        "Jeb holds a sword"
+    );
     let grumm = players
         .iter()
         .find(|entity| matches!(&entity.kind, EntityKind::Player { name, .. } if name == "Grumm"))
         .expect("Grumm is in the lobby");
-    let tag = client.nametag(grumm).expect("Grumm's plate is visible");
-    assert_eq!(tag.plate(), "[BLU] Grumm [B] 83ms");
+    assert!(
+        grumm.equipment[play::equipment_slot::CHESTPLATE as usize].is_some(),
+        "Grumm wears an iron chestplate"
+    );
     let botto = players
         .iter()
         .find(|entity| matches!(&entity.kind, EntityKind::Player { name, .. } if name == "Botto"))

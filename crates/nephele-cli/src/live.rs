@@ -2842,17 +2842,29 @@ impl LiveApp {
             // shrink into the background. 14 blocks is roughly the point where
             // a 0.025-scale tag reaches one GUI pixel per texel.
             let local_scale = scale * (14.0 / distance.max(1.0)).clamp(0.55, 1.5);
-            let plate = tag.plate();
-            let label = match (entity.show_health, plate.is_empty()) {
-                (true, false) => format!("{plate}\n{} HP", entity.health.ceil() as i32),
-                (true, true) => format!("{} HP", entity.health.ceil() as i32),
-                (false, _) => plate,
-            };
-            if label.is_empty() {
+            let mut lines = parse_nametag_runs(&tag.raw_plate());
+            if entity.show_health {
+                if lines.len() == 1 && lines[0].is_empty() {
+                    lines.clear();
+                }
+                lines.push(vec![TextRun {
+                    text: format!("{} HP", entity.health.ceil() as i32),
+                    color: [0.85, 0.85, 0.85, 1.0],
+                }]);
+            }
+            if lines.is_empty() {
                 continue;
             }
-            let lines = label.lines().count().max(1) as f32;
-            let text_width = UiBatch::text_width(&label, local_scale);
+            let widths: Vec<f32> = lines
+                .iter()
+                .map(|line| {
+                    line.iter()
+                        .map(|run| UiBatch::text_width(&run.text, local_scale))
+                        .sum()
+                })
+                .collect();
+            let text_width = widths.iter().copied().fold(0.0f32, f32::max);
+            let line_count = lines.len() as f32;
             let line_height = 9.0 * local_scale;
             let padding = 2.0 * local_scale;
             self.ui_bg.rect(
@@ -2860,12 +2872,22 @@ impl LiveApp {
                     screen_x - text_width / 2.0 - padding,
                     screen_y - padding * 0.5,
                     text_width + padding * 2.0,
-                    lines * line_height + padding,
+                    line_count * line_height + padding,
                 ),
                 [0.0, 0.0, 0.0, 0.45],
             );
-            self.ui_fg
-                .text_centered(&label, screen_x, screen_y, local_scale, [1.0; 4]);
+            for (index, line) in lines.iter().enumerate() {
+                let mut cursor = screen_x - widths[index] / 2.0;
+                let line_y = screen_y + index as f32 * line_height;
+                for run in line {
+                    if run.text.is_empty() {
+                        continue;
+                    }
+                    self.ui_fg
+                        .text(&run.text, cursor, line_y, local_scale, run.color);
+                    cursor += UiBatch::text_width(&run.text, local_scale);
+                }
+            }
         }
 
         for block in &self.block_entities {
@@ -2903,7 +2925,96 @@ impl LiveApp {
             );
         }
     }
+}
 
+/// One coloured run of a nametag line.
+#[derive(Debug, Clone, PartialEq)]
+struct TextRun {
+    text: String,
+    color: [f32; 4],
+}
+
+const NAMETAG_WHITE: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+
+/// Vanilla `§` colour code to RGBA. Style codes (`§l`, `§o`, ...) return
+/// `None`, which leaves the current colour alone.
+fn chat_color(code: char) -> Option<[f32; 4]> {
+    let rgb = match code.to_ascii_lowercase() {
+        '0' => [0, 0, 0],
+        '1' => [0, 0, 170],
+        '2' => [0, 170, 0],
+        '3' => [0, 170, 170],
+        '4' => [170, 0, 0],
+        '5' => [170, 0, 170],
+        '6' => [255, 170, 0],
+        '7' => [170, 170, 170],
+        '8' => [85, 85, 85],
+        '9' => [85, 85, 255],
+        'a' => [85, 255, 85],
+        'b' => [85, 255, 255],
+        'c' => [255, 85, 85],
+        'd' => [255, 85, 255],
+        'e' => [255, 255, 85],
+        'f' => [255, 255, 255],
+        'r' => return Some(NAMETAG_WHITE),
+        _ => return None,
+    };
+    Some([
+        rgb[0] as f32 / 255.0,
+        rgb[1] as f32 / 255.0,
+        rgb[2] as f32 / 255.0,
+        1.0,
+    ])
+}
+
+/// Split a formatted plate into coloured lines. Codes are not drawn, and a
+/// newline resets the colour to white so a line without its own code stays
+/// readable.
+fn parse_nametag_runs(text: &str) -> Vec<Vec<TextRun>> {
+    let mut lines = Vec::new();
+    let mut line: Vec<TextRun> = Vec::new();
+    let mut color = NAMETAG_WHITE;
+    let mut run = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '§' => {
+                let Some(code) = chars.next() else {
+                    break;
+                };
+                if let Some(next) = chat_color(code) {
+                    if !run.is_empty() {
+                        line.push(TextRun {
+                            text: std::mem::take(&mut run),
+                            color,
+                        });
+                    }
+                    color = next;
+                }
+            }
+            '\n' => {
+                if !run.is_empty() {
+                    line.push(TextRun {
+                        text: std::mem::take(&mut run),
+                        color,
+                    });
+                }
+                lines.push(std::mem::take(&mut line));
+                color = NAMETAG_WHITE;
+            }
+            _ => run.push(ch),
+        }
+    }
+    if !run.is_empty() {
+        line.push(TextRun { text: run, color });
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+impl LiveApp {
     /// Apply a look delta, in raw device pixels.
     fn look(&mut self, dx: f32, dy: f32) {
         let mut state = self.shared.lock().unwrap();
@@ -4198,6 +4309,30 @@ fn hotbar_digit(code: KeyCode) -> Option<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_team_plate_keeps_its_colour_runs_and_drops_the_codes() {
+        let runs = parse_nametag_runs("§c[RED] §fSteve §7[R] §783ms");
+        assert_eq!(runs.len(), 1);
+        let line = &runs[0];
+        assert_eq!(
+            line.iter().map(|run| run.text.as_str()).collect::<Vec<_>>(),
+            ["[RED] ", "Steve ", "[R] ", "83ms"]
+        );
+        assert_eq!(line[0].color, chat_color('c').unwrap());
+        assert_eq!(line[1].color, NAMETAG_WHITE);
+        assert_eq!(line[2].color, chat_color('7').unwrap());
+    }
+
+    #[test]
+    fn a_hologram_keeps_its_two_lines_and_each_line_colour() {
+        let runs = parse_nametag_runs("§6§lCLICK TO PLAY\n§7§oJoin a game");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0][0].text, "CLICK TO PLAY");
+        assert_eq!(runs[0][0].color, chat_color('6').unwrap());
+        assert_eq!(runs[1][0].text, "Join a game");
+        assert_eq!(runs[1][0].color, chat_color('7').unwrap());
+    }
 
     fn local_state_for_test() -> Shared {
         Shared {
