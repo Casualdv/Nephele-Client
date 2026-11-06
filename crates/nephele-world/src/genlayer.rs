@@ -1296,7 +1296,11 @@ impl Layer for GenLayerHills {
 
     fn set_world_seed(&mut self, seed: i64) {
         self.parent.set_world_seed(seed);
-        self.hill_noise.set_world_seed(seed);
+        // `GenLayerHills` keeps its variance layer in a private field, not in
+        // `parent`, so vanilla's `initWorldGenSeed` never reaches it: the two
+        // zoom layers above the hill noise keep `worldGenSeed == 0` for the
+        // whole world. Seeding them here silently rewrites the 1:64 Hills map.
+        // Pinned by `debug_stage_trace`.
         self.seed.set_world_seed(seed);
     }
 }
@@ -1670,6 +1674,8 @@ impl BiomeLayers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     struct Constant(i32);
 
@@ -1788,6 +1794,39 @@ mod tests {
         assert!(layer.get_ints(0, 0, 8, 8).iter().all(|v| *v == 0));
     }
 
+    /// `GenLayerHills` holds its variance layer outside `parent`, so vanilla's
+    /// `initWorldGenSeed` never reaches it and the two zooms above the hill
+    /// noise keep `worldGenSeed == 0`. That quirk decides 1 in 29 of the 1:64
+    /// cells, so seeding it "correctly" rewrites the whole biome map.
+    #[test]
+    fn hills_never_seeds_its_variance_layer() {
+        use std::cell::Cell;
+
+        struct SeedSpy(Rc<Cell<usize>>);
+
+        impl Layer for SeedSpy {
+            fn get_ints(&mut self, _x: i32, _z: i32, width: usize, height: usize) -> Vec<i32> {
+                vec![2; width * height]
+            }
+            fn set_world_seed(&mut self, _seed: i64) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let calls = Rc::new(Cell::new(0));
+        let mut hills = GenLayerHills::new(
+            1000,
+            Box::new(Constant(1)),
+            Box::new(SeedSpy(Rc::clone(&calls))),
+        );
+        hills.set_world_seed(12345);
+        assert_eq!(
+            calls.get(),
+            0,
+            "vanilla's GenLayerHills never reseeds field_151628_d"
+        );
+    }
+
     #[test]
     fn rare_biome_only_mutates_plains() {
         let mut layer = GenLayerRareBiome::new(1001, Box::new(Constant(biome_id::DESERT)));
@@ -1826,6 +1865,148 @@ mod tests {
         );
     }
 
+    /// The mutation ids vanilla actually registers in `BiomeGenBase`'s static
+    /// block. A mutation is only usable when its base id appears here.
+    const REGISTERED_MUTATION_BASES: [i32; 21] = [
+        1, 2, 3, 4, 5, 6, 12, 21, 23, 27, 28, 29, 30, 32, 33, 34, 35, 36, 37, 38, 39,
+    ];
+
+    struct ReferenceCell {
+        counts: [u32; 256],
+        covered: u32,
+    }
+
+    impl Default for ReferenceCell {
+        fn default() -> Self {
+            Self {
+                counts: [0; 256],
+                covered: 0,
+            }
+        }
+    }
+
+    impl ReferenceCell {
+        fn add(&mut self, biome: u8) {
+            self.counts[biome as usize] += 1;
+            self.covered += 1;
+        }
+
+        fn majority(&self) -> Option<(i32, u32)> {
+            let mut best = None;
+            for (id, count) in self.counts.iter().copied().enumerate() {
+                if count == 0 {
+                    continue;
+                }
+                if best.is_none_or(|(_, best_count)| count > best_count) {
+                    best = Some((id as i32, count));
+                }
+            }
+            best
+        }
+    }
+
+    fn base_id(id: i32) -> i32 {
+        if id >= biome::MUTATED {
+            id - biome::MUTATED
+        } else {
+            id
+        }
+    }
+
+    fn is_registered_mutation(id: i32) -> bool {
+        id >= biome::MUTATED && REGISTERED_MUTATION_BASES.contains(&base_id(id))
+    }
+
+    #[ignore = "diagnostic: measures where a 1:64 Hills cell lands in block space"]
+    #[test]
+    fn debug_hills_to_block_mapping() {
+        struct Spike {
+            x: i32,
+            z: i32,
+        }
+
+        impl Layer for Spike {
+            fn get_ints(
+                &mut self,
+                area_x: i32,
+                area_z: i32,
+                width: usize,
+                height: usize,
+            ) -> Vec<i32> {
+                let mut out = vec![5; width * height];
+                for z in 0..height as i32 {
+                    for x in 0..width as i32 {
+                        if area_x + x == self.x && area_z + z == self.z {
+                            out[(z * width as i32 + x) as usize] = 133;
+                        }
+                    }
+                }
+                out
+            }
+
+            fn set_world_seed(&mut self, _seed: i64) {}
+        }
+
+        let mut layer: Box<dyn Layer> = Box::new(Spike { x: -2, z: 1 });
+        layer = Box::new(GenLayerRareBiome::new(1001, layer));
+        for step in 0..4i64 {
+            layer = Box::new(GenLayerZoom::new(1000 + step, layer));
+            if step == 0 {
+                layer = Box::new(GenLayerAddIsland::new(3, layer));
+            }
+            if step == 1 {
+                layer = Box::new(GenLayerShore::new(1000, layer));
+            }
+        }
+        let smoothed = Box::new(GenLayerSmooth::new(1000, layer));
+        let mixed = Box::new(GenLayerRiverMix::new(100, smoothed, Box::new(Constant(0))));
+        let mut voronoi = GenLayerVoronoiZoom::new(10, mixed);
+
+        let (x, z, w, h) = (-256, -256, 512, 1024);
+        let map = voronoi.get_ints(x, z, w as usize, h as usize);
+        let mut min = (i32::MAX, i32::MAX);
+        let mut max = (i32::MIN, i32::MIN);
+        let mut count = 0usize;
+        for bz in 0..h {
+            for bx in 0..w {
+                if map[(bz * w + bx) as usize] == 133 {
+                    min.0 = min.0.min(bx + x);
+                    min.1 = min.1.min(bz + z);
+                    max.0 = max.0.max(bx + x);
+                    max.1 = max.1.max(bz + z);
+                    count += 1;
+                }
+            }
+        }
+        println!("spike (-2,1) -> blocks {min:?}..{max:?}, {count} cells");
+    }
+
+    #[ignore = "diagnostic: checks the Hills layer's query-window dependence"]
+    #[test]
+    fn debug_hills_query_window() {
+        let targets = [(-2, 1), (-3, -1), (-3, 0)];
+        let windows = [
+            (-8, -4, 8usize, 16usize),
+            (-16, -16, 32, 32),
+            (-256, -256, 512, 512),
+            (-256, -256, 512, 1024),
+            (-512, -512, 1024, 1024),
+        ];
+        for (x, z, w, h) in windows {
+            let mut layers = BiomeLayers::new(12345);
+            let hills = layers.debug_hills_only(x, z, w, h);
+            let noises = layers.debug_hills_noise(x, z, w, h);
+            for target in targets {
+                let index = ((target.1 - z) * w as i32 + (target.0 - x)) as usize;
+                println!(
+                    "window ({x},{z},{w},{h}) at {target:?}: hills {:?} noise {:?}",
+                    hills.get(index).copied(),
+                    noises.get(index).copied()
+                );
+            }
+        }
+    }
+
     #[test]
     fn biome_results_do_not_depend_on_query_rectangle_size() {
         let (area_x, area_z) = (-160, -64);
@@ -1843,6 +2024,241 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// Compare the 1:64 `GenLayerHills` grid with a downsampled oracle: for
+    /// every 64x64 block square in the reference world, take the majority
+    /// biome and compare it with the Hills cell that covers that square.
+    ///
+    /// Only fully covered squares are scored, so a partially generated square
+    /// cannot bias its majority toward whichever chunks happened to exist.
+    #[ignore = "diagnostic: compares the 1:64 Hills grid with the reference world"]
+    #[test]
+    fn debug_hills_downsampled_confusion() {
+        use nephele_anvil::{parse_chunk, RegionFile};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::path::PathBuf;
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Nephele-private/parity/server/world/region");
+        let mut cells: BTreeMap<(i32, i32), ReferenceCell> = BTreeMap::new();
+        let mut chunks = 0usize;
+
+        for name in ["r.-1.-1.mca", "r.-1.0.mca"] {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let region = RegionFile::open(&path).expect("region opens");
+            for lz in 0..32 {
+                for lx in 0..32 {
+                    let Some(bytes) = region.chunk_nbt(lx, lz).ok().flatten() else {
+                        continue;
+                    };
+                    let Ok(stored) = parse_chunk(&bytes) else {
+                        continue;
+                    };
+                    if stored.biomes.len() != 256 {
+                        continue;
+                    }
+                    chunks += 1;
+                    for z in 0..16i32 {
+                        for x in 0..16i32 {
+                            let block_x = stored.x * 16 + x;
+                            let block_z = stored.z * 16 + z;
+                            let biome = stored.biomes[(z * 16 + x) as usize];
+                            let key = (block_x.div_euclid(64), block_z.div_euclid(64));
+                            cells.entry(key).or_default().add(biome);
+                        }
+                    }
+                }
+            }
+        }
+
+        let full_cells: Vec<_> = cells
+            .iter()
+            .filter(|(_, cell)| cell.covered == 64 * 64)
+            .collect();
+        let partial_cells = cells.len() - full_cells.len();
+        println!(
+            "reference: {chunks} chunks, {} cells, {} fully covered, {} partial",
+            cells.len(),
+            full_cells.len(),
+            partial_cells
+        );
+
+        let min_x = full_cells.iter().map(|entry| entry.0 .0).min().unwrap_or(0);
+        let min_z = full_cells.iter().map(|entry| entry.0 .1).min().unwrap_or(0);
+        let width = full_cells
+            .iter()
+            .map(|entry| entry.0 .0)
+            .max()
+            .unwrap_or(min_x)
+            - min_x
+            + 1;
+        let height = full_cells
+            .iter()
+            .map(|entry| entry.0 .1)
+            .max()
+            .unwrap_or(min_z)
+            - min_z
+            + 1;
+        let mut layers = BiomeLayers::new(12345);
+        // Query the Hills layer as one rectangle. A 1x1 query goes through the
+        // zoom layers with a different parent window, so it must not be used to
+        // judge the layer's bulk output.
+        let hills = layers.debug_hills_only(min_x, min_z, width as usize, height as usize);
+        let edges = layers.debug_biome_edge(min_x, min_z, width as usize, height as usize);
+        let noises = layers.debug_hills_noise(min_x, min_z, width as usize, height as usize);
+
+        let final_map = layers.biomes(
+            min_x * 64,
+            min_z * 64,
+            (width * 64) as usize,
+            (height * 64) as usize,
+        );
+        let mut final_exact = 0u32;
+        let mut final_base = 0u32;
+        let mut final_mismatches = Vec::new();
+        for (&(cell_x, cell_z), cell) in &full_cells {
+            let Some((expected, _)) = cell.majority() else {
+                continue;
+            };
+            let mut actual_cell = ReferenceCell::default();
+            for lz in 0..64 {
+                for lx in 0..64 {
+                    let block_x = cell_x * 64 + lx;
+                    let block_z = cell_z * 64 + lz;
+                    let index =
+                        ((block_z - min_z * 64) * width * 64 + (block_x - min_x * 64)) as usize;
+                    actual_cell.add(final_map[index] as u8);
+                }
+            }
+            let Some((actual, _)) = actual_cell.majority() else {
+                continue;
+            };
+            if actual == expected {
+                final_exact += 1;
+            }
+            if base_id(actual) == base_id(expected) {
+                final_base += 1;
+            } else {
+                final_mismatches.push((cell_x, cell_z, expected, actual));
+            }
+        }
+        println!(
+            "our final 1:1 map vs reference majority: exact {final_exact}/{}, \
+             base {final_base}/{}, cell mismatches {final_mismatches:?}",
+            full_cells.len(),
+            full_cells.len()
+        );
+        let mut raw_pairs: BTreeMap<(i32, i32), u32> = BTreeMap::new();
+        let mut base_pairs: BTreeMap<(i32, i32), u32> = BTreeMap::new();
+        let mut exact = 0u32;
+        let mut mutation_only = 0u32;
+        let mut different_base = 0u32;
+        let mut invalid_actual_mutations = 0u32;
+
+        for (&(cell_x, cell_z), cell) in &full_cells {
+            let Some((expected, _)) = cell.majority() else {
+                continue;
+            };
+            let cell_index = ((cell_z - min_z) * width + (cell_x - min_x)) as usize;
+            let actual = hills[cell_index];
+            let expected_base = base_id(expected);
+            let actual_base = base_id(actual);
+            if expected != actual {
+                let edge_at = |x: i32, z: i32| {
+                    if x < min_x || z < min_z {
+                        return 0;
+                    }
+                    let index = ((z - min_z) * width + (x - min_x)) as usize;
+                    edges.get(index).copied().unwrap_or(0)
+                };
+                let neighbours = [
+                    edge_at(cell_x, cell_z - 1),
+                    edge_at(cell_x + 1, cell_z),
+                    edge_at(cell_x - 1, cell_z),
+                    edge_at(cell_x, cell_z + 1),
+                ];
+                let matching = neighbours
+                    .iter()
+                    .filter(|value| biome::equal_or_mesa_plateau(**value, edges[cell_index]))
+                    .count();
+                let mut hills_seed = LayerSeed::new(1000);
+                hills_seed.set_world_seed(12345);
+                hills_seed.init_chunk(cell_x as i64, cell_z as i64);
+                let roll = hills_seed.next_int(3);
+                println!(
+                    "  cell ({cell_x:>3},{cell_z:>3}) expected {expected:>3} \
+                     ({}/4096) actual {actual:>3} edge {:>3} neighbours {neighbours:?} \
+                     matching {matching} roll {roll} noise {}",
+                    cell.majority().map_or(0, |(_, count)| count),
+                    edges[cell_index],
+                    noises[cell_index]
+                );
+            }
+
+            *raw_pairs.entry((expected, actual)).or_default() += 1;
+            *base_pairs.entry((expected_base, actual_base)).or_default() += 1;
+
+            if expected == actual {
+                exact += 1;
+            } else if expected_base == actual_base {
+                mutation_only += 1;
+            } else {
+                different_base += 1;
+            }
+            if actual >= biome::MUTATED && !is_registered_mutation(actual) {
+                invalid_actual_mutations += 1;
+            }
+        }
+
+        let scored = full_cells.len() as u32;
+        println!(
+            "raw Hills exact: {exact}/{scored} ({:.4}%), mutation-only {mutation_only}, \
+             different-base {different_base}, invalid actual mutations {invalid_actual_mutations}",
+            if scored == 0 {
+                0.0
+            } else {
+                100.0 * f64::from(exact) / f64::from(scored)
+            }
+        );
+
+        let mut raw: Vec<_> = raw_pairs.into_iter().collect();
+        raw.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        println!("raw mismatches (expected -> actual):");
+        for ((expected, actual), count) in raw
+            .iter()
+            .filter(|((expected, actual), _)| expected != actual)
+        {
+            println!(
+                "  {expected:>3} ({}) -> {actual:>3} ({}): {count}",
+                biome::name_of(*expected),
+                biome::name_of(*actual)
+            );
+        }
+
+        let expected_ids: BTreeSet<i32> = base_pairs.keys().map(|(id, _)| *id).collect();
+        let actual_ids: BTreeSet<i32> = base_pairs.keys().map(|(_, id)| *id).collect();
+        println!("base-id confusion matrix (expected rows, actual columns):");
+        print!("      ");
+        for id in &actual_ids {
+            print!("{id:>5}");
+        }
+        println!();
+        for expected in &expected_ids {
+            print!("{expected:>4}: ");
+            for actual in &actual_ids {
+                let count = base_pairs.get(&(*expected, *actual)).copied().unwrap_or(0);
+                if count == 0 {
+                    print!("{:>5}", ".");
+                } else {
+                    print!("{count:>5}");
+                }
+            }
+            println!();
+        }
+    }
+
     /// Every chunk the real 1.8.9 server generated must carry the same biome
     /// ids we produce. This is what proves the chain is a faithful port.
     ///
@@ -1852,6 +2268,7 @@ mod tests {
     #[test]
     fn debug_first_mismatch() {
         use nephele_anvil::{parse_chunk, RegionFile};
+        use std::collections::BTreeMap;
         use std::path::PathBuf;
 
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1860,6 +2277,7 @@ mod tests {
         let mut total = 0usize;
         let mut bad = 0usize;
         let mut first = 0usize;
+        let mut pairs: BTreeMap<(i32, i32), usize> = BTreeMap::new();
         let offsets = [
             (0, 0),
             (-1, 0),
@@ -1907,6 +2325,7 @@ mod tests {
                             }
                             if maps[0][i] != expected {
                                 bad += 1;
+                                *pairs.entry((maps[0][i], expected)).or_default() += 1;
                                 if first == 0 {
                                     first = 1;
                                     let block_x = stored.x * 16 + x;
@@ -1942,8 +2361,361 @@ mod tests {
             }
         }
         println!("mismatched {bad} of {total}");
+        let mut pairs: Vec<_> = pairs.into_iter().collect();
+        pairs.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
+        println!("final block mismatches (ours -> reference), top 30:");
+        for ((ours, reference), count) in pairs.iter().take(30) {
+            println!(
+                "  {ours:>3} ({}) -> {reference:>3} ({}): {count}",
+                biome::name_of(*ours),
+                biome::name_of(*reference)
+            );
+        }
         for (offset, mismatches) in offsets.iter().zip(offset_mismatches) {
             println!("offset {offset:?}: mismatched {mismatches} of {total}");
+        }
+    }
+
+    /// One `getInts` call, captured by [`Rec`].
+    struct Snapshot {
+        name: String,
+        x: i32,
+        z: i32,
+        w: usize,
+        h: usize,
+        data: Vec<i32>,
+    }
+
+    /// Records every layer's output on the way back up the chain. Mirrors
+    /// `dev.nephele.oracle.Trace`'s `Rec` so the two traces line up call for
+    /// call: the oracle snapshots each layer inside one continuous generation,
+    /// which avoids the `IntCache` aliasing that makes isolated stage queries
+    /// contradict each other.
+    struct Rec {
+        name: &'static str,
+        inner: Box<dyn Layer>,
+        log: Rc<RefCell<Vec<Snapshot>>>,
+    }
+
+    impl Layer for Rec {
+        fn get_ints(&mut self, area_x: i32, area_z: i32, width: usize, height: usize) -> Vec<i32> {
+            let out = self.inner.get_ints(area_x, area_z, width, height);
+            self.log.borrow_mut().push(Snapshot {
+                name: self.name.to_string(),
+                x: area_x,
+                z: area_z,
+                w: width,
+                h: height,
+                data: out.clone(),
+            });
+            out
+        }
+
+        fn set_world_seed(&mut self, seed: i64) {
+            self.inner.set_world_seed(seed);
+        }
+    }
+
+    fn rec(
+        name: &'static str,
+        inner: Box<dyn Layer>,
+        log: &Rc<RefCell<Vec<Snapshot>>>,
+    ) -> Box<dyn Layer> {
+        Box::new(Rec {
+            name,
+            inner,
+            log: Rc::clone(log),
+        })
+    }
+
+    /// The oracle's stack, rebuilt node for node with the same names (see
+    /// `Nephele-private/oracle/src/dev/nephele/oracle/Trace.java`).
+    fn traced_stack(log: &Rc<RefCell<Vec<Snapshot>>>) -> Box<dyn Layer> {
+        let island = rec("island", Box::new(GenLayerIsland::new(1)), log);
+        let fuzzy = rec(
+            "fuzzyZoom",
+            Box::new(GenLayerZoom::fuzzy(2000, island)),
+            log,
+        );
+        let add1 = rec("add1", Box::new(GenLayerAddIsland::new(1, fuzzy)), log);
+        let zoom2001 = rec("zoom2001", Box::new(GenLayerZoom::new(2001, add1)), log);
+        let add2 = rec("add2", Box::new(GenLayerAddIsland::new(2, zoom2001)), log);
+        let add3 = rec("add3", Box::new(GenLayerAddIsland::new(50, add2)), log);
+        let add4 = rec("add4", Box::new(GenLayerAddIsland::new(70, add3)), log);
+        let ocean = rec(
+            "removeOcean",
+            Box::new(GenLayerRemoveTooMuchOcean::new(2, add4)),
+            log,
+        );
+        let snow = rec("addSnow", Box::new(GenLayerAddSnow::new(2, ocean)), log);
+        let add5 = rec("add5", Box::new(GenLayerAddIsland::new(3, snow)), log);
+        let edge1 = rec(
+            "edgeCoolWarm",
+            Box::new(GenLayerEdge::new(2, add5, EdgeMode::CoolWarm)),
+            log,
+        );
+        let edge2 = rec(
+            "edgeHeatIce",
+            Box::new(GenLayerEdge::new(2, edge1, EdgeMode::HeatIce)),
+            log,
+        );
+        let edge3 = rec(
+            "edgeSpecial",
+            Box::new(GenLayerEdge::new(3, edge2, EdgeMode::Special)),
+            log,
+        );
+        let zoom2002 = rec("zoom2002", Box::new(GenLayerZoom::new(2002, edge3)), log);
+        let zoom2003 = rec("zoom2003", Box::new(GenLayerZoom::new(2003, zoom2002)), log);
+        let add6 = rec("add6", Box::new(GenLayerAddIsland::new(4, zoom2003)), log);
+        let mushroom = rec(
+            "mushroom",
+            Box::new(GenLayerAddMushroomIsland::new(5, add6)),
+            log,
+        );
+        let deep = rec(
+            "deepOcean",
+            Box::new(GenLayerDeepOcean::new(4, mushroom)),
+            log,
+        );
+
+        let base = SharedLayer::new(deep);
+        let river_init = SharedLayer::new(rec(
+            "riverInit",
+            Box::new(GenLayerRiverInit::new(100, base.boxed())),
+            log,
+        ));
+
+        let biome_source = rec(
+            "biomeSource",
+            Box::new(GenLayerBiome::new(200, base.boxed())),
+            log,
+        );
+        let bio_zoom0 = rec(
+            "bioZoom0",
+            Box::new(GenLayerZoom::new(1000, biome_source)),
+            log,
+        );
+        let bio_zoom1 = rec(
+            "bioZoom1",
+            Box::new(GenLayerZoom::new(1001, bio_zoom0)),
+            log,
+        );
+        let biome_edge = rec(
+            "biomeEdge",
+            Box::new(GenLayerBiomeEdge::new(1000, bio_zoom1)),
+            log,
+        );
+
+        let hill_noise0 = rec(
+            "hillNoiseZoom0",
+            Box::new(GenLayerZoom::new(1000, river_init.boxed())),
+            log,
+        );
+        let hill_noise1 = rec(
+            "hillNoiseZoom1",
+            Box::new(GenLayerZoom::new(1001, hill_noise0)),
+            log,
+        );
+        let hills = rec(
+            "hills",
+            Box::new(GenLayerHills::new(1000, biome_edge, hill_noise1)),
+            log,
+        );
+
+        let river_zoom0 = rec(
+            "riverZoom0",
+            Box::new(GenLayerZoom::new(1000, river_init.boxed())),
+            log,
+        );
+        let river_zoom1 = rec(
+            "riverZoom1",
+            Box::new(GenLayerZoom::new(1001, river_zoom0)),
+            log,
+        );
+        let river_zoom2 = rec(
+            "riverZoom2",
+            Box::new(GenLayerZoom::new(1000, river_zoom1)),
+            log,
+        );
+        let river_zoom3 = rec(
+            "riverZoom3",
+            Box::new(GenLayerZoom::new(1001, river_zoom2)),
+            log,
+        );
+        let river_zoom4 = rec(
+            "riverZoom4",
+            Box::new(GenLayerZoom::new(1002, river_zoom3)),
+            log,
+        );
+        let river_zoom5 = rec(
+            "riverZoom5",
+            Box::new(GenLayerZoom::new(1003, river_zoom4)),
+            log,
+        );
+        let river = rec("river", Box::new(GenLayerRiver::new(1, river_zoom5)), log);
+        let river_smooth = rec(
+            "riverSmooth",
+            Box::new(GenLayerSmooth::new(1000, river)),
+            log,
+        );
+
+        let rare = rec(
+            "rareBiome",
+            Box::new(GenLayerRareBiome::new(1001, hills)),
+            log,
+        );
+        let chain_zoom0 = rec("chainZoom0", Box::new(GenLayerZoom::new(1000, rare)), log);
+        let chain_add = rec(
+            "chainAddIsland",
+            Box::new(GenLayerAddIsland::new(3, chain_zoom0)),
+            log,
+        );
+        let chain_zoom1 = rec(
+            "chainZoom1",
+            Box::new(GenLayerZoom::new(1001, chain_add)),
+            log,
+        );
+        let chain_shore = rec(
+            "chainShore",
+            Box::new(GenLayerShore::new(1000, chain_zoom1)),
+            log,
+        );
+        let chain_zoom2 = rec(
+            "chainZoom2",
+            Box::new(GenLayerZoom::new(1002, chain_shore)),
+            log,
+        );
+        let chain_zoom3 = rec(
+            "chainZoom3",
+            Box::new(GenLayerZoom::new(1003, chain_zoom2)),
+            log,
+        );
+        let smooth = rec(
+            "smooth",
+            Box::new(GenLayerSmooth::new(1000, chain_zoom3)),
+            log,
+        );
+        let mixed = rec(
+            "riverMix",
+            Box::new(GenLayerRiverMix::new(100, smooth, river_smooth)),
+            log,
+        );
+        rec(
+            "voronoi",
+            Box::new(GenLayerVoronoiZoom::new(10, mixed)),
+            log,
+        )
+    }
+
+    fn read_trace(path: &std::path::Path) -> Vec<Snapshot> {
+        use std::io::Read;
+
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .expect("stage trace exists")
+            .read_to_end(&mut bytes)
+            .expect("stage trace reads");
+        assert_eq!(&bytes[..8], b"NEPHTRC1", "stage trace magic");
+        let mut cursor = 8usize;
+        let read_i32 = |cursor: &mut usize| {
+            let value = i32::from_be_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap());
+            *cursor += 4;
+            value
+        };
+        let count = read_i32(&mut cursor) as usize;
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let name_len = read_i32(&mut cursor) as usize;
+            let name = String::from_utf8(bytes[cursor..cursor + name_len].to_vec()).unwrap();
+            cursor += name_len;
+            let x = read_i32(&mut cursor);
+            let z = read_i32(&mut cursor);
+            let w = read_i32(&mut cursor) as usize;
+            let h = read_i32(&mut cursor) as usize;
+            let len = read_i32(&mut cursor) as usize;
+            let mut data = Vec::with_capacity(len);
+            for _ in 0..len {
+                data.push(read_i32(&mut cursor));
+            }
+            out.push(Snapshot {
+                name,
+                x,
+                z,
+                w,
+                h,
+                data,
+            });
+        }
+        out
+    }
+
+    /// Reports which stage first diverges from the vanilla trace. Needs
+    /// `Nephele-private/parity/stage_trace.bin`, produced by
+    /// `dev.nephele.oracle.Trace <seed> -512 -512 512 1024 <out>`.
+    #[ignore = "diagnostic: stage-by-stage diff against the vanilla trace"]
+    #[test]
+    fn debug_stage_trace() {
+        use std::path::PathBuf;
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Nephele-private/parity/stage_trace.bin");
+        if !path.is_file() {
+            eprintln!("skipped: no stage trace at {}", path.display());
+            return;
+        }
+        let expected = read_trace(&path);
+
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut stack = traced_stack(&log);
+        stack.set_world_seed(12345);
+        stack.get_ints(-512, -512, 512, 1024);
+        let actual = log.borrow();
+
+        println!("records: oracle {} ours {}", expected.len(), actual.len());
+        let mut first_bad = true;
+        for (index, (want, got)) in expected.iter().zip(actual.iter()).enumerate() {
+            let same_window =
+                want.x == got.x && want.z == got.z && want.w == got.w && want.h == got.h;
+            let mut mismatches = 0usize;
+            let mut first_cell = None;
+            let cells = want.w * want.h;
+            if same_window && want.data.len() >= cells && got.data.len() >= cells {
+                for cell in 0..cells {
+                    if want.data[cell] != got.data[cell] {
+                        mismatches += 1;
+                        if first_cell.is_none() {
+                            first_cell = Some((
+                                cell % want.w,
+                                cell / want.w,
+                                want.data[cell],
+                                got.data[cell],
+                            ));
+                        }
+                    }
+                }
+            } else {
+                mismatches = want.data.len().max(got.data.len());
+            }
+            let mark = if mismatches == 0 { "ok  " } else { "DIFF" };
+            println!(
+                "{mark} #{index:>2} {:<14} want ({},{},{},{}) got ({},{},{},{}) diff {}/{} {:?}",
+                want.name,
+                want.x,
+                want.z,
+                want.w,
+                want.h,
+                got.x,
+                got.z,
+                got.w,
+                got.h,
+                mismatches,
+                want.data.len(),
+                first_cell
+            );
+            if mismatches > 0 && first_bad {
+                first_bad = false;
+                println!("^ first diverging stage");
+            }
         }
     }
 

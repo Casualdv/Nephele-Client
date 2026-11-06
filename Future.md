@@ -95,10 +95,9 @@ preparation. Performance: 143 fps / p99 7.4 ms on integrated AMD at 1280×720,
 view distance 8, vsync off, with a committed baseline that fails the build on
 regression.
 
-Measured parity against a world the real 1.8.9 server generated: **92.8%** of
-biome cells, **96%** of surface heights, **98.8%** of surface block types. The
-Hills variance layer has since been reseeded the way vanilla does it; that number
-needs re-measuring before it is quoted again.
+Measured parity against a world the real 1.8.9 server generated: **100%** of
+biome cells (0 / 160,000, seed 12345, 625 chunks — every GenLayer stage diff 0),
+**96%** of surface heights, **98.8%** of surface block types.
 
 ---
 
@@ -259,7 +258,7 @@ No audio exists yet.
 
 | Item | Size | Notes |
 |---|---|---|
-| Java oracle parity harness (`Nephele-private/oracle`) | exists | Extend per feature: terrain, blocks, biome overrides. |
+| Java oracle parity harness (`Nephele-private/oracle`) | exists | Extend per feature: terrain, blocks, biome overrides. Stage-by-stage tracing landed 2026-11-05 (`trace.ps1` + `debug_stage_trace`). |
 | Reference worlds for regression tests | exists | Seed 12345, structures off. |
 | Performance benchmark on low-end hardware | M | Define the bar: 60 fps, Intel HD 4000-class. |
 | Automated multiplayer smoke test against a real server | M | |
@@ -276,7 +275,7 @@ and worktree for each.
 | Lane | Done | What is left |
 |---|---:|---|
 | `render` | 95% | shape audit leftovers; first-person hand depth-clear |
-| `biomes` | ? | Hills reseeded, **re-measure**; remaining divergence downstream |
+| `biomes` | 100% | nothing — every GenLayer stage diffs 0 against the oracle |
 | `worldgen` | 15% | `provide_chunk`/`populate` split landed; caves, ores, flora, structures |
 | `survival` | 90% | eating, potions, enchantments, XP orbs |
 | `net` | 95% | resource packs, reconnect polish |
