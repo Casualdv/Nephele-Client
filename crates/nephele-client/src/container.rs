@@ -15,12 +15,48 @@ pub enum ContainerKind {
     CraftingTable,
     Furnace,
     /// A generic server-driven container, drawn with `generic_54`: `rows` rows
-    /// of nine chest slots above the player's 36. Vanilla's `GuiChest` handles
-    /// one to six rows, and Hypixel's menus are all six-row chests that only
-    /// fill the first few rows.
+    /// of nine grid slots above the player's 36. When `header` is set, slot 0
+    /// is a leading slot drawn in the title band and the grid starts at slot 1
+    /// — Hypixel's Game Menu, shop chests and Ticket Machine are all
+    /// `1 + rows*9 + 36`.
     Chest {
         rows: u8,
+        header: bool,
     },
+}
+
+/// How a generic server window is laid out, derived from `S2D`'s slot count.
+///
+/// The player's 36 slots are always last. Everything before them is the
+/// container: either a plain `rows*9` grid, or a leading slot plus the grid
+/// (`1 + rows*9`), which is the shape every Hypixel menu uses. Keeping the
+/// leading slot in the count is what keeps the player half aligned and makes a
+/// click report the slot the server actually numbered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerLayout {
+    pub rows: u8,
+    pub header: bool,
+}
+
+impl ContainerLayout {
+    /// `total` is `S2D`'s slot count, including the player's 36.
+    pub fn from_slot_count(total: u8) -> Self {
+        let container = total.saturating_sub(36) as usize;
+        // `1 + rows*9` leaves a remainder of one; a plain chest is a multiple
+        // of nine.
+        let header = container >= 1 && container % 9 == 1;
+        let grid = container - usize::from(header);
+        Self {
+            rows: grid.div_ceil(9).clamp(1, 6) as u8,
+            header,
+        }
+    }
+
+    /// Slots taken by the container (leading slot + grid), i.e. the index of
+    /// the first player slot.
+    pub fn container_slots(self) -> usize {
+        usize::from(self.header) + self.rows as usize * 9
+    }
 }
 
 /// Ticks a furnace needs per smelted item (10 s at 20 tps).

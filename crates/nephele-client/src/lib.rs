@@ -21,7 +21,7 @@ use nephele_world::{
     decode_chunk_bulk, decode_chunk_data, ChunkColumn, ChunkCoord, ChunkUpdate, World,
 };
 
-pub use container::{ContainerKind, LocalContainer, LocalFurnace};
+pub use container::{ContainerKind, ContainerLayout, LocalContainer, LocalFurnace};
 pub use entities::{Entities, Entity, EntityKind};
 pub use mining::{Aim, Miner, MiningEvent};
 pub use skins::{SkinInfo, Skins};
@@ -33,22 +33,19 @@ pub struct OpenWindowState {
     pub kind: String,
     /// Total slots the server announced in `S2D`.
     ///
-    /// This is authoritative for a generic container: `rows * 9 + 36` for a
-    /// chest (the player's 36 slots sit below the container's), 46 for a
-    /// crafting table and 39 for a furnace. Derive the layout from this rather
-    /// than from `kind`, because a server can send any window size under a
-    /// fixed type string.
+    /// This is authoritative for a generic container. Hypixel's menus are
+    /// `1 + rows*9 + 36`: one leading slot in the title band, the grid, then
+    /// the player's 36. Derive the layout from this rather than from `kind`,
+    /// because a server can send any window size under a fixed type string.
     pub slot_count: u8,
     /// Slot contents as sent by `S30`; empty until the first resync.
     pub slots: Vec<Option<ItemStack>>,
 }
 
 impl OpenWindowState {
-    /// Rows of nine slots in the container section, derived from the announced
-    /// window size. Clamped to vanilla's `GuiChest` range.
-    pub fn container_rows(&self) -> u8 {
-        let container = self.slot_count.saturating_sub(36) as usize;
-        (container.div_ceil(9).clamp(1, 6)) as u8
+    /// Rows and leading-slot flag for a generic container window.
+    pub fn container_layout(&self) -> ContainerLayout {
+        ContainerLayout::from_slot_count(self.slot_count)
     }
 }
 
@@ -663,6 +660,13 @@ impl GameClient {
             play::clientbound::SET_SLOT => {
                 let update = play::parse_set_slot(&packet)?;
                 if update.window_id == 0 && update.slot >= 0 {
+                    // A server fills the lobby hotbar with individual Set Slot
+                    // packets, which can arrive before any Window Items has
+                    // sized the vector. Grow it here so the first item is not
+                    // dropped because slot 36 did not exist yet.
+                    if self.inventory.len() < play::PLAYER_CONTAINER_SLOTS {
+                        self.inventory.resize(play::PLAYER_CONTAINER_SLOTS, None);
+                    }
                     let slot = update.slot as usize;
                     if slot < self.inventory.len() {
                         self.inventory[slot] = update.item;
@@ -686,8 +690,14 @@ impl GameClient {
                             self.inventory[slot] = *item;
                         }
                     }
-                    for slot in update.items.len()..self.inventory.len() {
-                        self.inventory[slot] = None;
+                    // Only a full 45-slot snapshot is authoritative for the
+                    // whole container. A shorter one (some lobbies send only
+                    // the 36 main-inventory slots) must not wipe a hotbar that
+                    // arrived as individual Set Slot packets.
+                    if update.items.len() >= play::PLAYER_CONTAINER_SLOTS {
+                        for slot in update.items.len()..self.inventory.len() {
+                            self.inventory[slot] = None;
+                        }
                     }
                 } else if let Some(open) = self.open_window.as_mut() {
                     if update.window_id as u8 == open.id {
@@ -1476,8 +1486,9 @@ mod tests {
     async fn open_window_keeps_the_servers_slot_count() {
         let (mut client, _peer) = test_game_client().await;
 
-        // Hypixel's Game Menu: a six-row chest, 54 container slots + 36 player.
-        let packet = play::open_window(7, "minecraft:chest", "{\"text\":\"Game Menu\"}", 90);
+        // Hypixel's Game Menu: `1 + 6*9 + 36` = 91, one leading slot plus the
+        // grid and the player's half.
+        let packet = play::open_window(7, "minecraft:chest", "{\"text\":\"Game Menu\"}", 91);
         let event = client
             .handle(Packet::new(play::clientbound::OPEN_WINDOW, packet.data))
             .await
@@ -1491,14 +1502,55 @@ mod tests {
         );
 
         let open = client.open_window.as_ref().unwrap();
-        assert_eq!(open.slot_count, 90);
-        assert_eq!(open.container_rows(), 6);
+        assert_eq!(open.slot_count, 91);
+        let layout = open.container_layout();
+        assert_eq!((layout.rows, layout.header), (6, true));
+        assert_eq!(layout.container_slots(), 55);
 
-        // A single chest and a crafting table both keep their announced count.
-        client.open_window.as_mut().unwrap().slot_count = 63;
-        assert_eq!(client.open_window.as_ref().unwrap().container_rows(), 3);
-        client.open_window.as_mut().unwrap().slot_count = 46;
-        assert_eq!(client.open_window.as_ref().unwrap().container_rows(), 2);
+        // A plain chest and a three-row Ticket Machine both keep their count.
+        client.open_window.as_mut().unwrap().slot_count = 90;
+        let layout = client.open_window.as_ref().unwrap().container_layout();
+        assert_eq!((layout.rows, layout.header), (6, false));
+        client.open_window.as_mut().unwrap().slot_count = 64;
+        let layout = client.open_window.as_ref().unwrap().container_layout();
+        assert_eq!((layout.rows, layout.header), (3, true));
+        assert_eq!(layout.container_slots(), 28);
+    }
+
+    #[tokio::test]
+    async fn lobby_hotbar_arrives_before_window_items() {
+        let (mut client, _peer) = test_game_client().await;
+
+        // Hypixel fills the lobby hotbar with individual Set Slot packets
+        // before any Window Items sizes the vector.
+        for slot in 36..=44 {
+            client
+                .handle(play::set_slot(0, slot, Some(&ItemStack::new(4, 1, 0))))
+                .await
+                .unwrap();
+        }
+        assert_eq!(client.inventory[36], Some(ItemStack::new(4, 1, 0)));
+        assert_eq!(client.inventory[44], Some(ItemStack::new(4, 1, 0)));
+
+        // A full 45-slot snapshot keeps the 36..44 mapping.
+        let mut items = vec![None; play::PLAYER_CONTAINER_SLOTS];
+        items[36] = Some(ItemStack::new(276, 1, 0));
+        items[44] = Some(ItemStack::new(346, 1, 0));
+        client.handle(play::window_items(0, &items)).await.unwrap();
+        assert_eq!(client.inventory[36], Some(ItemStack::new(276, 1, 0)));
+        assert_eq!(client.inventory[44], Some(ItemStack::new(346, 1, 0)));
+
+        // A partial snapshot (main inventory only) must not wipe a hotbar that
+        // already arrived, or every item vanishes the moment it lands.
+        let mut partial = vec![None; 36];
+        partial[9] = Some(ItemStack::new(1, 1, 0));
+        client
+            .handle(play::window_items(0, &partial))
+            .await
+            .unwrap();
+        assert_eq!(client.inventory[9], Some(ItemStack::new(1, 1, 0)));
+        assert_eq!(client.inventory[36], Some(ItemStack::new(276, 1, 0)));
+        assert_eq!(client.inventory[44], Some(ItemStack::new(346, 1, 0)));
     }
 
     #[tokio::test]

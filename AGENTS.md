@@ -520,17 +520,30 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   matched after trimming empty rows/columns, so a shape can sit anywhere in the
   grid; stack sizes in the grid do not matter. Local singleplayer uses the same
   recipe matcher; a real multiplayer server still computes its own output.
-- **Server container windows are sized from `S2D`'s slot count (2026-11-05).**
-  `OpenWindowState.slot_count` keeps the packet's own count and
-  `container_rows()` derives `ceil((slot_count - 36) / 9)` clamped to 1..=6, so
-  Hypixel's six-row "Game Menu" (90 slots) is no longer drawn as a fixed
-  three-row chest. `live::window_kind_for` maps `minecraft:furnace` and
-  `minecraft:crafting_table` to their panels and everything else to
-  `ContainerKind::Chest { rows }`; `ui` crops `generic_54` to
-  `rows*18 + 17` plus the 96-pixel player section and puts the player slots at
-  `rows*18 + 31` / `rows*18 + 89`, matching `ContainerChest`. Server click
-  mapping is untouched: the raw window slot index goes straight back in `C0E`,
-  and only the local furnace/chest path uses the layout table.
+- **Generic container windows are `1 + rows*9 + 36` (2026-11-06).**
+  `OpenWindowState.slot_count` keeps `S2D`'s own count and
+  `ContainerLayout::from_slot_count` derives the layout: the player's 36 slots
+  are last, and if the remainder after removing them is `1 mod 9` the first
+  slot is a **header slot** (Hypixel's Game Menu, shop chests and Ticket
+  Machine). `ContainerKind::Chest { rows, header }` then draws `generic_54`
+  cropped to `rows*18 + 17` plus the 96-pixel player section, with the header
+  slot at `(8,0)` in the title band, grid slots `1..=rows*9` at
+  `(8 + i%9*18, 18 + i/9*18)`, and the player half at `rows*18 + 31` /
+  `rows*18 + 89`. Slot indices are the server's: a click on the header reports
+  0, the first grid cell 1, the first player slot `1 + rows*9` — the raw index
+  goes straight back in `C0E`, so left/right/shift all land on the slot the
+  server numbered. A plain chest (`rows*9 + 36`) has `header = false`; local
+  chests stay three rows with no header.
+- **The lobby hotbar needs three things to land (2026-11-06).** Hypixel fills
+  slots 36..44 with individual `S2F Set Slot` packets, which may arrive before
+  any `S30 Window Items`; `SET_SLOT` grows `inventory` to
+  `PLAYER_CONTAINER_SLOTS` (45) first, so they are not dropped. A full 45-entry
+  `Window Items` snapshot maps the hotbar to 36..44; a **shorter** snapshot
+  (some lobbies send only the 36 main-inventory slots) no longer clears
+  36..44, which used to wipe a hotbar that had already arrived. `draw_stack`
+  renders stack counts and a vanilla 13x2 durability bar (green→red via
+  `Color.HSBtoRGB(fraction/3, 1, 1)`, 1 px minimum) for any item with a
+  `max_damage` entry and `damage > 0`.
 - **HUD sprites are pinned to `icons.png`/`widgets.png` (2026-11-05).** Hearts
   sample x=52/61 (not 54/63, which drew a background plus a two-pixel-shifted
   overlay), food comes from y=27, the armour row from y=9 with vanilla item

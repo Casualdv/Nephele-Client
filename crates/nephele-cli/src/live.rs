@@ -277,7 +277,10 @@ fn open_local_chest(state: &mut Shared, pos: (i32, i32, i32)) {
     state.chests.entry(pos).or_insert_with(|| vec![None; 27]);
     state.window_slots = vec![None; 63];
     state.window_id = Some(1);
-    state.window_kind = Some(ContainerKind::Chest { rows: 3 });
+    state.window_kind = Some(ContainerKind::Chest {
+        rows: 3,
+        header: false,
+    });
     state.window_pos = Some(pos);
     state.window_open = true;
     sync_local_chest(state);
@@ -285,18 +288,22 @@ fn open_local_chest(state: &mut Shared, pos: (i32, i32, i32)) {
 
 /// Map a server window's inventory type onto the panel the UI draws.
 ///
-/// The row count comes from `OpenWindowState::container_rows`, which reads
-/// `S2D`'s own slot count rather than the type string: Hypixel sends
-/// `minecraft:chest` for every menu, from a one-row reward summary to the
-/// six-row Game Menu, so the string alone cannot size the panel.
+/// The row count and leading slot come from `OpenWindowState::container_layout`,
+/// which reads `S2D`'s own slot count rather than the type string: Hypixel
+/// sends `minecraft:chest` for every menu, from a one-row reward summary to the
+/// six-row Game Menu, and sizes them `1 + rows*9 + 36`.
 fn window_kind_for(open: &OpenWindowState) -> ContainerKind {
     let name = open.kind.rsplit(':').next().unwrap_or(&open.kind);
     match name {
         "furnace" => ContainerKind::Furnace,
         "crafting_table" => ContainerKind::CraftingTable,
-        _ => ContainerKind::Chest {
-            rows: open.container_rows(),
-        },
+        _ => {
+            let layout = open.container_layout();
+            ContainerKind::Chest {
+                rows: layout.rows,
+                header: layout.header,
+            }
+        }
     }
 }
 
@@ -314,8 +321,8 @@ fn simple_window_slot(index: usize, kind: ContainerKind) -> Option<SlotStore> {
             3..=38 => Some(SlotStore::Player(index - 3)),
             _ => None,
         },
-        ContainerKind::Chest { rows } => {
-            let container = rows as usize * 9;
+        ContainerKind::Chest { rows, header } => {
+            let container = usize::from(header) + rows as usize * 9;
             if index < container {
                 Some(SlotStore::Container(index))
             } else if index < container + 36 {
@@ -340,7 +347,7 @@ fn click_local_simple_container(state: &mut Shared, index: usize, button: i8, sh
         return;
     };
     let container_len = match kind {
-        ContainerKind::Chest { rows } => rows as usize * 9,
+        ContainerKind::Chest { rows, header } => usize::from(header) + rows as usize * 9,
         _ => 3,
     };
 
@@ -3522,21 +3529,44 @@ mod tests {
     }
 
     #[test]
-    fn server_window_rows_come_from_the_announced_slot_count() {
-        // A chest window is `rows * 9 + 36`. Hypixel's six-row Game Menu
-        // announces 90, so the panel must not fall back to the three-row chest
-        // just because the type string is `minecraft:chest`.
+    fn server_window_layout_comes_from_the_announced_slot_count() {
+        // Hypixel's menus are `1 + rows*9 + 36`: six rows is 91, three is 64.
+        // The leading slot is what keeps the player half at 1+rows*9.
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 91)),
+            ContainerKind::Chest {
+                rows: 6,
+                header: true
+            }
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 64)),
+            ContainerKind::Chest {
+                rows: 3,
+                header: true
+            }
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 46)),
+            ContainerKind::Chest {
+                rows: 1,
+                header: true
+            }
+        );
+        // A plain chest has no leading slot.
         assert_eq!(
             window_kind_for(&window("minecraft:chest", 90)),
-            ContainerKind::Chest { rows: 6 }
+            ContainerKind::Chest {
+                rows: 6,
+                header: false
+            }
         );
         assert_eq!(
             window_kind_for(&window("minecraft:chest", 63)),
-            ContainerKind::Chest { rows: 3 }
-        );
-        assert_eq!(
-            window_kind_for(&window("minecraft:chest", 45)),
-            ContainerKind::Chest { rows: 1 }
+            ContainerKind::Chest {
+                rows: 3,
+                header: false
+            }
         );
         // The special panels keep their own layout.
         assert_eq!(
@@ -3547,10 +3577,13 @@ mod tests {
             window_kind_for(&window("minecraft:furnace", 39)),
             ContainerKind::Furnace
         );
-        // A type we do not know still draws as a chest of the right height.
+        // A type we do not know still draws as a chest of the right shape.
         assert_eq!(
-            window_kind_for(&window("minecraft:dispenser", 63)),
-            ContainerKind::Chest { rows: 3 }
+            window_kind_for(&window("minecraft:dispenser", 64)),
+            ContainerKind::Chest {
+                rows: 3,
+                header: true
+            }
         );
     }
 
