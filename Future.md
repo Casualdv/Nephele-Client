@@ -125,7 +125,8 @@ the unported population pass can place.
 
 | Item | Size | Notes |
 |---|---|---|
-| **Two-stage pipeline (`provideChunk` + `populate`) + `GenWorld` shim** | L | **Done 2026-11-05:** terrain → surface → caves → ravines → structure-start discovery → height map, then a `populate` driver with vanilla's 2×2 eligibility rule. `populate_owner` still calls an empty `decorate` stub. |
+| **Two-stage pipeline (`provideChunk` + `populate`) + `GenWorld` shim** | L | **Done 2026-11-05:** terrain → surface → caves → ravines → structure-start discovery → height map, then a `populate` driver with vanilla's 2×2 eligibility rule. The overworld's `populate_owner` still calls an empty `decorate` stub. |
+| **Nether generation (`ChunkProviderHell`, caves, glowstone/quartz/fire/springs) and the End island + obsidian pillars** | L | **Done 2026-11-06:** `nether.rs`, `end.rs`, `hell_caves.rs`, `Dimension`, `ChunkGenerator`, `nephele view --dimension`. Nether fortresses, the End dragon and the End's dead surface pass are out of scope; pillars are deterministic here because vanilla's RNG is unseeded. Lava-sea behaviour still needs a saved-world check (AGENTS.md §6). |
 | **Mesa** stratified hardened clay | M | The last missing biome override. |
 | Caves (`MapGenCaves`) and ravines | L | **Implemented** in `provide_chunk`; shape shows up as the buried part of the block diff (18,235 blocks). |
 | Ores + granite/diorite/andesite, dirt/gravel/clay pockets | M | **Population stage, not wired.** `ores.rs` still exists but is no longer called: its seed and `+8` offsets only make sense inside `populate`. |
@@ -278,9 +279,9 @@ and worktree for each.
 | Lane | Done | What is left |
 |---|---:|---|
 | `render` | 95% | shape audit leftovers; first-person hand depth-clear |
+
 | `biomes` | 100% | nothing — every GenLayer stage diffs 0 against the oracle |
-| `worldgen` | 15% | `provide_chunk`/`populate` split landed; caves, ores, flora, structures |
-| `survival` | 90% | eating, potions, enchantments, XP orbs |
+| `worldgen` | 15% | `provide_chunk`/`populate` split landed; caves, ores, flora, structures || `survival` | 90% | eating, potions, enchantments, XP orbs |
 | `net` | 95% | resource packs, reconnect polish |
 | `client-ui` | 20% | scoreboard rendering, chat colours, HUD modules, keybinds |
 | `entities` | 60% | skins and second layer, equipment, frame rendering, particles |

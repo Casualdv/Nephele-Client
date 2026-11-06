@@ -114,6 +114,7 @@ cargo build --bins
 .\scripts\check_public_tree.ps1          # publish gate
 
 cargo run -p nephele -- view --seed 12345        # offline world demo
+cargo run -p nephele -- view --dimension nether  # ... or nether / end
 cargo run -p nephele -- play <host:port>         # offline-mode join
 cargo run -p nephele -- play <host:port> --online  # Microsoft-authed join
 cargo run -p nephele -- auth [--legacy] [--client-id <id>]
@@ -294,6 +295,52 @@ is a 625-chunk block export (structures on) produced by
 against it chunk by chunk. Compare only the inner area: the outermost ring of the
 fixture lacks some of its populated neighbours.
 
+### The Nether and the End (2026-11-06)
+
+Both are ported from their providers and selectable through
+[`ChunkGenerator`](../crates/nephele-world/src/generator.rs):
+
+| Piece | File | State |
+|---|---|---|
+| `Dimension` | `dimension.rs` | ids `0/-1/1`, `has_skylight`, `actual_height` (128 for no-sky) |
+| `ChunkProviderHell` | `nether.rs` | density field, soul sand/gravel/bedrock surface, lava below `63/2+1`, hell caves, fire/glowstone/quartz/lava-spring/mushroom decoration |
+| `MapGenCavesHell` | `hell_caves.rs` | 17×17 source sweep, room+tunnel carver, lava-abort shell scan, `MathHelper` sin/cos table (`math.rs`) |
+| `ChunkProviderEnd` | `end.rs` | radial island density, end-stone fill, obsidian pillars via `WorldGenSpikes` |
+
+- **The nether shares one `Random` between `provide_chunk` and `populate`.**
+  `ChunkProviderHell.populate` never reseeds: it continues the stream left by the
+  `provideChunk` that loaded the triggering chunk, so decoration depends on load
+  order (unlike the overworld, whose population seed is per-owner). The port keeps
+  one `JavaRandom` and the glue calls `provide_chunk` immediately before
+  `populate`, mirroring `ChunkProviderServer.loadChunk`.
+- **The End's pillars are not vanilla-reproducible.** `ChunkProviderEnd.populate`
+  decorates with `World.rand = new Random()` (unseeded), so vanilla pillar positions
+  differ every server start. This port seeds a `Random` per owner chunk from the
+  chunk coordinates: shape, height distribution and the 1-in-5 rate are vanilla;
+  positions are deterministic instead of random. `generateOres()` and the dragon
+  spawn are omitted (the ore pass places nothing — its predicate is `stone`, the
+  End is `end_stone` — and the dragon is out of scope).
+- **Nether structures are not ported.** `MapGenNetherBridge` is a no-op, so a
+  chunk containing a fortress piece differs from vanilla, including the `Random`
+  draws the piece would have consumed. That is a stated non-goal.
+- **Lava springs** (`WorldGenHellLava`) place static lava: vanilla's forced tick
+  turns the flowing source static immediately, then lets it flow into its one air
+  neighbour using the world RNG. The cascade is not modelled, so a spring with an
+  air neighbour matches at the source and is missing its downstream flow.
+- **The MCP tree's `WorldGenGlowStone2` is a copy of `WorldGenGlowStone1`** (both
+  grow downward); vanilla 1.8 ships `+rand.nextInt(12)` in `GlowStone2`. The port
+  follows vanilla's upward draw for the second generator. Not yet checked against
+  a saved world.
+- **Skylight.** Nether/End chunk sections carry no sky-light array; `World::new`
+  already derives `has_skylight` from the dimension, and decode/mesh read it. The
+  End still builds the height map (`generateSkylightMap` does that in both
+  dimensions); the nether does **not** — vanilla leaves its height map at zero,
+  and nothing in the nether's generation reads it.
+- **Open question — the lava sea.** On seed 12345 the reference code (compiled
+  from the real `NoiseGenerator*` classes and the provider's terrain/surface pass)
+  produces only a sparse lava layer around y=24..31, not a full ocean. The Rust
+  port matches that output; no saved Nether exists to say whether the game differs.
+  See §13.
 
 ### The biome bug — solved 2026-11-05
 
@@ -725,9 +772,9 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | Lane | Owns | Branch | State |
 |---|---|---|---|
 | `render` | shapes, tinting, sky, fog | `render` | 95%: bars, fire, plant culling and biome tint landed; audit leftovers |
+
 | `biomes` | GenLayer parity | `biomes` | **100% biome cells, every stage diff 0 — lane complete** |
-| `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) |
-| `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
+| `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) || `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
 | `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | 95%: scoreboards, teams, `C02`, maps and frames all parsed |
 | `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | 20%: worktree exists, nothing landed yet |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
@@ -799,7 +846,37 @@ re-serialize the chunk wholesale.
 
 **Worldgen**
 
-- `getBiomesForGeneration` reads `initializeAllBiomeGenerators()[0]` — the coarse
+- **The Nether is not the overworld with different blocks.** Its provider shares
+  one `Random` between `provideChunk` and `populate`, so decoration depends on the
+  last chunk generated, not on the owner's coordinates; `provide_chunk` must be
+  called immediately before `populate` or the stream is wrong. The End is the
+  opposite: its decoration RNG is unseeded in vanilla, so the port seeds per chunk
+  and cannot match vanilla pillar positions.
+- **`ChunkProviderHell` does not build a height map** (no `generateSkylightMap`);
+  `World.getHeight` returns 0 during its generation. Nothing in the nether path
+  reads it, so do not "fix" this by adding one — it would diverge from vanilla.
+- **`MapGenCavesHell` aborts a carve when its bounding box touches lava**, and
+  samples only the box shell for that test. It never *places* lava; the sea comes
+  from the density default. The shell snap (`l1 = k2`) is load-bearing.
+- **Vanilla's `MathHelper.sin/cos` are 65,536-entry table lookups**, not libm
+  calls; `crates/nephele-world/src/math.rs` reproduces the table and the
+  `(int)(x*10430.378F) & 65535` masking. The carvers use it.
+- **The MCP 9.19 `WorldGenGlowStone2` in `Nephele-private` is a byte-for-byte copy
+  of `WorldGenGlowStone1`** (both grow downward). Vanilla 1.8 grows the second one
+  upward; the port follows vanilla. Re-check against a saved Nether when one exists.
+- **Lava springs are static in the port.** `WorldGenHellLava` places flowing lava
+  and forces an immediate tick; vanilla's first tick turns it static, then flows
+  it into its single air neighbour with the world RNG. Only the source conversion
+  is modelled.
+- **`ChunkProviderEnd.func_180519_a` is dead code.** It rewrites `Blocks.stone`,
+  but the End's primer is `end_stone`, so it does nothing. Preserve that.
+- **Open question: the nether lava sea.** Compiling the real noise classes and a
+  faithful transcription of `func_180515_a/b` on seed 12345 yields a mostly-solid
+  low nether with a sparse lava layer at y≈24..31, not a global ocean. The Rust
+  port matches that output byte-for-byte at the noise level. No saved Nether exists
+  to settle whether the shipped game differs; produce one before changing the
+  density sign or the `seaLevel / 2 + 1` threshold.
+- **`getBiomesForGeneration` reads `initializeAllBiomeGenerators()[0]` — the coarse
   **1:64 RiverMix layer** — not the 1:1 voronoi map. Getting this wrong was a 50.7%
   error; fixing it dropped it to 4%. Then terrain height converged to 96%.
 - `NoiseGeneratorSimplex`'s 2D path uses `xCoord` + **`yCoord`**, not `zCoord`.
@@ -880,12 +957,12 @@ re-serialize the chunk wholesale.
 - Reference-world checks live in `genlayer.rs`, `worldgen.rs` and
   `tests/block_parity.rs`. `chunk_biomes_match_a_world_the_real_server_generated`
 
+
   pins chunk `(-28, 4)`; the biome map is **100%** (0 / 160,000 cells, 2026-11-08),
   and `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **530 test cases across the workspace** (528 passed, 2 ignored, including two  doctests). `nephele-cli` has 80 passing tests; `nephele-assets` has 39;
-  `nephele-render` has 50 passing tests, including seven shape-meshing
-  regressions; `nephele-world` has 146 passing tests and one ignored, including
-  the two `block_parity` harness tests. The six real-socket tests in
+- **530 test cases across the workspace** (528 passed, 2 ignored, including two  doctests). `nephele-cli` has 80 passing tests; `nephele-assets` has 39;  `nephele-render` has 50 passing tests, including seven shape-meshing
+  regressions; `nephele-world` has 168 library tests and one ignored, plus the two
+  `block_parity` harness tests. The six real-socket tests in
   `crates/nephele-client/tests/join_mock.rs` cover status, compression, chat,
   joining/loading the mock world, drop pickup, and crafting planks through `C0E`.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
