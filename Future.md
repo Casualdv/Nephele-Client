@@ -76,20 +76,29 @@ own 1.8.9 jar by `nephele-prepare`, verified against `research-lock.json`.
 
 ## Where we are today
 
-Working: protocol 47 handshake / login / status / join, chunk codec + light,
-wgpu renderer, worker-pooled meshing, player skins, bitmap font + UI atlas,
-title / pause / settings / connect / creative screens, HUD (hotbar, crosshair,
-health), physics (walk, sprint, sneak, fly, jump, sneak edge protection),
-mining + placement, creative inventory, anvil **reading**, biomes + density
-height field + surface pass, shape-aware block meshing (slabs, stairs, fence
-posts, panes, doors and torches), animated textures, mipmapped filtering,
-procedural sky and per-biome fog, frustum + height-field occlusion culling,
-a per-frame upload budget, damage vignette, launcher, CI, verified-resource
-preparation. Performance bar: 143 fps / p99 7.41 ms on the integrated AMD
-Radeon at 1280×720, view distance 8, vsync off (`NEPHELE_PERF=1`).
+Working: protocol 47 handshake / login / status / join, **live play on a real 1.8.9
+server** (Hypixel, 169 chunks, no desync), chunk codec + light, wgpu renderer,
+worker-pooled meshing, player skins, bitmap font + UI atlas, title / pause /
+settings / connect / creative screens, HUD (hotbar, crosshair, health, hunger,
+armour), physics (walk, sprint, sneak, fly, jump, sneak edge protection, slime
+bounce), mining + placement, creative inventory, anvil **reading and writing**,
+vanilla-compatible world saves (level.dat with player state, unknown-NBT
+preservation, atomic writes with backups, region compaction, weather), biomes +
+density height field + surface pass, shape-aware block meshing (slabs, stairs,
+fences, panes, bars, doors, torches, fire, cross-plants with correct culling),
+animated textures, mipmapped filtering, procedural sky and per-biome fog, grass
+tinting, frustum + height-field occlusion culling, a per-frame upload budget,
+damage vignette, **scoreboards + teams + chat**, **maps, item frames and entity
+metadata**, players with head yaw and armour-stand holograms, **audio** (symphonia
+decode, kira mixing, break/place/step/hurt), launcher, CI, verified-resource
+preparation. Performance: 143 fps / p99 7.4 ms on integrated AMD at 1280×720,
+view distance 8, vsync off, with a committed baseline that fails the build on
+regression.
 
 Measured parity against a world the real 1.8.9 server generated: **92.8%** of
-biome cells, **96%** of surface heights, **98.8%** of surface block types.
+biome cells, **96%** of surface heights, **98.8%** of surface block types. The
+Hills variance layer has since been reseeded the way vanilla does it; that number
+needs re-measuring before it is quoted again.
 
 ---
 
@@ -259,26 +268,27 @@ No audio exists yet.
 
 ## Milestones
 
-**M0 — Foundations (done).** Protocol, rendering, movement, worldgen height
-field, launcher, CI.
+The M-numbers are retired — they collided (`M5` was both world saves and the
+product; `M6` was both entities and performance). Lanes are named, and each one
+reports a percentage rather than a status word. `AGENTS.md` §12 holds the branch
+and worktree for each.
 
-**M1 - A world worth walking in.** *Rendering done:* mesa, caves, ores, flora, shape-aware meshing (slabs, stairs, fences, panes that connect, doors, torches), smooth lighting with ambient occlusion, animated textures, mipmapped filtering, procedural sky with sun/moon/stars/clouds and per-biome fog, frustum + height-field occlusion culling, a per-frame upload budget and damage vignette. *Still open:* biome-map parity, currently 92.8175% against the reference world - the world is right at scale and wrong in patches. *Exit:* singleplayer world looks like Minecraft from above and from underground.
+| Lane | Done | What is left |
+|---|---:|---|
+| `render` | 95% | shape audit leftovers; first-person hand depth-clear |
+| `biomes` | ? | Hills reseeded, **re-measure**; remaining divergence downstream |
+| `worldgen` | 15% | `provide_chunk`/`populate` split landed; caves, ores, flora, structures |
+| `survival` | 90% | eating, potions, enchantments, XP orbs |
+| `net` | 95% | resource packs, reconnect polish |
+| `client-ui` | 20% | scoreboard rendering, chat colours, HUD modules, keybinds |
+| `entities` | 60% | skins and second layer, equipment, frame rendering, particles |
+| `audio` | 35% | music, volume settings, positional falloff tuning |
+| `saves` | 90% | live memory walk; tile entities dropped on imported chunks |
+| `perf` | 100% | Intel HD-class hardware still unverified |
+| `product` | 25% | launcher v2, updater, installer, legal — blocked on code signing |
 
-**M2 - Survival loop.** *Exit criterion met offline.* A recorded play-through punched logs, made planks, sticks and a crafting table through the 2x2 grid, placed the table, opened the 3x3 window and crafted a wooden pickaxe - correct counts, no item loss. The block atlas now loads every `textures/blocks` PNG, packs sixteen tiles per layer (488 tiles in 31 layers) and reports unresolved names at boot, so the device-limit clip is gone; mipmaps survive because each tile is downsampled before its level is packed. Remaining polish, none of it blocking the exit: eating, armour effects, XP orbs, block entities, real GUI art and item-icon coverage.
-
-**M3 — Join a real server.** Microsoft auth (**done**, missing only a shippable
-Azure client id), server list (**done**), online-mode handshake (**done**),
-dimension change. *Exit:* join a public 1.8.9 server and play.
-
-**M4 — PvP client.** HUD modules, toggle sprint, zoom, crosshair/hit indicators,
-chat, scoreboard, tab list. *Exit:* playable at a competitive level on an old
-laptop.
-
-**M5 — Product.** Launcher v2, auto-update, crash reporting, legal pages,
-installer. *Exit:* a stranger can download, install and play without help.
-
-**M6 — Depth.** Entities and mobs, block entities, particles, audio, singleplayer
-saving, structures.
+**Overall: roughly 60% of a shippable PvP client.** What is missing is no longer
+engine work — it is UI chrome, entity detail and content breadth.
 
 ---
 

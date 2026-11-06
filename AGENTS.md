@@ -630,17 +630,18 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 
 | Lane | Owns | Branch | State |
 |---|---|---|---|
-| `render` | shapes, tinting, sky, fog | `render` | bars/fire/flowers left |
-| `biomes` | GenLayer parity (92.8%) | `biomes` | active, isolated |
-| `worldgen` | two-stage generation, caves, ores, flora, structures (phases W1–W5) | `w-worldgen` | not started |
-| `survival` | inventory, containers, HUD art | `survival` | 85%, HUD art left |
-| `net` | protocol, real servers, maps, frames, metadata | `net` | needs rebase, then merge |
-| `client-ui` | chat colours, settings, loading screen, modules | — | not started |
-| `saves` | `level.dat`, player data, region writing | `saves` | 90%, needs landing |
-| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 35% |
-| `perf` | startup, view distance, baseline gate | `perf` | done, needs merge |
-| `audio` | everything sound | — | 0%, unassigned |
-| `product` | launcher v2, updater, installer, legal | `saves` (WIP commit) | 25%, blocked on signing |
+| `render` | shapes, tinting, sky, fog | `render` | 95%: bars, fire, plant culling and biome tint landed; audit leftovers |
+| `biomes` | GenLayer parity | `biomes` | Hills variance reseeded vanilla-style; **re-measure before quoting 92.8%** |
+| `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | `provide_chunk`/`populate` split done; generators next |
+| `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
+| `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | 95%: scoreboards, teams, `C02`, maps and frames all parsed |
+| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | 20%: worktree exists, nothing landed yet |
+| `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
+| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
+| `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
+| `audio` | everything sound | `audio` | 35%: symphonia + kira, break/place/step/hurt |
+| `product` | launcher v2, updater, installer, legal | `saves-landing` (WIP commit) | 25%, blocked on code signing |
+
 
 Rules that hold across all of them: one worktree per lane (never edit the main
 checkout), its own `target/`, and `scripts/run_client.ps1 -Session <lane>` for
