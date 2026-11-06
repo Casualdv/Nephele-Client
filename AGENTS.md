@@ -6,6 +6,31 @@ of a task. Keep it accurate when you change behaviour.
 
 ---
 
+## 0. Standing rules (every session, no exceptions)
+
+1. **Work in your own worktree.** Create or use `np-<lane>` on branch `<lane>`; §12
+   lists the lanes. **Never edit the main checkout** at
+   `C:\Users\dariu\Desktop\Nephele Client` — that is where merges land and where every
+   other lane's rebase passes through. Build into your own `target/`.
+2. **One client at a time.** Test through `scripts/run_client.ps1 -Session <lane>`,
+   never a bare `nephele.exe`. Two clients fight over the window and over a single
+   Microsoft account (which is how a 503 from the session server happens).
+3. **Stay in your lane's files.** If you need a change in another lane — a protocol
+   field, an atlas change — say so in your report instead of editing it. A second
+   copy of the atlas or of a parser is worse than waiting.
+4. **Licence.** `Nephele-private` is read-only reference: read the decompiled 1.8.9
+   sources, reimplement in Rust, cite the class in a comment. Never copy code, assets
+   or data into this repository. GPL projects (`PommeMC`, `minecrab`) are read-only.
+5. **Gates before pushing.** `cargo fmt --all -- --check`,
+   `cargo clippy --workspace --all-targets -- -D warnings`,
+   `cargo test --workspace`, `scripts/check_public_tree.ps1`. Push your branch; **do
+   not merge to `main`** — the integrator merges.
+6. **Report honestly.** What changed, what you verified and with which command or
+   screenshot, and what you did **not** verify. Write "not verified" rather than
+   implying it. A known gap is worth more than a confident guess.
+
+---
+
 ## 1. What this is
 
 Nephele is a **from-scratch Rust client for Minecraft Java Edition 1.8.9**
