@@ -34,6 +34,9 @@ pub trait GenWorld {
     /// `ChunkProvider.chunkExists(chunkX, chunkZ)`.
     fn has_chunk(&self, chunk_x: i32, chunk_z: i32) -> bool;
 
+    /// Store a freshly generated chunk: `ChunkProviderServer`'s "load" step.
+    fn insert_chunk(&mut self, column: ChunkColumn);
+
     /// `Chunk.isTerrainPopulated`.
     fn is_terrain_populated(&self, chunk_x: i32, chunk_z: i32) -> bool;
 
@@ -155,6 +158,10 @@ impl GenWorld for TestWorld {
         self.chunks.contains_key(&ChunkCoord::new(chunk_x, chunk_z))
     }
 
+    fn insert_chunk(&mut self, column: ChunkColumn) {
+        self.insert(column);
+    }
+
     fn is_terrain_populated(&self, chunk_x: i32, chunk_z: i32) -> bool {
         self.chunk(chunk_x, chunk_z)
             .map(ChunkColumn::is_terrain_populated)
@@ -191,6 +198,10 @@ impl GenWorld for World {
 
     fn has_chunk(&self, chunk_x: i32, chunk_z: i32) -> bool {
         self.contains(ChunkCoord::new(chunk_x, chunk_z))
+    }
+
+    fn insert_chunk(&mut self, column: ChunkColumn) {
+        self.insert(column);
     }
 
     fn is_terrain_populated(&self, chunk_x: i32, chunk_z: i32) -> bool {

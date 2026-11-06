@@ -6,8 +6,7 @@ use std::time::Instant;
 
 use nephele_assets::{TextureArray, UiAtlas};
 use nephele_render::{build_world_mesh, Camera, Environment, Renderer};
-use nephele_world::worldgen::VanillaGenerator;
-use nephele_world::World;
+use nephele_world::{ChunkGenerator, Dimension, World};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -23,6 +22,7 @@ pub struct ViewerOptions {
     pub assets_dir: PathBuf,
     pub speed: f32,
     pub seed: i64,
+    pub dimension: Dimension,
 }
 
 pub fn run(options: ViewerOptions) -> Result<(), Box<dyn Error>> {
@@ -134,11 +134,11 @@ impl Viewer {
         }
 
         let seed = self.options.seed;
-        let mut generator = VanillaGenerator::new(seed);
-        self.world = World::new(0);
+        let dimension = self.options.dimension;
+        let mut generator = ChunkGenerator::new(dimension, seed);
+        self.world = World::new(dimension.id());
         // Two stages, as vanilla: `provide_chunk` per chunk, then the population
-        // pass once a chunk's 2x2 neighbourhood exists. Population places nothing
-        // yet (see AGENTS.md §6), but the order is the real one.
+        // pass once a chunk's 2x2 neighbourhood exists.
         for cx in -self.options.radius..=self.options.radius {
             for cz in -self.options.radius..=self.options.radius {
                 self.world.insert(generator.provide_chunk(cx, cz));
@@ -147,14 +147,15 @@ impl Viewer {
         }
         let mesh = build_world_mesh(&self.world, &textures);
         println!(
-            "World: {} chunks, {} vertices, {} triangles",
+            "{}: {} chunks, {} vertices, {} triangles",
+            dimension.label(),
             self.world.loaded_chunks(),
             mesh.vertices.len(),
             mesh.indices.len() / 3
         );
         renderer.set_mesh(&mesh);
 
-        let spawn_height = generator.height_at(8, 8) as f32;
+        let spawn_height = self.world.height_at(8, 8).unwrap_or(64) as f32;
         self.spawn = glam::Vec3::new(8.5, spawn_height + 9.0, 8.5);
         self.camera.position = glam::Vec3::new(8.5, spawn_height + 9.0, 8.5);
         self.camera.set_aspect(size.width, size.height);
