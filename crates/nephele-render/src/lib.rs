@@ -4,14 +4,19 @@
 //! layout, fully testable without a GPU. The GPU half ([`gpu`]) owns the
 //! surface, pipelines and draw calls.
 
+pub mod beacon;
 pub mod camera;
 pub mod entity;
 pub mod environment;
 pub mod gpu;
 pub mod lines;
 pub mod mesh;
+pub mod particles;
 pub mod ui;
 
+pub use beacon::{
+    beam_at, beams_in_column, build_beams, dye_color, find_beams, BeaconBeam, BeaconSegment,
+};
 pub use camera::Camera;
 pub use entity::{
     append_hand, build_entities, EntityDraw, EntityMesh, EntityVertex, HandDraw, HandPose,
@@ -24,4 +29,5 @@ pub use mesh::{
     build_item_mesh, build_world_mesh, mesh_column, ColumnMeshJob, HandItem, ItemDraw, MeshData,
     Vertex,
 };
+pub use particles::{note_color, Particles};
 pub use ui::{Rect, UiBatch, UiVertex};

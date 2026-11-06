@@ -33,6 +33,8 @@ pub mod clientbound {
     pub const CHUNK_DATA: i32 = 0x21;
     pub const MULTI_BLOCK_CHANGE: i32 = 0x22;
     pub const BLOCK_CHANGE: i32 = 0x23;
+    /// `S24`: a block did something visible (note blocks, chests, ...).
+    pub const BLOCK_ACTION: i32 = 0x24;
     pub const BLOCK_BREAK_ANIMATION: i32 = 0x25;
     pub const MAP_CHUNK_BULK: i32 = 0x26;
     pub const SET_SLOT: i32 = 0x2F;
@@ -609,6 +611,40 @@ pub fn parse_block_break_animation(packet: &Packet) -> Result<BlockBreakAnimatio
         y,
         z,
         stage,
+    })
+}
+
+/// `S24 Block Action`: `(position, event, data, block id)`.
+///
+/// Vanilla dispatches it to `Block.onBlockEventReceived`. A note block sends
+/// event = instrument (0..4) and data = note (0..24), which is what drives the
+/// note particle and its pitch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockAction {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+    /// Block-specific event id (the instrument for a note block).
+    pub event: u8,
+    /// Block-specific parameter (the note, 0..=24).
+    pub data: u8,
+    pub block_id: i32,
+}
+
+pub fn parse_block_action(packet: &Packet) -> Result<BlockAction> {
+    let mut r = packet.reader();
+    let (x, y, z) = r.read_position()?;
+    let event = r.read_u8()?;
+    let data = r.read_u8()?;
+    // Vanilla masks the id field; metadata bits in the high half are ignored.
+    let block_id = r.read_varint()? & 4095;
+    Ok(BlockAction {
+        x,
+        y,
+        z,
+        event,
+        data,
+        block_id,
     })
 }
 
@@ -1884,6 +1920,27 @@ pub fn parse_use_entity(packet: &Packet) -> Result<(i32, i32, Option<[f32; 3]>)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_a_note_block_action() {
+        let mut w = PacketWriter::new();
+        write_position(&mut w, 10, 64, -3);
+        w.write_u8(2).write_u8(7).write_varint(25);
+        let action =
+            parse_block_action(&Packet::new(clientbound::BLOCK_ACTION, w.into_bytes())).unwrap();
+        assert_eq!(
+            action,
+            BlockAction {
+                x: 10,
+                y: 64,
+                z: -3,
+                // Instrument 2 (snare), note 7, note block id 25.
+                event: 2,
+                data: 7,
+                block_id: 25,
+            }
+        );
+    }
 
     #[test]
     fn parses_join_game() {

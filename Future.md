@@ -160,8 +160,8 @@ per render frame — it no longer does. Keep new simulation work inside
 | Item entities rendering with correct spin/bob | **done** | `build_item_mesh`: a 0.25-block textured cube, spinning and bobbing. Non-block items draw the missing-texture tile until the item atlas exists. |
 | Slim (Alex) player model, capes | S | |
 | Player nametags above heads | S | |
-| Particles (block break, splash, smoke, flame, crit, portal) | M | Port from Leafish `particle/`. |
-| Block entities: signs, chests, banners, beacon beam, enchanting table book | L | Port from Leafish `entity/block_entity/`. |
+| Particles (block break, splash, smoke, flame, crit, portal) | M | **Block-break debris, note particles and beacon beams done** (`nephele-render::{particles, beacon}`). Debris are block-atlas quads in the break-overlay buffer; notes are coloured billboards in the entity buffer; beams are an additive pass over the entity vertex format. Splash/smoke/flame/crit/portal and the `textures/particle` sheet are still missing. |
+| Block entities: signs, chests, banners, beacon beam, enchanting table book | L | **Beacon beam done**, derived from the world (stained glass/pane colour, obstruction check, additively blended). Signs, chests, banners and the enchanting-table book are still missing. |
 
 ### 5. Inventory, containers and survival
 

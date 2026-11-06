@@ -4,7 +4,7 @@
 //! (a small tokio runtime); the window thread only renders and feeds input.
 //! Chunks travel between them as plain messages.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -26,9 +26,10 @@ use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
 use nephele_render::{
-    append_hand, biome_fog_color, block_outline, break_overlay_texture, build_break_overlay,
-    build_entities, build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw,
-    Environment, HandDraw, HandItem, ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
+    append_hand, beams_in_column, biome_fog_color, block_outline, break_overlay_texture,
+    build_beams, build_break_overlay, build_entities, build_hand_item, build_item_mesh, BeaconBeam,
+    Camera, ColumnMeshJob, EntityDraw, Environment, HandDraw, HandItem, ItemDraw, LineMesh,
+    MeshData, Particles, Renderer, UiBatch,
 };
 use nephele_world::save::{
     self, SavedItemStack, SavedPlayerState, WorldMetadata, WorldMode, WorldSave,
@@ -92,6 +93,20 @@ enum NetMsg {
     Entities(Vec<EntitySnapshot>),
     /// Tab-list skin hashes (uuid, texture hash).
     Skins(Vec<([u8; 16], String)>),
+    /// A block was destroyed (or placed) near the player; throw debris.
+    BlockEffect {
+        x: i32,
+        y: i32,
+        z: i32,
+        state: u16,
+    },
+    /// A note block played; `pitch` is its note (0..=24).
+    NoteBlock {
+        x: i32,
+        y: i32,
+        z: i32,
+        pitch: u8,
+    },
     Error(String),
 }
 
@@ -630,6 +645,12 @@ fn local_loop(
         for event in miner.tick(&world, aim, attacking, creative) {
             if let MiningEvent::Stop(target) = event {
                 let broken = world.get_block(target.x, target.y, target.z);
+                let _ = tx.send(NetMsg::BlockEffect {
+                    x: target.x,
+                    y: target.y,
+                    z: target.z,
+                    state: broken.raw(),
+                });
                 world.set_block(target.x, target.y, target.z, BlockState::AIR);
                 dirty.insert((target.x.div_euclid(16), target.z.div_euclid(16)));
                 if !creative {
@@ -689,6 +710,12 @@ fn local_loop(
                             && !placement_hits_player(&aim, player_feet)
                         {
                             world.set_block(bx, by, bz, block);
+                            let _ = tx.send(NetMsg::BlockEffect {
+                                x: bx,
+                                y: by,
+                                z: bz,
+                                state: state_block,
+                            });
                             dirty.insert((bx.div_euclid(16), bz.div_euclid(16)));
                             if !creative {
                                 consume_held_block(
@@ -793,6 +820,20 @@ fn look_direction(yaw: f32, pitch: f32) -> [f64; 3] {
         sin_pitch as f64,
         (-cos_yaw * cos_pitch) as f64,
     ]
+}
+
+/// Tell the UI thread to throw debris for the block at `target`, using the
+/// state the world still has (before the server's change lands).
+fn send_block_effect(world: &World, tx: &Sender<NetMsg>, target: &Aim) {
+    let state = world.get_block(target.x, target.y, target.z).raw();
+    if state != 0 {
+        let _ = tx.send(NetMsg::BlockEffect {
+            x: target.x,
+            y: target.y,
+            z: target.z,
+            state,
+        });
+    }
 }
 
 /// Drop every cached chunk column when the client world is rebuilt for another
@@ -990,11 +1031,20 @@ async fn net_loop(
                 for event in miner.tick(&client.world, mining_aim, attacking, creative) {
                     match event {
                         MiningEvent::Start(target) => {
+                            // Creative removes the block on the click; survival
+                            // waits for the break to finish, so only one of the
+                            // two produces the debris.
+                            if creative {
+                                send_block_effect(&client.world, &tx, &target);
+                            }
                             client.dig(digging::START_DESTROY_BLOCK, &target).await
                                 .map_err(|err| err.to_string())?;
                             client.swing().await.map_err(|err| err.to_string())?;
                         }
                         MiningEvent::Stop(target) => {
+                            if !creative {
+                                send_block_effect(&client.world, &tx, &target);
+                            }
                             client.dig(digging::STOP_DESTROY_BLOCK, &target).await
                                 .map_err(|err| err.to_string())?;
                         }
@@ -1046,10 +1096,17 @@ async fn net_loop(
                                 .and_then(|item| item.block_state())
                                 .is_some();
                             if placeable {
-                                client
+                                let state = client
+                                    .held_item()
+                                    .and_then(|item| item.block_state())
+                                    .unwrap_or_default();
+                                let placed = client
                                     .place(&target)
                                     .await
                                     .map_err(|err| err.to_string())?;
+                                if let Some((x, y, z)) = placed {
+                                    let _ = tx.send(NetMsg::BlockEffect { x, y, z, state });
+                                }
                             } else {
                                 client
                                     .use_block(&target)
@@ -1160,6 +1217,20 @@ async fn net_loop(
                     Ok(Event::BlocksChanged(_)) => {
                         world_dirty = true;
                     }
+                    Ok(Event::BlockAction {
+                        x,
+                        y,
+                        z,
+                        data,
+                        block_id,
+                        ..
+                    }) => {
+                        // Vanilla `BlockNote.onBlockEventReceived`: a note block
+                        // (id 25) spawns the note particle on every event.
+                        if block_id == 25 {
+                            let _ = tx.send(NetMsg::NoteBlock { x, y, z, pitch: data });
+                        }
+                    }
                     Ok(Event::Respawn { dimension }) => {
                         // Chunk coordinates are reused across dimensions, so
                         // nothing the renderer already has can be trusted. Drop
@@ -1261,6 +1332,12 @@ struct LiveApp {
     skin_atlas: SkinAtlas,
     skin_slots: std::collections::HashMap<[u8; 16], u32>,
     skin_loader: SkinLoader,
+    /// Break debris and note particles, simulated at display rate.
+    particles: Particles,
+    /// Beacon beams per loaded column; a resent column replaces its beams.
+    beacons: HashMap<(i32, i32), Vec<BeaconBeam>>,
+    /// Dev-only commands run once the world has loaded (`NEPHELE_CMDS`).
+    startup_cmds: Vec<String>,
     /// Per-phase frame timings, printed once a second under `NEPHELE_PROFILE=1`.
     profile: bool,
     prof_ui: f32,
@@ -1389,6 +1466,11 @@ impl LiveApp {
             skin_atlas: SkinAtlas::new(),
             skin_slots: std::collections::HashMap::new(),
             skin_loader: SkinLoader::new(),
+            particles: Particles::new(),
+            beacons: HashMap::new(),
+            startup_cmds: std::env::var("NEPHELE_CMDS")
+                .map(|value| value.split(';').map(str::to_string).collect())
+                .unwrap_or_default(),
             profile: std::env::var("NEPHELE_PROFILE").is_ok(),
             prof_ui: 0.0,
             prof_mesh: 0.0,
@@ -1669,7 +1751,7 @@ impl LiveApp {
         self.inventory_cursor = None;
         self.chat_open = false;
         self.chat_input.clear();
-        self.update_highlights(None, None);
+        self.update_highlights(None, None, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 0.0);
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.clear_chunks();
         }
@@ -1742,6 +1824,14 @@ impl LiveApp {
         }
         let mut entity_mesh = build_entities(&draws);
         let mut item_mesh = build_item_mesh(&items, textures, self.time);
+        // Note particles ride in the entity buffer: same shader, per-vertex
+        // colour, no extra pipeline.
+        self.particles.append_notes(
+            &mut entity_mesh,
+            view.camera.right().to_array(),
+            view.camera.up().to_array(),
+            view.alpha as f32,
+        );
         if self.screen == Screen::Game {
             // The first-person arm is built in camera space and placed in the
             // world, so it lands in the same depth-tested pass as everything else.
@@ -1786,8 +1876,26 @@ impl LiveApp {
         }
         renderer.set_entities(&entity_mesh);
         renderer.set_items(&item_mesh);
+        let beams: Vec<BeaconBeam> = self.beacons.values().flatten().cloned().collect();
+        renderer.set_beams(&build_beams(&beams, self.time));
     }
 
+    /// Recompute the beams a column contributes. A beam only depends on the
+    /// blocks in its own column, so a resent column replaces its entry.
+    fn refresh_beacons(&mut self, key: (i32, i32)) {
+        let beams = self
+            .world
+            .get(ChunkCoord::new(key.0, key.1))
+            .map(|column| beams_in_column(&self.world, column))
+            .unwrap_or_default();
+        if beams.is_empty() {
+            self.beacons.remove(&key);
+        } else {
+            self.beacons.insert(key, beams);
+        }
+    }
+
+    /// Every loaded beacon, flattened for the beam pass.
     fn drain_network(&mut self) {
         loop {
             match self.rx.try_recv() {
@@ -1795,6 +1903,7 @@ impl LiveApp {
                     for column in columns {
                         let key = (column.x, column.z);
                         self.world.insert(column);
+                        self.refresh_beacons(key);
                         self.mark_dirty(key);
                         // A new column changes what its neighbours' border faces
                         // must cull, so they need re-meshing too.
@@ -1803,6 +1912,7 @@ impl LiveApp {
                 }
                 Ok(NetMsg::Unload(x, z)) => {
                     self.world.remove(ChunkCoord::new(x, z));
+                    self.beacons.remove(&(x, z));
                     self.queued.remove(&(x, z));
                     self.stale.remove(&(x, z));
                     self.pending_uploads.retain(|(key, _)| *key != (x, z));
@@ -1812,8 +1922,19 @@ impl LiveApp {
                     self.mark_neighbours_dirty((x, z));
                 }
                 Ok(NetMsg::WorldReset { dimension }) => {
+                    self.particles.clear();
+                    self.beacons.clear();
                     self.reset_for_dimension(dimension);
                     self.enter_game();
+                }
+                Ok(NetMsg::BlockEffect { x, y, z, state }) => {
+                    if let Some(textures) = self.textures.as_ref() {
+                        self.particles
+                            .spawn_block(textures, BlockState::from_raw(state), x, y, z);
+                    }
+                }
+                Ok(NetMsg::NoteBlock { x, y, z, pitch }) => {
+                    self.particles.spawn_note(x, y, z, pitch);
                 }
                 Ok(NetMsg::Chat(text)) => {
                     println!("[chat] {text}");
@@ -1878,10 +1999,17 @@ impl LiveApp {
         }
     }
 
-    /// Rebuild the selection outline and the crack overlay when they move.
-    fn update_highlights(&mut self, aim: Option<Aim>, stage: Option<u8>) {
-        if aim != self.drawn_aim {
-            self.drawn_aim = aim;
+    /// Rebuild the selection outline, then the crack overlay plus any debris.
+    fn update_highlights(
+        &mut self,
+        aim: Option<Aim>,
+        stage: Option<u8>,
+        right: [f32; 3],
+        up: [f32; 3],
+        alpha: f32,
+    ) {
+        let aim_moved = aim != self.drawn_aim;
+        if aim_moved {
             let lines = match aim {
                 Some(aim) => block_outline(aim.x, aim.y, aim.z, OUTLINE_COLOR),
                 None => LineMesh::default(),
@@ -1891,19 +2019,25 @@ impl LiveApp {
             }
         }
 
-        if stage != self.drawn_stage || (stage.is_some() && aim != self.drawn_aim) {
-            self.drawn_stage = stage;
-            let overlay = match (aim, stage, self.textures.as_ref()) {
+        // Debris moves every frame, so the overlay buffer is rebuilt while any
+        // is alive; otherwise it only changes when the crack stage or target
+        // does.
+        let animated = !self.particles.is_empty();
+        if stage != self.drawn_stage || (stage.is_some() && aim_moved) || animated {
+            let mut overlay = match (aim, stage, self.textures.as_ref()) {
                 (Some(aim), Some(stage), Some(textures)) => {
                     let layer = textures.slot_or_missing(break_overlay_texture(stage));
                     build_break_overlay(aim.x, aim.y, aim.z, layer)
                 }
                 _ => MeshData::default(),
             };
+            overlay.append(self.particles.build_debris(right, up, alpha));
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_overlay(&overlay);
             }
         }
+        self.drawn_stage = stage;
+        self.drawn_aim = aim;
     }
 
     fn frame(&mut self) {
@@ -1923,6 +2057,16 @@ impl LiveApp {
         self.drain_network();
         self.drain_pings();
         self.push_input();
+        self.particles.update(delta, &self.world);
+        if self.screen == Screen::Game
+            && !self.startup_cmds.is_empty()
+            && self.world.loaded_chunks() >= 16
+        {
+            let commands = std::mem::take(&mut self.startup_cmds);
+            for command in commands {
+                self.run_command(command.trim_start_matches('/'));
+            }
+        }
 
         let look = std::mem::take(&mut self.pending_look);
         let view = {
@@ -2100,7 +2244,13 @@ impl LiveApp {
 
         self.time += delta;
         let ui_start = Instant::now();
-        self.update_highlights(view.aim, view.stage);
+        self.update_highlights(
+            view.aim,
+            view.stage,
+            view.camera.right().to_array(),
+            view.camera.up().to_array(),
+            view.alpha as f32,
+        );
         self.draw_ui(&view);
         self.prof_ui += ui_start.elapsed().as_secs_f32() * 1000.0;
 

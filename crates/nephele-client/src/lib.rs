@@ -158,6 +158,16 @@ pub enum Event {
         z: i32,
         stage: u8,
     },
+    /// A block did something visible (`S24`). Note blocks use this: `data` is
+    /// the note (0..=24) and `block_id` says whether it was a note block.
+    BlockAction {
+        x: i32,
+        y: i32,
+        z: i32,
+        event: u8,
+        data: u8,
+        block_id: i32,
+    },
     /// Our own entity appeared in the world (`S0C` for our id).
     Spawned,
     /// A remote player or mob appeared.
@@ -817,6 +827,17 @@ impl GameClient {
                     y: animation.y,
                     z: animation.z,
                     stage: animation.stage,
+                })
+            }
+            play::clientbound::BLOCK_ACTION => {
+                let action = play::parse_block_action(packet)?;
+                Ok(Event::BlockAction {
+                    x: action.x,
+                    y: action.y,
+                    z: action.z,
+                    event: action.event,
+                    data: action.data,
+                    block_id: action.block_id,
                 })
             }
             play::clientbound::HELD_ITEM_CHANGE => {
@@ -1827,6 +1848,32 @@ mod tests {
         assert_eq!(rows[0].text(), "§c[RED] Steve");
         assert_eq!(rows[0].color, Some(12));
         assert_eq!(client.scoreboard.prefix_for("Steve"), Some("§c[RED] "));
+    }
+
+    #[tokio::test]
+    async fn block_action_packets_become_events() {
+        let (mut client, _peer) = test_game_client().await;
+        let mut action = nephele_protocol::PacketWriter::new();
+        play::write_position(&mut action, 4, 70, -9);
+        action.write_u8(0).write_u8(12).write_varint(25);
+        let event = client
+            .handle(Packet::new(
+                play::clientbound::BLOCK_ACTION,
+                action.into_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            event,
+            Event::BlockAction {
+                x: 4,
+                y: 70,
+                z: -9,
+                event: 0,
+                data: 12,
+                block_id: 25,
+            }
+        );
     }
 
     #[tokio::test]
