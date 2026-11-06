@@ -9,6 +9,9 @@
 
 use std::sync::OnceLock;
 
+use crate::chat::Span;
+use crate::hud_modules::{KeyBox, ModuleConfig, ModuleId, Values as ModuleValues};
+use crate::scoreboard::{self, Row as ScoreboardRow};
 use crate::servers::{Ping, PingBoard, ServerList};
 use crate::settings::{SettingId, Settings};
 use nephele_assets::{
@@ -62,6 +65,9 @@ pub enum Screen {
     Inventory,
     /// Vanilla's "You Died!" screen, shown until the player respawns.
     Death,
+    /// The HUD module editor: toggle rows plus the modules drawn in place, where
+    /// dragging moves them.
+    Modules,
 }
 
 /// A clickable thing the UI drew this frame.
@@ -110,6 +116,14 @@ pub enum Action {
     InventorySlot(usize),
     /// Perform respawn from the death screen.
     Respawn,
+    /// Open the HUD module editor from the settings screen.
+    OpenModules,
+    /// Leave the HUD module editor, back to settings.
+    ModulesDone,
+    /// Turn one HUD module on or off.
+    ModuleToggle(ModuleId),
+    /// Put every module back where it started.
+    ModulesReset,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -138,6 +152,8 @@ pub struct HudState<'a> {
     pub chatting: bool,
     /// Slots of the open container window (a crafting table), if any.
     pub window_slots: Option<&'a [Option<ItemStack>]>,
+    /// Inventory type of the open window (`minecraft:chest`, ...), for its title.
+    pub window_kind: Option<&'a str>,
 }
 
 /// Vanilla's automatic GUI scale: integers only so the pixel font stays crisp.
@@ -325,16 +341,20 @@ pub fn draw_hud(
     }
 
     // --- debug line and crosshair -----------------------------------------
-    let debug = format!(
-        "Nephele 1.8.9  {} fps  xyz {:.1} {:.1} {:.1}  chunks {}{}",
-        hud.fps as i32,
-        hud.position[0],
-        hud.position[1],
-        hud.position[2],
-        hud.chunks,
-        if hud.creative { "  [creative]" } else { "" }
-    );
-    fg.text(&debug, s(4.0), s(4.0), scale, TEXT);
+    // The one-line debug readout is a development aid; the modules carry FPS,
+    // coordinates and speed in play, so this would only be screen noise.
+    if debug_line_enabled() {
+        let debug = format!(
+            "Nephele 1.8.9  {} fps  xyz {:.1} {:.1} {:.1}  chunks {}{}",
+            hud.fps as i32,
+            hud.position[0],
+            hud.position[1],
+            hud.position[2],
+            hud.chunks,
+            if hud.creative { "  [creative]" } else { "" }
+        );
+        fg.text(&debug, s(4.0), s(4.0), scale, TEXT);
+    }
     fg.crosshair(cx, height / 2.0, scale);
     if !hud.captured && !hud.chatting {
         fg.text_centered(
@@ -397,14 +417,40 @@ pub fn draw_damage_vignette(bg: &mut UiBatch, width: f32, height: f32, strength:
     );
 }
 
+/// Draw coloured runs left to right. Returns the width drawn.
+pub fn draw_spans(fg: &mut UiBatch, spans: &[Span], x: f32, y: f32, scale: f32, alpha: f32) -> f32 {
+    let mut cursor = x;
+    for span in spans {
+        let color = [
+            span.color[0],
+            span.color[1],
+            span.color[2],
+            span.color[3] * alpha,
+        ];
+        fg.text(&span.text, cursor, y, scale, color);
+        cursor += UiBatch::text_width(&span.text, scale);
+    }
+    cursor - x
+}
+
+/// Width of a run list in pixels.
+pub fn spans_width(spans: &[Span], scale: f32) -> f32 {
+    spans
+        .iter()
+        .map(|span| UiBatch::text_width(&span.text, scale))
+        .sum()
+}
+
 /// Recent chat in the bottom-left, and the input line while it is open.
 ///
-/// `lines` carries `(text, alpha)` pairs so the caller owns the fade timing;
-/// the input line sits just above the hotbar so the two never overlap.
+/// `lines` carries `(spans, alpha)` pairs so the caller owns the fade timing;
+/// the input line sits just above the hotbar so the two never overlap. Chat
+/// arrives coloured (§ codes and JSON components, see [`crate::chat`]), so each
+/// line is drawn run by run.
 pub fn draw_chat(
     bg: &mut UiBatch,
     fg: &mut UiBatch,
-    lines: &[(String, f32)],
+    lines: &[(&[Span], f32)],
     input: Option<&str>,
     scale: f32,
     width: f32,
@@ -430,18 +476,422 @@ pub fn draw_chat(
     } else {
         height - s(24.0)
     };
-    for (index, (text, alpha)) in lines.iter().rev().enumerate() {
+    for (index, (spans, alpha)) in lines.iter().rev().enumerate() {
         let y = bottom - (index as f32 + 1.0) * line_h;
         if y < 0.0 {
             break;
         }
-        let text_w = UiBatch::text_width(text, scale);
+        let text_w = spans_width(spans, scale);
         bg.rect(
             Rect::new(s(2.0), y - s(1.0), text_w + s(4.0), line_h),
             [0.0, 0.0, 0.0, 0.35 * alpha],
         );
-        fg.text(text, s(4.0), y, scale, [TEXT[0], TEXT[1], TEXT[2], *alpha]);
+        draw_spans(fg, spans, s(4.0), y, scale, *alpha);
     }
+}
+
+/// The scoreboard sidebar: a translucent column against the right edge, its
+/// title across the top and one right-aligned row per entry.
+pub fn draw_sidebar(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    sidebar: &ScoreboardRowList,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Option<scoreboard::Layout> {
+    if sidebar.rows.is_empty() {
+        return None;
+    }
+    let s = |v: f32| v * scale;
+    // Measure in GUI pixels, lay out there too, then scale into the window.
+    let measured: Vec<(f32, f32)> = sidebar
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                spans_width(&row.spans, 1.0),
+                UiBatch::text_width(&row.score, 1.0),
+            )
+        })
+        .collect();
+    let title_width = sidebar.title.map(|title| spans_width(title, 1.0));
+    let layout = scoreboard::layout(&measured, title_width, (width / scale, height / scale));
+
+    let panel = Rect::new(s(layout.x), s(layout.y), s(layout.width), s(layout.height));
+    // Vanilla 1.8 paints the pane at 0x50000000; anything more hides the world.
+    bg.rect(panel, [0.0, 0.0, 0.0, 0.31]);
+
+    if let Some(title) = sidebar.title {
+        let title_w = spans_width(title, scale);
+        let x = panel.x + (panel.w - title_w) / 2.0;
+        draw_spans(fg, title, x, s(layout.title_y) + s(1.0), scale, 1.0);
+    }
+
+    for (index, row) in sidebar.rows.iter().enumerate() {
+        let y = s(layout.first_row_y) + index as f32 * s(layout.row_h);
+        draw_spans(fg, &row.spans, s(layout.text_x), y, scale, 1.0);
+        // Scores are right-aligned and red, as `GuiIngame` draws them.
+        let score_w = UiBatch::text_width(&row.score, scale);
+        fg.text(
+            &row.score,
+            s(layout.score_right) - score_w,
+            y,
+            scale,
+            [1.0, 0.25, 0.25, 1.0],
+        );
+    }
+    Some(layout)
+}
+
+/// What [`draw_sidebar`] needs: a title (optional) and the rows.
+pub struct ScoreboardRowList<'a> {
+    pub title: Option<&'a [Span]>,
+    pub rows: &'a [ScoreboardRow],
+}
+
+const MODULE_LABEL: [f32; 4] = [0.72, 0.72, 0.72, 1.0];
+const MODULE_PANEL: [f32; 4] = [0.0, 0.0, 0.0, 0.6];
+const KEY_BG: [f32; 4] = [0.08, 0.08, 0.08, 0.55];
+const KEY_BORDER: [f32; 4] = [0.85, 0.85, 0.85, 0.55];
+const KEY_PRESSED: [f32; 4] = [1.0, 1.0, 1.0, 0.92];
+const KEY_PRESSED_TEXT: [f32; 4] = [0.05, 0.05, 0.05, 1.0];
+
+/// One information module's text.
+fn module_text(id: ModuleId, values: &ModuleValues) -> (String, String, [f32; 4]) {
+    match id {
+        ModuleId::Fps => (
+            "FPS".to_string(),
+            (values.fps.round() as i32).to_string(),
+            TEXT,
+        ),
+        ModuleId::Ping => {
+            let (value, color) = match values.ping {
+                None => ("--".to_string(), TEXT_DIM),
+                Some(ping) => (
+                    format!("{ping}ms"),
+                    match ping {
+                        0..=80 => [0.45, 0.95, 0.45, 1.0],
+                        81..=200 => [0.95, 0.85, 0.30, 1.0],
+                        _ => [0.95, 0.42, 0.42, 1.0],
+                    },
+                ),
+            };
+            ("PING".to_string(), value, color)
+        }
+        ModuleId::Cps => (
+            "CPS".to_string(),
+            format!("{} | {}", values.cps.0, values.cps.1),
+            TEXT,
+        ),
+        ModuleId::Coords => (
+            "XYZ".to_string(),
+            format!(
+                "{:.0} {:.0} {:.0}",
+                values.position[0], values.position[1], values.position[2]
+            ),
+            [0.55, 0.95, 0.55, 1.0],
+        ),
+        ModuleId::Speed => (
+            "SPEED".to_string(),
+            format!("{:.1}", values.speed),
+            [0.80, 0.90, 1.0, 1.0],
+        ),
+        // Drawn as a key box, not a label/value row.
+        ModuleId::Keystrokes => (String::new(), String::new(), TEXT),
+    }
+}
+
+/// Width and height of one module in GUI pixels, without drawing it.
+fn module_size(id: ModuleId, values: &ModuleValues) -> (f32, f32) {
+    if id == ModuleId::Keystrokes {
+        return (
+            KEY_UNIT * 3.0 + KEY_GAP * 2.0 + MODULE_PAD * 2.0,
+            key_layout_height(),
+        );
+    }
+    let (label, value, _) = module_text(id, values);
+    let label_w = UiBatch::text_width(&label, 1.0);
+    let value_w = UiBatch::text_width(&value, 1.0);
+    (
+        label_w + MODULE_GAP + value_w + MODULE_PAD * 2.0,
+        FONT_LINE + MODULE_PAD * 2.0,
+    )
+}
+
+/// Keystroke key size and spacing, in GUI pixels.
+const KEY_UNIT: f32 = 13.0;
+const KEY_GAP: f32 = 1.0;
+const FONT_LINE: f32 = 9.0;
+const MODULE_GAP: f32 = 4.0;
+const MODULE_PAD: f32 = 2.0;
+
+fn key_layout_height() -> f32 {
+    // W / A S D / space / shift / LMB RMB.
+    5.0 * KEY_UNIT + 4.0 * KEY_GAP + MODULE_PAD * 2.0
+}
+
+fn draw_key(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    rect: Rect,
+    label: &str,
+    pressed: bool,
+    scale: f32,
+) {
+    bg.rect(rect, if pressed { KEY_PRESSED } else { KEY_BG });
+    bg.rect_outline(rect, scale.max(1.0), KEY_BORDER);
+    let text_w = UiBatch::text_width(label, scale);
+    fg.text(
+        label,
+        rect.x + (rect.w - text_w) / 2.0,
+        rect.y + (rect.h - FONT_LINE * scale) / 2.0,
+        scale,
+        if pressed { KEY_PRESSED_TEXT } else { TEXT },
+    );
+}
+
+/// The keystrokes module: W / A S D / space / shift, lit while held.
+fn draw_keystrokes(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    origin: (f32, f32),
+    values: &ModuleValues,
+    scale: f32,
+) {
+    let s = |v: f32| v * scale;
+    let unit = s(KEY_UNIT);
+    let gap = s(KEY_GAP);
+    let (x, y) = origin;
+
+    bg.rect(
+        Rect::new(
+            x,
+            y,
+            s(KEY_UNIT * 3.0 + KEY_GAP * 2.0 + MODULE_PAD * 2.0),
+            s(key_layout_height()),
+        ),
+        MODULE_PANEL,
+    );
+    let left = x + s(MODULE_PAD);
+    let mut top = y + s(MODULE_PAD);
+    let step = unit + gap;
+
+    // Row 1: W, centred over S.
+    draw_key(
+        bg,
+        fg,
+        Rect::new(left + step, top, unit, unit),
+        "W",
+        values.keys.pressed(KeyBox::Forward),
+        scale,
+    );
+    top += step;
+    for (index, (label, key)) in [
+        ("A", KeyBox::Left),
+        ("S", KeyBox::Back),
+        ("D", KeyBox::Right),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        draw_key(
+            bg,
+            fg,
+            Rect::new(left + index as f32 * step, top, unit, unit),
+            label,
+            values.keys.pressed(key),
+            scale,
+        );
+    }
+    top += step;
+    draw_key(
+        bg,
+        fg,
+        Rect::new(left, top, s(KEY_UNIT * 3.0 + KEY_GAP * 2.0), unit),
+        "SPACE",
+        values.keys.pressed(KeyBox::Jump),
+        scale,
+    );
+    top += step;
+    draw_key(
+        bg,
+        fg,
+        Rect::new(left, top, s(KEY_UNIT * 3.0 + KEY_GAP * 2.0), unit),
+        "SHIFT",
+        values.keys.pressed(KeyBox::Sneak),
+        scale,
+    );
+    // Mouse buttons last, split across the same width as the space bar.
+    top += step;
+    let half = s((KEY_UNIT * 3.0 + KEY_GAP) / 2.0);
+    draw_key(
+        bg,
+        fg,
+        Rect::new(left, top, half, unit),
+        "LMB",
+        values.keys.pressed(KeyBox::Attack),
+        scale,
+    );
+    draw_key(
+        bg,
+        fg,
+        Rect::new(left + half + gap, top, half, unit),
+        "RMB",
+        values.keys.pressed(KeyBox::UseItem),
+        scale,
+    );
+}
+
+/// Draw every enabled HUD module. Returns each module's rectangle so the editor
+/// can hit-test a drag.
+pub fn draw_modules(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    config: &ModuleConfig,
+    values: &ModuleValues,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Vec<(ModuleId, Rect)> {
+    let s = |v: f32| v * scale;
+    let mut rects = Vec::new();
+    for id in ModuleId::ALL {
+        let entry = config.get(id);
+        if !entry.enabled {
+            continue;
+        }
+        let (gui_w, gui_h) = module_size(id, values);
+        let (w, h) = (s(gui_w), s(gui_h));
+        // The anchor is the top-left; clamp so a dragged module never leaves
+        // the window even if the resolution changed underneath it.
+        let x = (entry.anchor[0] * width).clamp(0.0, (width - w).max(0.0));
+        let y = (entry.anchor[1] * height).clamp(0.0, (height - h).max(0.0));
+        let rect = Rect::new(x, y, w, h);
+        if id == ModuleId::Keystrokes {
+            draw_keystrokes(bg, fg, (rect.x, rect.y), values, scale);
+            rects.push((id, rect));
+            continue;
+        }
+
+        let (label, value, color) = module_text(id, values);
+        bg.rect(rect, MODULE_PANEL);
+        fg.text(
+            &label,
+            rect.x + s(MODULE_PAD),
+            rect.y + s(MODULE_PAD),
+            scale,
+            MODULE_LABEL,
+        );
+        let value_w = UiBatch::text_width(&value, scale);
+        fg.text(
+            &value,
+            rect.x + rect.w - s(MODULE_PAD) - value_w,
+            rect.y + s(MODULE_PAD),
+            scale,
+            color,
+        );
+        rects.push((id, rect));
+    }
+    rects
+}
+
+/// The HUD module editor: a left-hand list of toggles over the live module
+/// layout, so dragging a module moves the real thing.
+pub fn draw_modules_editor(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    config: &ModuleConfig,
+    values: &ModuleValues,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> (Vec<Button>, Vec<(ModuleId, Rect)>) {
+    let s = |v: f32| v * scale;
+    // A dim wash, light enough to keep the world (and the modules) readable.
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.0, 0.0, 0.0, 0.35]);
+
+    let mut buttons = Vec::new();
+    let rows = ModuleId::ALL.len() as f32;
+    let panel_w = s(210.0);
+    let panel_h = s(30.0 + rows * 20.0 + 56.0);
+    let panel = Rect::new(s(10.0), height / 2.0 - panel_h / 2.0, panel_w, panel_h);
+
+    // Modules first, panel second: the panel must stay readable even when a
+    // module is dragged underneath it, and the module rects are what the drag
+    // hit-test uses.
+    let rects = draw_modules(bg, fg, config, values, scale, width, height);
+    for (_, rect) in &rects {
+        bg.rect_outline(*rect, scale.max(1.0), SELECTION_BORDER);
+    }
+
+    bg.rect(panel, PANEL);
+    bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
+    fg.text_centered(
+        "HUD Modules",
+        panel.x + panel_w / 2.0,
+        panel.y + s(7.0),
+        scale,
+        TEXT,
+    );
+    fg.text(
+        "drag a module to move it",
+        panel.x + s(10.0),
+        panel.y + s(19.0),
+        scale,
+        TEXT_DIM,
+    );
+
+    for (index, id) in ModuleId::ALL.iter().enumerate() {
+        let y = panel.y + s(32.0) + index as f32 * s(20.0);
+        fg.text(id.label(), panel.x + s(10.0), y + s(4.0), scale, TEXT);
+        let toggle = Rect::new(panel.x + panel_w - s(56.0), y, s(46.0), s(16.0));
+        let enabled = config.is_enabled(*id);
+        draw_button(
+            bg,
+            fg,
+            toggle,
+            if enabled { "ON" } else { "OFF" },
+            scale,
+            false,
+        );
+        buttons.push(Button {
+            action: Action::ModuleToggle(*id),
+            rect: toggle,
+        });
+    }
+
+    let reset = Rect::new(
+        panel.x + s(10.0),
+        panel.y + panel_h - s(44.0),
+        s(90.0),
+        s(18.0),
+    );
+    draw_button(bg, fg, reset, "Reset", scale, false);
+    buttons.push(Button {
+        action: Action::ModulesReset,
+        rect: reset,
+    });
+    let done = Rect::new(
+        panel.x + panel_w - s(100.0),
+        panel.y + panel_h - s(44.0),
+        s(90.0),
+        s(18.0),
+    );
+    draw_button(bg, fg, done, "Done", scale, false);
+    buttons.push(Button {
+        action: Action::ModulesDone,
+        rect: done,
+    });
+
+    (buttons, rects)
+}
+
+/// `NEPHELE_DEBUG=1` restores the one-line footer readout that the modules
+/// replaced.
+fn debug_line_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NEPHELE_DEBUG").is_some())
 }
 
 fn draw_button(
@@ -599,7 +1049,7 @@ pub fn draw_settings(
 
     let rows = SettingId::ALL.len() as f32;
     let panel_w = s(320.0);
-    let panel_h = s(30.0 + rows * 22.0 + 30.0);
+    let panel_h = s(30.0 + rows * 22.0 + 52.0);
     let panel = Rect::new(
         cx - panel_w / 2.0,
         height / 2.0 - panel_h / 2.0,
@@ -653,6 +1103,20 @@ pub fn draw_settings(
             rect: next,
         });
     }
+
+    let modules = Rect::new(cx - s(90.0), panel.y + panel_h - s(52.0), s(180.0), s(20.0));
+    draw_button(
+        bg,
+        fg,
+        modules,
+        "HUD Modules...",
+        scale,
+        hovered(hud.pointer, &modules),
+    );
+    buttons.push(Button {
+        action: Action::OpenModules,
+        rect: modules,
+    });
 
     let done = Rect::new(cx - s(60.0), panel.y + panel_h - s(26.0), s(120.0), s(20.0));
     draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
@@ -906,8 +1370,119 @@ pub fn window_slot_rect(slot: usize, scale: f32, width: f32, height: f32) -> Opt
     ))
 }
 
+/// Slots in a crafting-table window: output, a 3x3 grid, 27 storage, 9 hotbar.
+pub const CRAFTING_WINDOW_SLOTS: usize = 46;
+
+/// Every window has the player's own 36 slots (27 storage + 9 hotbar) at the
+/// bottom; a container window is anything above them.
+const PLAYER_WINDOW_SLOTS: usize = 36;
+const WINDOW_PANEL_WIDTH: f32 = 176.0;
+const WINDOW_GRID_TOP: f32 = 18.0;
+const WINDOW_GRID_LEFT: f32 = 8.0;
+const WINDOW_SLOT_PITCH: f32 = 18.0;
+/// Gap between the container's grid and the player's storage rows.
+const WINDOW_PLAYER_GAP: f32 = 14.0;
+
+/// How many rows of nine the container part of a window needs.
+///
+/// A hopper (5 container slots) is one row; a double chest (54) is six. Slots
+/// that are not a multiple of nine still get a row, so nothing is dropped.
+pub fn window_rows(slots: usize) -> usize {
+    slots.saturating_sub(PLAYER_WINDOW_SLOTS).div_ceil(9).max(1)
+}
+
+/// Panel size of a generic container window, in GUI pixels.
+pub fn container_panel_size(slots: usize) -> [f32; 2] {
+    let rows = window_rows(slots) as f32;
+    let player_top = WINDOW_GRID_TOP + rows * WINDOW_SLOT_PITCH + WINDOW_PLAYER_GAP;
+    [
+        WINDOW_PANEL_WIDTH,
+        player_top + WINDOW_SLOT_PITCH * 4.0 + WINDOW_GRID_LEFT,
+    ]
+}
+
+fn container_panel(slots: usize, scale: f32, width: f32, height: f32) -> Rect {
+    let [panel_w, panel_h] = container_panel_size(slots);
+    Rect::new(
+        width / 2.0 - panel_w * scale / 2.0,
+        height / 2.0 - panel_h * scale / 2.0,
+        panel_w * scale,
+        panel_h * scale,
+    )
+}
+
+/// Top-left of a slot in a generic server window of any row count, in GUI
+/// pixels. Slots `0..slots-36` are the container's own, laid out nine to a row;
+/// the last 36 are the player's storage and hotbar, exactly as in their own
+/// inventory screen.
+pub fn server_window_origin(slot: usize, slots: usize) -> Option<[f32; 2]> {
+    if slot >= slots {
+        return None;
+    }
+    let container = slots.saturating_sub(PLAYER_WINDOW_SLOTS);
+    if slot < container {
+        return Some([
+            WINDOW_GRID_LEFT + (slot % 9) as f32 * WINDOW_SLOT_PITCH,
+            WINDOW_GRID_TOP + (slot / 9) as f32 * WINDOW_SLOT_PITCH,
+        ]);
+    }
+    let rows = window_rows(slots) as f32;
+    let player_top = WINDOW_GRID_TOP + rows * WINDOW_SLOT_PITCH + WINDOW_PLAYER_GAP;
+    let index = slot - container;
+    Some(if index < 27 {
+        [
+            WINDOW_GRID_LEFT + (index % 9) as f32 * WINDOW_SLOT_PITCH,
+            player_top + (index / 9) as f32 * WINDOW_SLOT_PITCH,
+        ]
+    } else {
+        [
+            WINDOW_GRID_LEFT + (index - 27) as f32 * WINDOW_SLOT_PITCH,
+            player_top + WINDOW_SLOT_PITCH * 3.0 + 4.0,
+        ]
+    })
+}
+
+pub fn server_window_rect(
+    slot: usize,
+    slots: usize,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Option<Rect> {
+    let [x, y] = server_window_origin(slot, slots)?;
+    let panel = container_panel(slots, scale, width, height);
+    Some(Rect::new(
+        panel.x + x * scale,
+        panel.y + y * scale,
+        SLOT_SIZE * scale,
+        SLOT_SIZE * scale,
+    ))
+}
+
+/// The window title to show for an `S2D` inventory type.
+pub fn window_kind_label(kind: &str) -> &'static str {
+    match kind {
+        "minecraft:chest" => "Chest",
+        "minecraft:crafting_table" => "Crafting Table",
+        "minecraft:furnace" => "Furnace",
+        "minecraft:dispenser" => "Dispenser",
+        "minecraft:hopper" => "Hopper",
+        "minecraft:enchanting_table" => "Enchanting",
+        "minecraft:beacon" => "Beacon",
+        "minecraft:anvil" => "Repair",
+        "minecraft:brewing_stand" => "Brewing Stand",
+        "minecraft:villager" => "Trading",
+        _ => "Container",
+    }
+}
+
 /// The survival inventory: 2x2 crafting, armour, storage and the hotbar, with
 /// the stack under the cursor drawn last.
+///
+/// An open server window replaces the crafting half of the panel. A 46-slot
+/// window is a crafting table and keeps the vanilla 3x3+output layout; anything
+/// else is laid out generically, so a chest of any row count — or a hopper, or
+/// a furnace — draws without a bespoke screen.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_inventory(
     bg: &mut UiBatch,
@@ -923,74 +1498,128 @@ pub fn draw_inventory(
     let s = |v: f32| v * scale;
     bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
 
-    let panel = inventory_panel(scale, width, height);
-    bg.rect(panel, PANEL);
-    bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
-
-    // A crafting table replaces the 2x2 half of the panel with its 3x3 grid;
-    // the storage and hotbar below are the same slots in both layouts.
-    let window = hud.window_slots;
-    let (slots, count, rect_of, title, subtitle) = match window {
-        Some(slots) => (
-            slots,
-            slots.len(),
-            window_slot_rect as fn(usize, f32, f32, f32) -> Option<Rect>,
-            "Crafting Table",
-            "Crafting",
-        ),
-        None => (
-            hud.inventory,
-            hud.inventory.len(),
-            inventory_slot_rect as fn(usize, f32, f32, f32) -> Option<Rect>,
-            "Inventory",
-            "Crafting",
-        ),
+    let mut buttons = Vec::new();
+    let draw_slots = |bg: &mut UiBatch,
+                      fg: &mut UiBatch,
+                      icons: &mut UiBatch,
+                      slots: &[Option<ItemStack>],
+                      rects: &[Option<Rect>],
+                      buttons: &mut Vec<Button>| {
+        for (slot, item) in slots.iter().enumerate() {
+            let Some(rect) = rects.get(slot).copied().flatten() else {
+                continue;
+            };
+            bg.rect(
+                rect,
+                if hovered(hud.pointer, &rect) {
+                    SLOT_HOVER
+                } else {
+                    SLOT_BG
+                },
+            );
+            if let Some(item) = item {
+                let inner = Rect::new(rect.x + s(1.0), rect.y + s(1.0), s(16.0), s(16.0));
+                draw_stack(fg, icons, inner, *item, textures, scale);
+            }
+            buttons.push(Button {
+                action: Action::InventorySlot(slot),
+                rect,
+            });
+        }
     };
 
-    fg.text_centered(title, width / 2.0, panel.y - s(13.0), scale, TEXT);
-    fg.text(
-        subtitle,
-        panel.x + s(if window.is_some() { 30.0 } else { 97.0 }),
-        panel.y + s(6.0),
-        scale,
-        TEXT_DIM,
-    );
+    match hud.window_slots {
+        Some(slots) if slots.len() == CRAFTING_WINDOW_SLOTS => {
+            let panel = inventory_panel(scale, width, height);
+            bg.rect(panel, PANEL);
+            bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
+            fg.text_centered(
+                "Crafting Table",
+                width / 2.0,
+                panel.y - s(13.0),
+                scale,
+                TEXT,
+            );
+            fg.text(
+                "Crafting",
+                panel.x + s(30.0),
+                panel.y + s(6.0),
+                scale,
+                TEXT_DIM,
+            );
 
-    let mut buttons = Vec::new();
-    for slot in 0..count {
-        let Some(rect) = rect_of(slot, scale, width, height) else {
-            continue;
-        };
-        bg.rect(
-            rect,
-            if hovered(hud.pointer, &rect) {
-                SLOT_HOVER
-            } else {
-                SLOT_BG
-            },
-        );
-        if let Some(item) = slots.get(slot).copied().flatten() {
-            let inner = Rect::new(rect.x + s(1.0), rect.y + s(1.0), s(16.0), s(16.0));
-            draw_stack(fg, icons, inner, item, textures, scale);
+            let rects: Vec<Option<Rect>> = (0..slots.len())
+                .map(|slot| window_slot_rect(slot, scale, width, height))
+                .collect();
+            draw_slots(bg, fg, icons, slots, &rects, &mut buttons);
+            fg.text_centered(
+                "Click to move stacks  -  E / Esc to close",
+                width / 2.0,
+                panel.y + panel.h + s(6.0),
+                scale,
+                TEXT_DIM,
+            );
         }
-        buttons.push(Button {
-            action: Action::InventorySlot(slot),
-            rect,
-        });
+        Some(slots) => {
+            let panel = container_panel(slots.len(), scale, width, height);
+            bg.rect(panel, PANEL);
+            bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
+            let title = hud
+                .window_kind
+                .map(window_kind_label)
+                .unwrap_or("Container");
+            fg.text_centered(title, width / 2.0, panel.y - s(13.0), scale, TEXT);
+            fg.text(
+                "Inventory",
+                panel.x + s(WINDOW_GRID_LEFT),
+                panel.y + panel.h - s(76.0),
+                scale,
+                TEXT_DIM,
+            );
+
+            let rects: Vec<Option<Rect>> = (0..slots.len())
+                .map(|slot| server_window_rect(slot, slots.len(), scale, width, height))
+                .collect();
+            draw_slots(bg, fg, icons, slots, &rects, &mut buttons);
+            fg.text_centered(
+                "Click to move stacks  -  E / Esc to close",
+                width / 2.0,
+                panel.y + panel.h + s(6.0),
+                scale,
+                TEXT_DIM,
+            );
+        }
+        None => {
+            let panel = inventory_panel(scale, width, height);
+            bg.rect(panel, PANEL);
+            bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
+            fg.text_centered("Inventory", width / 2.0, panel.y - s(13.0), scale, TEXT);
+            fg.text(
+                "Crafting",
+                panel.x + s(97.0),
+                panel.y + s(6.0),
+                scale,
+                TEXT_DIM,
+            );
+
+            let rects: Vec<Option<Rect>> = (0..hud.inventory.len())
+                .map(|slot| inventory_slot_rect(slot, scale, width, height))
+                .collect();
+            draw_slots(bg, fg, icons, hud.inventory, &rects, &mut buttons);
+            fg.text_centered(
+                "Click to move stacks  -  E / Esc to close",
+                width / 2.0,
+                panel.y + panel.h + s(6.0),
+                scale,
+                TEXT_DIM,
+            );
+        }
     }
 
     if let (Some(item), Some([x, y])) = (cursor, hud.pointer) {
         let rect = Rect::new(x - s(8.0), y - s(8.0), s(16.0), s(16.0));
         draw_stack(fg, icons, rect, item, textures, scale);
     }
-
-    fg.text_centered(
-        "Click to move stacks  -  E / Esc to close",
-        width / 2.0,
-        panel.y + panel.h + s(6.0),
-        scale,
-        TEXT_DIM,
-    );
 
     buttons
 }
@@ -2144,6 +2773,7 @@ mod tests {
             captured: false,
             chatting: false,
             window_slots: None,
+            window_kind: None,
         }
     }
 
@@ -2164,10 +2794,11 @@ mod tests {
         );
         assert_eq!(
             buttons.len(),
-            SettingId::ALL.len() * 2 + 1,
-            "two arrows + Done"
+            SettingId::ALL.len() * 2 + 2,
+            "two arrows per setting, then HUD Modules and Done"
         );
         assert!(buttons.iter().any(|b| b.action == Action::SettingsDone));
+        assert!(buttons.iter().any(|b| b.action == Action::OpenModules));
         assert!(!bg.is_empty());
         assert!(!fg.is_empty());
     }
@@ -2450,7 +3081,10 @@ mod tests {
     fn chat_draws_its_lines_and_the_input_strip() {
         let mut bg = UiBatch::default();
         let mut fg = UiBatch::default();
-        let lines = vec![("hello".to_string(), 1.0), ("fading".to_string(), 0.4)];
+        let hello = crate::chat::parse("§ahello");
+        let fading = crate::chat::parse("fading");
+        let lines: Vec<(&[crate::chat::Span], f32)> =
+            vec![(hello.as_slice(), 1.0), (fading.as_slice(), 0.4)];
         draw_chat(
             &mut bg,
             &mut fg,
@@ -2473,5 +3107,219 @@ mod tests {
             quiet.is_empty(),
             "nothing to draw with no lines and no input"
         );
+    }
+
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+    }
+
+    fn module_values() -> ModuleValues {
+        ModuleValues {
+            fps: 143.0,
+            ping: Some(42),
+            cps: (5, 2),
+            position: [-52.5, 96.0, 0.5],
+            speed: 4.3,
+            keys: crate::hud_modules::KeyState::default(),
+        }
+    }
+
+    #[test]
+    fn a_generic_window_lays_out_any_row_count() {
+        for slots in [41, 45, 63, 90] {
+            // 5 container slots (hopper) up to 54 (double chest), plus the 36
+            // player slots.
+            let rects: Vec<Rect> = (0..slots)
+                .map(|slot| server_window_rect(slot, slots, 2.0, 1280.0, 720.0).unwrap())
+                .collect();
+            assert_eq!(rects.len(), slots);
+            for (index, rect) in rects.iter().enumerate() {
+                for other in &rects[index + 1..] {
+                    assert!(
+                        !overlaps(*rect, *other),
+                        "{slots} slots: {index} overlaps a neighbour"
+                    );
+                }
+            }
+            // Inside the panel it was placed from.
+            let [panel_w, panel_h] = container_panel_size(slots);
+            let panel = container_panel(slots, 2.0, 1280.0, 720.0);
+            for rect in &rects {
+                assert!(rect.x >= panel.x && rect.y >= panel.y);
+                assert!(rect.x + rect.w <= panel.x + panel_w * 2.0 + 0.01);
+                assert!(rect.y + rect.h <= panel.y + panel_h * 2.0 + 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn a_six_row_chest_needs_more_panel_than_a_hopper() {
+        assert_eq!(window_rows(41), 1, "a hopper: 5 container slots");
+        assert_eq!(window_rows(45), 1, "nine container slots");
+        assert_eq!(window_rows(63), 3, "a single chest");
+        assert_eq!(window_rows(90), 6, "a double chest");
+        assert!(container_panel_size(90)[1] > container_panel_size(45)[1]);
+    }
+
+    #[test]
+    fn the_sidebar_draws_a_panel_and_every_row() {
+        let board = crate::scoreboard::Scoreboard::demo();
+        let objective = board.sidebar.as_ref().unwrap();
+        let rows = board.sidebar_rows();
+        let list = ScoreboardRowList {
+            title: Some(objective.title.as_slice()),
+            rows: &rows,
+        };
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let layout = draw_sidebar(&mut bg, &mut fg, &list, 2.0, 1280.0, 720.0).unwrap();
+
+        assert_eq!(bg.indices.len() / 6, 1, "one pane behind the column");
+        assert!(!fg.is_empty());
+        // Right-aligned against the screen edge, inside the window.
+        assert!((layout.x + layout.width - (1280.0 / 2.0 - 2.0)).abs() < 0.01);
+        assert!(layout.y > 0.0 && layout.y + layout.height < 720.0 / 2.0);
+    }
+
+    #[test]
+    fn only_enabled_modules_are_drawn_and_they_do_not_overlap() {
+        let config = ModuleConfig::default();
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let rects = draw_modules(
+            &mut bg,
+            &mut fg,
+            &config,
+            &module_values(),
+            2.0,
+            1280.0,
+            720.0,
+        );
+        assert_eq!(rects.len(), ModuleId::ALL.len());
+        for (index, (_, rect)) in rects.iter().enumerate() {
+            assert!(rect.x >= 0.0 && rect.y >= 0.0);
+            assert!(rect.x + rect.w <= 1280.0 && rect.y + rect.h <= 720.0);
+            for (_, other) in &rects[index + 1..] {
+                assert!(
+                    !overlaps(*rect, *other),
+                    "two default module positions overlap"
+                );
+            }
+        }
+
+        let mut hidden = ModuleConfig::default();
+        hidden.toggle(ModuleId::Cps);
+        let rects = draw_modules(
+            &mut UiBatch::default(),
+            &mut UiBatch::default(),
+            &hidden,
+            &module_values(),
+            2.0,
+            1280.0,
+            720.0,
+        );
+        assert_eq!(rects.len(), ModuleId::ALL.len() - 1);
+        assert!(!rects.iter().any(|(id, _)| *id == ModuleId::Cps));
+    }
+
+    #[test]
+    fn the_default_layout_clears_the_sidebar_and_the_hotbar() {
+        let board = crate::scoreboard::Scoreboard::demo();
+        let objective = board.sidebar.as_ref().unwrap();
+        let rows = board.sidebar_rows();
+        let list = ScoreboardRowList {
+            title: Some(objective.title.as_slice()),
+            rows: &rows,
+        };
+        // 1024x768 is left out on purpose: at GUI scale 3 a fifteen-row sidebar
+        // takes 438 of 1024 px, so nothing fits beside it. Dragging a module
+        // there is the user's call, not a default worth shipping.
+        for (width, height) in [
+            (1280.0, 720.0),
+            (1366.0, 768.0),
+            (1600.0, 900.0),
+            (1920.0, 1080.0),
+        ] {
+            let scale = gui_scale(width, height);
+            let mut bg = UiBatch::default();
+            let mut fg = UiBatch::default();
+            let layout = draw_sidebar(&mut bg, &mut fg, &list, scale, width, height).unwrap();
+            let sidebar = Rect::new(
+                layout.x * scale,
+                layout.y * scale,
+                layout.width * scale,
+                layout.height * scale,
+            );
+            let modules = draw_modules(
+                &mut UiBatch::default(),
+                &mut UiBatch::default(),
+                &ModuleConfig::default(),
+                &module_values(),
+                scale,
+                width,
+                height,
+            );
+            for (id, rect) in &modules {
+                assert!(
+                    !overlaps(*rect, sidebar),
+                    "{id:?} covers the scoreboard at {width}x{height}: module {rect:?} vs sidebar {sidebar:?} scale {scale}"
+                );
+                // The hotbar is the bottom 22 GUI pixels, centred.
+                let hotbar = Rect::new(
+                    width / 2.0 - 91.0 * scale,
+                    height - 22.0 * scale,
+                    182.0 * scale,
+                    22.0 * scale,
+                );
+                assert!(
+                    !overlaps(*rect, hotbar),
+                    "{id:?} covers the hotbar at {width}x{height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_module_editor_lists_every_module_and_shows_the_live_positions() {
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let (buttons, rects) = draw_modules_editor(
+            &mut bg,
+            &mut fg,
+            &ModuleConfig::default(),
+            &module_values(),
+            2.0,
+            1280.0,
+            720.0,
+        );
+        assert_eq!(
+            buttons.len(),
+            ModuleId::ALL.len() + 2,
+            "toggles, Reset, Done"
+        );
+        assert_eq!(rects.len(), ModuleId::ALL.len());
+        assert!(buttons.iter().any(|b| b.action == Action::ModulesDone));
+        assert!(buttons
+            .iter()
+            .any(|b| b.action == Action::ModuleToggle(ModuleId::Ping)));
+
+        // The Reset/Done row must clear the toggle rows above it.
+        let reset = buttons
+            .iter()
+            .find(|b| b.action == Action::ModulesReset)
+            .unwrap()
+            .rect;
+        let done = buttons
+            .iter()
+            .find(|b| b.action == Action::ModulesDone)
+            .unwrap()
+            .rect;
+        assert!(!overlaps(reset, done));
+        for button in &buttons {
+            if matches!(button.action, Action::ModuleToggle(_)) {
+                assert!(!overlaps(button.rect, reset), "{:?}", button.action);
+                assert!(!overlaps(button.rect, done), "{:?}", button.action);
+            }
+        }
     }
 }

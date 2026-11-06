@@ -121,11 +121,15 @@ crates/
       live.rs           network + local game loops, screens, input
       viewer.rs         offline world viewer
       ui.rs             immediate-mode UI batch + screens (draw_*)
+      chat.rs           chat colours: legacy `§` codes and JSON components
+      hud_modules.rs    HUD module toggles/anchors, CPS and speed meters
+      scoreboard.rs     scoreboard model, sidebar ordering and layout
+      interact.rs       entity click targeting and use/attack pacing
       commands.rs       client-side chat commands (/gamemode, /setblock, ...)
       paths.rs          per-user data directory + legacy `.local/` migration
       mesher.rs         CLI-side mesh helpers
       servers.rs        saved server list: entries, ordering, persistence, ping board
-      settings.rs       persisted options
+      settings.rs       persisted options (settings.json), incl. HUD modules
       skins.rs          skin fetch/cache
 ```
 
@@ -579,8 +583,8 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   movement keys are dropped; the HUD's "click to look around" hint is suppressed
   via `HudState.chatting`.
 - Recent chat is drawn bottom-left and fades after 10 s (`draw_chat` in `ui.rs`,
-  14 s hard expiry in `LiveApp::draw_chat`). Colour codes are **not** parsed yet —
-  chat arrives as plain text.
+  14 s hard expiry in `LiveApp::draw_chat`). **Colours are parsed** — see the
+  client-UI section below.
 - `commands.rs` parses `/help`, `/gamemode`, `/tp`, `/setblock`, `/give`, `/seed`.
   `~` relative coordinates and `~5` offsets work; `setblock`/`give` take block
   names through `nephele_world::blocks::by_name` (names are per-variant:
@@ -594,6 +598,75 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
 - `local_loop` now reads `Shared.creative` instead of hardcoding creative, and
   `start_local` sets it true, so `/gamemode survival` changes mining timing in
   singleplayer without breaking the old default.
+
+**Client HUD: chat colours, modules, scoreboard, containers** (added 2026-11-06,
+lane `client-ui`). Four new modules in `nephele-cli/src` carry it:
+
+- **`chat.rs` — colours.** `chat::parse` accepts both dialects: a line that
+  starts with `{`/`[` and parses as JSON is treated as a chat component
+  (`text`/`translate`/`with`/`extra`, colour inherited down the tree, named and
+  `#rrggbb` colours), anything else as the legacy `§` dialect. `§k`–`§o` are
+  consumed and dropped (the bitmap font has one weight), `§r` resets to white,
+  and a `§` swallows the next character even when it is not a code — matching the
+  client font renderer. Adjacent runs of one colour merge. **`S02` is still
+  flattened by `flatten_chat` before the client sees it, so today only the `§`
+  path fires in practice** (Hypixel embeds `§` inside its `text` fields, which is
+  exactly the bug the old code showed as `§b[MVP§c+§b]`). Handing the raw
+  component through `Event::Chat` needs a `net`-lane change; `chat::parse` already
+  handles it the day that lands. Team prefixes are composed server-side in 1.8;
+  the scoreboard's team prefixes decorate sidebar rows instead.
+- **`scoreboard.rs` — the sidebar.** `Objective`/`ScoreEntry`/`Team` model with
+  `set_score` (upsert), `remove`, and `sidebar_rows()`: score-descending, ties in
+  insertion order, **capped at vanilla's 15 rows** (a 16th is dropped), each entry
+  wrapped in its team's prefix/suffix. `layout()` is pure geometry — pane flush to
+  the right edge, vertically centred, title strip on top, scores right-aligned —
+  and is pinned by tests at several window sizes. **No packet feeds this yet**
+  (`S3B`–`S3E` are the net lane's); `NEPHELE_SCOREBOARD_DEMO=1` shows
+  `Scoreboard::demo()`, a hand-built 16-row model used for layout work and the
+  acceptance screenshot.
+- **`hud_modules.rs` + the HUD editor — modules.** FPS, ping, LMB/RMB CPS,
+  keystrokes (W/A/S/D/space/shift/LMB/RMB with pressed states), coordinates and
+  speed. Each is individually toggleable and draggable; the anchor is stored as a
+  **fraction of the window** so a layout set at 1280x720 lands in the same corner
+  at 1920x1080. Reached from Pause → Options → **HUD Modules...** (toggle rows,
+  drag the live modules, Reset/Done); `NEPHELE_SCREEN=modules` is the dev
+  shortcut. Defaults: five modules stacked in one left column at 0.062 vertical
+  steps (fits GUI scale 3, the tallest a 720p window picks), keystrokes at
+  `(0.48, 0.02)` so it clears both the sidebar and the hotbar — a test pins that
+  at 1280x720, 1366x768, 1600x900 and 1920x1080. **At 1024x768 a fifteen-row
+  sidebar takes 438 of 1024 px and nothing fits beside it**; that resolution is
+  deliberately not covered by the default layout.
+  - CPS counts clicks in the last second per mouse button, recorded on
+    `MouseInput`, so it measures presses rather than the held state.
+  - Speed is horizontal blocks/second from a position sample per frame with a
+    ~0.2 s exponential smoothing; samples closer than 4 ms are ignored.
+  - Ping comes from our own row in the `S38` tab list (`own_ping`, matching
+    `info.uuid` against `player_list`); 0/absent renders `--`.
+  - The old one-line debug readout (`Nephele 1.8.9 … fps xyz … chunks`) is now
+    behind `NEPHELE_DEBUG=1`; the modules carry that information by default.
+- **`settings.rs` — persistence.** `settings.json` in
+  `paths::user_data_dir()` (beside `servers.json`/`auth.json`): video settings plus
+  every module's `enabled`/`anchor`, keyed by the stable `ModuleId::key`.
+  Missing/corrupt/partial files fall back to defaults field by field, unknown keys
+  are ignored, and hand-edited values are clamped on load. Saved on every change
+  (adjust, toggle, drag-release, Done).
+- **Generic server windows.** A container window is now drawn for **any slot
+  count**: `window_rows`/`container_panel_size`/`server_window_origin` lay the
+  container slots nine to a row above the player's 36, so a hopper, a single chest,
+  a double chest or a furnace all render without a bespoke screen, titled from
+  `S2D`'s inventory type (`window_kind_label`). The 46-slot crafting table keeps
+  its vanilla 3x3-plus-output layout.
+- **`interact.rs` — entity clicks.** Ray–AABB targeting over `Entities` (0.6 wide;
+  1.8 tall for players, 1.5 for mobs), nearest hit inside reach, and only when it
+  is **nearer than the block** behind it. Click pacing is vanilla-flavoured:
+  `ATTACK_COOLDOWN = 125 ms` (a debounce — 1.8 has no attack-strength meter) and
+  `USE_COOLDOWN = 200 ms` (`rightClickDelayTimer = 4` ticks). While an entity is
+  targeted, mining and block placement are suppressed, as vanilla's
+  `objectMouseOver` priority does. **The packet is not sent:** `C02 Use Entity`
+  needs a constant/builder in `nephele-protocol` and a send path in
+  `nephele-client`, both `net`-lane files. The net loop records the decision in
+  `Shared.entity_actions` (capped at 16) and `Shared.target`; that queue is the
+  seam to complete the feature, and nothing drains it yet.
 
 ---
 
@@ -610,7 +683,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `worldgen` | two-stage generation, caves, ores, flora, structures (phases W1–W5) | `w-worldgen` | not started |
 | `survival` | inventory, containers, HUD art | `survival` | 85%, HUD art left |
 | `net` | protocol, real servers, maps, frames, metadata | `net` | needs rebase, then merge |
-| `client-ui` | chat colours, settings, loading screen, modules | — | not started |
+| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | chat colours, six HUD modules, scoreboard sidebar renderer + settings persistence landed 2026-11-06; scoreboard packets and entity `C02` wait on `net`; loading screen not started |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90%, needs landing |
 | `entities` | players, skins, nametags, frames, maps on screen | `entities` | 35% |
 | `perf` | startup, view distance, baseline gate | `perf` | done, needs merge |
@@ -647,6 +720,12 @@ item icons for unmapped item ids.
 **PowerShell**
 
 - `.Replace()` with CRLF fails on LF files → use the `edit` tool.
+- **Never round-trip a source file through `Get-Content -Raw` / `Set-Content`.**
+  `live.rs`'s first line is mojibake (non-ASCII bytes), and a PowerShell rewrite
+  re-encodes it *and* adds a UTF-8 BOM — the diff then shows an unreadable line 1
+  that has nothing to do with the change. Use the `edit` tool for text edits;
+  if it happens, splice the original first line back byte-for-byte with
+  `[System.IO.File]` APIs and `git show HEAD:<path>`.
 - `[System.IO.File]::ReadAllText` with a relative path resolves against the process
   CWD, not the PS location → always use absolute paths.
 - `-replace` needs `${1}_${2}` — `$1_$2` silently misbehaves.
@@ -698,10 +777,10 @@ item icons for unmapped item ids.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **446 test cases across the workspace** (445 passed, 1 ignored, including two
-  doctests). `nephele-cli` has 65 passing tests; `nephele-assets` has 34;
-  `nephele-render` has 43 passing tests, including seven shape-meshing
-  regressions; `nephele-world` has 119 passing tests and one ignored. The six
+- **560 test cases across the workspace** (560 passed, 2 ignored, including two
+  doctests). `nephele-cli` has 126 passing tests; `nephele-assets` has 39;
+  `nephele-render` has 50 passing tests, including seven shape-meshing
+  regressions; `nephele-world` has 131 passing tests and one ignored. The six
   real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,
   compression, chat, joining/loading the mock world, drop pickup, and crafting
   planks through `C0E`.

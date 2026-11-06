@@ -1,9 +1,13 @@
+mod chat;
 mod commands;
+mod hud_modules;
+mod interact;
 mod inventory;
 mod live;
 mod mesher;
 mod paths;
 mod perf;
+mod scoreboard;
 mod servers;
 mod settings;
 mod skins;

@@ -26,6 +26,9 @@ talks protocol 47, and joins offline-mode servers.
 - Block shapes: slabs, stairs, fence posts, panes, doors and torches render with shape-aware geometry
 - Movement and interaction: vanilla travel physics, sprinting, mining, block
   placement, creative item palette, chat
+- Client HUD: toggleable, draggable modules (FPS, ping, CPS, keystrokes,
+  coordinates, speed), a scoreboard sidebar and coloured chat, with settings
+  saved to `settings.json`
 - Players: entity tracking, skins and skin loading, humanoid rendering
 - Items: server drops render as spinning entities; local survival adds mined
   block items to inventory
