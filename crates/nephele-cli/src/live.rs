@@ -932,6 +932,9 @@ async fn net_loop(
     // Chunks we've already handed to the renderer. Diffing against the world
     // each tick catches bulk loads, which only report their last column.
     let mut sent: HashSet<(i32, i32)> = HashSet::new();
+    // The dimension the renderer's meshes belong to. S07 can arrive with the
+    // same dimension (a death respawn); only a change invalidates them.
+    let mut sent_dimension = client.world.dimension();
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1151,6 +1154,36 @@ async fn net_loop(
                     }
                     Ok(Event::BlocksChanged(_)) => {
                         world_dirty = true;
+                    }
+                    Ok(Event::Respawn { dimension }) => {
+                        let changed = dimension != sent_dimension;
+                        sent_dimension = dimension;
+                        // A same-dimension respawn keeps its chunks and meshes.
+                        // A real dimension change has already dropped the
+                        // client's chunks, so drop the matching meshes *now*:
+                        // if a new column at the same coordinate arrived first,
+                        // the per-tick diff would think it was already sent and
+                        // leave the old dimension's mesh on screen.
+                        if changed {
+                            let stale: Vec<(i32, i32)> = sent.drain().collect();
+                            for (x, z) in &stale {
+                                let _ = tx.send(NetMsg::Unload(*x, *z));
+                            }
+                            world_dirty = false;
+                        }
+                        let mut state = shared.lock().unwrap();
+                        state.spawned = false;
+                        state.aim = None;
+                        state.break_stage = None;
+                        state.teleport = None;
+                        eprintln!(
+                            "respawn: dimension {dimension}{}",
+                            if changed {
+                                ", dropped the old dimension's chunk meshes"
+                            } else {
+                                ""
+                            }
+                        );
                     }
                     Ok(Event::PlayerList) => {
                         let skins: Vec<([u8; 16], String)> = client
@@ -1735,6 +1768,7 @@ impl LiveApp {
                 }
                 Ok(NetMsg::Unload(x, z)) => {
                     self.world.remove(ChunkCoord::new(x, z));
+                    self.dirty_chunks.retain(|key| *key != (x, z));
                     self.queued.remove(&(x, z));
                     self.stale.remove(&(x, z));
                     self.pending_uploads.retain(|(key, _)| *key != (x, z));

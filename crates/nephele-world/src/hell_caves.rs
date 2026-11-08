@@ -91,8 +91,24 @@ impl HellCaves {
                 let pitch = (rand.next_float() - 0.5) * 2.0 / 8.0;
                 let radius = rand.next_float() * 2.0 + rand.next_float();
                 let seed = rand.next_long();
+                // `func_180704_a(..., f2 * 2.0F, ...)`: the branch radius is
+                // doubled at the call site. Passing `f2` here halves every
+                // tunnel and, because the lava scan box is built from the
+                // radius, makes tunnels abort less often than vanilla's.
                 self.tunnel(
-                    seed, target_x, target_z, column, x, y, z, radius, yaw, pitch, 0, 0, 0.5,
+                    seed,
+                    target_x,
+                    target_z,
+                    column,
+                    x,
+                    y,
+                    z,
+                    radius * 2.0,
+                    yaw,
+                    pitch,
+                    0,
+                    0,
+                    0.5,
                 );
             }
         }
@@ -150,13 +166,17 @@ impl HellCaves {
             y += f64::from(vertical);
             z += f64::from(math::sin(yaw) * planar);
 
-            yaw *= if round { 0.92 } else { 0.7 };
-            yaw += drift_yaw * 0.1;
+            // `p_180704_14_` is the *vertical* angle: vanilla scales it by
+            // 0.92/0.7 and feeds it the 0.9/×2 drift (`f1`). Yaw
+            // (`p_180704_13_`) only takes the 0.75/×4 drift (`f`). Swapping the
+            // pair bends every tunnel away from vanilla's path.
+            pitch *= if round { 0.92 } else { 0.7 };
             pitch += drift_pitch * 0.1;
-            drift_yaw *= 0.9;
-            drift_pitch *= 0.75;
-            drift_yaw += (rand.next_float() - rand.next_float()) * rand.next_float() * 2.0;
-            drift_pitch += (rand.next_float() - rand.next_float()) * rand.next_float() * 4.0;
+            yaw += drift_yaw * 0.1;
+            drift_pitch *= 0.9;
+            drift_yaw *= 0.75;
+            drift_pitch += (rand.next_float() - rand.next_float()) * rand.next_float() * 2.0;
+            drift_yaw += (rand.next_float() - rand.next_float()) * rand.next_float() * 4.0;
 
             if !room && step == fork_at && radius > 1.0 {
                 // Split into two child tunnels and stop the parent here.
@@ -249,7 +269,6 @@ impl HellCaves {
                         }
                         bx += 1;
                     }
-
                     if !lava {
                         // Pass B: carve the ellipsoid out of netherrack.
                         for carve_x in from_x..to_x {

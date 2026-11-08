@@ -307,6 +307,20 @@ Both are ported from their providers and selectable through
 | `MapGenCavesHell` | `hell_caves.rs` | 17×17 source sweep, room+tunnel carver, lava-abort shell scan, `MathHelper` sin/cos table (`math.rs`) |
 | `ChunkProviderEnd` | `end.rs` | radial island density, end-stone fill, obsidian pillars via `WorldGenSpikes` |
 
+**Measured parity (2026-11-08):**
+
+| Harness | Window | Result |
+|---|---|---|
+| `tests/nether_parity.rs` vs a server-saved `DIM-1` (`parity/blocks-nether.bin.gz`, seed 12345, structures off) | 169 chunks / 5,537,792 blocks | **6 terrain mismatches (0.000%)**; population 51,593 (0.93%) and shared 4,763 (0.09%), both expected because decoration depends on load order |
+| `debug_carver_hashes` vs the real `MapGenCavesHell` (`oracle/hellprobe/HellCavesDump`) | 169 chunks | **all 169 hashes identical**; the probe's counters (18,109 tunnels / 460 lava aborts / 26,422 carve passes) match exactly |
+| `tests/end_gen.rs` vs the real `ChunkProviderEnd` (`oracle/hellprobe/EndDump`) | 625 chunks | **all 625 hashes identical** (island, block for block) |
+| `tests/end_gen.rs` pillar shape | 13×13 chunks | 12 pillars, heights 13..=37, every disc inside the radius-4 `WorldGenSpikes` bound |
+
+The Nether fixture is a *real* server save: a 1.8.9 server was started on seed
+12345, the parity bot's playerdata was given `Dimension: -1` so the server
+spawned it in `DIM-1`, then `save-all` and `Export.java` wrote the block arrays.
+That is the saved-world check the first revision said was missing.
+
 - **The nether shares one `Random` between `provide_chunk` and `populate`.**
   `ChunkProviderHell.populate` never reseeds: it continues the stream left by the
   `provideChunk` that loaded the triggering chunk, so decoration depends on load
@@ -329,18 +343,22 @@ Both are ported from their providers and selectable through
   air neighbour matches at the source and is missing its downstream flow.
 - **The MCP tree's `WorldGenGlowStone2` is a copy of `WorldGenGlowStone1`** (both
   grow downward); vanilla 1.8 ships `+rand.nextInt(12)` in `GlowStone2`. The port
-  follows vanilla's upward draw for the second generator. Not yet checked against
-  a saved world.
+  follows vanilla's upward draw for the second generator. The saved Nether cannot
+  settle the *positions* (its decoration RNG is load-order dependent), so this
+  draw is still source-only.
 - **Skylight.** Nether/End chunk sections carry no sky-light array; `World::new`
   already derives `has_skylight` from the dimension, and decode/mesh read it. The
   End still builds the height map (`generateSkylightMap` does that in both
   dimensions); the nether does **not** — vanilla leaves its height map at zero,
-  and nothing in the nether's generation reads it.
-- **Open question — the lava sea.** On seed 12345 the reference code (compiled
-  from the real `NoiseGenerator*` classes and the provider's terrain/surface pass)
-  produces only a sparse lava layer around y=24..31, not a full ocean. The Rust
-  port matches that output; no saved Nether exists to say whether the game differs.
-  See §13.
+  and nothing in the nether's generation reads it. An *offline-generated* nether
+  column also has no block-light data, so `nephele view --dimension nether`
+  renders it unlit until block-light propagation exists; chunks received from a
+  server carry their light arrays and render normally.
+- **The lava sea is settled.** The saved `DIM-1` shows the same sparse lava layer
+  around y=24..31 that the compiled reference produced, not a full ocean; the
+  port matches it. Flowing-lava metas (`11:1`..`11:15`) left by
+  `WorldGenHellLava`'s cascade are the only large shared mismatch and are the
+  documented lava-flow gap above.
 
 ### The biome bug — solved 2026-11-05
 
@@ -465,6 +483,24 @@ the inner ±8 chunks, and prints mismatches by reference block state split into
 first differing coordinate. `terrain_states_are_complete` guards the list of
 states `provide_chunk` may write, so the stage attribution cannot silently rot.
 
+### Nether and End fixtures
+
+`parity/blocks-nether.bin.gz` uses the same format, exported from
+`parity/nether/world/DIM-1`. Getting a saved Nether does not need a portal walk:
+write `Dimension: -1` (an **int**) into the bot's
+`world/playerdata/<uuid>.dat`, start the server, and
+`ServerConfigurationManager.initializeConnectionToPlayer` spawns the player in
+`worldServerForDimension(-1)`; `save-all` then writes `DIM-1/region`. The tiny
+NBT patcher lives at `oracle/tools/PlayerDataTool.java` (dev-only, never
+shipped). `tests/nether_parity.rs` diffs it the same way `block_parity.rs` does.
+
+The End has no saved-world fixture, because nothing about the pillars is
+reproducible (see §6). Its *terrain* is checked against the real
+`ChunkProviderEnd`, compiled unchanged in `oracle/hellprobe` (`EndDump`), and its
+pillar shape against `WorldGenSpikes`'s bounds. The same probe's `HellCavesDump`
+runs the real `MapGenCavesHell` over our Nether primer and prints per-chunk
+hashes; `debug_carver_hashes` must match it exactly.
+
 ### Pinned checksums (`research-lock.json`)
 
 - client jar `1.8.9.jar` — sha1 `3870888a6c3d349d3771a3e9d16c9bf5e076b908`, 8,461,484 bytes
@@ -509,6 +545,23 @@ nothing writes there any more.
 - Order matters: **Mojang join call happens before** the encryption response is sent.
 - `Connection::send_encryption_response` + `read_login_outcome`;
   `GameClient::join_online` runs the HTTP join on `spawn_blocking`.
+
+### Dimension changes (`S07 Respawn`, 2026-11-08)
+
+- `client.world` owns the dimension id and derives `has_skylight` from it;
+  chunk decode is told which form to expect, so nether/end chunks (128 high, no
+  sky-light array) decode without guessing.
+- **Chunks are dropped only when the dimension actually changes.** A death
+  respawn sends `S07` with the same id; clearing then would throw away every
+  loaded column and force a full re-stream. Entities, block entities, the open
+  window, spawn position and the timers reset on every `S07`.
+- `live.rs` tracks the dimension its *meshes* belong to. On a change it unloads
+  every column it has handed the renderer before the new dimension's columns are
+  accepted: the per-tick diff is keyed by `(x, z)`, so a new column arriving at a
+  coordinate the old dimension already used would otherwise be suppressed and the
+  old mesh would stay on screen.
+- `S07` also re-sends client settings so the server starts streaming the new
+  dimension's chunks.
 
 ---
 
@@ -772,9 +825,9 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | Lane | Owns | Branch | State |
 |---|---|---|---|
 | `render` | shapes, tinting, sky, fog | `render` | 95%: bars, fire, plant culling and biome tint landed; audit leftovers |
-
 | `biomes` | GenLayer parity | `biomes` | **100% biome cells, every stage diff 0 — lane complete** |
-| `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) || `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
+| `worldgen` | generation for all three dimensions | `w-worldgen` | two-stage overworld split; Nether/End ported and block-exact (2026-11-08); overworld population next |
+| `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
 | `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | 95%: scoreboards, teams, `C02`, maps and frames all parsed |
 | `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | 20%: worktree exists, nothing landed yet |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
@@ -845,6 +898,20 @@ re-serialize the chunk wholesale.
   this way.
 
 **Worldgen**
+
+- **`MapGenCavesHell` damps and drifts *pitch*, not yaw, and the parameter names
+  hide it.** `p_180704_14_` is the vertical angle: it takes the 0.92/0.7 step
+  damping and the 0.9/×2 drift (`f1`), while yaw (`p_180704_13_`) only gets the
+  0.75/×4 drift (`f`). Swapping the pair still looks like tunnels but moves about
+  1.2k blocks per chunk away from vanilla; it was found by diffing per-step
+  yaw/pitch against the real class in `oracle/hellprobe`, and is pinned by
+  `tests/nether_parity.rs` + `debug_carver_hashes`.
+- **`func_180704_a`'s branch radius is `f2 * 2.0F` at the call site.** Passing
+  `f2` halves every tunnel and, because the lava-abort box is built from the
+  radius, makes fewer tunnels abort; that alone was a 1.7% block diff.
+- **The nether's decoration RNG is load-order dependent**, so a block-for-block
+  comparison of *populated* nether chunks is not meaningful. Compare terrain
+  (`provide_chunk`) and treat population as distribution-only.
 
 - **The Nether is not the overworld with different blocks.** Its provider shares
   one `Random` between `provideChunk` and `populate`, so decoration depends on the
@@ -954,17 +1021,22 @@ re-serialize the chunk wholesale.
 
 - Parity claims are **measured**, never asserted. Every number in §6 came from a run
   against the reference world.
-- Reference-world checks live in `genlayer.rs`, `worldgen.rs` and
-  `tests/block_parity.rs`. `chunk_biomes_match_a_world_the_real_server_generated`
-
-
-  pins chunk `(-28, 4)`; the biome map is **100%** (0 / 160,000 cells, 2026-11-08),
-  and `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **530 test cases across the workspace** (528 passed, 2 ignored, including two  doctests). `nephele-cli` has 80 passing tests; `nephele-assets` has 39;  `nephele-render` has 50 passing tests, including seven shape-meshing
-  regressions; `nephele-world` has 168 library tests and one ignored, plus the two
-  `block_parity` harness tests. The six real-socket tests in
-  `crates/nephele-client/tests/join_mock.rs` cover status, compression, chat,
-  joining/loading the mock world, drop pickup, and crafting planks through `C0E`.
+- Reference-world checks live in `genlayer.rs`, `worldgen.rs`,
+  `tests/block_parity.rs` and the two dimension harnesses. The biome test pins
+  chunk `(-28, 4)`; the biome map is **100%** (0 / 160,000 cells, 2026-11-08), and
+  `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
+  `tests/nether_parity.rs` diffs a server-saved `DIM-1` (and carries the ignored
+  `debug_carver_hashes` cross-check against the real `MapGenCavesHell`).
+  `tests/end_gen.rs` diffs the End island against the real `ChunkProviderEnd`
+  and pins the pillar shape.
+- **573 test cases across the workspace** (566 passed, 7 ignored, including two
+  doctests). `nephele-cli` has 81 passing tests; `nephele-assets` has 39;
+  `nephele-render` has 50 passing tests, including seven shape-meshing
+  regressions; `nephele-world` has 171 library tests (5 ignored) plus the
+  `block_parity`, `nether_parity` and `end_gen` harness tests. The six
+  real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,
+  compression, chat, joining/loading the mock world, drop pickup, and crafting
+  planks through `C0E`.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
 

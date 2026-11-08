@@ -84,7 +84,9 @@ armour), physics (walk, sprint, sneak, fly, jump, sneak edge protection, slime
 bounce), mining + placement, creative inventory, anvil **reading and writing**,
 vanilla-compatible world saves (level.dat with player state, unknown-NBT
 preservation, atomic writes with backups, region compaction, weather), biomes +
-density height field + surface pass, shape-aware block meshing (slabs, stairs,
+density height field + surface pass for all three dimensions (Nether terrain and
+the End island are block-verified against the real 1.8.9 providers, with the
+client following server dimension changes), shape-aware block meshing (slabs, stairs,
 fences, panes, bars, doors, torches, fire, cross-plants with correct culling),
 animated textures, mipmapped filtering, procedural sky and per-biome fog, grass
 tinting, frustum + height-field occlusion culling, a per-frame upload budget,
@@ -99,7 +101,10 @@ Measured parity against a world the real 1.8.9 server generated: **100%** of
 biome cells (0 / 160,000, seed 12345, 625 chunks), **96%** of surface heights,
 **98.8%** of surface block types. Block by block the overworld is **93.95%**
 identical across 18.9M blocks; of the 1.15M differences, **96.2%** are blocks only
-the unported population pass can place.
+the unported population pass can place. The Nether's terrain is **99.999%**
+identical (6 of 5,537,792 blocks against a server-saved `DIM-1`), and the End
+island matches the vanilla provider block for block in all 625 chunks checked.
+
 ---
 
 ## Pillars
@@ -126,7 +131,7 @@ the unported population pass can place.
 | Item | Size | Notes |
 |---|---|---|
 | **Two-stage pipeline (`provideChunk` + `populate`) + `GenWorld` shim** | L | **Done 2026-11-05:** terrain → surface → caves → ravines → structure-start discovery → height map, then a `populate` driver with vanilla's 2×2 eligibility rule. The overworld's `populate_owner` still calls an empty `decorate` stub. |
-| **Nether generation (`ChunkProviderHell`, caves, glowstone/quartz/fire/springs) and the End island + obsidian pillars** | L | **Done 2026-11-06:** `nether.rs`, `end.rs`, `hell_caves.rs`, `Dimension`, `ChunkGenerator`, `nephele view --dimension`. Nether fortresses, the End dragon and the End's dead surface pass are out of scope; pillars are deterministic here because vanilla's RNG is unseeded. Lava-sea behaviour still needs a saved-world check (AGENTS.md §6). |
+| **Nether generation (`ChunkProviderHell`, caves, glowstone/quartz/fire/springs) and the End island + obsidian pillars** | L | **Done 2026-11-06, block-verified 2026-11-08:** terrain is 6 blocks off in 5.54M against a *server-saved* `DIM-1` (seed 12345, structures off), and all 169 chunks match the real `MapGenCavesHell` byte for byte; the End island matches the real `ChunkProviderEnd` in all 625 chunks. Pillars are shape-verified only (vanilla's pillar RNG is the unseeded `World.rand`). Nether fortresses, the End dragon and flowing-lava cascades remain out of scope. |
 | **Mesa** stratified hardened clay | M | The last missing biome override. |
 | Caves (`MapGenCaves`) and ravines | L | **Implemented** in `provide_chunk`; shape shows up as the buried part of the block diff (18,235 blocks). |
 | Ores + granite/diorite/andesite, dirt/gravel/clay pockets | M | **Population stage, not wired.** `ores.rs` still exists but is no longer called: its seed and `+8` offsets only make sense inside `populate`. |
@@ -135,7 +140,7 @@ the unported population pass can place.
 | Snow and ice, podzol, vines, sand patches | S | Population stage; not ported. Snow and ice appear only where the surface pass puts them. |
 | Structures: villages, mineshafts, strongholds, temples, witch huts, monuments | XL | Structure **start discovery** and caching (village/scattered/monument grids, mineshaft, stronghold) is in `provide_chunk`; no pieces are placed yet. |
 | World types: superflat, large biomes, amplified, customized JSON | M | |
-| Nether and End generation, portals | XL | Out of scope for a PvP client v1. |
+| Nether and End **portals**, and singleplayer dimension switching | M | Generation is done (`ChunkProviderHell`/`ChunkProviderEnd`); the client already follows a server's `S07` into either dimension. Portal creation/travel is still only server-driven. |
 | Chunk generation on worker threads, streamed around the player | M | Singleplayer only; servers send chunks. |
 
 ### 3. The tick loop, movement and physics
@@ -281,7 +286,8 @@ and worktree for each.
 | `render` | 95% | shape audit leftovers; first-person hand depth-clear |
 
 | `biomes` | 100% | nothing — every GenLayer stage diffs 0 against the oracle |
-| `worldgen` | 15% | `provide_chunk`/`populate` split landed; caves, ores, flora, structures || `survival` | 90% | eating, potions, enchantments, XP orbs |
+| `worldgen` | 45% | overworld split, **Nether + End block-verified**; overworld population (ores, flora, lakes, dungeons, structures) is the remaining gap |
+| `survival` | 90% | eating, potions, enchantments, XP orbs |
 | `net` | 95% | resource packs, reconnect polish |
 | `client-ui` | 20% | scoreboard rendering, chat colours, HUD modules, keybinds |
 | `entities` | 60% | skins and second layer, equipment, frame rendering, particles |

@@ -575,7 +575,12 @@ impl GameClient {
             }
             play::clientbound::RESPAWN => {
                 let respawn = play::parse_respawn(&packet)?;
-                self.world.set_dimension(respawn.dimension);
+                // A death respawn sends S07 with the *same* dimension. Vanilla
+                // keeps the loaded chunks in that case; only a real dimension
+                // change invalidates them.
+                if self.world.dimension() != respawn.dimension {
+                    self.world.set_dimension(respawn.dimension);
+                }
                 self.entities.clear();
                 self.block_entities.clear();
                 self.info.dimension = respawn.dimension;
@@ -1479,6 +1484,31 @@ mod tests {
         assert_eq!(client.spawn_position, None);
         assert_eq!((client.world_age, client.time_of_day), (0, 0));
         assert!(client.open_window.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_respawn_in_the_same_dimension_keeps_the_loaded_chunks() {
+        let (mut client, mut peer) = test_game_client().await;
+        client.world.insert(ChunkColumn::empty(0, 0));
+
+        let mut w = nephele_protocol::PacketWriter::new();
+        w.write_i8(0)
+            .write_u8(3)
+            .write_u8(1)
+            .write_string("default");
+        let event = client
+            .handle(Packet::new(play::clientbound::RESPAWN, w.into_bytes()))
+            .await
+            .unwrap();
+        assert_eq!(event, Event::Respawn { dimension: 0 });
+        // The client still sends the settings packet, as vanilla does.
+        let settings = peer.read_packet().await.unwrap();
+        assert_eq!(settings.id, play::serverbound::CLIENT_SETTINGS);
+
+        assert_eq!(client.world.loaded_chunks(), 1);
+        assert!(client.world.has_skylight());
+        assert!(!client.spawned);
+        assert_eq!(client.position, Vec3::default());
     }
 
     #[tokio::test]

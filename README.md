@@ -19,6 +19,9 @@ talks protocol 47, and joins offline-mode servers.
 
 - Protocol 47: handshake, status ping, login and play, with zlib compression
 - World: chunk decoding, block states, lighting, raycasting, terrain generation
+- Dimensions: Overworld, Nether and End generation (Nether terrain and the End
+  island verified block-for-block against vanilla), and the client follows a
+  server's dimension change without losing or stranding chunks
 - Rendering: wgpu 30 with worker-threaded chunk meshing, vanilla block models,
   `.mcmeta` animations, mipmapped textures, procedural sky and per-biome fog,
   frustum + height-field occlusion culling and a per-frame upload budget
