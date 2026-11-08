@@ -28,7 +28,7 @@ pub use container::LocalContainer;
 pub use entities::{Entities, Entity, EntityKind};
 pub use maps::{MapState, Maps};
 pub use mining::{Aim, Miner, MiningEvent};
-pub use scene::{EntityRender, EntityRenderKind, SceneView};
+pub use scene::{EntityRender, EntityRenderKind, Nametag, SceneView};
 pub use scoreboard::{Objective, Scoreboard, SidebarRow, Team};
 pub use skins::{SkinInfo, Skins};
 
@@ -963,6 +963,14 @@ impl GameClient {
             }
             play::clientbound::SPAWN_OBJECT => {
                 let object = play::parse_spawn_object(packet)?;
+                if object.kind == crate::entities::OBJECT_TYPE_ARMOR_STAND {
+                    self.entities
+                        .spawn_armor_stand(object.entity_id, [object.x, object.y, object.z]);
+                    return Ok(Event::EntitySpawned {
+                        entity_id: object.entity_id,
+                        name: String::new(),
+                    });
+                }
                 if object.kind == play::OBJECT_TYPE_ITEM_FRAME {
                     // The frame's `data` field is its facing; the framed stack
                     // and rotation arrive later on `S1C`.
@@ -1069,6 +1077,18 @@ impl GameClient {
                 self.apply_entity_metadata(entity_id, metadata);
                 Ok(Event::Packet(packet.id))
             }
+            play::clientbound::ENTITY_EQUIPMENT => {
+                let update = play::parse_entity_equipment(packet)?;
+                self.entities
+                    .apply_equipment(update.entity_id, update.slot, update.item);
+                Ok(Event::Packet(packet.id))
+            }
+            play::clientbound::ANIMATION => {
+                let animation = play::parse_entity_animation(packet)?;
+                self.entities
+                    .play_animation(animation.entity_id, animation.animation);
+                Ok(Event::Packet(packet.id))
+            }
             play::clientbound::ENTITY_METADATA => {
                 let (entity_id, metadata) = play::parse_entity_metadata(packet)?;
                 self.apply_entity_metadata(entity_id, metadata);
@@ -1164,6 +1184,68 @@ impl GameClient {
         SceneView::new(&self.entities, &self.maps, &self.entity_metadata)
     }
 
+    /// The plate to draw above `entity`, with the team prefix/suffix and the
+    /// tab-list ping that only the client-level state knows about.
+    ///
+    /// Vanilla rules: an invisible player or mob hides its plate, an invisible
+    /// armour stand keeps it (the hologram *is* the name), a custom name is
+    /// gated by metadata index 3, and a team's `name_tag_visibility` is resolved
+    /// relative to the local player's team.
+    pub fn nametag(&self, entity: &EntityRender<'_>) -> Option<Nametag> {
+        if entity.invisible() && !entity.is_armor_stand() {
+            return None;
+        }
+        let name = if entity.is_player() {
+            entity
+                .custom_name()
+                .or_else(|| entity.name())
+                .unwrap_or_default()
+        } else {
+            if !entity.custom_name_visible() {
+                return None;
+            }
+            entity.custom_name()?
+        };
+        if name.is_empty() {
+            return None;
+        }
+        let mut tag = Nametag {
+            name: name.to_string(),
+            ..Nametag::default()
+        };
+        if let EntityRenderKind::Player {
+            name: player_name,
+            uuid,
+            ..
+        } = entity.kind
+        {
+            if let Some(team) = self.scoreboard.team_for(player_name) {
+                if !self.can_see_name_tag(team) {
+                    return None;
+                }
+                tag.prefix.clone_from(&team.prefix);
+                tag.suffix.clone_from(&team.suffix);
+            }
+            if let Some(entry) = self.player_list.get(&uuid) {
+                // 0 means "no measurement yet" on most servers.
+                if entry.ping > 0 {
+                    tag.ping = Some(entry.ping.min(u16::MAX as i32) as u16);
+                }
+            }
+        }
+        Some(tag)
+    }
+
+    fn can_see_name_tag(&self, team: &Team) -> bool {
+        let viewer = self.scoreboard.team_name_for(&self.info.username);
+        let same_team = viewer.is_some_and(|viewer| viewer == team.name);
+        match team.name_tag_visibility.as_str() {
+            "hideForOtherTeams" => !same_team,
+            "hideForOwnTeam" => same_team,
+            _ => true,
+        }
+    }
+
     /// Keep the last metadata seen for an entity, and fold the two entries an
     /// item frame uses into its entity record.
     ///
@@ -1172,16 +1254,39 @@ impl GameClient {
     /// storing the whole map means a renderer can read block states, held items
     /// and rotations for anything else too.
     fn apply_entity_metadata(&mut self, entity_id: i32, metadata: play::EntityMetadata) {
-        let item = match metadata.get(&8) {
+        let item = match metadata.get(&play::metadata_index::ITEM) {
             Some(play::MetadataValue::Slot(stack)) => Some(*stack),
             _ => None,
         };
-        let rotation = match metadata.get(&9) {
+        let rotation = match metadata.get(&play::metadata_index::ITEM_ROTATION) {
             Some(play::MetadataValue::Byte(value)) => Some(*value as u8),
             _ => None,
         };
         if item.is_some() || rotation.is_some() {
             self.entities.set_item_frame(entity_id, item, rotation);
+        }
+        if let Some(status) = metadata.byte(play::metadata_index::ARMOR_STAND_STATUS) {
+            self.entities
+                .set_armor_stand_status(entity_id, status as u8);
+        }
+        if let Some(health) = metadata.float(play::metadata_index::HEALTH) {
+            self.entities.set_health(entity_id, health);
+        }
+        // This server uses index 6 for head yaw in byte (1/256 turn) or
+        // `Rotation` form; index 11 is the vanilla armour-stand head pose.
+        // A `Float` at index 6 is health, handled above.
+        let head_yaw = match metadata.get(&play::metadata_index::HEALTH) {
+            Some(play::MetadataValue::Byte(turn)) => Some(*turn as f32 * (360.0 / 256.0)),
+            Some(play::MetadataValue::Rotation([_, yaw, _])) => Some(*yaw),
+            _ => None,
+        }
+        .or_else(|| {
+            metadata
+                .rotation(play::metadata_index::HEAD_ROTATION)
+                .map(|rotation| rotation[1])
+        });
+        if let Some(yaw) = head_yaw {
+            self.entities.head_look(entity_id, yaw);
         }
         self.entity_metadata.insert(entity_id, metadata);
     }

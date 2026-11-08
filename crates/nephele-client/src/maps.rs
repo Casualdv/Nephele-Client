@@ -67,6 +67,90 @@ impl MapState {
         }
         self.colors.get(y * Self::SIZE + x).copied()
     }
+
+    /// A deterministic picture for a map whose pixels have not arrived yet.
+    /// The indices go through [`map_color`], so this is a real sky/sun/ground
+    /// image rather than a flat square.
+    pub fn placeholder(id: i32) -> Self {
+        let mut colors = vec![0u8; Self::AREA];
+        let seed = id as u32;
+        for y in 0..Self::SIZE {
+            for x in 0..Self::SIZE {
+                let border = x < 3 || y < 3 || x >= Self::SIZE - 3 || y >= Self::SIZE - 3;
+                let sun = (x as i32 - 96).pow(2) + (y as i32 - 24).pow(2) < 11 * 11;
+                let index = if border {
+                    10 * 4 + 1 // brown frame edge
+                } else if sun {
+                    14 * 4 + 3 // white/yellow
+                } else if y < 64 {
+                    let cloud = ((x / 9 + y / 7 + seed as usize) % 11) == 0 && y > 12 && y < 48;
+                    if cloud {
+                        8 * 4 + 2 // white
+                    } else {
+                        12 * 4 + 2 // blue sky
+                    }
+                } else {
+                    let n = (x as u32 * 31 + y as u32 * 17 + seed) % 13;
+                    4 + (n % 3) as u8 // green ground shades
+                };
+                colors[y * Self::SIZE + x] = index;
+            }
+        }
+        Self {
+            scale: 0,
+            icons: Vec::new(),
+            colors,
+            patches: 1,
+        }
+    }
+
+    /// Flatten to the RGBA byte order the atlas upload expects.
+    pub fn to_rgba(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::AREA * 4);
+        for y in 0..Self::SIZE {
+            for x in 0..Self::SIZE {
+                let index = self.colors.get(y * Self::SIZE + x).copied().unwrap_or(0);
+                out.extend_from_slice(&map_color(index));
+            }
+        }
+        out
+    }
+}
+
+/// The 1.8 map palette is 64 colours: 16 base colours × 4 brightness shades.
+/// The exact table is Mojang data, so this derives an equivalent palette from
+/// the base hues instead of copying it.
+pub fn map_color(index: u8) -> [u8; 4] {
+    let index = index & 0x3F;
+    if index == 0 {
+        return [0, 0, 0, 0];
+    }
+    const BASE: [[u8; 3]; 16] = [
+        [0, 0, 0],
+        [127, 178, 56],
+        [247, 233, 163],
+        [199, 199, 199],
+        [255, 0, 0],
+        [160, 160, 255],
+        [167, 167, 167],
+        [0, 124, 0],
+        [255, 255, 255],
+        [164, 168, 184],
+        [151, 109, 77],
+        [112, 112, 112],
+        [64, 64, 255],
+        [143, 119, 72],
+        [255, 252, 245],
+        [216, 127, 51],
+    ];
+    let base = BASE[(index >> 2) as usize];
+    let shade = [0.45, 0.70, 1.0, 1.25][(index & 3) as usize];
+    [
+        (base[0] as f32 * shade).min(255.0) as u8,
+        (base[1] as f32 * shade).min(255.0) as u8,
+        (base[2] as f32 * shade).min(255.0) as u8,
+        255,
+    ]
 }
 
 /// Every map the client has received data for, keyed by map id.
@@ -90,6 +174,18 @@ impl Maps {
 
     pub fn get(&self, id: i32) -> Option<&MapState> {
         self.map.get(&id)
+    }
+
+    /// Get a map, creating the placeholder if no pixels have arrived yet.
+    pub fn ensure(&mut self, id: i32) -> &mut MapState {
+        self.map
+            .entry(id)
+            .or_insert_with(|| MapState::placeholder(id))
+    }
+
+    /// Replace one map with a state already merged on the network thread.
+    pub fn insert(&mut self, id: i32, state: MapState) {
+        self.map.insert(id, state);
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&i32, &MapState)> {

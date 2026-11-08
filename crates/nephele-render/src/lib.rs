@@ -19,15 +19,16 @@ pub use beacon::{
 };
 pub use camera::Camera;
 pub use entity::{
-    append_hand, build_entities, EntityDraw, EntityMesh, EntityVertex, HandDraw, HandPose,
+    append_hand, append_hand_map, append_item_frame, build_entities, humanoid_hand, EntityDraw,
+    EntityMesh, EntityVertex, HandDraw, HandPose, ItemFrameDraw, MobModel,
 };
 pub use environment::{biome_fog_color, Environment};
 pub use gpu::{DrawOutcome, Renderer, RendererError, StartupSample, StartupStage, StartupTimings};
 pub use lines::{block_outline, LineMesh, LineVertex};
 pub use mesh::{
     break_overlay_texture, build_break_overlay, build_column_mesh, build_hand_item,
-    build_item_mesh, build_world_mesh, mesh_column, ColumnMeshJob, HandItem, ItemDraw, MeshData,
-    Vertex,
+    build_hand_sprite, build_item_mesh, build_world_mesh, mesh_column, ColumnMeshJob, HandItem,
+    ItemDraw, MeshData, Vertex,
 };
 pub use particles::{note_color, Particles};
 pub use ui::{Rect, UiBatch, UiVertex};

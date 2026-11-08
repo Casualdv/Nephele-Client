@@ -91,6 +91,15 @@ impl<'a> SceneView<'a> {
                 item: *item,
                 rotation: *rotation,
             },
+            EntityKind::ArmorStand {
+                small,
+                marker,
+                show_arms,
+            } => EntityRenderKind::ArmorStand {
+                small: *small,
+                marker: *marker,
+                show_arms: *show_arms,
+            },
         };
         EntityRender {
             id: entity.id,
@@ -103,6 +112,10 @@ impl<'a> SceneView<'a> {
             head_yaw: entity.head_yaw,
             prev_head_yaw: entity.prev_head_yaw,
             metadata,
+            equipment: entity.equipment,
+            animation: entity.animation,
+            animation_ticks: entity.animation_ticks,
+            health: entity.health,
         }
     }
 }
@@ -121,6 +134,13 @@ pub struct EntityRender<'a> {
     pub prev_head_yaw: f32,
     /// The last metadata seen for this entity, if the server sent any.
     pub metadata: Option<&'a EntityMetadata>,
+    /// Held item, boots, leggings, chestplate, helmet (`S04`).
+    pub equipment: [Option<ItemStack>; nephele_protocol::packets::play::equipment_slot::COUNT],
+    /// Last `S0B` animation id (0 = arm swing) and its remaining ticks.
+    pub animation: u8,
+    pub animation_ticks: u8,
+    /// Last health reported in metadata index 6.
+    pub health: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +164,11 @@ pub enum EntityRenderKind<'a> {
         item: Option<ItemStack>,
         /// 45-degree steps, 0..=7.
         rotation: u8,
+    },
+    ArmorStand {
+        small: bool,
+        marker: bool,
+        show_arms: bool,
     },
 }
 
@@ -190,6 +215,138 @@ impl EntityRender<'_> {
             _ => None,
         }
     }
+
+    pub fn is_player(&self) -> bool {
+        matches!(self.kind, EntityRenderKind::Player { .. })
+    }
+
+    pub fn is_armor_stand(&self) -> bool {
+        matches!(self.kind, EntityRenderKind::ArmorStand { .. })
+    }
+
+    /// The display name before team decoration: a player's list name, or a
+    /// mob/hologram's `custom_name`.
+    pub fn name(&self) -> Option<&str> {
+        match self.kind {
+            EntityRenderKind::Player { name, .. } => Some(name),
+            _ => self.custom_name(),
+        }
+    }
+
+    fn flag(&self, mask: u8) -> bool {
+        self.metadata
+            .and_then(|metadata| metadata.byte(0))
+            .is_some_and(|flags| flags as u8 & mask != 0)
+    }
+
+    pub fn invisible(&self) -> bool {
+        self.flag(0x20)
+    }
+
+    pub fn crouched(&self) -> bool {
+        self.flag(0x02)
+    }
+
+    /// Metadata index 3: whether a custom name is drawn. Players always show
+    /// their list name; this only gates mobs and armour-stand holograms.
+    pub fn custom_name_visible(&self) -> bool {
+        self.metadata
+            .and_then(|metadata| metadata.byte(3))
+            .is_some_and(|visible| visible != 0)
+    }
+
+    /// Height above the feet at which the plate is centred.
+    pub fn label_height(&self) -> f32 {
+        match self.kind {
+            EntityRenderKind::Player { .. } => 2.05,
+            EntityRenderKind::ArmorStand { small, .. } => {
+                if small {
+                    0.8
+                } else {
+                    1.55
+                }
+            }
+            _ => 1.75,
+        }
+    }
+
+    /// Whether the plate carries a health line. Players read their own health
+    /// off the HUD; holograms have no health.
+    pub fn shows_health(&self) -> bool {
+        !self.is_armor_stand() && !self.is_player()
+    }
+
+    pub fn held_item(&self) -> Option<ItemStack> {
+        self.equipment[nephele_protocol::packets::play::equipment_slot::HELD as usize]
+    }
+
+    /// Boots, leggings, chestplate, helmet, in the order the renderer expects.
+    pub fn armor(&self) -> [Option<ItemStack>; 4] {
+        use nephele_protocol::packets::play::equipment_slot;
+        [
+            self.equipment[equipment_slot::BOOTS as usize],
+            self.equipment[equipment_slot::LEGGINGS as usize],
+            self.equipment[equipment_slot::CHESTPLATE as usize],
+            self.equipment[equipment_slot::HELMET as usize],
+        ]
+    }
+
+    pub fn item_frame(&self) -> Option<(u8, u8, Option<ItemStack>)> {
+        match self.kind {
+            EntityRenderKind::ItemFrame {
+                direction,
+                item,
+                rotation,
+            } => Some((direction, rotation, item)),
+            _ => None,
+        }
+    }
+}
+
+/// The plate drawn above an entity's head.
+///
+/// `prefix`/`suffix` are team formatting and `ping` is the tab-list latency;
+/// both are filled by `GameClient::nametag`. `raw_plate` keeps `§` codes for a
+/// colour-aware renderer, while `plate` is the plain-text form.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Nametag {
+    pub prefix: String,
+    pub name: String,
+    pub suffix: String,
+    pub ping: Option<u16>,
+}
+
+impl Nametag {
+    pub fn raw_plate(&self) -> String {
+        let mut text =
+            String::with_capacity(self.prefix.len() + self.name.len() + self.suffix.len() + 16);
+        text.push_str(&self.prefix);
+        text.push_str(&self.name);
+        text.push_str(&self.suffix);
+        if let Some(ping) = self.ping {
+            text.push_str(" §7");
+            text.push_str(&ping.to_string());
+            text.push_str("ms");
+        }
+        text
+    }
+
+    pub fn plate(&self) -> String {
+        strip_formatting(&self.raw_plate())
+    }
+}
+
+fn strip_formatting(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '§' {
+            chars.next();
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

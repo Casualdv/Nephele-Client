@@ -22,15 +22,28 @@ pub enum EntityKind {
     /// An item frame (`S0E` with object type 71). The framed stack and its
     /// rotation only exist as `S1C` metadata, so they start empty.
     ///
-    /// `direction` is the spawn packet's `data` field: 0 = down, 1 = up,
-    /// 2 = north, 3 = south, 4 = west, 5 = east.
+    /// `direction` is the spawn packet's `data` field:
+    /// `EnumFacing.getHorizontalIndex()`: 0 = south, 1 = west, 2 = north,
+    /// 3 = east. (`S0E` never sends the vertical faces for a frame.)
     ItemFrame {
         direction: u8,
         item: Option<nephele_protocol::packets::play::ItemStack>,
         /// Rotation in 45-degree steps, 0..=7 (vanilla's `getRotation`).
         rotation: u8,
     },
+    /// An armour stand (`S0E` with object type 78). Status flags and the head
+    /// pose arrive as metadata; an invisible marker stand is a lobby hologram
+    /// whose only visible part is its `custom_name`.
+    ArmorStand {
+        small: bool,
+        /// Marker stands have no hitbox and are what holograms are built from.
+        marker: bool,
+        show_arms: bool,
+    },
 }
+
+/// `S0E` object type for an armour stand.
+pub const OBJECT_TYPE_ARMOR_STAND: u8 = 78;
 
 #[derive(Debug, Clone)]
 pub struct Entity {
@@ -49,6 +62,14 @@ pub struct Entity {
     pub velocity: [f64; 3],
     /// Client tick this entity spawned on.
     pub spawned_at: u64,
+    /// Held item, boots, leggings, chestplate, helmet (`S04`).
+    pub equipment: [Option<nephele_protocol::packets::play::ItemStack>;
+        nephele_protocol::packets::play::equipment_slot::COUNT],
+    /// Last `S0B` animation id (0 = arm swing) and how many ticks it lasts.
+    pub animation: u8,
+    pub animation_ticks: u8,
+    /// Last health reported in metadata index 6, for the plate's HP line.
+    pub health: f32,
 }
 
 impl Entity {
@@ -65,6 +86,10 @@ impl Entity {
             prev_head_yaw: yaw,
             velocity: [0.0; 3],
             spawned_at: tick,
+            equipment: [None; nephele_protocol::packets::play::equipment_slot::COUNT],
+            animation: 0,
+            animation_ticks: 0,
+            health: 20.0,
         }
     }
 
@@ -107,6 +132,36 @@ impl Entity {
     fn look(&mut self, yaw: f32, pitch: f32) {
         self.yaw = yaw;
         self.pitch = pitch;
+    }
+
+    /// Apply the armour-stand status byte (0x01 small, 0x04 show arms,
+    /// 0x08 no base plate, 0x10 marker).
+    fn set_armor_stand_status(&mut self, status: u8) {
+        if let EntityKind::ArmorStand {
+            small,
+            marker,
+            show_arms,
+        } = &mut self.kind
+        {
+            *small = status & 0x01 != 0;
+            *show_arms = status & 0x04 != 0;
+            *marker = status & 0x10 != 0;
+        }
+    }
+
+    fn set_equipment(
+        &mut self,
+        slot: i16,
+        item: Option<nephele_protocol::packets::play::ItemStack>,
+    ) {
+        if (0..nephele_protocol::packets::play::equipment_slot::COUNT as i16).contains(&slot) {
+            self.equipment[slot as usize] = item;
+        }
+    }
+
+    fn play_animation(&mut self, animation: u8) {
+        self.animation = animation;
+        self.animation_ticks = 8;
     }
 }
 
@@ -169,6 +224,10 @@ impl Entities {
             entity.prev = entity.position;
             entity.prev_yaw = entity.yaw;
             entity.prev_head_yaw = entity.head_yaw;
+            entity.animation_ticks = entity.animation_ticks.saturating_sub(1);
+            if entity.animation_ticks == 0 {
+                entity.animation = 0;
+            }
         }
     }
 
@@ -256,6 +315,63 @@ impl Entities {
                 self.tick,
             ),
         );
+    }
+
+    /// Track an armour stand (`S0E`, object type 78). Status flags and the head
+    /// pose arrive as metadata afterwards.
+    pub fn spawn_armor_stand(&mut self, id: i32, position: [f64; 3]) {
+        self.map.insert(
+            id,
+            Entity::new(
+                id,
+                EntityKind::ArmorStand {
+                    small: false,
+                    marker: false,
+                    show_arms: false,
+                },
+                position,
+                0.0,
+                0.0,
+                self.tick,
+            ),
+        );
+    }
+
+    /// Apply one `S1C` armour-stand status byte.
+    pub fn set_armor_stand_status(&mut self, id: i32, status: u8) {
+        if let Some(entity) = self.map.get_mut(&id) {
+            entity.set_armor_stand_status(status);
+        }
+    }
+
+    /// Apply one `S04` equipment slot.
+    pub fn apply_equipment(
+        &mut self,
+        id: i32,
+        slot: i16,
+        item: Option<nephele_protocol::packets::play::ItemStack>,
+    ) -> bool {
+        let Some(entity) = self.map.get_mut(&id) else {
+            return false;
+        };
+        entity.set_equipment(slot, item);
+        true
+    }
+
+    /// Record an `S0B` animation on one entity.
+    pub fn play_animation(&mut self, id: i32, animation: u8) -> bool {
+        let Some(entity) = self.map.get_mut(&id) else {
+            return false;
+        };
+        entity.play_animation(animation);
+        true
+    }
+
+    /// Store the health reported in metadata index 6.
+    pub fn set_health(&mut self, id: i32, health: f32) {
+        if let Some(entity) = self.map.get_mut(&id) {
+            entity.health = health.max(0.0);
+        }
     }
 
     /// Apply the two metadata entries an item frame uses: index 8 is the framed
@@ -426,6 +542,10 @@ impl Entity {
             }
             EntityKind::Item { .. } => (0.125, 0.25, self.position[1] + 0.125),
             EntityKind::ItemFrame { .. } => (0.5, 1.0, self.position[1] + 0.5),
+            EntityKind::ArmorStand { small, .. } => {
+                let height = if small { 0.99 } else { 1.99 };
+                (0.25, height, self.position[1] + height / 2.0)
+            }
         };
         [
             [

@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use nephele_client::{Aim, EntityKind, GameClient};
+use nephele_client::{Aim, EntityKind, EntityRenderKind, GameClient};
 use nephele_mock::{MockConfig, MockServer};
 use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::ItemStack;
@@ -290,6 +290,110 @@ async fn a_log_in_the_crafting_grid_shows_planks_in_the_output_slot() {
         Some(ItemStack::new(5, 4, 0)),
         "the output preview is refreshed for the next craft"
     );
+
+    client.disconnect().await;
+}
+
+/// The lobby demo: bots with skins, team-coloured plates, equipment, a framed
+/// map with real `S34` pixels and an invisible armour-stand hologram.
+#[tokio::test]
+async fn the_lobby_has_players_skins_and_a_framed_map() {
+    let server = MockServer::start(MockConfig {
+        radius: 1,
+        greeting: false,
+        bots: true,
+        ..MockConfig::default()
+    })
+    .await
+    .unwrap();
+    let mut client = GameClient::join(&address_of(&server), "Visitor")
+        .await
+        .unwrap();
+    client
+        .pump(Duration::from_millis(1400), Duration::from_millis(50))
+        .await
+        .unwrap();
+
+    {
+        let scene = client.scene();
+        let players: Vec<_> = scene
+            .entities()
+            .filter(|entity| entity.is_player())
+            .collect();
+        assert!(
+            players.len() >= nephele_mock::BOT_COUNT,
+            "expected the lobby bots; entities={} player_list={} skins={} metadata={}",
+            client.entities.len(),
+            client.player_list.len(),
+            client.skins.len(),
+            client.entity_metadata.len()
+        );
+        // Half the bots are slim, so both arm layouts are exercised.
+        assert!(client.skins.iter().any(|(_, info)| info.slim));
+        assert!(client.skins.iter().any(|(_, info)| !info.slim));
+
+        let jeb = players
+            .iter()
+            .find(|entity| {
+                matches!(entity.kind, EntityRenderKind::Player { name, .. } if name == "Jeb")
+            })
+            .expect("Jeb is in the lobby");
+        let tag = client.nametag(jeb).expect("Jeb's plate is visible");
+        assert_eq!(tag.plate(), "[BLU] Jeb [B] 83ms");
+        assert_eq!(
+            jeb.held_item().map(|item| item.id),
+            Some(276),
+            "Jeb holds a sword"
+        );
+        assert!(jeb.crouched(), "Jeb is crouched");
+
+        let grumm = players
+            .iter()
+            .find(|entity| {
+                matches!(entity.kind, EntityRenderKind::Player { name, .. } if name == "Grumm")
+            })
+            .expect("Grumm is in the lobby");
+        assert!(grumm.armor()[2].is_some(), "Grumm wears an iron chestplate");
+
+        // Bot 0 takes its head yaw from metadata index 6, not `S19`.
+        let botto = players
+            .iter()
+            .find(|entity| {
+                matches!(entity.kind, EntityRenderKind::Player { name, .. } if name == "Botto")
+            })
+            .expect("Botto is in the lobby");
+        assert!(
+            (botto.head_yaw - botto.yaw).abs() > 1.0,
+            "metadata head yaw should differ from the body yaw"
+        );
+
+        let frame = scene
+            .entities()
+            .find(|entity| matches!(entity.kind, EntityRenderKind::ItemFrame { .. }))
+            .expect("the mock spawns a framed map");
+        let (direction, rotation, item) = frame.item_frame().expect("frame");
+        assert_eq!(direction, 0, "frame faces south, toward the player");
+        assert_eq!(rotation, 0);
+        let item = item.expect("the frame contains an item");
+        assert_eq!(item.id, play::ITEM_FILLED_MAP);
+        let map = client
+            .maps
+            .get(item.damage as i32)
+            .expect("the mock sends S34 pixels");
+        assert!(map.patches > 0, "real pixels, not the placeholder");
+        assert_eq!(map.color_at(0, 0), Some(41), "brown border");
+        assert_eq!(map.color_at(100, 20), Some(59), "the sun");
+
+        let hologram = scene
+            .entities()
+            .find(|entity| entity.is_armor_stand())
+            .expect("the mock spawns a hologram");
+        assert!(hologram.invisible(), "the hologram body is invisible");
+        let plate = client
+            .nametag(&hologram)
+            .expect("an invisible armour stand keeps its plate");
+        assert_eq!(plate.plate(), "CLICK TO PLAY\nJoin a game");
+    }
 
     client.disconnect().await;
 }

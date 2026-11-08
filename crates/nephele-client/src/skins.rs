@@ -13,6 +13,8 @@ pub struct SkinInfo {
     pub name: String,
     /// Texture hash from the skin URL, if the account has a custom skin.
     pub hash: Option<String>,
+    /// The `metadata.model` field: `true` for the 3px-wide "slim" arms.
+    pub slim: bool,
     /// UUID of the owning account, kept for `GET /session/minecraft/profile`.
     pub uuid: [u8; 16],
 }
@@ -56,16 +58,18 @@ impl Skins {
     /// Record one tab-list entry. Entries that carry no `textures` property are
     /// still stored, so the name is known even when the skin isn't.
     pub fn record(&mut self, entry: &nephele_protocol::packets::play::PlayerListEntry) {
-        let hash = entry
+        let (hash, slim) = entry
             .properties
             .iter()
             .find(|property| property.name == "textures")
-            .and_then(|property| skin_hash_from_property(&property.value));
+            .and_then(|property| skin_from_property(&property.value))
+            .unwrap_or((None, false));
         self.entries.insert(
             entry.uuid,
             SkinInfo {
                 name: entry.name.clone(),
                 hash,
+                slim,
                 uuid: entry.uuid,
             },
         );
@@ -78,11 +82,28 @@ impl Skins {
 
 /// Extract the skin hash out of the base64 `textures` property value.
 pub fn skin_hash_from_property(value: &str) -> Option<String> {
+    skin_from_property(value).and_then(|(hash, _)| hash)
+}
+
+/// Extract the skin hash and the slim/classic model from a `textures` property.
+///
+/// The model is `"slim"` for Alex-shaped skins and absent (classic) for Steve.
+/// Unknown values are treated as classic so a malformed profile still renders.
+pub fn skin_from_property(value: &str) -> Option<(Option<String>, bool)> {
     let decoded = base64_decode(value)?;
     let json = std::str::from_utf8(&decoded).ok()?;
     let parsed: serde_json::Value = serde_json::from_str(json).ok()?;
-    let url = parsed.get("textures")?.get("SKIN")?.get("url")?.as_str()?;
-    texture_hash_from_url(url)
+    let skin = parsed.get("textures")?.get("SKIN")?;
+    let hash = skin
+        .get("url")
+        .and_then(|url| url.as_str())
+        .and_then(texture_hash_from_url);
+    let slim = skin
+        .get("metadata")
+        .and_then(|metadata| metadata.get("model"))
+        .and_then(|model| model.as_str())
+        .is_some_and(|model| model.eq_ignore_ascii_case("slim"));
+    Some((hash, slim))
 }
 
 /// `http(s)://textures.minecraft.net/texture/<hash>` -> `<hash>`.
@@ -134,6 +155,24 @@ mod tests {
         assert_eq!(
             skin_hash_from_property(PROPERTY).as_deref(),
             Some("6ace13d95e13f7c1aff01a652426f1f")
+        );
+    }
+
+    #[test]
+    fn slim_metadata_selects_the_slim_model() {
+        // {"textures":{"SKIN":{"url":".../abc123","metadata":{"model":"slim"}}}}
+        let value = "eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvYWJjMTIzIiwibWV0YWRhdGEiOnsibW9kZWwiOiJzbGltIn19fX0=";
+        assert_eq!(
+            skin_from_property(value),
+            Some((Some("abc123".to_string()), true))
+        );
+    }
+
+    #[test]
+    fn missing_model_metadata_is_classic() {
+        assert_eq!(
+            skin_from_property(PROPERTY),
+            Some((Some("6ace13d95e13f7c1aff01a652426f1f".to_string()), false))
         );
     }
 

@@ -91,7 +91,9 @@ fences, panes, bars, doors, torches, fire, cross-plants with correct culling),
 animated textures, mipmapped filtering, procedural sky and per-biome fog, grass
 tinting, frustum + height-field occlusion culling, a per-frame upload budget,
 damage vignette, **scoreboards + teams + chat**, **maps, item frames and entity
-metadata**, players with head yaw and armour-stand holograms, **audio** (symphonia
+metadata**, players with skins (classic/slim, second layer), held items and
+armour, crouch and arm swing, team-coloured nametags with tab-list ping,
+armour-stand holograms and framed maps with cached pictures, **audio** (symphonia
 decode, kira mixing, break/place/step/hurt), launcher, CI, verified-resource
 preparation. Performance: 143 fps / p99 7.4 ms on integrated AMD at 1280×720,
 view distance 8, vsync off, with a committed baseline that fails the build on
@@ -165,11 +167,11 @@ per render frame — it no longer does. Keep new simulation work inside
 | Item | Size | Notes |
 |---|---|---|
 | Mob models + walk animation (humanoid, quadruped, creeper, slime, squid, bat, chicken, spider, enderman) | **L** | Port from Leafish `entity/`. |
-| Entity metadata: equipment, nametags, invisibility, crouch, arm swing, health | M | |
+| Entity metadata: equipment, nametags, invisibility, crouch, arm swing, health | **done** | `S04` equipment and `S0B` animation are parsed; `EntityRender` carries the derived state. Nametags use team prefix/suffix, tab-list ping and vanilla visibility rules. |
 | Dropped items, XP orbs, arrows, fireworks, paintings, falling blocks | M | **Block drops done**: `SPAWN_OBJECT`/`COLLECT_ITEM` tracked, rendered, collected into the hotbar. XP orbs, arrows and the rest are parsed but not drawn. |
 | Item entities rendering with correct spin/bob | **done** | `build_item_mesh`: a 0.25-block textured cube, spinning and bobbing. Non-block items draw the missing-texture tile until the item atlas exists. |
-| Slim (Alex) player model, capes | S | |
-| Player nametags above heads | S | |
+| Slim (Alex) player model, capes | S | **Slim done**; capes are not drawn. |
+| Player nametags above heads | **done** | Screen-space plates with team colours, suffix and ping; hidden for invisible players/mobs and kept for armour-stand holograms. |
 | Particles (block break, splash, smoke, flame, crit, portal) | M | **Block-break debris, note particles and beacon beams done** (`nephele-render::{particles, beacon}`). Debris are block-atlas quads in the break-overlay buffer; notes are coloured billboards in the entity buffer; beams are an additive pass over the entity vertex format. Splash/smoke/flame/crit/portal and the `textures/particle` sheet are still missing. |
 | Block entities: signs, chests, banners, beacon beam, enchanting table book | L | **Beacon beam done**, derived from the world (stained glass/pane colour, obstruction check, additively blended). Signs, chests, banners and the enchanting-table book are still missing. |
 
@@ -285,7 +287,7 @@ and worktree for each.
 | `survival` | 90% | eating, potions, enchantments, XP orbs |
 | `net` | 95% | resource packs, reconnect polish |
 | `client-ui` | 20% | scoreboard rendering, chat colours, HUD modules, keybinds |
-| `entities` | 60% | skins and second layer, equipment, frame rendering, particles |
+| `entities` | 90% | capes, hurt tint, remaining mob models and particles |
 | `audio` | 35% | music, volume settings, positional falloff tuning |
 | `saves` | 90% | live memory walk; tile entities dropped on imported chunks |
 | `perf` | 100% | Intel HD-class hardware still unverified |

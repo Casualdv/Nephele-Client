@@ -563,6 +563,76 @@ by `shade * light`.
 
 ---
 
+### Entities, nametags, frames and maps — lane pass (2026-11-08)
+
+The `entities` lane was rebased onto the merged `net` model. `net` owns the
+wire parsers and `crates/nephele-client/src/scene.rs`; this pass extends that
+contract rather than keeping a parallel entity snapshot model.
+
+- **Scene contract.** `SceneView` borrows `entities`, `maps` and the metadata
+  map. `EntityRender` now also carries `equipment`, `animation`,
+  `animation_ticks` and `health`, and `EntityRenderKind` has
+  `ArmorStand { small, marker, show_arms }`. `EntityRender::map_for_item`
+  remains the only map-id join (`filled map damage == map id`). The CLI builds
+  its owned channel snapshot from `EntityRender` in `net_loop`, so the render
+  thread does not grow a second entity model.
+- **Nametags.** `GameClient::nametag(&EntityRender)` returns
+  `Nametag { prefix, name, suffix, ping }`. Prefix/suffix come from
+  `Scoreboard::team_for`; ping comes from the `S38` tab list (0 is omitted).
+  Vanilla rules: an invisible player/mob hides its plate, an invisible armour
+  stand keeps it, and metadata index 3 gates custom names. Team
+  `name_tag_visibility` (`always`/`hideForOtherTeams`/`hideForOwnTeam`) is
+  resolved against the local player's team. `live.rs` parses `§0`-`§f`/`§r`
+  into coloured runs; style codes are ignored. Plates scale by distance and are
+  projected above `EntityRender::label_height`.
+- **Players.** `nephele-render::entity` draws classic 4px and slim 3px arms,
+  the hat/jacket/sleeve/pants second layer, tinted armour shells, a held block
+  or item sprite, crouch (2 model pixels) and the `S0B` arm swing. Skin hashes
+  come from the tab-list `textures` property and are downloaded by
+  `nephele-cli/src/skins.rs`; the atlas is 8×8 (2048²) with slot 0 the stand-in
+  and slot 1 solid white for armour tints.
+- **Item frames.** `S0E` type 71 uses `EnumFacing.getHorizontalIndex()`:
+  **0 = south, 1 = west, 2 = north, 3 = east**. `append_item_frame` draws the
+  wooden border (`textures/blocks/itemframe_background.png`, loaded into the
+  skin atlas at runtime) with the framed item flat in front, rotated in 45°
+  steps. A filled map uploads `MapState::to_rgba()` through
+  `SkinAtlas::set_map` and is drawn with UVs `0..128`; non-map items use a flat
+  tint.
+- **Protocol deltas (outside the lane).** `S04 Entity Equipment` and
+  `S0B Animation` were missing from the merged `net` model; this pass added
+  `clientbound::ENTITY_EQUIPMENT`/`ANIMATION`, `equipment_slot`, their parsers,
+  and metadata indices `NAME_VISIBLE`/`HEALTH`/`ARMOR_STAND_STATUS`/
+  `HEAD_ROTATION`. `OBJECT_TYPE_ARMOR_STAND = 78` lives in `entities.rs`.
+  Metadata index 6 accepts a byte (1/256 turn) or `Rotation` for head yaw;
+  index 11 is the armour-stand head pose; index 6 `Float` is health.
+- **Map rendering helpers (lane delta).** `maps.rs` keeps `net`'s
+  `MapState`/`Maps` model and adds `placeholder`, `to_rgba`, `Maps::ensure` and
+  `Maps::insert`; the 64-colour palette is derived from the 16 base colours.
+- **Atlas/render deltas (outside the lane).** `skin_atlas.rs` is 8×8 with
+  `set_map`, dirty-slot tracking and `take_dirty`; `gpu.rs::set_skins` still
+  uploads the whole atlas on a version change, so map-heavy scenes are
+  functional but not yet budgeted. `mesh.rs` gained `build_hand_sprite` for
+  non-block held items. `entity.rs` no longer carries block-entity geometry;
+  that belongs to the render/block-entity lane.
+- **Mock lobby.** `nephele mock-server --bots` now sends two `S3E` teams with
+  prefix/suffix, a `S38` latency update (Jeb, 83 ms), static bots with
+  per-bot synthetic skins, Jeb crouched with a sword, Grumm in full iron with a
+  sword, Dinnerbone holding a map, a framed map at `[8.5, feet+2, 7]` facing
+  south with eight 16-row `S34` patches, and an invisible marker armour-stand
+  hologram (`§6§lCLICK TO PLAY\n§7§oJoin a game`). Bots are static because
+  streaming `S17` movement every 50 ms exposed the `live.rs` race below.
+- **`live.rs` movement-write race (fixed).** The network loop's `select!`
+  could cancel an in-flight `send_movement_tick` when a packet arrived, leaving
+  a half frame on the wire; the mock then read a truncated packet and closed.
+  The movement write now happens **after** the `select!`, outside any
+  cancellation point. Other writes inside the ticker branch are still
+  cancellable in principle; the next pass should move them too or split the
+  connection into read/write tasks.
+- **Known gaps.** Capes and hurt tint are not drawn; visible armour stands have
+  no body model (only their plate); mob textures are not loaded, so mobs use
+  the humanoid model with a flat tint. Block entities and particles remain the
+  render lane's work.
+
 ## 11. Gameplay state
 
 **Mining** is mode-aware and must stay that way:
@@ -827,7 +897,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | **merged at `f0347c1`** - scoreboards, teams, `C02`, maps, frames, keep-alive, beacon/note/debris particles |
 | `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, options tree with a live Video Settings page, `keybinds.rs` (26 actions, click-to-rebind, conflict handling); tab list, boss bar, titles and the loading screen still open |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
-| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
+| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 90%: rebased onto `net`; skins/second layer, equipment, team plates, framed maps and holograms landed; capes/hurt tint remain |
 | `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
 | `audio` | everything sound | `audio` | **merged** - `nephele-audio` (symphonia + kira), break/place/step/hurt wired; music, mob sounds and the fifth volume bus still open |
 | `product` | launcher v2, updater, installer, legal | `saves-landing` (WIP commit) | 25%, blocked on code signing |
