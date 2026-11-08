@@ -893,6 +893,32 @@ re-serialize the chunk wholesale.
 - `cmd1; cmd2` does **not** stop on failure — a clippy error once rode into a commit
   this way.
 
+**Build and tests**
+
+- `crates/nephele-client/tests/scoreboard_capture.rs` replays a lobby capture that is
+  gitignored (365 KB, holds real player names). It pulled the file in with
+  `include_bytes!`, so `cargo clippy --all-targets` failed on every branch without the
+  capture. It reads at runtime and skips when the file is absent. Never bake a
+  gitignored file into the build.
+- Non-ASCII text in `live.rs` has been re-encoded repeatedly (line 1 is quad-mangled
+  UTF-8). It is a comment, so it compiles, but a round-trip through `Set-Content` makes
+  it worse. Use the `edit` tool, which preserves bytes.
+
+**Merging lanes and concurrent sessions**
+
+- During a rebase `--ours` is the upstream (`main`) and `--theirs` the commit being
+  replayed; during a merge it is the other way round. Know which you are in before
+  resolving in bulk.
+- If another session is editing the worktree, gate in a throwaway worktree and stage
+  your hunks onto `HEAD`'s blob (`git hash-object -w --path`, then
+  `git update-index --cacheinfo`) instead of touching the shared working files.
+- A branch whose name differs from its upstream needs an explicit refspec:
+  `git push --force-with-lease=refs/heads/<upstream>:<old> origin <sha>:refs/heads/<upstream>`.
+- **Grep for conflict markers before committing a merge**
+  (`git grep -n "^<<<<<<<\|^>>>>>>>"`). `git add -A` clears the unmerged state without
+  the content being resolved, and fmt, clippy, tests and the publish gate all pass on a
+  file full of markers. This has happened once.
+
 **Worldgen**
 
 - `getBiomesForGeneration` reads `initializeAllBiomeGenerators()[0]` — the coarse
