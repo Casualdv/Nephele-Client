@@ -919,6 +919,19 @@ re-serialize the chunk wholesale.
   the content being resolved, and fmt, clippy, tests and the publish gate all pass on a
   file full of markers. This has happened once.
 
+**Gameplay numbers**
+
+- **Entity reach is 3.0, block reach is 4.5 (survival) / 5.0 (creative).** The
+  server validates `C02` against the victim's box plus a 0.1 cushion and drops
+  anything further without a reply, so using the block distance for entities
+  produced hits that looked real locally and never landed.
+- **Ground speeds run ~2% above vanilla**: this model measures walk 4.405,
+  sprint 5.727, sneak 1.322 against vanilla's 4.317/5.612/1.30, and the
+  sprint-jump chain measures 8.99 against ~7.13. The jump overshoot being larger
+  than the ground delta points at airtime, not the +0.2 boost. Pinned by
+  `ground_speeds_and_sprint_jump_match_the_model`; do not "fix" it by tuning the
+  constants, which are descriptions of what the simulation produces.
+
 **Worldgen**
 
 - `getBiomesForGeneration` reads `initializeAllBiomeGenerators()[0]` — the coarse

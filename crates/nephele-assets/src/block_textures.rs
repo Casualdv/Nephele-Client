@@ -659,6 +659,29 @@ mod tests {
         assert!(face_textures(BlockState::AIR).is_none());
     }
 
+    /// Every id that `nephele-render` draws as two crossed quads must resolve a
+    /// real texture. A name that does not exist in the jar resolves to the
+    /// missing tile, and a plant ends up as a black or white X lying on the
+    /// ground instead of a plant.
+    #[test]
+    fn every_cross_plant_resolves_a_texture() {
+        // Keep this list in step with `is_cross_plant` in
+        // crates/nephele-render/src/mesh.rs.
+        for id in [6u16, 31, 32, 37, 38, 39, 40, 59, 83, 141, 142, 175] {
+            for meta in 0..16u8 {
+                let state = BlockState::from_raw((id << 4) | u16::from(meta));
+                let faces = face_textures(state)
+                    .unwrap_or_else(|| panic!("block {id}:{meta} has no texture at all"));
+                for name in [faces.top, faces.bottom, faces.side] {
+                    assert!(
+                        !name.is_empty() && !name.contains(' ') && !name.contains('/'),
+                        "block {id}:{meta} resolves to {name:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn grass_uses_three_textures() {
         let grass = face_textures(BlockState::GRASS).unwrap();

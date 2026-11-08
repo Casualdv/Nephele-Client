@@ -58,6 +58,12 @@ const PLAYER_STATE_SAVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Vanilla's `PlayerControllerMP.getBlockReachDistance`.
 const REACH_CREATIVE: f64 = 5.0;
 const REACH_SURVIVAL: f64 = 4.5;
+/// How far `C02 Use Entity` may reach.
+///
+/// The server validates an attack against the victim's bounding box plus a
+/// 0.1 block cushion and silently drops anything beyond 3.0, so aiming further
+/// only produces hits that never register.
+const ENTITY_REACH: f64 = 3.0;
 /// Minimum gap between entity attacks while the left button is held.
 const ENTITY_ATTACK_INTERVAL: Duration = Duration::from_millis(250);
 /// Selection outline colour, matching vanilla's black wireframe.
@@ -1432,7 +1438,13 @@ async fn net_loop(
                 });
                 // A player in front of the crosshair wins over the block behind
                 // them, exactly as vanilla's object pick does.
-                let entity_hit = client.entities.raycast(eye, direction, reach);
+                //
+                // Entities use their own, shorter reach: `C02` is validated
+                // against the victim's box plus a 0.1 block cushion, and a hit
+                // past 3.0 is dropped by the server without a word. Reaching
+                // with the block distance made 3.0..4.5 look like a hit on our
+                // screen and vanish on theirs.
+                let entity_hit = client.entities.raycast(eye, direction, ENTITY_REACH);
                 let entity_in_front = match (&block_hit, &entity_hit) {
                     (Some(block), Some(entity)) => block.distance > entity.distance,
                     (None, Some(_)) => true,
