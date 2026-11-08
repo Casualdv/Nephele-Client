@@ -75,7 +75,6 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         );
         texel = textureSampleLevel(animation_atlas, block_sampler, anim_uv, 0.0);
     }
-
     // Leaves, glass and other cutout textures use alpha testing.
     if (texel.a < 0.5) {
         discard;

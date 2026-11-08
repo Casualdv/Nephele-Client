@@ -41,6 +41,7 @@ talks protocol 47, and joins offline-mode servers.
 - Inventory: survival panel with 2x2 crafting, armour, storage and hotbar;
   supported tool, armour and food icons
 - Crafting: shared recipes in the survival 2×2 inventory and a usable placed-table 3×3 grid
+- Containers: server windows of any row count (Hypixel's Game Menu, shops and Ticket Machine) use the vanilla chest panel; worn items show durability bars
 - Chat: on-screen log and input, with client-side `/gamemode`, `/tp`, `/setblock`, `/give`
 - UI: title, multiplayer (live ping, MOTD and version), direct connect, pause, settings
   and creative screens; HUD, hotbar, hearts

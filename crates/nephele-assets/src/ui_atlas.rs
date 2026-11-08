@@ -62,6 +62,15 @@ pub mod sheets {
     pub const LOGO: SpriteRect = SpriteRect::new(512, 0, 256, 256);
     /// `textures/gui/options_background.png` - the tiled dirt backdrop.
     pub const OPTIONS_BACKGROUND: SpriteRect = SpriteRect::new(512, 256, 16, 16);
+    /// `textures/gui/container/inventory.png` - the player inventory panel.
+    pub const INVENTORY: SpriteRect = SpriteRect::new(0, 512, 256, 256);
+    /// `textures/gui/container/crafting_table.png` - the 3x3 table panel.
+    pub const CRAFTING_TABLE: SpriteRect = SpriteRect::new(256, 512, 256, 256);
+    /// `textures/gui/container/furnace.png` - the furnace panel plus its
+    /// flame and progress-arrow sprites.
+    pub const FURNACE: SpriteRect = SpriteRect::new(512, 512, 256, 256);
+    /// `textures/gui/container/generic_54.png` - the chest panel.
+    pub const CHEST: SpriteRect = SpriteRect::new(768, 512, 256, 256);
 }
 
 /// Individual sprites, in the coordinates vanilla's GUI classes use.
@@ -70,11 +79,15 @@ pub mod sprites {
 
     pub const CROSSHAIR: SpriteRect = sheets::ICONS.sub(0, 0, 16, 16);
     pub const HEART_BACKGROUND: SpriteRect = sheets::ICONS.sub(16, 0, 9, 9);
-    pub const HEART_FULL: SpriteRect = sheets::ICONS.sub(54, 0, 9, 9);
-    pub const HEART_HALF: SpriteRect = sheets::ICONS.sub(63, 0, 9, 9);
+    pub const HEART_FULL: SpriteRect = sheets::ICONS.sub(52, 0, 9, 9);
+    pub const HEART_HALF: SpriteRect = sheets::ICONS.sub(61, 0, 9, 9);
     pub const FOOD_BACKGROUND: SpriteRect = sheets::ICONS.sub(16, 27, 9, 9);
     pub const FOOD_FULL: SpriteRect = sheets::ICONS.sub(52, 27, 9, 9);
     pub const FOOD_HALF: SpriteRect = sheets::ICONS.sub(61, 27, 9, 9);
+    /// Armour row: empty, half and full share the heart row's 16/25/34 layout.
+    pub const ARMOUR_BACKGROUND: SpriteRect = sheets::ICONS.sub(16, 9, 9, 9);
+    pub const ARMOUR_HALF: SpriteRect = sheets::ICONS.sub(25, 9, 9, 9);
+    pub const ARMOUR_FULL: SpriteRect = sheets::ICONS.sub(34, 9, 9, 9);
     pub const XP_BAR_BACKGROUND: SpriteRect = sheets::ICONS.sub(0, 64, 182, 5);
     pub const XP_BAR_FILL: SpriteRect = sheets::ICONS.sub(0, 69, 182, 5);
 
@@ -88,6 +101,22 @@ pub mod sprites {
 
     /// Only the inked part of the 256x256 logo image (the rest is transparent).
     pub const LOGO_INK: SpriteRect = sheets::LOGO.sub(0, 0, 199, 89);
+
+    /// The drawn part of each container panel (the rest of the sheet is unused).
+    pub const INVENTORY_PANEL: SpriteRect = sheets::INVENTORY.sub(0, 0, 176, 166);
+    pub const CRAFTING_TABLE_PANEL: SpriteRect = sheets::CRAFTING_TABLE.sub(0, 0, 176, 166);
+    pub const FURNACE_PANEL: SpriteRect = sheets::FURNACE.sub(0, 0, 176, 166);
+    /// `generic_54.png`'s chest section. The top is the full six-row header
+    /// (`rows * 18 + 17` tall) and callers crop it to their row count; the
+    /// bottom is the player section, drawn at `(0, 126)` like `GuiChest`.
+    pub const CHEST_TOP: SpriteRect = sheets::CHEST.sub(0, 0, 176, 125);
+    pub const CHEST_BOTTOM: SpriteRect = sheets::CHEST.sub(0, 126, 176, 96);
+    /// Furnace progress art, taken from the right-hand column of its sheet.
+    pub const FURNACE_FLAME: SpriteRect = sheets::FURNACE.sub(176, 0, 14, 14);
+    pub const FURNACE_ARROW: SpriteRect = sheets::FURNACE.sub(176, 14, 24, 16);
+    /// Empty/full versions of the arrow and flame, so progress can be clipped.
+    pub const FURNACE_ARROW_BACKGROUND: SpriteRect = sheets::FURNACE.sub(176, 30, 24, 16);
+    pub const FURNACE_FLAME_BACKGROUND: SpriteRect = sheets::FURNACE.sub(176, 46, 14, 14);
 }
 
 /// Bitmap font metrics for `ascii.png`.
@@ -184,6 +213,10 @@ impl UiAtlas {
             (sheets::ICONS, "gui/icons.png"),
             (sheets::WIDGETS, "gui/widgets.png"),
             (sheets::LOGO, "gui/title/minecraft.png"),
+            (sheets::INVENTORY, "gui/container/inventory.png"),
+            (sheets::CRAFTING_TABLE, "gui/container/crafting_table.png"),
+            (sheets::FURNACE, "gui/container/furnace.png"),
+            (sheets::CHEST, "gui/container/generic_54.png"),
         ] {
             let full = textures_dir.join(path);
             if !full.is_file() {
@@ -256,6 +289,48 @@ fn blit(dest: &mut RgbaImage, src: &RgbaImage, x: u32, y: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hud_sprites_sit_at_the_vanilla_sheet_offsets() {
+        // Absolute atlas coordinates: ICONS is blitted at (128, 0) and WIDGETS
+        // at (128, 256). GuiIngame's offsets are fixed, so pin them here; a
+        // 2-pixel slip is what made the hearts draw twice.
+        let icons = sheets::ICONS;
+        assert_eq!(icons.x, 128);
+        assert_eq!(icons.y, 0);
+        assert_eq!(
+            sprites::HEART_BACKGROUND,
+            SpriteRect::new(128 + 16, 0, 9, 9)
+        );
+        assert_eq!(sprites::HEART_FULL, SpriteRect::new(128 + 52, 0, 9, 9));
+        assert_eq!(sprites::HEART_HALF, SpriteRect::new(128 + 61, 0, 9, 9));
+        assert_eq!(
+            sprites::FOOD_BACKGROUND,
+            SpriteRect::new(128 + 16, 27, 9, 9)
+        );
+        assert_eq!(sprites::FOOD_FULL, SpriteRect::new(128 + 52, 27, 9, 9));
+        assert_eq!(sprites::FOOD_HALF, SpriteRect::new(128 + 61, 27, 9, 9));
+        assert_eq!(
+            sprites::ARMOUR_BACKGROUND,
+            SpriteRect::new(128 + 16, 9, 9, 9)
+        );
+        assert_eq!(sprites::ARMOUR_HALF, SpriteRect::new(128 + 25, 9, 9, 9));
+        assert_eq!(sprites::ARMOUR_FULL, SpriteRect::new(128 + 34, 9, 9, 9));
+        assert_eq!(sprites::XP_BAR_BACKGROUND, SpriteRect::new(128, 64, 182, 5));
+        assert_eq!(sprites::XP_BAR_FILL, SpriteRect::new(128, 69, 182, 5));
+        assert_eq!(sprites::HOTBAR, SpriteRect::new(128, 256, 182, 22));
+        assert_eq!(
+            sprites::HOTBAR_SELECTION,
+            SpriteRect::new(128, 256 + 22, 24, 22)
+        );
+    }
+
+    #[test]
+    fn hearts_and_food_come_from_different_rows() {
+        // The hunger row must not read the heart row: they are 27 pixels apart.
+        assert_eq!(sprites::HEART_FULL.y + 27, sprites::FOOD_FULL.y);
+        assert_ne!(sprites::HEART_FULL, sprites::FOOD_FULL);
+    }
 
     #[test]
     fn glyphs_tile_into_the_font_sheet() {

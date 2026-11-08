@@ -20,6 +20,7 @@ use crate::settings::{
 use nephele_assets::{
     face_textures, font, item_texture_name, sprites, TextureArray, UiAtlas, MISSING_TEXTURE,
 };
+use nephele_client::ContainerKind;
 use nephele_protocol::packets::play::{ItemStack, HOTBAR_FIRST_SLOT, HOTBAR_SLOTS};
 use nephele_render::{Rect, UiBatch};
 use nephele_world::save::{WorldMetadata, WorldMode};
@@ -188,8 +189,10 @@ pub struct HudState<'a> {
     pub lightning: f32,
     /// Seconds since launch; drives rain-streak animation.
     pub clock: f32,
-    /// Inventory type of the open window (`minecraft:chest`, ...), for its title.
-    pub window_kind: Option<&'a str>,
+    /// Which panel to draw behind those slots.
+    pub window_kind: Option<ContainerKind>,
+    /// Furnace flame and arrow progress, 0..=1 each.
+    pub furnace_progress: Option<(f32, f32)>,
 }
 
 /// Vanilla's automatic GUI scale: integers only so the pixel font stays crisp.
@@ -300,6 +303,39 @@ fn draw_weather(bg: &mut UiBatch, hud: &HudState<'_>, scale: f32, width: f32, he
     }
 }
 
+/// Armour points worn in the four armour slots, using vanilla's item values.
+///
+/// Slot 5..=8 of the player container are helmet, chestplate, leggings, boots;
+/// 20 points fills the ten-icon row.
+pub fn armour_points(inventory: &[Option<ItemStack>]) -> i32 {
+    (5..=8)
+        .filter_map(|slot| inventory.get(slot).copied().flatten())
+        .map(|item| match item.id {
+            298 => 1, // leather
+            299 => 3,
+            300 => 2,
+            301 => 1,
+            302 => 2, // chainmail
+            303 => 5,
+            304 => 4,
+            305 => 1,
+            306 => 2, // iron
+            307 => 6,
+            308 => 5,
+            309 => 2,
+            310 => 3, // diamond
+            311 => 8,
+            312 => 6,
+            313 => 3,
+            314 => 2, // gold
+            315 => 5,
+            316 => 3,
+            317 => 1,
+            _ => 0,
+        })
+        .sum()
+}
+
 /// Draw the in-game HUD: crosshair, hotbar, health, food, XP and a debug line.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_hud(
@@ -336,22 +372,9 @@ pub fn draw_hud(
             .copied()
             .flatten()
         {
-            if let Some(state) = item.block_state() {
-                if let Some((top, side)) = icon_layers(BlockState::from_raw(state), textures) {
-                    icons.block_icon(item_rect.x, item_rect.y, item_rect.w, top, side, 1.0);
-                }
-            }
-            if item.count > 1 {
-                let label = item.count.to_string();
-                let text_w = UiBatch::text_width(&label, scale);
-                fg.text(
-                    &label,
-                    item_rect.x + item_rect.w + s(1.0) - text_w,
-                    item_rect.y + item_rect.h - s(7.0),
-                    scale,
-                    TEXT,
-                );
-            }
+            // Same path as the inventory, so tools and food get their sprites
+            // instead of only blocks getting an isometric icon.
+            draw_stack(fg, icons, item_rect, item, textures, scale);
         }
     }
 
@@ -382,6 +405,29 @@ pub fn draw_hud(
             continue;
         };
         bg.sprite(overlay, Rect::new(x, health_y, s(9.0), s(9.0)), TEXT);
+    }
+
+    // --- armour (the row above the hearts, only when something is worn) ----
+    let armour = armour_points(hud.inventory);
+    if armour > 0 {
+        let armour_y = health_y - s(10.0);
+        for i in 0..10 {
+            let x = left + i as f32 * s(8.0);
+            bg.sprite(
+                sprites::ARMOUR_BACKGROUND,
+                Rect::new(x, armour_y, s(9.0), s(9.0)),
+                TEXT,
+            );
+            let filled = armour - i * 2;
+            let overlay = if filled >= 2 {
+                sprites::ARMOUR_FULL
+            } else if filled > 0 {
+                sprites::ARMOUR_HALF
+            } else {
+                continue;
+            };
+            bg.sprite(overlay, Rect::new(x, armour_y, s(9.0), s(9.0)), TEXT);
+        }
     }
 
     // --- food (hunger), mirrored to the right ------------------------------
@@ -1987,6 +2033,28 @@ fn inventory_panel(scale: f32, width: f32, height: f32) -> Rect {
     )
 }
 
+/// Height of a container panel in GUI pixels.
+///
+/// Vanilla's `GuiChest` sizes itself `114 + rows * 18`, so a six-row chest is
+/// 222 tall while the player inventory and the furnace panels stay at 166.
+pub fn container_panel_height(kind: Option<ContainerKind>) -> f32 {
+    match kind {
+        Some(ContainerKind::Chest { rows, .. }) => 114.0 + rows as f32 * 18.0,
+        _ => INVENTORY_PANEL_H,
+    }
+}
+
+/// The panel rect for whatever window is open, centred on the screen.
+fn container_panel(kind: Option<ContainerKind>, scale: f32, width: f32, height: f32) -> Rect {
+    let panel_h = container_panel_height(kind);
+    Rect::new(
+        width / 2.0 - INVENTORY_PANEL_W * scale / 2.0,
+        height / 2.0 - panel_h * scale / 2.0,
+        INVENTORY_PANEL_W * scale,
+        panel_h * scale,
+    )
+}
+
 /// Top-left of a player-container slot inside the panel, in GUI pixels.
 ///
 /// Vanilla 1.8 layout: output at (144,36), 2x2 grid at (98/116, 18/36), armour
@@ -2012,7 +2080,13 @@ pub fn inventory_slot_origin(slot: usize) -> Option<[f32; 2]> {
 }
 
 /// Screen-space rectangle of a container slot, for hit-testing and drawing.
-pub fn inventory_slot_rect(slot: usize, scale: f32, width: f32, height: f32) -> Option<Rect> {
+pub fn inventory_slot_rect(
+    slot: usize,
+    _kind: Option<ContainerKind>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Option<Rect> {
     let [x, y] = inventory_slot_origin(slot)?;
     let panel = inventory_panel(scale, width, height);
     Some(Rect::new(
@@ -2023,7 +2097,8 @@ pub fn inventory_slot_rect(slot: usize, scale: f32, width: f32, height: f32) -> 
     ))
 }
 
-/// One stack: an isometric block icon or flat item sprite, plus a count.
+/// One stack: an isometric block icon or flat item sprite, plus a count and a
+/// durability bar.
 fn draw_stack(
     fg: &mut UiBatch,
     icons: &mut UiBatch,
@@ -2055,6 +2130,7 @@ fn draw_stack(
             );
         }
     }
+    draw_durability_bar(fg, inner, item, scale);
     if item.count > 1 {
         let label = item.count.to_string();
         let text_w = UiBatch::text_width(&label, scale);
@@ -2068,122 +2144,165 @@ fn draw_stack(
     }
 }
 
-/// Top-left of a crafting-table window slot (46 slots: output, 9 grid cells,
-/// 27 storage, 9 hotbar) inside the same 176x166 panel.
-pub fn window_slot_origin(slot: usize) -> Option<[f32; 2]> {
-    Some(match slot {
-        0 => [124.0, 35.0],
-        1..=9 => {
-            let index = slot - 1;
-            [
-                30.0 + (index % 3) as f32 * 18.0,
-                17.0 + (index / 3) as f32 * 18.0,
-            ]
-        }
-        10..=36 => {
-            let index = slot - 10;
-            [
-                8.0 + (index % 9) as f32 * 18.0,
-                84.0 + (index / 9) as f32 * 18.0,
-            ]
-        }
-        37..=45 => [8.0 + (slot - 37) as f32 * 18.0, 142.0],
+/// Vanilla's 13x2 durability bar: black track, one-pixel-minimum fill that
+/// runs green to red as the item wears out.
+fn draw_durability_bar(fg: &mut UiBatch, inner: Rect, item: ItemStack, scale: f32) {
+    let Some(max) = max_damage(item.id) else {
+        return;
+    };
+    if item.damage <= 0 {
+        return;
+    }
+    let fraction = (max - item.damage).clamp(0, max) as f32 / max as f32;
+    let s = |v: f32| v * scale;
+    let bar = Rect::new(inner.x + s(2.0), inner.y + s(13.0), s(13.0), s(2.0));
+    fg.rect(bar, [0.0, 0.0, 0.0, 1.0]);
+    let filled = (fraction * 13.0).ceil().clamp(1.0, 13.0);
+    fg.rect(
+        Rect::new(bar.x, bar.y, s(filled), s(2.0)),
+        durability_colour(fraction),
+    );
+}
+
+/// `Color.HSBtoRGB(fraction / 3, 1, 1)`: green at full, red as it empties.
+fn durability_colour(fraction: f32) -> [f32; 4] {
+    let h = (fraction / 3.0).clamp(0.0, 1.0) * 6.0;
+    let sector = h.floor() as i32 % 6;
+    let f = h - h.floor();
+    let (r, g, b) = match sector {
+        0 => (1.0, f, 0.0),
+        1 => (1.0 - f, 1.0, 0.0),
+        2 => (0.0, 1.0, f),
+        3 => (0.0, 1.0 - f, 1.0),
+        4 => (f, 0.0, 1.0),
+        _ => (1.0, 0.0, 1.0 - f),
+    };
+    [r, g, b, 1.0]
+}
+
+/// Maximum damage (durability) for the 1.8 items that show a bar, or `None`
+/// for everything that does not wear out.
+fn max_damage(id: i16) -> Option<i16> {
+    Some(match id {
+        // Wood, stone, iron, diamond and gold tools and swords.
+        268 | 269 | 270 | 271 | 290 => 59,
+        272 | 273 | 274 | 275 | 291 => 131,
+        267 | 256 | 257 | 258 | 292 => 250,
+        276 | 277 | 278 | 279 | 293 => 1561,
+        283 | 284 | 285 | 286 | 294 => 32,
+        // Bow, flint and steel, shears, fishing rod, carrot on a stick.
+        261 => 384,
+        259 => 64,
+        359 => 238,
+        346 => 64,
+        398 => 25,
+        // Leather, chainmail, iron, diamond and gold armour:
+        // helmet, chestplate, leggings, boots.
+        298 => 55,
+        299 => 80,
+        300 => 75,
+        301 => 65,
+        302 | 306 => 165,
+        303 | 307 => 240,
+        304 | 308 => 225,
+        305 | 309 => 195,
+        310 => 363,
+        311 => 528,
+        312 => 495,
+        313 => 429,
+        314 => 77,
+        315 => 112,
+        316 => 105,
+        317 => 91,
         _ => return None,
     })
 }
 
-pub fn window_slot_rect(slot: usize, scale: f32, width: f32, height: f32) -> Option<Rect> {
-    let [x, y] = window_slot_origin(slot)?;
-    let panel = inventory_panel(scale, width, height);
-    Some(Rect::new(
-        panel.x + x * scale,
-        panel.y + y * scale,
-        SLOT_SIZE * scale,
-        SLOT_SIZE * scale,
-    ))
-}
-
-/// Slots in a crafting-table window: output, a 3x3 grid, 27 storage, 9 hotbar.
-pub const CRAFTING_WINDOW_SLOTS: usize = 46;
-
-/// Every window has the player's own 36 slots (27 storage + 9 hotbar) at the
-/// bottom; a container window is anything above them.
-const PLAYER_WINDOW_SLOTS: usize = 36;
-const WINDOW_PANEL_WIDTH: f32 = 176.0;
-const WINDOW_GRID_TOP: f32 = 18.0;
-const WINDOW_GRID_LEFT: f32 = 8.0;
-const WINDOW_SLOT_PITCH: f32 = 18.0;
-/// Gap between the container's grid and the player's storage rows.
-const WINDOW_PLAYER_GAP: f32 = 14.0;
-
-/// How many rows of nine the container part of a window needs.
+/// Top-left of a container-window slot inside the same 176-pixel panel.
 ///
-/// A hopper (5 container slots) is one row; a double chest (54) is six. Slots
-/// that are not a multiple of nine still get a row, so nothing is dropped.
-pub fn window_rows(slots: usize) -> usize {
-    slots.saturating_sub(PLAYER_WINDOW_SLOTS).div_ceil(9).max(1)
-}
-
-/// Panel size of a generic container window, in GUI pixels.
-pub fn container_panel_size(slots: usize) -> [f32; 2] {
-    let rows = window_rows(slots) as f32;
-    let player_top = WINDOW_GRID_TOP + rows * WINDOW_SLOT_PITCH + WINDOW_PLAYER_GAP;
-    [
-        WINDOW_PANEL_WIDTH,
-        player_top + WINDOW_SLOT_PITCH * 4.0 + WINDOW_GRID_LEFT,
-    ]
-}
-
-fn container_panel(slots: usize, scale: f32, width: f32, height: f32) -> Rect {
-    let [panel_w, panel_h] = container_panel_size(slots);
-    Rect::new(
-        width / 2.0 - panel_w * scale / 2.0,
-        height / 2.0 - panel_h * scale / 2.0,
-        panel_w * scale,
-        panel_h * scale,
-    )
-}
-
-/// Top-left of a slot in a generic server window of any row count, in GUI
-/// pixels. Slots `0..slots-36` are the container's own, laid out nine to a row;
-/// the last 36 are the player's storage and hotbar, exactly as in their own
-/// inventory screen.
-pub fn server_window_origin(slot: usize, slots: usize) -> Option<[f32; 2]> {
-    if slot >= slots {
-        return None;
+/// - Crafting table: output, nine grid cells, 27 storage, 9 hotbar (46 slots).
+/// - Furnace: input, fuel, output, then the same 36 player slots (39 slots).
+/// - Chest: an optional leading slot in the title band, `rows * 9` grid slots,
+///   then the same 36 player slots. The player section shifts down by the row
+///   count, exactly as `ContainerChest` does.
+pub fn window_slot_origin(slot: usize, kind: Option<ContainerKind>) -> Option<[f32; 2]> {
+    match kind {
+        Some(ContainerKind::Furnace) => Some(match slot {
+            0 => [56.0, 17.0],
+            1 => [56.0, 53.0],
+            2 => [116.0, 31.0],
+            3..=38 => player_slot_origin(slot - 3)?,
+            _ => return None,
+        }),
+        Some(ContainerKind::Chest { rows, header }) => {
+            let header = usize::from(header);
+            let grid = rows as usize * 9;
+            if header == 1 && slot == 0 {
+                // The leading slot lives in the 17-pixel title band, left of
+                // the panel's label. It is one pixel taller than the band.
+                Some([8.0, 0.0])
+            } else if slot < header + grid {
+                let index = slot - header;
+                Some([
+                    8.0 + (index % 9) as f32 * 18.0,
+                    18.0 + (index / 9) as f32 * 18.0,
+                ])
+            } else {
+                chest_player_slot_origin(slot - header - grid, rows)
+            }
+        }
+        _ => Some(match slot {
+            0 => [124.0, 35.0],
+            1..=9 => {
+                let index = slot - 1;
+                [
+                    30.0 + (index % 3) as f32 * 18.0,
+                    17.0 + (index / 3) as f32 * 18.0,
+                ]
+            }
+            10..=45 => player_slot_origin(slot - 10)?,
+            _ => return None,
+        }),
     }
-    let container = slots.saturating_sub(PLAYER_WINDOW_SLOTS);
-    if slot < container {
-        return Some([
-            WINDOW_GRID_LEFT + (slot % 9) as f32 * WINDOW_SLOT_PITCH,
-            WINDOW_GRID_TOP + (slot / 9) as f32 * WINDOW_SLOT_PITCH,
-        ]);
-    }
-    let rows = window_rows(slots) as f32;
-    let player_top = WINDOW_GRID_TOP + rows * WINDOW_SLOT_PITCH + WINDOW_PLAYER_GAP;
-    let index = slot - container;
-    Some(if index < 27 {
-        [
-            WINDOW_GRID_LEFT + (index % 9) as f32 * WINDOW_SLOT_PITCH,
-            player_top + (index / 9) as f32 * WINDOW_SLOT_PITCH,
-        ]
-    } else {
-        [
-            WINDOW_GRID_LEFT + (index - 27) as f32 * WINDOW_SLOT_PITCH,
-            player_top + WINDOW_SLOT_PITCH * 3.0 + 4.0,
-        ]
+}
+
+/// Top-left of one of the 36 player slots in `GuiChest`.
+///
+/// `ContainerChest` places storage at `103 + (rows - 4) * 18` and the hotbar at
+/// `161 + (rows - 4) * 18`, i.e. `rows * 18 + 31` and `rows * 18 + 89`.
+fn chest_player_slot_origin(slot: usize, rows: u8) -> Option<[f32; 2]> {
+    let base = rows as f32 * 18.0;
+    Some(match slot {
+        0..=26 => [
+            8.0 + (slot % 9) as f32 * 18.0,
+            base + 31.0 + (slot / 9) as f32 * 18.0,
+        ],
+        27..=35 => [8.0 + (slot - 27) as f32 * 18.0, base + 89.0],
+        _ => return None,
     })
 }
 
-pub fn server_window_rect(
+/// Top-left of one of the 36 player slots: three storage rows then the hotbar.
+fn player_slot_origin(slot: usize) -> Option<[f32; 2]> {
+    Some(match slot {
+        0..=26 => [
+            8.0 + (slot % 9) as f32 * 18.0,
+            84.0 + (slot / 9) as f32 * 18.0,
+        ],
+        27..=35 => [8.0 + (slot - 27) as f32 * 18.0, 142.0],
+        _ => return None,
+    })
+}
+
+pub fn window_slot_rect(
     slot: usize,
-    slots: usize,
+    kind: Option<ContainerKind>,
     scale: f32,
     width: f32,
     height: f32,
 ) -> Option<Rect> {
-    let [x, y] = server_window_origin(slot, slots)?;
-    let panel = container_panel(slots, scale, width, height);
+    let [x, y] = window_slot_origin(slot, kind)?;
+    let panel = container_panel(kind, scale, width, height);
     Some(Rect::new(
         panel.x + x * scale,
         panel.y + y * scale,
@@ -2192,30 +2311,44 @@ pub fn server_window_rect(
     ))
 }
 
-/// The window title to show for an `S2D` inventory type.
-pub fn window_kind_label(kind: &str) -> &'static str {
-    match kind {
-        "minecraft:chest" => "Chest",
-        "minecraft:crafting_table" => "Crafting Table",
-        "minecraft:furnace" => "Furnace",
-        "minecraft:dispenser" => "Dispenser",
-        "minecraft:hopper" => "Hopper",
-        "minecraft:enchanting_table" => "Enchanting",
-        "minecraft:beacon" => "Beacon",
-        "minecraft:anvil" => "Repair",
-        "minecraft:brewing_stand" => "Brewing Stand",
-        "minecraft:villager" => "Trading",
-        _ => "Container",
+/// The furnace's flame and progress arrow, clipped to the smelting progress.
+fn draw_furnace_progress(bg: &mut UiBatch, hud: &HudState<'_>, panel: Rect, scale: f32) {
+    let s = |v: f32| v * scale;
+    let (burn, cook) = hud.furnace_progress.unwrap_or((0.0, 0.0));
+
+    // Arrow: 24x16, filled left to right.
+    let arrow = Rect::new(panel.x + s(79.0), panel.y + s(34.0), s(24.0), s(16.0));
+    bg.sprite(sprites::FURNACE_ARROW_BACKGROUND, arrow, TEXT);
+    if cook > 0.0 {
+        let filled = (arrow.w * cook.clamp(0.0, 1.0)).round().max(1.0);
+        bg.sprite(
+            sprites::FURNACE_ARROW.sub(0, 0, (filled / scale).round().max(1.0) as u32, 16),
+            Rect::new(arrow.x, arrow.y, filled, arrow.h),
+            TEXT,
+        );
+    }
+
+    // Flame: 14x14, filled bottom to top.
+    let flame = Rect::new(panel.x + s(56.0), panel.y + s(36.0), s(14.0), s(14.0));
+    bg.sprite(sprites::FURNACE_FLAME_BACKGROUND, flame, TEXT);
+    if burn > 0.0 {
+        let lit = (flame.h * burn.clamp(0.0, 1.0)).round().max(1.0);
+        bg.sprite(
+            sprites::FURNACE_FLAME.sub(0, 0, 14, (lit / scale).round().max(1.0) as u32),
+            Rect::new(flame.x, flame.y + flame.h - lit, flame.w, lit),
+            TEXT,
+        );
     }
 }
 
 /// The survival inventory: 2x2 crafting, armour, storage and the hotbar, with
 /// the stack under the cursor drawn last.
 ///
-/// An open server window replaces the crafting half of the panel. A 46-slot
-/// window is a crafting table and keeps the vanilla 3x3+output layout; anything
-/// else is laid out generically, so a chest of any row count — or a hopper, or
-/// a furnace — draws without a bespoke screen.
+/// An open window replaces the crafting half of the panel: a crafting table
+/// keeps the vanilla 3x3+output layout, a furnace uses its own panel and
+/// progress art, and a server chest is drawn from `generic_54` cropped to the
+/// announced row count (with a leading slot in the title band when the server
+/// sends `1 + rows*9 + 36`).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_inventory(
     bg: &mut UiBatch,
@@ -2231,122 +2364,95 @@ pub fn draw_inventory(
     let s = |v: f32| v * scale;
     bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
 
-    let mut buttons = Vec::new();
-    let draw_slots = |bg: &mut UiBatch,
-                      fg: &mut UiBatch,
-                      icons: &mut UiBatch,
-                      slots: &[Option<ItemStack>],
-                      rects: &[Option<Rect>],
-                      buttons: &mut Vec<Button>| {
-        for (slot, item) in slots.iter().enumerate() {
-            let Some(rect) = rects.get(slot).copied().flatten() else {
-                continue;
-            };
-            bg.rect(
-                rect,
-                if hovered(hud.pointer, &rect) {
-                    SLOT_HOVER
-                } else {
-                    SLOT_BG
-                },
-            );
-            if let Some(item) = item {
-                let inner = Rect::new(rect.x + s(1.0), rect.y + s(1.0), s(16.0), s(16.0));
-                draw_stack(fg, icons, inner, *item, textures, scale);
-            }
-            buttons.push(Button {
-                action: Action::InventorySlot(slot),
-                rect,
-            });
-        }
+    let panel = container_panel(hud.window_kind, scale, width, height);
+
+    // A crafting table replaces the 2x2 half of the panel with its 3x3 grid;
+    // the storage and hotbar below are the same slots in both layouts.
+    let window = hud.window_slots;
+    let (slots, count, rect_of, title, subtitle) = match window {
+        Some(slots) => (
+            slots,
+            slots.len(),
+            window_slot_rect as fn(usize, Option<ContainerKind>, f32, f32, f32) -> Option<Rect>,
+            match hud.window_kind {
+                Some(ContainerKind::Furnace) => "Furnace",
+                Some(ContainerKind::Chest { .. }) => "Chest",
+                _ => "Crafting Table",
+            },
+            match hud.window_kind {
+                Some(ContainerKind::Furnace) => "Smelting",
+                Some(ContainerKind::Chest { .. }) => "Storage",
+                _ => "Crafting",
+            },
+        ),
+        None => (
+            hud.inventory,
+            hud.inventory.len(),
+            inventory_slot_rect as fn(usize, Option<ContainerKind>, f32, f32, f32) -> Option<Rect>,
+            "Inventory",
+            "Crafting",
+        ),
     };
 
-    match hud.window_slots {
-        Some(slots) if slots.len() == CRAFTING_WINDOW_SLOTS => {
-            let panel = inventory_panel(scale, width, height);
-            bg.rect(panel, PANEL);
-            bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
-            fg.text_centered(
-                "Crafting Table",
-                width / 2.0,
-                panel.y - s(13.0),
-                scale,
+    // The jar's own panel art replaces the flat rectangle and its slot
+    // backgrounds; only the hover highlight and the items are drawn on top.
+    match hud.window_kind {
+        Some(ContainerKind::Furnace) => {
+            bg.sprite(sprites::FURNACE_PANEL, panel, TEXT);
+        }
+        Some(ContainerKind::Chest { rows, .. }) => {
+            // `GuiChest` blits the top at `(0, 0, 176, rows*18 + 17)` and the
+            // player section at `(0, 126, 176, 96)`, so the same `generic_54`
+            // sheet crops to any row count.
+            let top_h = rows as f32 * 18.0 + 17.0;
+            bg.sprite(
+                sprites::CHEST_TOP.sub(0, 0, 176, top_h as u32),
+                Rect::new(panel.x, panel.y, panel.w, s(top_h)),
                 TEXT,
             );
-            fg.text(
-                "Crafting",
-                panel.x + s(30.0),
-                panel.y + s(6.0),
-                scale,
-                TEXT_DIM,
-            );
-
-            let rects: Vec<Option<Rect>> = (0..slots.len())
-                .map(|slot| window_slot_rect(slot, scale, width, height))
-                .collect();
-            draw_slots(bg, fg, icons, slots, &rects, &mut buttons);
-            fg.text_centered(
-                "Click to move stacks  -  E / Esc to close",
-                width / 2.0,
-                panel.y + panel.h + s(6.0),
-                scale,
-                TEXT_DIM,
+            bg.sprite(
+                sprites::CHEST_BOTTOM,
+                Rect::new(panel.x, panel.y + s(top_h), panel.w, s(96.0)),
+                TEXT,
             );
         }
-        Some(slots) => {
-            let panel = container_panel(slots.len(), scale, width, height);
-            bg.rect(panel, PANEL);
-            bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
-            let title = hud
-                .window_kind
-                .map(window_kind_label)
-                .unwrap_or("Container");
-            fg.text_centered(title, width / 2.0, panel.y - s(13.0), scale, TEXT);
-            fg.text(
-                "Inventory",
-                panel.x + s(WINDOW_GRID_LEFT),
-                panel.y + panel.h - s(76.0),
-                scale,
-                TEXT_DIM,
-            );
-
-            let rects: Vec<Option<Rect>> = (0..slots.len())
-                .map(|slot| server_window_rect(slot, slots.len(), scale, width, height))
-                .collect();
-            draw_slots(bg, fg, icons, slots, &rects, &mut buttons);
-            fg.text_centered(
-                "Click to move stacks  -  E / Esc to close",
-                width / 2.0,
-                panel.y + panel.h + s(6.0),
-                scale,
-                TEXT_DIM,
-            );
+        Some(ContainerKind::CraftingTable) => {
+            bg.sprite(sprites::CRAFTING_TABLE_PANEL, panel, TEXT);
         }
         None => {
-            let panel = inventory_panel(scale, width, height);
-            bg.rect(panel, PANEL);
-            bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
-            fg.text_centered("Inventory", width / 2.0, panel.y - s(13.0), scale, TEXT);
-            fg.text(
-                "Crafting",
-                panel.x + s(97.0),
-                panel.y + s(6.0),
-                scale,
-                TEXT_DIM,
-            );
-
-            let rects: Vec<Option<Rect>> = (0..hud.inventory.len())
-                .map(|slot| inventory_slot_rect(slot, scale, width, height))
-                .collect();
-            draw_slots(bg, fg, icons, hud.inventory, &rects, &mut buttons);
-            fg.text_centered(
-                "Click to move stacks  -  E / Esc to close",
-                width / 2.0,
-                panel.y + panel.h + s(6.0),
-                scale,
-                TEXT_DIM,
-            );
+            bg.sprite(sprites::INVENTORY_PANEL, panel, TEXT);
         }
+    }
+
+    fg.text_centered(title, width / 2.0, panel.y - s(13.0), scale, TEXT);
+    fg.text(
+        subtitle,
+        panel.x + s(if window.is_some() { 30.0 } else { 97.0 }),
+        panel.y + s(6.0),
+        scale,
+        TEXT_DIM,
+    );
+
+    let mut buttons = Vec::new();
+    for slot in 0..count {
+        let Some(rect) = rect_of(slot, hud.window_kind, scale, width, height) else {
+            continue;
+        };
+        if hovered(hud.pointer, &rect) {
+            bg.rect(rect, SLOT_HOVER);
+        }
+        if let Some(item) = slots.get(slot).copied().flatten() {
+            let inner = Rect::new(rect.x + s(1.0), rect.y + s(1.0), s(16.0), s(16.0));
+            draw_stack(fg, icons, inner, item, textures, scale);
+        }
+        buttons.push(Button {
+            action: Action::InventorySlot(slot),
+            rect,
+        });
+    }
+
+    if hud.window_kind == Some(ContainerKind::Furnace) {
+        draw_furnace_progress(bg, hud, panel, scale);
     }
 
     if let (Some(item), Some([x, y])) = (cursor, hud.pointer) {
@@ -3503,6 +3609,54 @@ mod tests {
         assert!(icons.vertices.iter().all(|vertex| vertex.layer == layer));
     }
 
+    #[test]
+    fn armour_points_use_vanilla_item_values() {
+        let mut inventory = vec![None; 45];
+        assert_eq!(armour_points(&inventory), 0);
+
+        // Full diamond: 3 + 8 + 6 + 3 = 20 points, a full row.
+        inventory[5] = Some(ItemStack::new(310, 1, 0));
+        inventory[6] = Some(ItemStack::new(311, 1, 0));
+        inventory[7] = Some(ItemStack::new(312, 1, 0));
+        inventory[8] = Some(ItemStack::new(313, 1, 0));
+        assert_eq!(armour_points(&inventory), 20);
+
+        // Iron chestplate + boots: 6 + 2 = 8 points.
+        inventory[5] = None;
+        inventory[6] = Some(ItemStack::new(307, 1, 0));
+        inventory[7] = None;
+        inventory[8] = Some(ItemStack::new(309, 1, 0));
+        assert_eq!(armour_points(&inventory), 8);
+    }
+
+    #[test]
+    fn hud_draws_the_armour_row_only_when_worn() {
+        let mut inventory = vec![None; 45];
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let mut icons = UiBatch::default();
+        let textures = TextureArray::from_tiles(vec![(
+            "missing".to_string(),
+            image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 255, 255])),
+        )]);
+        let hud = hud_state(&inventory);
+        draw_hud(
+            &mut bg, &mut fg, &mut icons, &hud, &textures, 2.0, 1280.0, 720.0,
+        );
+        let without = bg.vertices.len();
+
+        inventory[6] = Some(ItemStack::new(307, 1, 0));
+        let hud = hud_state(&inventory);
+        let mut bg2 = UiBatch::default();
+        draw_hud(
+            &mut bg2, &mut fg, &mut icons, &hud, &textures, 2.0, 1280.0, 720.0,
+        );
+        assert!(
+            bg2.vertices.len() > without,
+            "an iron chestplate must add armour icons"
+        );
+    }
+
     fn hud_state<'a>(inventory: &'a [Option<ItemStack>]) -> HudState<'a> {
         HudState {
             inventory,
@@ -3525,6 +3679,7 @@ mod tests {
             lightning: 0.0,
             clock: 0.0,
             window_kind: None,
+            furnace_progress: None,
         }
     }
 
@@ -3742,7 +3897,7 @@ mod tests {
         let panel = inventory_panel(scale, width, height);
         let mut rects: Vec<Rect> = Vec::new();
         for slot in 0..45 {
-            let rect = inventory_slot_rect(slot, scale, width, height).expect("slot exists");
+            let rect = inventory_slot_rect(slot, None, scale, width, height).expect("slot exists");
             assert!(rect.x >= panel.x && rect.y >= panel.y);
             assert!(rect.x + rect.w <= panel.x + panel.w);
             assert!(rect.y + rect.h <= panel.y + panel.h);
@@ -3759,20 +3914,20 @@ mod tests {
 
     #[test]
     fn crafting_table_slots_cover_the_grid_and_the_player_half() {
-        assert_eq!(window_slot_origin(0), Some([124.0, 35.0]));
-        assert_eq!(window_slot_origin(1), Some([30.0, 17.0]));
-        assert_eq!(window_slot_origin(9), Some([66.0, 53.0]));
-        assert_eq!(window_slot_origin(10), Some([8.0, 84.0]));
-        assert_eq!(window_slot_origin(36), Some([152.0, 120.0]));
-        assert_eq!(window_slot_origin(37), Some([8.0, 142.0]));
-        assert_eq!(window_slot_origin(45), Some([152.0, 142.0]));
-        assert_eq!(window_slot_origin(46), None);
+        assert_eq!(window_slot_origin(0, None), Some([124.0, 35.0]));
+        assert_eq!(window_slot_origin(1, None), Some([30.0, 17.0]));
+        assert_eq!(window_slot_origin(9, None), Some([66.0, 53.0]));
+        assert_eq!(window_slot_origin(10, None), Some([8.0, 84.0]));
+        assert_eq!(window_slot_origin(36, None), Some([152.0, 120.0]));
+        assert_eq!(window_slot_origin(37, None), Some([8.0, 142.0]));
+        assert_eq!(window_slot_origin(45, None), Some([152.0, 142.0]));
+        assert_eq!(window_slot_origin(46, None), None);
 
         let (width, height, scale) = (1280.0, 720.0, 3.0);
         let panel = inventory_panel(scale, width, height);
         let mut rects: Vec<Rect> = Vec::new();
         for slot in 0..46 {
-            let rect = window_slot_rect(slot, scale, width, height).expect("slot exists");
+            let rect = window_slot_rect(slot, None, scale, width, height).expect("slot exists");
             assert!(rect.x >= panel.x && rect.y >= panel.y);
             assert!(rect.x + rect.w <= panel.x + panel.w);
             assert!(rect.y + rect.h <= panel.y + panel.h);
@@ -3785,6 +3940,144 @@ mod tests {
             }
             rects.push(rect);
         }
+    }
+
+    #[test]
+    fn chest_slots_follow_the_row_count() {
+        // Vanilla `ContainerChest`: chest cells at `18 + row*18`, player
+        // storage at `rows*18 + 31`, hotbar at `rows*18 + 89`.
+        let six = Some(ContainerKind::Chest {
+            rows: 6,
+            header: false,
+        });
+        assert_eq!(window_slot_origin(0, six), Some([8.0, 18.0]));
+        assert_eq!(window_slot_origin(8, six), Some([152.0, 18.0]));
+        assert_eq!(window_slot_origin(53, six), Some([152.0, 108.0]));
+        assert_eq!(window_slot_origin(54, six), Some([8.0, 139.0]));
+        assert_eq!(window_slot_origin(81, six), Some([8.0, 197.0]));
+        assert_eq!(window_slot_origin(89, six), Some([152.0, 197.0]));
+        assert_eq!(window_slot_origin(90, six), None);
+
+        // A three-row chest keeps the single-chest layout.
+        let three = Some(ContainerKind::Chest {
+            rows: 3,
+            header: false,
+        });
+        assert_eq!(window_slot_origin(26, three), Some([152.0, 54.0]));
+        assert_eq!(window_slot_origin(27, three), Some([8.0, 85.0]));
+        assert_eq!(window_slot_origin(54, three), Some([8.0, 143.0]));
+
+        // Hypixel's `1 + rows*9 + 36`: slot 0 is in the title band, the grid
+        // is 1..=27, and the player half starts at 28.
+        let ticket = Some(ContainerKind::Chest {
+            rows: 3,
+            header: true,
+        });
+        assert_eq!(window_slot_origin(0, ticket), Some([8.0, 0.0]));
+        assert_eq!(window_slot_origin(1, ticket), Some([8.0, 18.0]));
+        assert_eq!(window_slot_origin(27, ticket), Some([152.0, 54.0]));
+        assert_eq!(window_slot_origin(28, ticket), Some([8.0, 85.0]));
+        assert_eq!(window_slot_origin(55, ticket), Some([8.0, 143.0]));
+        assert_eq!(window_slot_origin(63, ticket), Some([152.0, 143.0]));
+        assert_eq!(window_slot_origin(64, ticket), None);
+
+        // The panel grows with the rows: `114 + rows * 18`.
+        assert_eq!(container_panel_height(six), 222.0);
+        assert_eq!(container_panel_height(three), 168.0);
+        assert_eq!(container_panel_height(ticket), 168.0);
+
+        let (width, height, scale) = (1280.0, 720.0, 3.0);
+        for (kind, slots) in [(six, 90), (ticket, 64)] {
+            let panel = container_panel(kind, scale, width, height);
+            let mut rects: Vec<Rect> = Vec::new();
+            for slot in 0..slots {
+                let rect = window_slot_rect(slot, kind, scale, width, height).expect("slot exists");
+                assert!(rect.x >= panel.x && rect.y >= panel.y);
+                assert!(rect.x + rect.w <= panel.x + panel.w);
+                assert!(rect.y + rect.h <= panel.y + panel.h);
+                for other in &rects {
+                    let overlap = rect.x < other.x + other.w
+                        && other.x < rect.x + rect.w
+                        && rect.y < other.y + other.h
+                        && other.y < rect.y + rect.h;
+                    assert!(!overlap, "chest slots overlap");
+                }
+                rects.push(rect);
+            }
+        }
+    }
+
+    #[test]
+    fn durability_bars_only_show_for_worn_damageable_items() {
+        assert_eq!(max_damage(267), Some(250)); // iron sword
+        assert_eq!(max_damage(276), Some(1561)); // diamond sword
+        assert_eq!(max_damage(310), Some(363)); // diamond helmet
+        assert_eq!(max_damage(4), None); // cobblestone does not wear out
+
+        let inner = Rect::new(10.0, 20.0, 16.0, 16.0);
+        let mut fg = UiBatch::default();
+        draw_durability_bar(&mut fg, inner, ItemStack::new(267, 1, 0), 2.0);
+        assert!(fg.vertices.is_empty(), "a pristine tool has no bar");
+
+        draw_durability_bar(&mut fg, inner, ItemStack::new(267, 1, 125), 2.0);
+        assert!(!fg.vertices.is_empty(), "a worn tool draws its bar");
+
+        // Green when almost full, red when almost gone.
+        let full = durability_colour(0.99);
+        assert!(full[1] > 0.9 && full[0] < 0.1, "green at full");
+        let empty = durability_colour(0.05);
+        assert!(empty[0] > 0.9 && empty[1] <= 0.2, "red when nearly broken");
+    }
+
+    #[test]
+    fn window_buttons_carry_the_server_slot_index() {
+        // A three-row Hypixel window: 1 + 27 + 36 = 64.
+        let slots = vec![None; 64];
+        let inventory = vec![None; 45];
+        let textures = TextureArray::from_tiles(vec![(
+            "missing".to_string(),
+            image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 255, 255])),
+        )]);
+        let hud = HudState {
+            window_slots: Some(&slots),
+            window_kind: Some(ContainerKind::Chest {
+                rows: 3,
+                header: true,
+            }),
+            ..hud_state(&inventory)
+        };
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let mut icons = UiBatch::default();
+        let buttons = draw_inventory(
+            &mut bg, &mut fg, &mut icons, &hud, None, &textures, 2.0, 1280.0, 720.0,
+        );
+        let action_at = |slot: usize| {
+            let rect =
+                window_slot_rect(slot, hud.window_kind, 2.0, 1280.0, 720.0).expect("slot exists");
+            hit_test(&buttons, [rect.x + rect.w / 2.0, rect.y + rect.h / 2.0])
+        };
+        assert_eq!(action_at(0), Some(Action::InventorySlot(0)), "header slot");
+        assert_eq!(
+            action_at(1),
+            Some(Action::InventorySlot(1)),
+            "first grid cell"
+        );
+        assert_eq!(
+            action_at(27),
+            Some(Action::InventorySlot(27)),
+            "last grid cell"
+        );
+        assert_eq!(
+            action_at(28),
+            Some(Action::InventorySlot(28)),
+            "first player slot"
+        );
+        assert_eq!(
+            action_at(63),
+            Some(Action::InventorySlot(63)),
+            "last hotbar slot"
+        );
     }
 
     #[test]
@@ -4035,43 +4328,6 @@ mod tests {
             speed: 4.3,
             keys: crate::hud_modules::KeyState::default(),
         }
-    }
-
-    #[test]
-    fn a_generic_window_lays_out_any_row_count() {
-        for slots in [41, 45, 63, 90] {
-            // 5 container slots (hopper) up to 54 (double chest), plus the 36
-            // player slots.
-            let rects: Vec<Rect> = (0..slots)
-                .map(|slot| server_window_rect(slot, slots, 2.0, 1280.0, 720.0).unwrap())
-                .collect();
-            assert_eq!(rects.len(), slots);
-            for (index, rect) in rects.iter().enumerate() {
-                for other in &rects[index + 1..] {
-                    assert!(
-                        !overlaps(*rect, *other),
-                        "{slots} slots: {index} overlaps a neighbour"
-                    );
-                }
-            }
-            // Inside the panel it was placed from.
-            let [panel_w, panel_h] = container_panel_size(slots);
-            let panel = container_panel(slots, 2.0, 1280.0, 720.0);
-            for rect in &rects {
-                assert!(rect.x >= panel.x && rect.y >= panel.y);
-                assert!(rect.x + rect.w <= panel.x + panel_w * 2.0 + 0.01);
-                assert!(rect.y + rect.h <= panel.y + panel_h * 2.0 + 0.01);
-            }
-        }
-    }
-
-    #[test]
-    fn a_six_row_chest_needs_more_panel_than_a_hopper() {
-        assert_eq!(window_rows(41), 1, "a hopper: 5 container slots");
-        assert_eq!(window_rows(45), 1, "nine container slots");
-        assert_eq!(window_rows(63), 3, "a single chest");
-        assert_eq!(window_rows(90), 6, "a double chest");
-        assert!(container_panel_size(90)[1] > container_panel_size(45)[1]);
     }
 
     #[test]
