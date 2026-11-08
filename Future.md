@@ -190,13 +190,13 @@ This is what separates a PvP client from a compatible one.
 | Chat overlay + input + command suggestions | M | **Overlay + input done** (fade, `T`/`/`, Enter/Esc). Client-side `/help /gamemode /tp /setblock /give /seed`; unknown commands go to the server. **Colours done 2026-11-06**: `chat.rs` parses both the legacy `§` dialect and JSON chat components (colour inheritance, `#rrggbb`, team-prefix-ready spans). No tab-completion. `azalea-brigadier` and `azalea-chat` are MIT references. |
 | Scoreboard sidebar, tab player list, boss bar, titles | M | **Sidebar renderer + model done 2026-11-06** (`scoreboard.rs`: objectives, scores, teams, 15-row cap, right-aligned pane, `NEPHELE_SCOREBOARD_DEMO=1` shows a hand-built model). `S3B`–`S3E` parsing is still the net lane's half. No tab list, boss bar or titles yet. |
 | **Client modules:** FPS, CPS, keystrokes, coordinates, ping, armour status, potion timers, reach display | M | **Six done 2026-11-06**: FPS, ping, LMB/RMB CPS, keystrokes with pressed states, coordinates, speed. Each toggleable and draggable in the HUD editor (Pause → Options → HUD Modules), positions stored as window fractions in `settings.json`. Ping needs `S38` rows, so it shows `--` until a server sends them. Armour status, potion timers and reach are still open. |
-| **Toggle sprint, toggle sneak** | S | |
+| **Toggle sprint, toggle sneak** | S | **Done 2026-11-08:** two latched actions in `keybinds.rs`, unbound by default, ORed into the movement input. Not persisted across sessions. |
 | **Zoom** (OptiFine-style smooth zoom) | S | |
 | **Custom crosshair, hit colour, hit delay indicator**, block outline toggle | M | |
 | **Motion blur off, brightness/gamma slider, fullbright** | S | |
 | Freelook / 360 view | S | |
 | Nametag scaling, entity hurt tint | S | |
-| Settings screen: keybinds, GUI scale, render distance, particles, graphics, language, resource packs | L | |
+| Settings screen: keybinds, GUI scale, render distance, particles, graphics, language, resource packs | L | **Options tree done 2026-11-08:** Options, Video Settings, Controls (rebind, conflicts, reset), Music & Sounds, Chat Settings, Language, Resource Packs, Skin Customization, all persisted in `settings.json`. Live effects: FOV, GUI scale, render distance, max framerate, vsync, view bobbing, brightness, chat opacity/size/width. Graphics/Smooth Lighting/Dynamic Lights/Alternate Blocks are stored but await a renderer hook. Particles not started. |
 | Debug screen (F3) parity | M | |
 
 ### 7. Audio

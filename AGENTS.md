@@ -123,6 +123,7 @@ crates/
       ui.rs             immediate-mode UI batch + screens (draw_*)
       chat.rs           chat colours: legacy `§` codes and JSON components
       hud_modules.rs    HUD module toggles/anchors, CPS and speed meters
+      keybinds.rs       bindable actions, defaults, encode/decode, conflicts
       scoreboard.rs     scoreboard model, sidebar ordering and layout
       interact.rs       entity click targeting and use/attack pacing
       commands.rs       client-side chat commands (/gamemode, /setblock, ...)
@@ -668,6 +669,57 @@ lane `client-ui`). Four new modules in `nephele-cli/src` carry it:
   `Shared.entity_actions` (capped at 16) and `Shared.target`; that queue is the
   seam to complete the feature, and nothing drains it yet.
 
+**Options tree and keybinds** (added 2026-11-08, same lane). Eight screens behind
+`Screen::Options`: Options, Video Settings, Controls, Music & Sounds, Chat Settings,
+Language, Resource Packs, Skin Customization. Every row is a field in
+`settings.rs`; the whole tree is reachable by mouse, and `NEPHELE_SCREEN` accepts
+`settings|video|controls|sounds|chat_settings|language|resource_packs|skin` as a
+development shortcut (never the only route).
+
+- **Keybinds (`keybinds.rs`, new).** 24 actions in five categories (Movement,
+  Gameplay, Inventory, Multiplayer, Miscellaneous), vanilla 1.8 defaults. Stored as
+  text (`key:R`, `mouse:Left`, `none`) so `settings.json` stays readable and an
+  unknown key degrades to `NONE`. `assign` **displaces** any action already holding
+  the binding and returns it, which is what the Controls screen's conflict warning
+  reports; the old owner becomes unbound (vanilla would silently allow the
+  duplicate). `Reset` per row and `Reset Keys` for all. Escape is deliberately not
+  bindable − it is the cancel/menu key.
+- **Input goes through the table.** `push_input` asks the binding table which held
+  keys mean forward/back/left/right/jump/sneak/**attack** and writes
+  `Shared.attacking` from that, so rebinding attack to a key drives the same mining
+  path left-click does. Edge-triggered actions (use, drop, pick block, inventory,
+  hotbar 1–9, chat, command, fullscreen) are resolved from the pressed key/button
+  in one place, `trigger_action`.
+- **Controls screen.** Scrollable list (wheel; `controls_rows` clamps the offset),
+  category headers, one bind button + one Reset per row, click-to-rebind with a
+  "Press a key or mouse button" hint, conflict warning line, and `Reset Keys`.
+- **Video Settings, and what is actually live.** Live and verified: **FOV** (slider,
+  per-frame camera), **GUI scale** (per-frame `draw_ui`), **render distance**
+  (streamed + `C16` client settings), **max framerate** (frame pacing sleeps out the
+  budget at the end of `frame()`), **vsync** (`Renderer::set_vsync`), **view
+  bobbing** (camera sway from horizontal speed), **brightness** (light values
+  rewritten in the `ColumnMeshJob` before meshing, then `remesh_everything()`;
+  `Brightness::Normal` is the identity so the default look is unchanged).
+  **Persisted but not yet rendered**, because the renderer has no hook for them:
+  **Graphics Fast/Fancy**, **Smooth Lighting** (+level), **Dynamic Lights**,
+  **Alternate Blocks**. Those four are drawn with a trailing `*`, dimmed, and a
+  footnote on the screen names the gap; `OptionRow::takes_effect()` is the single
+  place that classifies a row. Do not let them pass for working controls.
+- **Music & Sounds** reads and writes the one `SoundOptions { master, music,
+  blocks, weather }` model. No audio engine exists yet (`audio` is unassigned), so
+  the sliders persist and the screen says so; the engine reads this struct.
+- **Chat Settings** is real: opacity, text size and width are applied by
+  `ui::draw_chat` (width clips runs mid-line), plus a live preview.
+- **Language** has one honest entry ("English (US)"); **Resource Packs** has the
+  built-in pack only; **Skin Customization** stores seven part toggles for the
+  entity renderer, which does not read them yet. All three persist.
+- **Persistence.** Everything lives in `settings.json` and every change saves
+  immediately (adjust, toggle, drag-release, Done). Missing/partial/corrupt files
+  fall back field by field; hand-edited numbers are clamped (the stored integer
+  knobs are read as `u32` and clamped, so a `"scale": 999` cannot nuke the file).
+- Difficulty is stored and shown; single-player has nothing that spawns yet and a
+  server owns it in multiplayer, so it changes no behaviour.
+
 ---
 
 ## 12. Milestones
@@ -683,7 +735,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `worldgen` | two-stage generation, caves, ores, flora, structures (phases W1–W5) | `w-worldgen` | not started |
 | `survival` | inventory, containers, HUD art | `survival` | 85%, HUD art left |
 | `net` | protocol, real servers, maps, frames, metadata | `net` | needs rebase, then merge |
-| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | chat colours, six HUD modules, scoreboard sidebar renderer + settings persistence landed 2026-11-06; scoreboard packets and entity `C02` wait on `net`; loading screen not started |
+| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | chat colours, HUD modules + editor, scoreboard renderer, options tree, keybinds landed 2026-11-08; four video rows await a renderer hook; scoreboard packets and `C02` await `net`; loading screen not started |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90%, needs landing |
 | `entities` | players, skins, nametags, frames, maps on screen | `entities` | 35% |
 | `perf` | startup, view distance, baseline gate | `perf` | done, needs merge |
@@ -763,6 +815,17 @@ item icons for unmapped item ids.
 **Tooling**
 
 - `.gitattributes` sets `* text=auto eol=lf`. Keep it.
+- **Synthetic input into the game window is unreliable and needs three things at
+  once.** (1) The window must be the foreground window (`AppActivate` or
+  `SetForegroundWindow`, then *verify* with `GetForegroundWindow`), or a posted
+  `WM_KEYDOWN`/`WM_LBUTTONDOWN` is dropped. (2) `SetCursorPos` only updates
+  winit's pointer while the cursor is not grabbed, so after a match has held the
+  mouse you must leave the game screen first. (3) Take screenshots with
+  `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)` — `CopyFromScreen` reads stale
+  or partial frames from a DXGI flip-model swapchain and produces ghost windows.
+  Menu clicks hit-test against the *last published* pointer position, so a click
+  can land on the previously hovered button; verify the hover highlight in a
+  screenshot before trusting a click.
 - Git identity is repo-local: `Casualdv <Casualdv@users.noreply.github.com>`.
 - `project_root()` walks up from the executable and prefers a `[workspace]` Cargo.toml
   over a stray `.local/prepared` — that stray-directory case used to break asset
@@ -777,8 +840,8 @@ item icons for unmapped item ids.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **560 test cases across the workspace** (560 passed, 2 ignored, including two
-  doctests). `nephele-cli` has 126 passing tests; `nephele-assets` has 39;
+- **581 test cases across the workspace** (581 passed, 2 ignored, including two
+  doctests). `nephele-cli` has 147 passing tests; `nephele-assets` has 39;
   `nephele-render` has 50 passing tests, including seven shape-meshing
   regressions; `nephele-world` has 131 passing tests and one ignored. The six
   real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,

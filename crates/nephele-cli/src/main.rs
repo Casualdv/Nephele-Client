@@ -3,6 +3,7 @@ mod commands;
 mod hud_modules;
 mod interact;
 mod inventory;
+mod keybinds;
 mod live;
 mod mesher;
 mod paths;

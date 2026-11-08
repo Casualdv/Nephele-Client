@@ -17,11 +17,12 @@ use crate::hud_modules::{
 };
 use crate::interact::{self, EntityAction};
 use crate::inventory;
+use crate::keybinds::{Action as BindableAction, Bind};
 use crate::mesher::MeshPool;
 use crate::perf;
 use crate::scoreboard::Scoreboard;
 use crate::servers::{Ping, PingBoard, ServerEntry, ServerList, Status};
-use crate::settings::Settings;
+use crate::settings::{Brightness, OptionRow, Settings};
 use crate::skins::SkinLoader;
 use crate::ui::{self, Action, HudState, Screen};
 use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
@@ -198,6 +199,8 @@ struct Shared {
     ping: Option<i32>,
     /// Entity under the crosshair, as picked by the network thread.
     target: Option<i32>,
+    /// The player pressed the bound Drop Item key; both loops consume it.
+    drop_item: bool,
     /// Clicks the network thread turned into entity actions. `C02 Use Entity`
     /// itself lives in the `net` lane (protocol + send path), so nothing drains
     /// this yet; it is bounded so it cannot grow without a consumer.
@@ -374,6 +377,7 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
         window_kind: None,
         ping: None,
         target: None,
+        drop_item: false,
         entity_actions: Vec::new(),
         window_id: None,
         local_container: LocalContainer::default(),
@@ -567,7 +571,7 @@ fn local_loop(
             ],
         });
 
-        let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode) = {
+        let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode, drop_item) = {
             let mut state = shared.lock().unwrap();
             (
                 state.attacking,
@@ -577,8 +581,21 @@ fn local_loop(
                 std::mem::take(&mut state.chat_out),
                 std::mem::take(&mut state.world_edits),
                 state.creative_override.take(),
+                std::mem::take(&mut state.drop_item),
             )
         };
+        if drop_item {
+            // Single-player owns the inventory outright, so dropping is a
+            // decrement of the held stack.
+            let mut state = shared.lock().unwrap();
+            let slot = play::HOTBAR_FIRST_SLOT + state.held_slot.max(0) as usize;
+            if let Some(Some(stack)) = state.inventory.get_mut(slot) {
+                stack.count -= 1;
+                if stack.count <= 0 {
+                    state.inventory[slot] = None;
+                }
+            }
+        }
         if let Some(slot) = pending_slot {
             shared.lock().unwrap().held_slot = slot;
         }
@@ -855,7 +872,17 @@ async fn net_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 let (position, yaw, pitch, on_ground) = step_player(&shared, &client.world);
-                let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode, clicks) = {
+                let (
+                    attacking,
+                    use_pressed,
+                    pending_slot,
+                    give,
+                    chat,
+                    edits,
+                    gamemode,
+                    clicks,
+                    drop_item,
+                ) = {
                     let mut state = shared.lock().unwrap();
                     (
                         state.attacking,
@@ -866,8 +893,25 @@ async fn net_loop(
                         std::mem::take(&mut state.world_edits),
                         state.creative_override.take(),
                         std::mem::take(&mut state.inventory_clicks),
+                        std::mem::take(&mut state.drop_item),
                     )
                 };
+                if drop_item {
+                    // `C07 DROP_ITEM` drops one item from the held stack; the
+                    // block position it carries is informational and the server
+                    // ignores it.
+                    let target = Aim {
+                        x: 0,
+                        y: 0,
+                        z: 0,
+                        face: 0,
+                        cursor: [0.0; 3],
+                    };
+                    client
+                        .dig(digging::DROP_ITEM, &target)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
                 for (slot, button, mode, clicked) in clicks {
                     client
                         .click_slot_with(slot, button, mode, clicked)
@@ -1175,6 +1219,8 @@ struct FrameView {
     time_of_day: f32,
     chunks: usize,
     feet: [f64; 3],
+    /// Whether the player is standing on something, for view bobbing.
+    on_ground: bool,
     /// Fraction of the way through the current 20 Hz tick.
     alpha: f64,
 }
@@ -1285,6 +1331,30 @@ struct LiveApp {
     module_rects: Vec<(ModuleId, nephele_render::Rect)>,
     /// Module being dragged by the editor, with the grab offset inside it.
     module_drag: Option<(ModuleId, [f32; 2])>,
+    /// Slider tracks from the last options frame, for click-and-drag.
+    slider_rects: Vec<(OptionRow, nephele_render::Rect)>,
+    /// Slider currently being dragged.
+    active_slider: Option<OptionRow>,
+    /// Action whose binding the controls screen is waiting for.
+    rebinding: Option<BindableAction>,
+    /// "W is already bound to Walk Forward" and similar.
+    keybind_warning: Option<String>,
+    /// First visible row of the controls list.
+    controls_scroll: usize,
+    /// Rows the controls screen laid out last frame, for clamping the scroll.
+    controls_rows: usize,
+    /// Left mouse button held, independent of what it is bound to.
+    left_held: bool,
+    /// Latched sprint/sneak from the toggle actions (not persisted: they reset
+    /// each session, like most clients).
+    toggle_sprint: bool,
+    toggle_sneak: bool,
+    /// View-bobbing phase, advanced by horizontal speed.
+    bob_phase: f32,
+    /// Feet position from the previous frame, for the bob amplitude.
+    last_feet: [f64; 3],
+    /// Brightness the loaded meshes were built with, so a change can re-mesh.
+    applied_brightness: Brightness,
     error: Option<Box<dyn Error>>,
 }
 
@@ -1299,7 +1369,16 @@ impl LiveApp {
         let env_screen = match std::env::var("NEPHELE_SCREEN").as_deref() {
             Ok("creative") => Some(Screen::Creative),
             Ok("pause") => Some(Screen::Pause),
-            Ok("settings") => Some(Screen::Settings),
+            Ok("settings") => Some(Screen::Options),
+            // Options sub-screens, so a screenshot pass can reach each one
+            // without driving the mouse. The buttons are the real route.
+            Ok("video") => Some(Screen::VideoSettings),
+            Ok("controls") => Some(Screen::Controls),
+            Ok("sounds") => Some(Screen::Sounds),
+            Ok("chat_settings") => Some(Screen::ChatSettings),
+            Ok("language") => Some(Screen::Language),
+            Ok("resource_packs") => Some(Screen::ResourcePacks),
+            Ok("skin") => Some(Screen::SkinCustomization),
             Ok("modules") => Some(Screen::Modules),
             Ok("connect") => Some(Screen::Connect),
             Ok("servers") => Some(Screen::Servers),
@@ -1319,6 +1398,7 @@ impl LiveApp {
         let (ping_tx, ping_rx) = mpsc::channel();
 
         let has_address = options.address.is_some();
+        let settings_brightness = settings.brightness;
         let mut app = Self {
             options,
             shared,
@@ -1405,6 +1485,18 @@ impl LiveApp {
             },
             module_rects: Vec::new(),
             module_drag: None,
+            slider_rects: Vec::new(),
+            active_slider: None,
+            rebinding: None,
+            keybind_warning: None,
+            controls_scroll: 0,
+            controls_rows: 0,
+            left_held: false,
+            toggle_sprint: false,
+            toggle_sneak: false,
+            bob_phase: 0.0,
+            last_feet: [0.0, 0.0, 0.0],
+            applied_brightness: settings_brightness,
             error: None,
         };
 
@@ -1757,27 +1849,132 @@ impl LiveApp {
         }
     }
 
+    /// Is this action currently held down? Movement and attack read this.
+    fn held(&self, action: BindableAction) -> bool {
+        match self.settings.keys.get(action) {
+            Bind::Key(code) => self.keys.contains(&code),
+            Bind::Mouse(MouseButton::Left) => self.left_held,
+            Bind::Mouse(MouseButton::Right) => self.right_held,
+            Bind::Mouse(_) | Bind::Unbound => false,
+        }
+    }
+
+    fn action_for(&self, bind: Bind) -> Option<BindableAction> {
+        self.settings.keys.action_for(bind)
+    }
+
+    /// Edge-triggered half of the controls: one press of a key or button.
+    fn trigger_action(&mut self, action: BindableAction) {
+        match action {
+            BindableAction::UseItem => {
+                self.shared.lock().unwrap().use_pressed = true;
+            }
+            // Attack, movement, sneak, sprint are held states, read by
+            // `push_input` on the next frame.
+            BindableAction::Attack
+            | BindableAction::Forward
+            | BindableAction::Back
+            | BindableAction::Left
+            | BindableAction::Right
+            | BindableAction::Jump
+            | BindableAction::Sneak
+            | BindableAction::Sprint => {}
+            BindableAction::PickBlock => self.pick_block(),
+            BindableAction::DropItem => {
+                self.shared.lock().unwrap().drop_item = true;
+            }
+            BindableAction::Inventory => {
+                let creative = self.shared.lock().unwrap().creative;
+                if creative {
+                    self.open_creative();
+                } else {
+                    self.open_inventory();
+                }
+            }
+            BindableAction::Chat => self.open_chat(false),
+            BindableAction::Command => self.open_chat(true),
+            BindableAction::Hotbar(slot) => {
+                self.shared.lock().unwrap().pending_slot = Some((slot.clamp(1, 9) - 1) as i16);
+            }
+            BindableAction::Fullscreen => self.toggle_fullscreen(),
+            BindableAction::ToggleSprint => self.toggle_sprint = !self.toggle_sprint,
+            BindableAction::ToggleSneak => self.toggle_sneak = !self.toggle_sneak,
+        }
+    }
+
+    /// Put the block being looked at into the selected hotbar slot.
+    ///
+    /// Vanilla's survival version pulls the stack out of the inventory; this
+    /// client only has the creative path, so survival says so instead of
+    /// pretending.
+    fn pick_block(&mut self) {
+        let (aim, creative, slot) = {
+            let state = self.shared.lock().unwrap();
+            (state.aim, state.creative, state.held_slot)
+        };
+        let Some(aim) = aim else { return };
+        if !creative {
+            self.push_chat("Pick Block needs creative mode for now.");
+            return;
+        }
+        let block = self.world.get_block(aim.x, aim.y, aim.z);
+        if block.id() == 0 {
+            return;
+        }
+        let item = ItemStack::new(block.id() as i16, 1, block.meta() as i16);
+        self.shared.lock().unwrap().give_item =
+            Some((play::HOTBAR_FIRST_SLOT as i16 + slot.max(0), item));
+    }
+
+    fn toggle_fullscreen(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let next = if window.fullscreen().is_some() {
+            None
+        } else {
+            Some(winit::window::Fullscreen::Borderless(None))
+        };
+        window.set_fullscreen(next);
+    }
+
+    /// Finish a rebind, warning about the action that lost the key.
+    fn assign_binding(&mut self, action: BindableAction, bind: Bind) {
+        let displaced = self.settings.keys.assign(action, bind);
+        self.rebinding = None;
+        self.keybind_warning = displaced.map(|other| {
+            format!(
+                "{} took {} from {}.",
+                action.label(),
+                bind.name(),
+                other.label()
+            )
+        });
+        self.settings.save();
+    }
+
     fn push_input(&mut self) {
         let mut input = Input::default();
-        if self.keys.contains(&KeyCode::KeyW) {
+        if self.held(BindableAction::Forward) {
             input.forward += 1.0;
         }
-        if self.keys.contains(&KeyCode::KeyS) {
+        if self.held(BindableAction::Back) {
             input.forward -= 1.0;
         }
-        if self.keys.contains(&KeyCode::KeyD) {
+        if self.held(BindableAction::Right) {
             input.strafe += 1.0;
         }
-        if self.keys.contains(&KeyCode::KeyA) {
+        if self.held(BindableAction::Left) {
             input.strafe -= 1.0;
         }
-        input.jump = self.keys.contains(&KeyCode::Space);
-        input.sneak =
-            self.keys.contains(&KeyCode::ShiftLeft) || self.keys.contains(&KeyCode::ShiftRight);
-        input.sprint = self.keys.contains(&KeyCode::ControlLeft);
+        input.jump = self.held(BindableAction::Jump);
+        input.sneak = self.held(BindableAction::Sneak) || self.toggle_sneak;
+        input.sprint = self.held(BindableAction::Sprint) || self.toggle_sprint;
+        let attack = self.held(BindableAction::Attack);
 
         let mut state = self.shared.lock().unwrap();
         state.input = input;
+        state.attacking = attack;
         if std::env::var_os("NEPHELE_TRACE_INPUT").is_some()
             && (input.forward != 0.0 || input.strafe != 0.0)
         {
@@ -1831,7 +2028,7 @@ impl LiveApp {
         self.drain_pings();
         self.push_input();
 
-        let view = {
+        let mut view = {
             let mut state = self.shared.lock().unwrap();
             // Physics runs at 20 Hz; render between ticks so motion is smooth
             // instead of stepping, like vanilla's `lastTickPos` interpolation.
@@ -1880,9 +2077,35 @@ impl LiveApp {
                 time_of_day: state.time_of_day,
                 chunks: state.chunks,
                 feet,
+                on_ground: state.player.on_ground,
                 alpha,
             }
         };
+
+        // View bobbing: vanilla sways the camera with the walk cycle. Amplitude
+        // follows horizontal speed, so standing still does not bob at all.
+        let moved = [
+            view.feet[0] - self.last_feet[0],
+            view.feet[2] - self.last_feet[2],
+        ];
+        let horizontal =
+            ((moved[0] * moved[0] + moved[1] * moved[1]).sqrt() / delta.max(1e-3) as f64) as f32;
+        self.last_feet = view.feet;
+        if self.settings.view_bobbing && view.on_ground {
+            if horizontal > 0.5 {
+                self.bob_phase += delta * horizontal.min(8.0) * 1.4;
+            }
+            let amplitude = (horizontal / 4.317).clamp(0.0, 1.0) * 0.05;
+            let bob = (self.bob_phase * 2.0).sin() * amplitude;
+            let sway = self.bob_phase.cos() * amplitude * 0.6;
+            view.camera.position.y += bob;
+            view.camera.position += view.camera.right() * sway;
+        } else if !self.settings.view_bobbing {
+            self.bob_phase = 0.0;
+        }
+
+        // The framerate cap sleeps out whatever is left of the frame's budget
+        // at the end of `frame()`, once the picture is presented.
 
         if let Some(err) = &view.error {
             eprintln!("disconnected: {err}");
@@ -1988,7 +2211,9 @@ impl LiveApp {
                     self.queued.remove(&key);
                     continue;
                 }
-                jobs.push(ColumnMeshJob::from_world(key, &self.world));
+                let mut job = ColumnMeshJob::from_world(key, &self.world);
+                brighten_job(&mut job, self.applied_brightness);
+                jobs.push(job);
             }
             if let Some(pool) = self.mesh_pool.as_mut() {
                 for job in jobs {
@@ -2142,6 +2367,17 @@ impl LiveApp {
             self.title_timer = 0.0;
             self.frames = 0;
         }
+
+        // Frame pacing belongs at the end of the frame: sleep out whatever is
+        // left of the budget so a cap actually holds the rate down under
+        // `ControlFlow::Poll`.
+        if self.settings.max_framerate > 0 {
+            let budget = Duration::from_secs_f32(1.0 / self.settings.max_framerate as f32);
+            let spent = now.elapsed();
+            if spent < budget {
+                std::thread::sleep(budget - spent);
+            }
+        }
     }
 
     /// Build and upload this frame's HUD / menu geometry.
@@ -2183,6 +2419,98 @@ impl LiveApp {
             },
             window_kind: view.window_kind.as_deref(),
         };
+
+        // The options tree has sliders, which the button list cannot express, so
+        // it is drawn before the plain-button screens and its tracks kept for
+        // hit-testing.
+        let options = match self.screen {
+            Screen::Options => Some(ui::draw_options(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &hud,
+                &self.settings,
+                scale,
+                width,
+                height,
+            )),
+            Screen::VideoSettings => Some(ui::draw_video_settings(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &hud,
+                &self.settings,
+                scale,
+                width,
+                height,
+            )),
+            Screen::Controls => Some(ui::draw_controls(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &hud,
+                &self.settings,
+                self.controls_scroll,
+                self.rebinding,
+                self.keybind_warning.as_deref(),
+                scale,
+                width,
+                height,
+            )),
+            Screen::Sounds => Some(ui::draw_sounds(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &hud,
+                &self.settings,
+                scale,
+                width,
+                height,
+            )),
+            Screen::ChatSettings => Some(ui::draw_chat_settings(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &hud,
+                &self.settings,
+                scale,
+                width,
+                height,
+            )),
+            Screen::Language => Some(ui::draw_language(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &hud,
+                &self.settings,
+                scale,
+                width,
+                height,
+            )),
+            Screen::ResourcePacks => Some(ui::draw_resource_packs(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &hud,
+                &self.settings,
+                scale,
+                width,
+                height,
+            )),
+            Screen::SkinCustomization => Some(ui::draw_skin_customization(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &hud,
+                &self.settings,
+                scale,
+                width,
+                height,
+            )),
+            _ => None,
+        };
+        if let Some(output) = options {
+            self.slider_rects = output.sliders;
+            self.controls_rows = output.scroll_rows;
+            self.buttons = output.buttons;
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.set_ui(&self.ui_bg, &self.ui_icons, &self.ui_fg);
+            }
+            return;
+        }
+        self.slider_rects.clear();
 
         self.buttons = match self.screen {
             Screen::Title => ui::draw_title(
@@ -2312,15 +2640,6 @@ impl LiveApp {
             Screen::Pause => {
                 ui::draw_pause(&mut self.ui_bg, &mut self.ui_fg, &hud, scale, width, height)
             }
-            Screen::Settings => ui::draw_settings(
-                &mut self.ui_bg,
-                &mut self.ui_fg,
-                &hud,
-                &self.settings,
-                scale,
-                width,
-                height,
-            ),
             Screen::Creative => {
                 let Some(textures) = self.textures.as_ref() else {
                     return;
@@ -2366,6 +2685,16 @@ impl LiveApp {
                 self.module_rects = rects;
                 buttons
             }
+            // The options tree is drawn above, because its sliders need tracks
+            // the button list cannot carry.
+            Screen::Options
+            | Screen::VideoSettings
+            | Screen::Controls
+            | Screen::Sounds
+            | Screen::ChatSettings
+            | Screen::Language
+            | Screen::ResourcePacks
+            | Screen::SkinCustomization => Vec::new(),
         };
 
         if self.screen == Screen::Game {
@@ -2905,6 +3234,7 @@ impl LiveApp {
             &mut self.ui_fg,
             &lines,
             input,
+            &self.settings.chat,
             scale,
             width,
             height,
@@ -2984,8 +3314,28 @@ impl LiveApp {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.set_vsync(self.settings.vsync);
         }
-        let mut shared = self.shared.lock().unwrap();
-        shared.view_distance = self.settings.view_distance;
+        {
+            let mut shared = self.shared.lock().unwrap();
+            shared.view_distance = self.settings.view_distance;
+        }
+        // Brightness is baked into each mesh's per-vertex light, so changing it
+        // means rebuilding what is already on screen. Normal is the identity, so
+        // the default path costs nothing.
+        if self.settings.brightness != self.applied_brightness {
+            self.applied_brightness = self.settings.brightness;
+            self.remesh_everything();
+        }
+    }
+
+    /// Queue every loaded column for a rebuild.
+    fn remesh_everything(&mut self) {
+        self.dirty_chunks.clear();
+        self.queued.clear();
+        self.stale.clear();
+        self.pending_uploads.clear();
+        for (coord, _) in self.world.iter() {
+            self.dirty_chunks.push((coord.x, coord.z));
+        }
     }
 
     fn open_pause(&mut self) {
@@ -3263,7 +3613,7 @@ impl LiveApp {
             }
             Action::TitleOptions => {
                 self.settings_return = Screen::Title;
-                self.screen = Screen::Settings;
+                self.screen = Screen::Options;
             }
             Action::Quit => event_loop.exit(),
             Action::ConnectSubmit => self.connect_from_input(),
@@ -3271,17 +3621,57 @@ impl LiveApp {
             Action::Resume => self.enter_game(),
             Action::OpenSettings => {
                 self.settings_return = Screen::Pause;
-                self.screen = Screen::Settings;
+                self.rebinding = None;
+                self.keybind_warning = None;
+                self.controls_scroll = 0;
+                self.screen = Screen::Options;
             }
-            Action::SettingsDone => {
+            Action::OptionsDone => {
+                self.rebinding = None;
+                self.keybind_warning = None;
                 self.settings.save();
                 self.screen = self.settings_return;
             }
-            Action::SettingAdjust(id, delta) => {
-                if self.settings.adjust(id, delta) {
+            Action::Open(screen) => {
+                self.rebinding = None;
+                self.keybind_warning = None;
+                if screen == Screen::Controls {
+                    self.controls_scroll = 0;
+                }
+                self.screen = screen;
+                self.settings.save();
+            }
+            Action::OptionAdjust(row, delta) => {
+                if self.settings.adjust(row, delta) {
                     self.apply_settings();
                     self.settings.save();
                 }
+            }
+            Action::BeginRebind(action) => {
+                self.rebinding = Some(action);
+                self.keybind_warning = None;
+            }
+            Action::ResetBind(action) => {
+                self.settings.keys.reset(action);
+                self.settings.save();
+                self.keybind_warning = None;
+            }
+            Action::ResetAllBinds => {
+                self.settings.keys.reset_all();
+                self.settings.save();
+                self.keybind_warning = Some("All keys reset to their defaults.".to_string());
+            }
+            Action::SelectLanguage(language) => {
+                self.settings.language = language;
+                self.settings.save();
+            }
+            Action::SelectResourcePack(pack) => {
+                self.settings.resource_pack = pack;
+                self.settings.save();
+            }
+            Action::ToggleSkinPart(part) => {
+                self.settings.skin_parts.toggle(part);
+                self.settings.save();
             }
             Action::OpenModules => {
                 self.module_drag = None;
@@ -3290,7 +3680,7 @@ impl LiveApp {
             Action::ModulesDone => {
                 self.module_drag = None;
                 self.settings.save();
-                self.screen = Screen::Settings;
+                self.screen = Screen::Options;
             }
             Action::ModuleToggle(id) => {
                 self.settings.modules.toggle(id);
@@ -3394,6 +3784,26 @@ impl ApplicationHandler for LiveApp {
                         "key {:?} {:?} screen={:?} captured={}",
                         event.physical_key, event.state, self.screen, self.mouse_captured
                     );
+                }
+                // A rebind owns the keyboard until it gets a key or Esc.
+                if let Some(action) = self.rebinding {
+                    if event.state == ElementState::Pressed {
+                        match event.physical_key {
+                            PhysicalKey::Code(KeyCode::Escape) => {
+                                self.rebinding = None;
+                                self.keybind_warning = None;
+                            }
+                            PhysicalKey::Code(code)
+                                if crate::keybinds::KEY_NAMES
+                                    .iter()
+                                    .any(|(known, _)| *known == code) =>
+                            {
+                                self.assign_binding(action, Bind::Key(code));
+                            }
+                            _ => {}
+                        }
+                    }
+                    return;
                 }
                 // While the chat line is open it owns the keyboard.
                 if self.chat_open && event.state == ElementState::Pressed {
@@ -3549,11 +3959,26 @@ impl ApplicationHandler for LiveApp {
                             Screen::Game => self.open_pause(),
                             Screen::Pause | Screen::Creative => self.enter_game(),
                             Screen::Inventory => self.close_inventory(),
-                            Screen::Settings => self.screen = self.settings_return,
                             Screen::Modules => {
                                 self.module_drag = None;
                                 self.settings.save();
-                                self.screen = Screen::Settings;
+                                self.screen = Screen::Options;
+                            }
+                            Screen::Options => {
+                                self.settings.save();
+                                self.screen = self.settings_return;
+                            }
+                            Screen::VideoSettings
+                            | Screen::Controls
+                            | Screen::Sounds
+                            | Screen::ChatSettings
+                            | Screen::Language
+                            | Screen::ResourcePacks
+                            | Screen::SkinCustomization => {
+                                self.rebinding = None;
+                                self.keybind_warning = None;
+                                self.settings.save();
+                                self.screen = Screen::Options;
                             }
                             Screen::Title => {}
                             Screen::Worlds | Screen::Servers => self.screen = Screen::Title,
@@ -3567,47 +3992,30 @@ impl ApplicationHandler for LiveApp {
                             }
                             Screen::Connect | Screen::Death => self.screen = Screen::Title,
                         },
-                        (KeyCode::KeyT, ElementState::Pressed) if self.screen == Screen::Game => {
-                            self.open_chat(false);
-                        }
-                        (KeyCode::Slash, ElementState::Pressed) if self.screen == Screen::Game => {
-                            self.open_chat(true);
-                        }
-                        (KeyCode::KeyE, ElementState::Pressed) => match self.screen {
-                            Screen::Game => {
-                                let creative = self.shared.lock().unwrap().creative;
-                                if creative {
-                                    self.open_creative();
-                                } else {
-                                    self.open_inventory();
-                                }
-                            }
-                            Screen::Creative => self.enter_game(),
-                            Screen::Inventory => self.close_inventory(),
-                            Screen::Pause
-                            | Screen::Settings
-                            | Screen::Modules
-                            | Screen::Title
-                            | Screen::Worlds
-                            | Screen::WorldCreate
-                            | Screen::WorldRename
-                            | Screen::WorldDeleteConfirm
-                            | Screen::Servers
-                            | Screen::Connect
-                            | Screen::Death => {}
-                        },
                         (KeyCode::KeyF, ElementState::Pressed) if self.screen == Screen::Game => {
                             let mut state = self.shared.lock().unwrap();
                             state.player.flying = !state.player.flying;
                             state.player.vy = 0.0;
                             println!("flying: {}", state.player.flying);
                         }
-                        (digit, ElementState::Pressed) if self.screen == Screen::Game => {
-                            if let Some(slot) = hotbar_digit(digit) {
-                                let mut state = self.shared.lock().unwrap();
-                                state.pending_slot = Some(slot);
-                            } else {
-                                self.keys.insert(code);
+                        (_, ElementState::Pressed)
+                            if self.screen == Screen::Inventory
+                                || self.screen == Screen::Creative =>
+                        {
+                            if self.action_for(Bind::Key(code)) == Some(BindableAction::Inventory) {
+                                if self.screen == Screen::Creative {
+                                    self.enter_game();
+                                } else {
+                                    self.close_inventory();
+                                }
+                            }
+                        }
+                        (_, ElementState::Pressed) if self.screen == Screen::Game => {
+                            // Every held key is tracked: `push_input` asks the
+                            // binding table which of them currently move.
+                            self.keys.insert(code);
+                            if let Some(action) = self.action_for(Bind::Key(code)) {
+                                self.trigger_action(action);
                             }
                         }
                         (_, ElementState::Released) => {
@@ -3618,6 +4026,13 @@ impl ApplicationHandler for LiveApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // A rebind accepted a mouse button.
+                if let Some(action) = self.rebinding {
+                    if state == ElementState::Pressed {
+                        self.assign_binding(action, Bind::Mouse(button));
+                    }
+                    return;
+                }
                 // Menus use the free cursor; the game uses the captured one.
                 if self.screen == Screen::Inventory {
                     if state == ElementState::Pressed {
@@ -3660,12 +4075,50 @@ impl ApplicationHandler for LiveApp {
                     return;
                 }
                 if self.screen != Screen::Game {
-                    if button == MouseButton::Left && state == ElementState::Pressed {
-                        if let Some([x, y]) = self.pointer {
+                    match (button, state) {
+                        (MouseButton::Left, ElementState::Pressed) => {
+                            let Some([x, y]) = self.pointer else {
+                                return;
+                            };
+                            // A slider wins over the buttons: its track is the
+                            // whole row, including the value text.
+                            if let Some((row, rect)) = self
+                                .slider_rects
+                                .iter()
+                                .find(|(_, rect)| rect.contains(x, y))
+                                .copied()
+                            {
+                                self.active_slider = Some(row);
+                                let fraction = ((x - rect.x) / rect.w).clamp(0.0, 1.0);
+                                if self.settings.set_slider(row, fraction) {
+                                    self.apply_settings();
+                                    self.settings.save();
+                                }
+                                return;
+                            }
                             if let Some(action) = ui::hit_test(&self.buttons, [x, y]) {
+                                if std::env::var_os("NEPHELE_TRACE_INPUT").is_some() {
+                                    eprintln!(
+                                        "menu click {:?} at {x},{y} -> {action:?} ({} buttons)",
+                                        self.screen,
+                                        self.buttons.len()
+                                    );
+                                }
                                 self.handle_action(action, event_loop);
+                            } else if std::env::var_os("NEPHELE_TRACE_INPUT").is_some() {
+                                eprintln!(
+                                    "menu click {:?} at {x},{y} hit nothing ({} buttons)",
+                                    self.screen,
+                                    self.buttons.len()
+                                );
                             }
                         }
+                        (MouseButton::Left, ElementState::Released)
+                            if self.active_slider.take().is_some() =>
+                        {
+                            self.settings.save();
+                        }
+                        _ => {}
                     }
                     return;
                 }
@@ -3678,23 +4131,41 @@ impl ApplicationHandler for LiveApp {
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => {
                         self.clicks.click(MouseSide::Left, Instant::now());
-                        let mut shared = self.shared.lock().unwrap();
-                        shared.attacking = true;
+                        self.left_held = true;
+                        if let Some(action) = self.action_for(Bind::Mouse(MouseButton::Left)) {
+                            self.trigger_action(action);
+                        }
                     }
                     (MouseButton::Left, ElementState::Released) => {
-                        let mut shared = self.shared.lock().unwrap();
-                        shared.attacking = false;
+                        self.left_held = false;
                     }
                     (MouseButton::Right, ElementState::Pressed) => {
                         self.clicks.click(MouseSide::Right, Instant::now());
                         self.right_held = true;
-                        let mut shared = self.shared.lock().unwrap();
-                        shared.use_pressed = true;
+                        if let Some(action) = self.action_for(Bind::Mouse(MouseButton::Right)) {
+                            self.trigger_action(action);
+                        }
                     }
                     (MouseButton::Right, ElementState::Released) => {
                         self.right_held = false;
                     }
+                    (MouseButton::Middle, ElementState::Pressed) => {
+                        if let Some(action) = self.action_for(Bind::Mouse(MouseButton::Middle)) {
+                            self.trigger_action(action);
+                        }
+                    }
                     _ => {}
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if self.screen == Screen::Controls => {
+                let steps = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
+                    MouseScrollDelta::PixelDelta(position) => (position.y / 40.0).round() as i32,
+                };
+                if steps != 0 {
+                    let max = self.controls_rows.saturating_sub(5);
+                    self.controls_scroll =
+                        (self.controls_scroll as i32 - steps).clamp(0, max as i32) as usize;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } if self.screen == Screen::Servers => {
@@ -3727,6 +4198,19 @@ impl ApplicationHandler for LiveApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if let Some(row) = self.active_slider {
+                    if let Some((_, rect)) = self
+                        .slider_rects
+                        .iter()
+                        .find(|(known, _)| *known == row)
+                        .copied()
+                    {
+                        let fraction = ((position.x as f32 - rect.x) / rect.w).clamp(0.0, 1.0);
+                        if self.settings.set_slider(row, fraction) {
+                            self.apply_settings();
+                        }
+                    }
+                }
                 if let Some((id, offset)) = self.module_drag {
                     if let Some(window) = self.window.as_ref() {
                         let size = window.inner_size();
@@ -3902,20 +4386,34 @@ fn placement_hits_player(aim: &Aim, feet: [f64; 3]) -> bool {
     )
 }
 
-fn hotbar_digit(code: KeyCode) -> Option<i16> {
-    let slot = match code {
-        KeyCode::Digit1 => 0,
-        KeyCode::Digit2 => 1,
-        KeyCode::Digit3 => 2,
-        KeyCode::Digit4 => 3,
-        KeyCode::Digit5 => 4,
-        KeyCode::Digit6 => 5,
-        KeyCode::Digit7 => 6,
-        KeyCode::Digit8 => 7,
-        KeyCode::Digit9 => 8,
-        _ => return None,
-    };
-    Some(slot)
+/// Apply the brightness setting to a mesh job's light samples.
+///
+/// The renderer has no lightmap texture, so vanilla's gamma curve is realised by
+/// raising (or lowering) the 0..15 light value the mesher reads. `Normal` is the
+/// identity and short-circuits, which is the common case and keeps the default
+/// look byte-identical to before the option existed.
+fn brighten_job(job: &mut ColumnMeshJob, brightness: Brightness) {
+    if brightness == Brightness::Normal {
+        return;
+    }
+    for value in &mut job.light_levels {
+        *value = brightness.adjust_light(*value);
+    }
+    for plane in [
+        &mut job.west_lights,
+        &mut job.east_lights,
+        &mut job.north_lights,
+        &mut job.south_lights,
+    ] {
+        for value in plane.iter_mut() {
+            *value = brightness.adjust_light(*value);
+        }
+    }
+    for corner in &mut job.corner_lights {
+        for value in corner.iter_mut() {
+            *value = brightness.adjust_light(*value);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3957,6 +4455,7 @@ mod tests {
             window_kind: None,
             ping: None,
             target: None,
+            drop_item: false,
             entity_actions: Vec::new(),
             window_id: None,
             local_container: LocalContainer::default(),
@@ -4064,10 +4563,30 @@ mod tests {
     }
 
     #[test]
-    fn hotbar_digits_map_to_slots() {
-        assert_eq!(hotbar_digit(KeyCode::Digit1), Some(0));
-        assert_eq!(hotbar_digit(KeyCode::Digit9), Some(8));
-        assert_eq!(hotbar_digit(KeyCode::KeyW), None);
+    fn brightness_short_circuits_at_normal() {
+        let mut job = ColumnMeshJob {
+            key: (0, 0),
+            sections: Vec::new(),
+            west: Vec::new(),
+            east: Vec::new(),
+            north: Vec::new(),
+            south: Vec::new(),
+            light_levels: vec![0, 4, 15],
+            has_skylight: true,
+            corners: Default::default(),
+            corner_lights: [vec![4], vec![4], vec![4], vec![4]],
+            west_lights: vec![4],
+            east_lights: vec![4],
+            north_lights: vec![4],
+            south_lights: vec![4],
+        };
+        brighten_job(&mut job, Brightness::Normal);
+        assert_eq!(job.light_levels, vec![0, 4, 15]);
+        brighten_job(&mut job, Brightness::Brightest);
+        assert!(job.light_levels[1] > 4, "{:?}", job.light_levels);
+        assert_eq!(job.light_levels[2], 15, "saturated");
+        assert!(job.west_lights[0] > 4);
+        assert!(job.corner_lights[0][0] > 4);
     }
 
     /// A player standing on the block at (0, 63, 0), so their feet are at y = 64.
