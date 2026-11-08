@@ -895,6 +895,13 @@ re-serialize the chunk wholesale.
 
 **Build and tests**
 
+- **Disk is the build limit.** Every worktree carries its own `target\` (5–13 GB
+  each) and agents add `CARGO_TARGET_DIR` scratch under
+  `%TEMP%\opencode\tgt-*`. `scripts\clean_merged_worktrees.ps1` prints what each
+  worktree costs and, with `-Force`, removes the ones whose branch is merged and
+  whose tree is clean — the branch and its commits stay in the repository, so
+  that is build output only. Run it when a lane lands; "not enough space" has
+  already killed one session.
 - `crates/nephele-client/tests/scoreboard_capture.rs` replays a lobby capture that is
   gitignored (365 KB, holds real player names). It pulled the file in with
   `include_bytes!`, so `cargo clippy --all-targets` failed on every branch without the
