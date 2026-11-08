@@ -97,19 +97,18 @@ open with a message instead of taking the whole app down with it.
 
 ### Launching without a console
 
-Double-click **`Launch Nephele.cmd`** in the repository root. It runs the
-launcher out of `target\release`, next to the `nephele.exe` and
-`nephele-prepare.exe` it spawns. Those files are replaced in place by
-`cargo build`, so the shortcut keeps working after every edit — there is nothing
-to re-copy and no second executable to keep in sync.
+Double-click **`Launch Nephele.cmd`** in the repository root. It builds the three
+binaries into `target\release` and starts the launcher from there, next to the
+`nephele.exe` and `nephele-prepare.exe` it spawns. Because it builds first, the
+shortcut always runs the code you just edited; an up-to-date build costs about a
+second, since cargo only recompiles what changed.
 
 ```bat
 Launch Nephele.cmd            :: release build (recommended)
 Launch Nephele.cmd debug      :: debug build: faster to build, slower to play
 ```
 
-If the binaries are missing it builds them once first. To produce a folder you
-can zip and hand to someone else, run:
+To produce a folder you can zip and hand to someone else, run:
 
 ```powershell
 scripts\build_launcher.ps1    # builds all three and fills dist\

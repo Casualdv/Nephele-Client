@@ -1,13 +1,16 @@
 @echo off
-rem Launch Nephele without cargo or a console.
+rem Launch Nephele without a console, always from the current source.
 rem
-rem Runs the launcher out of target\<profile>, next to the nephele.exe and
-rem nephele-prepare.exe it spawns. Rebuilding with cargo replaces those files in
-rem place, so this shortcut keeps working after every edit - there is nothing to
-rem re-copy.
+rem Builds the three binaries into target\<profile> and starts the launcher from
+rem there. The launcher spawns `nephele.exe` and `nephele-prepare.exe` as
+rem siblings, so all three are built together and stay in step with the code you
+rem just edited - there is nothing to re-copy and no second executable to keep in
+rem sync.
 rem
 rem Usage:  Launch Nephele.cmd            (release build)
-rem         Launch Nephele.cmd debug      (debug build, slower game, faster build)
+rem         Launch Nephele.cmd debug      (debug build: faster to build, slower game)
+rem
+rem An up-to-date build costs about a second; cargo only recompiles what changed.
 
 setlocal
 cd /d "%~dp0"
@@ -22,16 +25,11 @@ if /i "%PROFILE%"=="debug" (
     set OUTDIR=release
 )
 
-set LAUNCHER=target\%OUTDIR%\nephele-launcher.exe
-
-if exist "%LAUNCHER%" goto run
-
-echo Building the %CARGO_PROFILE% binaries once...
+echo Building (%CARGO_PROFILE%)...
 cargo build --profile %CARGO_PROFILE% -p nephele-launcher -p nephele -p nephele-prepare
 if errorlevel 1 goto fail
 
-:run
-start "" "%LAUNCHER%"
+start "" "target\%OUTDIR%\nephele-launcher.exe"
 exit /b 0
 
 :fail
