@@ -2420,6 +2420,57 @@ mod tests {
     }
 
     #[test]
+    fn window_buttons_carry_the_server_slot_index() {
+        // A three-row Hypixel window: 1 + 27 + 36 = 64.
+        let slots = vec![None; 64];
+        let inventory = vec![None; 45];
+        let textures = TextureArray::from_tiles(vec![(
+            "missing".to_string(),
+            image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 255, 255])),
+        )]);
+        let hud = HudState {
+            window_slots: Some(&slots),
+            window_kind: Some(ContainerKind::Chest {
+                rows: 3,
+                header: true,
+            }),
+            ..hud_state(&inventory)
+        };
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let mut icons = UiBatch::default();
+        let buttons = draw_inventory(
+            &mut bg, &mut fg, &mut icons, &hud, None, &textures, 2.0, 1280.0, 720.0,
+        );
+        let action_at = |slot: usize| {
+            let rect =
+                window_slot_rect(slot, hud.window_kind, 2.0, 1280.0, 720.0).expect("slot exists");
+            hit_test(&buttons, [rect.x + rect.w / 2.0, rect.y + rect.h / 2.0])
+        };
+        assert_eq!(action_at(0), Some(Action::InventorySlot(0)), "header slot");
+        assert_eq!(
+            action_at(1),
+            Some(Action::InventorySlot(1)),
+            "first grid cell"
+        );
+        assert_eq!(
+            action_at(27),
+            Some(Action::InventorySlot(27)),
+            "last grid cell"
+        );
+        assert_eq!(
+            action_at(28),
+            Some(Action::InventorySlot(28)),
+            "first player slot"
+        );
+        assert_eq!(
+            action_at(63),
+            Some(Action::InventorySlot(63)),
+            "last hotbar slot"
+        );
+    }
+
+    #[test]
     fn hit_test_picks_the_last_matching_button() {
         let buttons = vec![
             Button {

@@ -1554,6 +1554,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_window_clicks_send_the_ui_slot_index() {
+        let (mut client, mut peer) = test_game_client().await;
+        // A three-row Hypixel window: 1 + 27 + 36 = 64 slots.
+        client.open_window = Some(OpenWindowState {
+            id: 5,
+            kind: "minecraft:chest".into(),
+            slot_count: 64,
+            slots: vec![None; 64],
+        });
+
+        // The UI resolves a click to these indices: header 0, first grid cell
+        // 1, last grid cell 27, first player slot 28. Right-click and
+        // shift-click must carry the same index.
+        for (slot, button, mode) in [
+            (0, 0, play::click_mode::CLICK),
+            (1, 0, play::click_mode::CLICK),
+            (27, 0, play::click_mode::CLICK),
+            (28, 0, play::click_mode::CLICK),
+            (28, 1, play::click_mode::CLICK),
+            (1, 0, play::click_mode::SHIFT_CLICK),
+        ] {
+            client
+                .click_slot_with(slot, button, mode, None)
+                .await
+                .unwrap();
+            let packet = peer.read_packet().await.unwrap();
+            assert_eq!(packet.id, play::serverbound::CLICK_WINDOW);
+            let mut r = packet.reader();
+            assert_eq!(r.read_u8().unwrap(), 5, "open window id");
+            assert_eq!(r.read_i16().unwrap(), slot, "slot the client sent");
+            assert_eq!(r.read_i8().unwrap(), button);
+            let _action = r.read_i16().unwrap();
+            assert_eq!(r.read_i8().unwrap(), mode);
+            assert_eq!(r.read_i16().unwrap(), -1, "no clicked stack");
+        }
+    }
+
+    #[tokio::test]
     async fn tab_list_actions_keep_rows_current() {
         let (mut client, _peer) = test_game_client().await;
         let uuid = [9; 16];

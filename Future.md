@@ -168,10 +168,10 @@ per render frame — it no longer does. Keep new simulation work inside
 | Item | Size | Notes |
 |---|---|---|
 | Survival inventory screen (2×2 crafting, armour slots) | L | Done: vanilla layout, cursor stack, left/right/shift clicks via `C0E`. |
-| Crafting table, furnace, chest, hopper, dispenser, brewing, enchanting, anvil, beacon | XL | **Crafting table done** (server window protocol plus a local 3×3 window); furnace/chest and the rest unstarted. |
+| Crafting table, furnace, chest, hopper, dispenser, brewing, enchanting, anvil, beacon | XL | **Crafting table, furnace and chest done**: the crafting table keeps its vanilla 46-slot layout; a local furnace/chest has its own panel and state; any server window sized `1 + rows*9 + 36` (Hypixel's Game Menu, shop chests, Ticket Machine) is drawn from `generic_54` with a title-band header slot and the player half aligned. Hoppers and the remaining bespoke containers still fall back to the generic grid; only the `1 + rows*9 + 36` shape is pixel-aligned. |
 | Shift-click, drag-split, item dragging, hotbar swap keys | M | |
 | Item tooltips: name, rarity colour, enchantments | M | |
-| Durability bar, stack counts, item icons | M | Partial: prepared icons now render for mapped tools, armour, materials and common food; unmapped ids still use the missing tile. |
+| Durability bar, stack counts, item icons | M | **Durability bar and stack counts done** (vanilla 13×2 bar, green→red, 1 px minimum). Prepared icons render for mapped tools, armour, materials and common food; unmapped ids still use the missing tile. |
 | Crafting recipe matching | L | Partial: a shared recipe book drives local 2×2/3×3 grids and the mock's 3×3 recipes, including the tree-to-pickaxe chain. The mock's 2×2 recipes remain separate; most vanilla recipes and container recipes are absent. |
 | Eating, potions, status effects | L | |
 | Enchantments | L | |
@@ -186,7 +186,7 @@ This is what separates a PvP client from a compatible one.
 | Item | Size | Notes |
 |---|---|---|
 | Hunger / XP / armour / air HUD | M | |
-| Hotbar selection highlight, item counts, durability | S | |
+| Hotbar selection highlight, item counts, durability | S | **Done**: selection frame, stack counts and durability bars come from `draw_stack`; lobby hotbar items arrive through `Set Slot` / `Window Items` window 0 (36..44). |
 | Chat overlay + input + command suggestions | M | **Overlay + input done** (fade, `T`/`/`, Enter/Esc). Client-side `/help /gamemode /tp /setblock /give /seed`; unknown commands go to the server. No tab-completion or chat colours yet. `azalea-brigadier` and `azalea-chat` are MIT references. |
 | Scoreboard sidebar, tab player list, boss bar, titles | M | |
 | **Client modules:** FPS, CPS, keystrokes, coordinates, ping, armour status, potion timers, reach display | M | The Lunar/Badlion basics. |
