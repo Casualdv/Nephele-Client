@@ -5,6 +5,7 @@
 
 # Build output
 /target
+/dist/
 
 # --- Mojang artifacts -------------------------------------------------------
 *.jar

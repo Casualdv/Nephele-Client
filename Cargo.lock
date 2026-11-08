@@ -1411,10 +1411,17 @@ name = "nephele-launcher"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "hex",
+ "image",
  "nephele-assets",
+ "nephele-prepare",
  "nephele-render",
+ "ring",
+ "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "winit",
 ]
 

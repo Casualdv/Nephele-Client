@@ -58,7 +58,9 @@ This is the single most important constraint in the project.
   `1.8.9.jar`, verified by SHA-1 against `research-lock.json`. Derived output goes to
   `.local/` which is gitignored.
 - `scripts/check_public_tree.ps1` is the publish gate and runs in CI. If it fails,
-  the tree is not publishable.
+  the tree is not publishable. A working-tree scan skips `dist/`, the generated
+  release bundle; the git-tracked scan (what a clone publishes) still covers
+  every file, so keeping `dist/` gitignored is part of the gate.
 - A non-affiliation disclaimer is required in the README.
 
 **Licence rules for reference code:**
@@ -119,9 +121,17 @@ cargo run -p nephele -- play <host:port> --online  # Microsoft-authed join
 cargo run -p nephele -- auth [--legacy] [--client-id <id>]
 cargo run -p nephele-launcher                    # the launcher UI
 
+# packaging / install (product lane)
+.\scripts\package_windows.ps1                    # dist/nephele-<version>-win64
+.\scripts\reproducible_build.ps1 [-Verify]       # pinned build + hash compare
+.\dist\nephele-<version>-win64\install.cmd       # per-user install
+.\dist\nephele-<version>-win64\uninstall.cmd     # keeps user data by default
+
 # development shortcuts (never the only way to reach a screen):
 $env:NEPHELE_SCREEN="servers"   # title|servers|connect|settings|creative|pause|local
 $env:NEPHELE_DATA_DIR="..."     # override the user data directory
+$env:NEPHELE_WINDOW_SIZE="WxH"  # initial game window size (launcher sets it per profile)
+$env:NEPHELE_FORCE_SETUP=1      # exercise the launcher's first-run screen
 ```
 
 CI runs fmt, clippy with `-D warnings`, tests, and the publish gate. **A commit that
@@ -136,6 +146,14 @@ that chaining with `;` in PowerShell does **not** stop on failure.
 crates/
   nephele/              CLI binary: view / play / auth / prepare flows
   nephele-launcher/     winit + UiBatch launcher; spawns `nephele play` as a child
+      main.rs           launcher UI, profiles, setup/progress, crash handling
+      profile.rs        per-profile game directory + game window size (JSON)
+      setup.rs          resource discovery, prepare arguments, staleness check
+      update.rs         signed update check (empty key by default)
+      crash.rs          local crash reports + opt-in upload
+      legal.rs          in-app non-affiliation / terms / privacy text
+      fallback.rs       built-in 3x5 font for the no-resources setup screen
+      paths.rs          launcher state directory
   nephele-protocol/     packets, codecs, crypto (server_id_hash, rsa_encrypt)
   nephele-client/       connection lifecycle, mining, physics
   nephele-auth/         device-code OAuth → XBL → XSTS → Minecraft
@@ -682,7 +700,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
 | `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
 | `audio` | everything sound | `audio` | 35%: symphonia + kira, break/place/step/hurt |
-| `product` | launcher v2, updater, installer, legal | `saves-landing` (WIP commit) | 25%, blocked on code signing |
+| `product` | launcher v2, updater, installer, legal | `product` | launcher profiles/setup/crash/legal/installer landed; signed update remains blocked on code signing |
 
 Rules that hold across all of them: one worktree per lane (never edit the main
 checkout), its own `target/`, and `scripts/run_client.ps1 -Session <lane>` for
@@ -876,3 +894,94 @@ file is the only one that carries the full story.
 - Prefer measurement to reasoning about Minecraft internals. Every time I reasoned from
   the decompiled source alone, I was wrong; every time I measured, I found the bug.
 - Commit only when the tree is green: fmt, clippy, tests, publish gate.
+
+## 17. Launcher v2, packaging and legal (`product` lane)
+
+The launcher is no longer a single fixed window that runs `nephele-prepare`
+before it opens. It owns profiles, first-run setup, the update *check*, crash
+reports and the legal text; the game is still a child process.
+
+**Profiles.** `%APPDATA%\Nephele\launcher\profiles.json` (override the whole
+launcher state root with `NEPHELE_LAUNCHER_DIR`). Each entry is a **game
+directory** and a **game window size**:
+
+- The default profile points at `%APPDATA%\Nephele` so an upgrade keeps the
+  existing `saves/`, `auth.json`, `servers.json` and prepared resources.
+- New profiles get `%APPDATA%\Nephele\profiles\<slug>`; duplicating copies the
+  window size only, never save data.
+- Window presets cycle 1280x720 → 1600x900 → 1920x1080 → 2560x1440. A
+  hand-edited value is clamped to 640x480..7680x4320 in `profile.rs`.
+- The child receives `NEPHELE_DATA_DIR=<profile.game_dir>`,
+  `NEPHELE_MINECRAFT_ASSETS=<assets>`, `NEPHELE_WINDOW_SIZE=WxH` and
+  `RUST_BACKTRACE=1`. `live.rs` reads `NEPHELE_WINDOW_SIZE` at window creation
+  (one contiguous block, ~1450) and falls back to 1280x720. `viewer.rs` is
+  still fixed-size: only the play window is per-profile.
+
+**First-run resources.** `crates/nephele-launcher/src/setup.rs` looks for
+`NEPHELE_MINECRAFT_ASSETS`, then `<checkout>/.local/prepared/1.8.9`, then
+`<data>/prepared/1.8.9`. A `prepared.json` whose `outputVersion` differs is
+treated as stale and forces setup again. When nothing is found the launcher
+opens the **Setup** screen *before* any game assets exist:
+
+- `UiAtlas::blank()` leaves its white texel transparent, so the pre-resource UI
+  writes a generated 1x1 white `gui/widgets.png` under
+  `<launcher>/bootstrap` and uses a generated 17-tile white `TextureArray`
+  (two layers: a one-layer array views as D2 and wgpu rejects it for the D2Array
+  binding).
+- Text uses `fallback.rs`, a built-in 3x5 block font (uppercased); the vanilla
+  font is used as soon as resources load.
+- Prepare runs as a child with `--out <data>/prepared` and an optional
+  `--minecraft-dir`, writes to `<launcher>/prepare.log`, and the UI polls the
+  output file count. On failure it shows the exit reason plus the log tail; on
+  success it reloads the atlases and switches to the main screen without a
+  restart.
+
+**Update check — signed, and empty by default.** `NEPHELE_UPDATE_PUBLIC_KEY`
+(Ed25519, hex) is compiled in via `option_env!` and **is empty unless a release
+pipeline sets it**. Empty means: no network request, `UNSIGNED BUILD` in the
+top bar, and a `tracing::warn!` at startup. With a key and
+`NEPHELE_UPDATE_URL`, the launcher fetches a JSON manifest, verifies an Ed25519
+signature over the canonical payload
+`nephele-update-v1\n<version>\n<notes>\n<url>` with `ring`, and compares
+versions. It never downloads or executes an update. RFC 8032 test vector 1
+pins the verifier; `research-lock.json` and Cargo.lock pin the rest of the
+build.
+
+**Crash reports.** The game's stdout/stderr go to
+`<profile>/logs/game-<utc>.log`. An abnormal exit writes
+`<profile>/crashes/crash-game-<utc>.txt` **locally** with the version, build,
+profile, OS, exit code and log tail. Upload happens only when both
+`launcher.json`'s `upload_crashes` is true (default `false`) and the build has
+`NEPHELE_CRASH_URL`; there is no upload endpoint today. A panic in the launcher
+itself writes `crash-launcher-*.txt` through a panic hook.
+
+**Legal.** `legal.rs` is the single text used by the in-app Legal screen (and
+mirrored in the README): non-affiliation, terms, privacy. It states plainly
+that this build is unsigned.
+
+**Packaging (scripts, no committed binaries).**
+
+- `scripts/package_windows.ps1` builds with `--locked`, stages
+  `dist/nephele-<version>-win64` (three exes, `research-lock.json`, README,
+  install/uninstall scripts, `BUILD-INFO.txt`, `version.txt`), zips it and
+  writes `SHA256SUMS.txt`. It prints the signing blocker.
+- `scripts/reproducible_build.ps1` pins `SOURCE_DATE_EPOCH` to the commit time,
+  sets `CARGO_INCREMENTAL=0`, and builds with `codegen-units=1`,
+  `debuginfo=0`, `strip=symbols`, a `remap-path-prefix` and `/Brepro` via
+  `CARGO_ENCODED_RUSTFLAGS`. `-Verify` cleans and rebuilds the three packages,
+  then compares SHA-256 hashes.
+- `scripts/install.ps1` is per-user: `%LOCALAPPDATA%\Programs\Nephele`, a Start
+  Menu shortcut, and an HKCU uninstall entry (Apps & Features). Updates delete
+  exactly the previous `install.json` file list, never user data. It writes
+  `<data>/install.json` with `dataVersion`, creates the standard subdirectories
+  (`logs`, `crashes`, `prepared`, `launcher`) and records a version bump without
+  touching saves, auth, servers or profiles.
+- `scripts/uninstall.ps1` removes the manifest-listed files, shortcut and
+  registry key; user data is **kept by default** and `-RemoveData` deletes it
+  only after confirming the leaf is `Nephele`.
+
+**Blocker, stated plainly.** There is no code-signing certificate. Unsigned
+builds say so in the UI and log, and automatic updates are disabled; there is
+no downloadable signed update to verify. The install → prepare → join →
+uninstall acceptance path has **not** been run on a clean VM; it was exercised
+against temp directories on the development machine.

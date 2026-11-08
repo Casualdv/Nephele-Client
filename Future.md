@@ -93,7 +93,10 @@ metadata**, players with head yaw and armour-stand holograms, **audio** (symphon
 decode, kira mixing, break/place/step/hurt), launcher, CI, verified-resource
 preparation. Performance: 143 fps / p99 7.4 ms on integrated AMD at 1280×720,
 view distance 8, vsync off, with a committed baseline that fails the build on
-regression.
+regression. The launcher now has per-profile game directories and window sizes,
+a first-run setup screen that reports a failed `nephele-prepare`, local crash
+reports with opt-in-only upload, an in-app legal screen, and a signed update
+*check* that stays disabled while the signing key is empty.
 
 Measured parity against a world the real 1.8.9 server generated: **100%** of
 biome cells (0 / 160,000, seed 12345, 625 chunks — every GenLayer stage diff 0),
@@ -246,13 +249,13 @@ No audio exists yet.
 
 | Item | Size | Notes |
 |---|---|---|
-| Launcher v2: profiles, versions, news, update check | L | v0.1 exists. |
-| Signed auto-update | L | |
-| Crash reporter with opt-in upload | M | |
-| Telemetry opt-in only, and never on by default | S | |
+| Launcher v2: profiles, versions, news, update check | L | **Profiles + first-run setup landed.** Per-profile game directory and game window size; setup screen with live file count, progress bar and the failed-prepare log tail; unsigned build badge. No news feed or version switcher. |
+| Signed auto-update | L | **Blocked on code signing.** The check is implemented (`NEPHELE_UPDATE_PUBLIC_KEY`, Ed25519 via `ring`) and is disabled when the key is empty, which it is today. Nothing downloads yet. |
+| Crash reporter with opt-in upload | M | **Done.** Local `crashes/*.txt` by default, log tail included; upload only with an explicit launcher toggle and a configured `NEPHELE_CRASH_URL`. |
+| Telemetry opt-in only, and never on by default | S | No telemetry exists; legal text says so. |
 | Mod/plugin API for client modules | XL | Only if we want a third-party ecosystem. |
-| Terms, privacy policy, non-affiliation disclaimer | S | Required before public release. |
-| Branding, installer, packaging | M | |
+| Terms, privacy policy, non-affiliation disclaimer | S | **Done** in the launcher's Legal screen and the README. |
+| Branding, installer, packaging | M | **Script-based installer done** (`scripts/package_windows.ps1` → `install.ps1`/`uninstall.ps1`), per-user, Start Menu entry, HKCU uninstall entry, clean updates that preserve data. No signed `.exe` installer. |
 
 ### 11. Testing and parity
 
@@ -284,7 +287,7 @@ and worktree for each.
 | `audio` | 35% | music, volume settings, positional falloff tuning |
 | `saves` | 90% | live memory walk; tile entities dropped on imported chunks |
 | `perf` | 100% | Intel HD-class hardware still unverified |
-| `product` | 25% | launcher v2, updater, installer, legal — blocked on code signing |
+| `product` | 70% | signed update and a clean-VM install pass; code signing is the external blocker |
 
 **Overall: roughly 60% of a shippable PvP client.** What is missing is no longer
 engine work — it is UI chrome, entity detail and content breadth.

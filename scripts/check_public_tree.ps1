@@ -76,13 +76,16 @@ $deniedExtensions = @(
 )
 
 # Local caches that .gitignore already excludes: skipped by a working-tree scan
-# so a normal development checkout still passes.
+# so a normal development checkout still passes. `dist` is the release bundle
+# written by scripts/package_windows.ps1: generated, gitignored, and never
+# published from the source tree (the zip is uploaded separately).
 $localCaches = @(
     "target",
     ".git",
     "node_modules",
     "bin",
     "obj",
+    "dist",
     "references",
     ".local",
     "assets\vanilla",

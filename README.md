@@ -36,6 +36,8 @@ talks protocol 47, and joins offline-mode servers.
 - Chat: on-screen log and input, with client-side `/gamemode`, `/tp`, `/setblock`, `/give`
 - UI: title, multiplayer (live ping, MOTD and version), direct connect, pause, settings
   and creative screens; HUD, hotbar, hearts
+- Launcher: per-profile game directory and window size, first-run resource setup with a
+  real progress/error panel, local crash reports and in-app legal text
 
 **Not implemented yet**
 
@@ -85,6 +87,25 @@ A window with Play, a demo-world button and the resource status. It runs
 the game as a **child process**, so a crash in the client leaves the launcher
 open with a message instead of taking the whole app down with it.
 
+- **Profiles** each have their own game directory (saves, sign-in, server list)
+  and game window size. The default profile uses `%APPDATA%\Nephele`; new ones
+  get their own folder under `profiles/`. Window sizes cycle 1280x720 through
+  2560x1440.
+- **First run** opens a setup screen before any game files exist. It shows the
+  files being extracted, and on failure it shows `nephele-prepare`'s own output
+  instead of closing silently.
+- **The build is unsigned.** The launcher says so in the title bar area and in
+  the log; update checks are disabled until a signing key is compiled in.
+- **Crash reports are local by default.** An abnormal exit writes a report with
+  the end of the game log under the profile's `crashes/` folder. Upload is a
+  separate, off-by-default toggle.
+
+An installed build is produced with `scripts/package_windows.ps1`, then
+`install.cmd` from the bundle. The installer is per-user (no administrator
+rights), adds a Start Menu entry and an Apps & Features uninstall entry, and
+keeps user data across updates. `uninstall.cmd` keeps saves and settings unless
+`-RemoveData` is passed.
+
 ### Preparing the resources
 
 `nephele-prepare` reads the 1.8.9 client jar you already have, checks it against
@@ -102,6 +123,27 @@ cargo run -p nephele-prepare -- --verify-only        # rehash an existing prepar
 A standard game directory, a Prism/MultiMC instance and a launcher root are all
 understood. Nothing is downloaded: if the jar is missing, start 1.8.9 once in
 your launcher and run it again.
+
+## Legal
+
+**Nephele is not an official Minecraft product.** It is not approved by,
+endorsed by, or associated with Mojang Synergies AB or Microsoft Corporation.
+"Minecraft" is a trademark of Mojang Synergies AB and is used here only to say
+what this client is compatible with.
+
+**Terms.** Nephele's own source is licensed under MIT OR Apache-2.0. You must
+own a legitimate copy of Minecraft: Java Edition 1.8.9 to use it; Nephele never
+downloads the game for you. The software is provided "as is", without warranty
+of any kind, and you are responsible for the rules of any server you join. It
+does not bypass authentication, server anti-cheat or Mojang's terms.
+
+**Privacy.** There is no telemetry. Your Microsoft session token and server
+list are stored only on this machine and are never uploaded. Crash reports are
+written locally and are uploaded only if you switch crash uploads on and the
+build has an upload endpoint. An update check runs only in builds that carry an
+update signing key, and it downloads nothing. Joining an online server sends the
+same login and play packets any 1.8.9 client sends, to the server you chose.
+The same text is available in the launcher's Legal screen.
 
 ## What is and is not in this repository
 
@@ -143,6 +185,13 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 pwsh scripts/check_public_tree.ps1
+```
+
+Release packaging is scripted too:
+
+```sh
+pwsh scripts/package_windows.ps1        # build + stage + zip + SHA-256
+pwsh scripts/reproducible_build.ps1 -Verify
 ```
 
 All of these run in CI on every push and pull request.

@@ -1447,9 +1447,22 @@ impl LiveApp {
 
     fn init(&mut self, event_loop: &ActiveEventLoop) {
         let window_start = Instant::now();
+        // The launcher passes the active profile's window size. A missing or
+        // malformed value falls back to the old fixed 1280x720.
+        let (window_width, window_height) = std::env::var("NEPHELE_WINDOW_SIZE")
+            .ok()
+            .and_then(|value| {
+                let (width, height) = value.split_once('x')?;
+                Some((
+                    width.trim().parse::<f32>().ok()?,
+                    height.trim().parse::<f32>().ok()?,
+                ))
+            })
+            .filter(|(width, height)| *width >= 320.0 && *height >= 240.0)
+            .unwrap_or((1280.0, 720.0));
         let attributes = Window::default_attributes()
             .with_title("Nephele")
-            .with_inner_size(LogicalSize::new(1280.0, 720.0));
+            .with_inner_size(LogicalSize::new(window_width, window_height));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(err) => return self.fail(event_loop, err),
