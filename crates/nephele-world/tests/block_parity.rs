@@ -1,6 +1,6 @@
 //! Block-level parity harness against the structures-on reference world.
 //!
-//! Reads `Nephele-private/parity/blocks-random.bin.gz` — a gzipped dump of every
+//! Reads `Nephele-private/parity/blocks-random.bin.gz` â€” a gzipped dump of every
 //! chunk the real 1.8.9 server saved (seed 12345, DEFAULT, structures **on**,
 //! 625 chunks / 25x25 around spawn), produced by
 //! `Nephele-private/oracle/tools/Export.java`. The format is documented at the
@@ -23,7 +23,7 @@
 //! The biomes are raw bytes either way.
 //!
 //! Only the inner `+-8` chunks are compared, counting from the fixture's own
-//! 25x25 grid, not from 0,0 — the world spawns at a negative chunk position, so
+//! 25x25 grid, not from 0,0 â€” the world spawns at a negative chunk position, so
 //! the grid is not centred on the origin. The outer ring is skipped because
 //! population writes into the chunk east and south of its owner, and the fixture
 //! has no neighbours beyond its own edge.
@@ -34,14 +34,26 @@
 //! cargo test -p nephele-world --test block_parity -- --nocapture
 //! ```
 //!
-//! The report groups every mismatch by the block state the **reference** has
-//! there, which is what separates "we cannot do this yet because population is
-//! not ported" from "our terrain is wrong": a reference state that
-//! [`PROVIDED_STATES`] cannot produce is, by definition, a block vanilla's
-//! population pass placed.
+//! The report groups every mismatch into one of three buckets **by block id**,
+//! not by "what can our terrain stage produce". The earlier reference-state rule
+//! was unreadable once population became partial: a tree that we misplace where
+//! vanilla has stone is a *population* error, but the reference block there is
+//! stone, so it was filed as terrain and inflated the regression guard while the
+//! population bucket looked healthy.
+//!
+//! - **population** â€” a block only the decorate pass places: leaves, logs, ores,
+//!   flowers, tall grass, mushrooms, crops, structures (mossy cobble, spawner,
+//!   chest, rails, fences), the granite/diorite/andesite veins, and water or lava
+//!   **above sea level**, i.e. a pool rather than an ocean.
+//! - **shared** â€” blocks both stages place: dirt and gravel (vein material *and*
+//!   terrain filler), sand, snow layer, ice, and water/lava at or below sea level.
+//! - **terrain** â€” everything else, which is the height-field and cave guard.
+//!
+//! A mismatch is population if **either** side is a population block, so a
+//! missing tree and a tree in the wrong place both land there.
 //!
 //! Mismatches are also split by whether the chunk's biome map agrees with vanilla.
-//! The biome layer is a known open bug (AGENTS.md §6), and a wrong biome means a
+//! The biome layer is a known open bug (AGENTS.md Â§6), and a wrong biome means a
 //! wrong surface and a wrong height field, so the two have to be reported apart.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,7 +78,7 @@ const BIOME_CELLS: usize = 256;
 
 /// Every block state `provide_chunk` can write.
 ///
-/// Derived from the code that writes blocks in the stage — `terrain::primer`
+/// Derived from the code that writes blocks in the stage â€” `terrain::primer`
 /// (stone/water), `surface::apply` (bedrock, the per-biome top and filler pair,
 /// ice at the waterline, the swamp lily), `surface::generate_biome_terrain`
 /// (sandstone under sand), `mesa::MesaTerrain` (coloured clay bands) and the
@@ -104,47 +116,82 @@ fn is_provided(raw: u16) -> bool {
     PROVIDED_STATES.contains(&raw)
 }
 
-/// Which stage of the pipeline can put a reference block where it is.
-///
-/// The interesting case is the middle one: vanilla's population pass places the
-/// same *block* the terrain pass does, so a block-level diff cannot name the
-/// culprit by id alone. Dirt and gravel are the loud examples — `generateOres`
-/// runs ten dirt and eight gravel veins of size 33 per chunk, straight through
-/// the stone body — so those are reported as `Shared` and their counts are left
-/// to speak for themselves (hundreds of blocks per chunk, against a surface
-/// error which would be a handful at the top of a column).
+/// Which bucket a mismatch belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Stage {
-    /// Only `provide_chunk` places this.
+    /// Only `provide_chunk` places this: the height field and cave guard.
     Terrain,
     /// Both stages place it.
     Shared,
-    /// Only `populate` places this: none of it exists in our world yet.
+    /// Only `populate` places this.
     Population,
 }
 
-fn stage(raw: u16) -> Stage {
+/// Sea level, from AGENTS.md Â§6. Pools above it are population's; water and lava
+/// at or below it could be the ocean, so they are shared and cannot be used to
+/// inflate the population bucket.
+const SEA_LEVEL: u16 = 63;
+
+/// Blocks only vanilla's decorate (population) pass places.
+///
+/// Read off `BiomeDecorator`, the per-biome `decorate` overrides, `WorldGenMinable`
+/// (ores and the stone-variant patches), `WorldGenLakes`, `WorldGenDungeons`,
+/// `WorldGenMineshaft` and the village pieces.
+fn is_population_id(id: u16) -> bool {
+    matches!(
+        id,
+        // Trees and their parts.
+        17 | 18 | 161 | 162
+        // Plants: saplings, tall grass, dead bush, flowers, mushrooms, cactus,
+        // reeds, pumpkins and stems, vines, lilies, crops, cocoa, double plants.
+        | 6 | 31 | 32 | 37..=40 | 59 | 81 | 83 | 86 | 103..=106 | 111 | 115 | 127 | 141
+        | 142 | 175
+        // Ores, and the granite/diorite/andesite veins that are population-only.
+        | 14..=16 | 21 | 56 | 73 | 74 | 129 | 153
+        // Structures: dungeon shell/spawner/chest, mineshaft rails and planks,
+        // village fences, the extreme-hills monster egg, obsidian and cobweb.
+        | 4 | 5 | 30 | 48 | 49 | 52 | 54 | 66 | 85 | 97
+        // Clay patches under water.
+        | 82
+    )
+}
+
+/// Blocks both stages place, so a block-level diff cannot name the culprit.
+fn is_shared_id(id: u16) -> bool {
+    matches!(
+        id,
+        // Dirt and gravel veins run through terrain's own dirt and gravel.
+        3 | 13
+        // Sand, the snow layer and ice from the surface sweep and the snow pass.
+        | 12 | 78 | 79
+        // Water and lava: an ocean is terrain's, a lake is population's.
+        | 8..=11
+    )
+}
+
+/// Population blocks that share an id with a terrain block: stone's granite,
+/// diorite and andesite variants are only ever placed by the ore pass.
+fn is_population_state(raw: u16) -> bool {
     let id = raw >> 4;
-    let meta = raw & 0x0F;
-    match (id, meta) {
-        // Terrain-only. Air counts: the only population stage that *removes* a
-        // block is `WorldGenDungeons`, and one dungeon every ~31 chunks cannot
-        // explain a per-chunk air difference.
-        (0, _) | (2, _) | (7, _) | (24, _) | (110, _) | (159, _) | (172, _) => Stage::Terrain,
-        // Plain stone is terrain's; stone:1/3/5 are the granite, diorite and
-        // andesite veins, which only population places.
-        (1, 0) => Stage::Terrain,
-        (1, 1) | (1, 3) | (1, 5) => Stage::Population,
-        // Both: dirt and gravel veins, water and lava lakes (plus the liquid
-        // levels a running server leaves behind), the underwater sand/clay/gravel
-        // pass, snow from the ice/snow sweep, ice, and swamp lilies.
-        (3, _) | (8, _) | (9, _) | (11, _) | (12, _) | (13, _) | (78, _) | (79, _) | (111, _) => {
-            Stage::Shared
-        }
-        // Everything else is a population-only block in this fixture: ores,
-        // trees, plants, and the dungeon/mineshaft/village pieces.
-        _ => Stage::Population,
+    is_population_id(id) || (id == 1 && matches!(raw & 0x0F, 1 | 3 | 5))
+}
+
+/// Bucket a mismatch at `y` by the blocks on both sides.
+fn bucket(ours: u16, theirs: u16, y: usize) -> Stage {
+    let above_sea = y > SEA_LEVEL as usize;
+    let is_pool = |raw: u16| matches!(raw >> 4, 8..=11);
+
+    if is_population_state(ours)
+        || is_population_state(theirs)
+        || (above_sea && (is_pool(ours) || is_pool(theirs)))
+    {
+        return Stage::Population;
     }
+    let ids = [ours >> 4, theirs >> 4];
+    if ids.iter().any(|id| is_shared_id(*id)) {
+        return Stage::Shared;
+    }
+    Stage::Terrain
 }
 
 fn stage_name(stage: Stage) -> &'static str {
@@ -155,10 +202,22 @@ fn stage_name(stage: Stage) -> &'static str {
     }
 }
 
+/// How a *reference* block reads on its own, for the per-state table. A full
+/// bucket needs both sides (see [`bucket`]), so this only labels the row.
+fn reference_class(raw: u16) -> &'static str {
+    if is_population_state(raw) {
+        "population"
+    } else if is_shared_id(raw >> 4) || raw >> 4 == 78 {
+        "shared"
+    } else {
+        "terrain"
+    }
+}
+
 /// Whether this block can sit on *top* of the terrain without being part of it:
 /// everything population places, plus the snow layer its ice/snow sweep drops.
 fn dresses_the_top(raw: u16) -> bool {
-    stage(raw) == Stage::Population || raw >> 4 == 78
+    is_population_state(raw) || raw >> 4 == 78
 }
 
 fn fixture_path() -> PathBuf {
@@ -294,7 +353,7 @@ impl Report {
             return;
         }
         self.mismatches += 1;
-        let kind = stage(theirs);
+        let kind = bucket(ours, theirs, y);
         *self.by_stage.entry(kind).or_default() += 1;
         if kind == Stage::Terrain {
             if (y as u16) + SURFACE_DEPTH >= reference_top {
@@ -366,6 +425,29 @@ fn describe(entry: &IdDiff) -> String {
         .map(|(state, count)| format!("{} ({count})", state_name(*state)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[test]
+fn mismatches_are_bucketed_by_block_id() {
+    let stone = 1 << 4;
+    let leaves = 18 << 4;
+    let dirt = 3 << 4;
+    let water = 9 << 4;
+
+    // A missing tree and a misplaced tree are both population.
+    assert_eq!(bucket(stone, leaves, 70), Stage::Population);
+    assert_eq!(bucket(leaves, stone, 70), Stage::Population);
+    // Ores are population wherever they are.
+    assert_eq!(bucket(stone, 16 << 4, 12), Stage::Population);
+    // Dirt/gravel veins are shared: both stages place them.
+    assert_eq!(bucket(stone, dirt, 12), Stage::Shared);
+    // A pool above sea level is population's; an ocean at sea level is terrain's.
+    assert_eq!(bucket(stone, water, 70), Stage::Population);
+    assert_eq!(bucket(stone, water, 40), Stage::Shared);
+    // Air against stone is the height-field and cave guard.
+    assert_eq!(bucket(0, stone, 40), Stage::Terrain);
+    // A stone variant vein is population-only, plain stone is not.
+    assert_eq!(bucket(stone, (1 << 4) | 3, 12), Stage::Population);
 }
 
 #[test]
@@ -533,7 +615,7 @@ fn terrain_matches_the_reference_except_where_vanilla_populates() {
     // 1. Vanilla's population pass accounts for the overwhelming majority of the
     //    difference. It cannot be *all* of it: population and terrain place the
     //    same blocks sometimes (dirt and gravel veins, snow, lake water), and the
-    //    height field itself is not exact yet (AGENTS.md §6).
+    //    height field itself is not exact yet (AGENTS.md Â§6).
     let population = report.count(Stage::Population);
     let shared = report.count(Stage::Shared);
     assert!(
@@ -633,7 +715,7 @@ fn print_report(
             "  {:<30} {:>10}  {:<10} {}",
             state_name(*state),
             diff.count,
-            stage_name(stage(*state)),
+            reference_class(*state),
             describe(diff)
         );
     }
@@ -648,7 +730,7 @@ fn print_report(
                 "  {:<30} {:>10}  {:<10} {}",
                 state_name(*state),
                 diff.count,
-                stage_name(stage(*state)),
+                reference_class(*state),
                 describe(diff)
             );
         }
