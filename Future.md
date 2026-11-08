@@ -83,7 +83,9 @@ settings / connect / creative screens, HUD (hotbar, crosshair, health, hunger,
 armour), physics (walk, sprint, sneak, fly, jump, sneak edge protection, slime
 bounce), mining + placement, creative inventory, anvil **reading and writing**,
 vanilla-compatible world saves (level.dat with player state, unknown-NBT
-preservation, atomic writes with backups, region compaction, weather), biomes +
+preservation, atomic writes with backups, region compaction, weather),
+**singleplayer on the vanilla pipeline** (GenLayer biomes, density height field,
+per-biome surface, stored as `Level.Biomes`), biomes +
 density height field + surface pass, shape-aware block meshing (slabs, stairs,
 fences, panes, bars, doors, torches, fire, cross-plants with correct culling),
 animated textures, mipmapped filtering, procedural sky and per-biome fog, grass
@@ -276,6 +278,7 @@ and worktree for each.
 |---|---:|---|
 | `render` | 95% | shape audit leftovers; first-person hand depth-clear |
 | `biomes` | 100% | nothing — every GenLayer stage diffs 0 against the oracle |
+| `biome-vis` | 100% | singleplayer streams the vanilla pipeline and columns carry `Level.Biomes`; visible grass tint waits on `render` |
 | `worldgen` | 15% | `provide_chunk`/`populate` split landed; caves, ores, flora, structures |
 | `survival` | 90% | eating, potions, enchantments, XP orbs |
 | `net` | 95% | resource packs, reconnect polish |

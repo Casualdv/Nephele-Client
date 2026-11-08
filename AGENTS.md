@@ -254,7 +254,7 @@ Environment: **overworld, sea level 63**, infinite generation, biome map from th
 | Caves | done | 308 air/chunk below y=56 |
 | Ravines | done | 426 vs 435 reference (98%) |
 | Ores | done, wrong stage | 5–12% above reference (caves absent when measured) |
-| **Biome map** | **done** | **0 / 160,000 blocks differ** (seed 12345, reference server world) |
+| **Biome map** | **done** | **0 / 160,000 blocks differ** (seed 12345, reference server world), and 0 / 160,000 again after a full `column()` pass, read from `ChunkColumn::biomes()` |
 | Features | partial | flowers, grass, dead bush, cactus, oak-shape trees |
 
 **Every number above except the biome map was measured per chunk, which is a
@@ -306,6 +306,34 @@ continuous generation and `debug_stage_trace` replays the same stack in Rust
 (see §7). The first differing stage was `hillNoiseZoom0` — 56 of 256 cells —
 while its input `riverInit` matched exactly, which localised the fault to the
 layer above the input rather than to any zoom arithmetic.
+
+### Where the map reaches the screen — fixed 2026-11-08
+
+A correct map is not a visible one. Two separate links were broken:
+
+1. **Singleplayer never called this generator.** `live.rs::local_loop` streamed
+   `TerrainGenerator` from `generation.rs` — the value-noise stand-in whose own
+   module docs say it "is not vanilla's generator". Singleplayer now streams
+   `VanillaGenerator`: the same code the parity harness measures.
+2. **`VanillaGenerator::column` dropped the map.** It computed the 16×16 biome
+   map, used it for the surface, cave and feature passes, then returned a
+   column with `biomes: None`. Vanilla's `ChunkProviderGenerate` stores it as
+   `Level.Biomes`, so `column()` now calls `set_biomes`. Pinned by
+   `generated_chunks_carry_the_biome_map` and
+   `generated_chunk_biomes_match_the_reference_world` — the latter reads the
+   bytes back out of `ChunkColumn::biomes()` for all 625 reference chunks
+   (160,000 cells, 0 mismatched), which is the same window as the GenLayer test
+   but one layer closer to the screen.
+
+Consumers of `ChunkColumn::biomes()`: `live.rs::biome_at` (sky/fog colour) on
+`main`, and on the unmerged `render` branch `ColumnMeshJob.biomes` +
+`atlas.tint` (grass, foliage, water, with the vanilla 3×3 neighbourhood
+average). **On `main` there is still no per-block tint**: `nephele-assets`
+bakes the plains colour into grass (`PLAINS_GRASS` / `PLAINS_FOLIAGE`), so grass
+is plains-green everywhere until `render` merges. Every consumer falls back to
+plains (1) when a column has no biomes, which is why the missing map read as
+"all plains" rather than as an error. Server-joined worlds only needed the
+render half: `decode.rs` already stores the S21 `Level.Biomes` payload.
 
 ---
 
@@ -674,6 +702,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 |---|---|---|---|
 | `render` | shapes, tinting, sky, fog | `render` | 95%: bars, fire, plant culling and biome tint landed; audit leftovers |
 | `biomes` | GenLayer parity | `biomes` | **100% biome cells, every stage diff 0 — lane complete** |
+| `biome-vis` | singleplayer generator + biome data path | `biome-vis` | done: `local_loop` streams `VanillaGenerator`, columns carry `Level.Biomes`; needs merge |
 | `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) |
 | `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
 | `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | 95%: scoreboards, teams, `C02`, maps and frames all parsed |
@@ -763,7 +792,11 @@ re-serialize the chunk wholesale.
   `[Biome; 40]` table.
 - Hills surface rule is three rules, not one: mutations get gravel when noise
   ∉ (−1..=2); stone appears above noise 1.0 unless the biome is Extreme Hills+ (34).
-- **`GenLayerHills` never seeds its variance layer, and that is correct.** Vanilla
+- **Generated columns must carry `Level.Biomes`.** `ChunkColumn::set_biomes` is
+  what `biome_at`, `ColumnMeshJob`, the save writer and `biome_at`'s fog read.
+  Every one of them falls back to plains when it is absent, so a missing map
+  looks like "this world is all plains", not like an error.
+- `GenLayerHills` never seeds its variance layer, and that is correct. Vanilla
   keeps the hill-noise layer in `field_151628_d`, outside `parent`, so
   `initWorldGenSeed` never reaches it and the two zooms above it run with
   `worldGenSeed == 0` for the whole world. Seeding it changes the
@@ -813,7 +846,7 @@ re-serialize the chunk wholesale.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`;
   `chunk_biomes_match_a_world_the_real_server_generated` passes and
   `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **523 test cases across the workspace** (517 passed, 6 ignored). `nephele-world`
+- **536 test cases across the workspace** (529 passed, 7 ignored). `nephele-world`
   carries the parity suite, including `debug_stage_trace` and
   `debug_first_mismatch`. The six real-socket tests in
   `crates/nephele-client/tests/join_mock.rs` cover status,
