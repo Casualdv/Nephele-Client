@@ -10,10 +10,16 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::chat;
 use crate::commands;
+use crate::hud_modules::{
+    ClickCounter, KeyState, ModuleId, MouseSide, Speedometer, Values as ModuleValues,
+};
+
 use crate::inventory;
 use crate::mesher::MeshPool;
 use crate::perf;
+use crate::scoreboard::Scoreboard;
 use crate::servers::{Ping, PingBoard, ServerEntry, ServerList, Status};
 use crate::settings::Settings;
 use crate::skins::SkinLoader;
@@ -222,6 +228,12 @@ struct Shared {
     /// Slots of the server's open container (crafting table), and whether one is.
     window_slots: Vec<Option<ItemStack>>,
     window_open: bool,
+    /// `S2D` inventory type of the open window, for the panel title.
+    window_kind: Option<String>,
+    /// Our own tab-list latency, `None` until the server tells us.
+    ping: Option<i32>,
+    /// Entity under the crosshair, as picked by the network thread.
+    target: Option<i32>,
     /// Server window id, or 1 for the local crafting-table window.
     window_id: Option<u8>,
     /// Offline crafting-table grid and cursor; the player's inventory stays above.
@@ -419,6 +431,9 @@ impl Default for Shared {
             inventory_clicks: Vec::new(),
             window_slots: Vec::new(),
             window_open: false,
+            window_kind: None,
+            ping: None,
+            target: None,
             window_id: None,
             local_container: LocalContainer::default(),
             close_window: false,
@@ -991,6 +1006,37 @@ fn reset_chunk_caches(
     stale.clear();
 }
 
+/// Our own latency, from the tab list row the server maintains for us.
+///
+/// 1.8 has no dedicated latency packet: `S38` action 2 updates each player's
+/// ping, and servers include the client's own row. `0` means "not measured
+/// yet", which the HUD shows as `--`.
+fn own_ping(client: &GameClient) -> Option<i32> {
+    let uuid = uuid_bytes(&client.info.uuid)?;
+    client
+        .player_list
+        .get(&uuid)
+        .map(|entry| entry.ping)
+        .filter(|ping| *ping > 0)
+}
+
+/// `"069a79f4-44e9-4726-a5be-fca90e698512"` -> 16 bytes.
+fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
+    let hex: Vec<u8> = text.bytes().filter(|byte| *byte != b'-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(
+            std::str::from_utf8(&hex[index * 2..index * 2 + 2]).ok()?,
+            16,
+        )
+        .ok()?;
+    }
+    Some(bytes)
+}
+
 async fn net_loop(
     address: ServerAddress,
     username: String,
@@ -1297,6 +1343,9 @@ async fn net_loop(
                         .as_ref()
                         .map(|open| open.slots.clone())
                         .unwrap_or_default();
+                    state.window_kind = client.open_window.as_ref().map(|open| open.kind.clone());
+                    state.ping = own_ping(&client);
+                    state.target = entity_hit.map(|hit| hit.id);
                 }
 
                 let mut batch = Vec::new();
@@ -1415,7 +1464,8 @@ async fn net_loop(
 
 /// One line of the on-screen chat log.
 struct ChatLine {
-    text: String,
+    /// Coloured runs, already parsed from `Â§` codes or a JSON component.
+    spans: Vec<chat::Span>,
     at: Instant,
 }
 
@@ -1435,6 +1485,10 @@ struct FrameView {
     inventory: Vec<Option<ItemStack>>,
     window_open: bool,
     window_slots: Vec<Option<ItemStack>>,
+    /// Inventory type of the open window, for the panel title.
+    window_kind: Option<String>,
+    /// Our own latency, from the tab list.
+    ping: Option<i32>,
     health: f32,
     food: i32,
     xp_bar: f32,
@@ -1458,8 +1512,8 @@ struct LiveApp {
     renderer: Option<Renderer>,
     textures: Option<Arc<TextureArray>>,
     world: World,
-    /// Columns whose mesh needs rebuilding, ordered farΓåÆnear so `pop()` hands
-    /// the nearest chunk to the mesher first.
+    /// Columns whose mesh needs rebuilding, ordered farthest first so `pop()`
+    /// hands the nearest chunk to the mesher first.
     dirty_chunks: Vec<(i32, i32)>,
     /// Columns currently somewhere in the meshing pipeline.
     queued: HashSet<(i32, i32)>,
@@ -1552,6 +1606,8 @@ struct LiveApp {
     inventory_cursor: Option<ItemStack>,
     /// Shift held down, for inventory quick-move clicks.
     shift: bool,
+    /// Right mouse button held, for the keystrokes module.
+    right_held: bool,
     last_fps: f32,
     /// Previous health value, so a drop can flash the damage vignette.
     last_health: f32,
@@ -1561,6 +1617,16 @@ struct LiveApp {
     disconnect_reason: Option<String>,
     /// Address of the last connection, kept so `R` can reconnect.
     last_address: Option<ServerAddress>,
+    /// Clicks in the last second, for the CPS module.
+    clicks: ClickCounter,
+    /// Horizontal blocks per second, for the speed module.
+    speed: Speedometer,
+    /// Scoreboard, empty until the net lane parses `S3B`..`S3E`.
+    sidebar: Scoreboard,
+    /// Module rectangles from the last frame, so the editor can hit-test a drag.
+    module_rects: Vec<(ModuleId, nephele_render::Rect)>,
+    /// Module being dragged by the editor, with the grab offset inside it.
+    module_drag: Option<(ModuleId, [f32; 2])>,
     error: Option<Box<dyn Error>>,
 }
 
@@ -1576,6 +1642,7 @@ impl LiveApp {
             Ok("creative") => Some(Screen::Creative),
             Ok("pause") => Some(Screen::Pause),
             Ok("settings") => Some(Screen::Settings),
+            Ok("modules") => Some(Screen::Modules),
             Ok("connect") => Some(Screen::Connect),
             Ok("servers") => Some(Screen::Servers),
             Ok("worlds") => Some(Screen::Worlds),
@@ -1674,11 +1741,21 @@ impl LiveApp {
             creative_page: 0,
             inventory_cursor: None,
             shift: false,
+            right_held: false,
             last_fps: 0.0,
             last_health: 20.0,
             hurt_flash: 0.0,
             disconnect_reason: None,
             last_address: None,
+            clicks: ClickCounter::new(),
+            speed: Speedometer::new(),
+            sidebar: if std::env::var_os("NEPHELE_SCOREBOARD_DEMO").is_some() {
+                Scoreboard::demo()
+            } else {
+                Scoreboard::new()
+            },
+            module_rects: Vec::new(),
+            module_drag: None,
             error: None,
         };
 
@@ -2083,7 +2160,7 @@ impl LiveApp {
                     self.particles.spawn_note(x, y, z, pitch);
                 }
                 Ok(NetMsg::Chat(text)) => {
-                    println!("[chat] {text}");
+                    println!("[chat] {}", chat::plain(&chat::parse(&text)));
                     self.push_chat(text);
                 }
                 Ok(NetMsg::Entities(snapshot)) => {
@@ -2258,6 +2335,8 @@ impl LiveApp {
                 inventory: state.inventory.clone(),
                 window_open: state.window_open,
                 window_slots: state.window_slots.clone(),
+                window_kind: state.window_kind.clone(),
+                ping: state.ping,
                 health: state.health,
                 food: state.food,
                 xp_bar: state.xp_bar,
@@ -2358,7 +2437,7 @@ impl LiveApp {
                 let dz = key.1 as f32 * 16.0 + 8.0 - eye_z;
                 dx * dx + dz * dz
             };
-            // Sorted farΓåÆnear so `pop()` yields the closest column.
+            // Sorted farthest first so `pop()` yields the closest column.
             self.dirty_chunks
                 .sort_unstable_by(|a, b| distance(b).total_cmp(&distance(a)));
 
@@ -2579,6 +2658,7 @@ impl LiveApp {
             thundering: view.thundering,
             lightning: view.lightning,
             clock: self.time,
+            window_kind: view.window_kind.as_deref(),
         };
 
         self.buttons = match self.screen {
@@ -2750,6 +2830,20 @@ impl LiveApp {
                     height,
                 )
             }
+            Screen::Modules => {
+                let values = self.module_values(view);
+                let (buttons, rects) = ui::draw_modules_editor(
+                    &mut self.ui_bg,
+                    &mut self.ui_fg,
+                    &self.settings.modules,
+                    &values,
+                    scale,
+                    width,
+                    height,
+                );
+                self.module_rects = rects;
+                buttons
+            }
         };
 
         if self.screen == Screen::Game {
@@ -2785,9 +2879,18 @@ impl LiveApp {
                     height,
                 );
             }
-        }
 
-        if self.screen == Screen::Game {
+            let values = self.module_values(view);
+            self.module_rects = ui::draw_modules(
+                &mut self.ui_bg,
+                &mut self.ui_fg,
+                &self.settings.modules,
+                &values,
+                scale,
+                width,
+                height,
+            );
+            self.draw_scoreboard(scale, width, height);
             self.draw_chat(scale, width, height);
         }
 
@@ -3204,8 +3307,9 @@ impl LiveApp {
     }
 
     fn push_chat(&mut self, text: impl Into<String>) {
+        let raw = text.into();
         self.chat_log.push_back(ChatLine {
-            text: text.into(),
+            spans: chat::parse(&raw),
             at: Instant::now(),
         });
         while self.chat_log.len() > 100 {
@@ -3301,12 +3405,64 @@ impl LiveApp {
         }
     }
 
+    /// Everything the HUD modules show this frame.
+    fn module_values(&mut self, view: &FrameView) -> ModuleValues {
+        let now = Instant::now();
+        let (left, right) = self.clicks.counts(now);
+        self.speed.sample(now, view.feet);
+        ModuleValues {
+            fps: self.last_fps,
+            ping: view.ping,
+            cps: (left, right),
+            position: view.feet,
+            speed: self.speed.blocks_per_second,
+            keys: self.key_state(view),
+        }
+    }
+
+    fn key_state(&self, view: &FrameView) -> KeyState {
+        KeyState {
+            forward: self.keys.contains(&KeyCode::KeyW),
+            left: self.keys.contains(&KeyCode::KeyA),
+            back: self.keys.contains(&KeyCode::KeyS),
+            right: self.keys.contains(&KeyCode::KeyD),
+            jump: self.keys.contains(&KeyCode::Space),
+            sneak: self.keys.contains(&KeyCode::ShiftLeft)
+                || self.keys.contains(&KeyCode::ShiftRight),
+            attack: view.attacking,
+            use_item: self.right_held,
+        }
+    }
+
+    /// The scoreboard sidebar, if the server has given us one.
+    fn draw_scoreboard(&mut self, scale: f32, width: f32, height: f32) {
+        if self.sidebar.is_empty() {
+            return;
+        }
+        let Some(objective) = self.sidebar.sidebar.as_ref() else {
+            return;
+        };
+        let rows = self.sidebar.sidebar_rows();
+        let list = ui::ScoreboardRowList {
+            title: Some(objective.title.as_slice()),
+            rows: &rows,
+        };
+        ui::draw_sidebar(
+            &mut self.ui_bg,
+            &mut self.ui_fg,
+            &list,
+            scale,
+            width,
+            height,
+        );
+    }
+
     /// Recent chat and, while it is open, the input line.
     fn draw_chat(&mut self, scale: f32, width: f32, height: f32) {
         let now = Instant::now();
         self.chat_log
             .retain(|line| now.duration_since(line.at).as_secs_f32() < 14.0);
-        let lines: Vec<(String, f32)> = self
+        let lines: Vec<(&[chat::Span], f32)> = self
             .chat_log
             .iter()
             .rev()
@@ -3319,7 +3475,7 @@ impl LiveApp {
                 } else {
                     (1.0 - (age - 10.0) / 4.0).clamp(0.0, 1.0)
                 };
-                (line.text.clone(), alpha)
+                (line.spans.as_slice(), alpha)
             })
             .collect();
         let input = self.chat_open.then_some(self.chat_input.as_str());
@@ -3699,11 +3855,32 @@ impl LiveApp {
                 self.settings_return = Screen::Pause;
                 self.screen = Screen::Settings;
             }
-            Action::SettingsDone => self.screen = self.settings_return,
+            Action::SettingsDone => {
+                self.settings.save();
+                self.screen = self.settings_return;
+            }
             Action::SettingAdjust(id, delta) => {
                 if self.settings.adjust(id, delta) {
                     self.apply_settings();
+                    self.settings.save();
                 }
+            }
+            Action::OpenModules => {
+                self.module_drag = None;
+                self.screen = Screen::Modules;
+            }
+            Action::ModulesDone => {
+                self.module_drag = None;
+                self.settings.save();
+                self.screen = Screen::Settings;
+            }
+            Action::ModuleToggle(id) => {
+                self.settings.modules.toggle(id);
+                self.settings.save();
+            }
+            Action::ModulesReset => {
+                self.settings.modules.reset();
+                self.settings.save();
             }
             Action::Disconnect => {
                 self.stop_local();
@@ -3788,6 +3965,7 @@ impl ApplicationHandler for LiveApp {
             }
             WindowEvent::Focused(false) => {
                 self.keys.clear();
+                self.right_held = false;
                 if self.mouse_captured {
                     self.set_mouse_capture(false);
                 }
@@ -3996,6 +4174,11 @@ impl ApplicationHandler for LiveApp {
                             Screen::Pause | Screen::Creative => self.enter_game(),
                             Screen::Inventory => self.close_inventory(),
                             Screen::Settings => self.screen = self.settings_return,
+                            Screen::Modules => {
+                                self.module_drag = None;
+                                self.settings.save();
+                                self.screen = Screen::Settings;
+                            }
                             Screen::Title => {}
                             Screen::Worlds | Screen::WorldBackups | Screen::Servers => {
                                 self.screen = Screen::Title
@@ -4029,6 +4212,7 @@ impl ApplicationHandler for LiveApp {
                             Screen::Inventory => self.close_inventory(),
                             Screen::Pause
                             | Screen::Settings
+                            | Screen::Modules
                             | Screen::Title
                             | Screen::Worlds
                             | Screen::WorldBackups
@@ -4075,6 +4259,33 @@ impl ApplicationHandler for LiveApp {
                     }
                     return;
                 }
+                if self.screen == Screen::Modules {
+                    match (button, state) {
+                        (MouseButton::Left, ElementState::Pressed) => {
+                            if let Some([x, y]) = self.pointer {
+                                if let Some(action) = ui::hit_test(&self.buttons, [x, y]) {
+                                    self.handle_action(action, event_loop);
+                                    return;
+                                }
+                                // A press on a module starts a drag; the grab
+                                // offset keeps it under the cursor.
+                                for (id, rect) in &self.module_rects {
+                                    if rect.contains(x, y) {
+                                        self.module_drag = Some((*id, [x - rect.x, y - rect.y]));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        (MouseButton::Left, ElementState::Released)
+                            if self.module_drag.take().is_some() =>
+                        {
+                            self.settings.save();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
                 if self.screen != Screen::Game {
                     if button == MouseButton::Left && state == ElementState::Pressed {
                         if let Some([x, y]) = self.pointer {
@@ -4093,6 +4304,7 @@ impl ApplicationHandler for LiveApp {
                 }
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => {
+                        self.clicks.click(MouseSide::Left, Instant::now());
                         let mut shared = self.shared.lock().unwrap();
                         shared.attacking = true;
                     }
@@ -4101,8 +4313,13 @@ impl ApplicationHandler for LiveApp {
                         shared.attacking = false;
                     }
                     (MouseButton::Right, ElementState::Pressed) => {
+                        self.clicks.click(MouseSide::Right, Instant::now());
+                        self.right_held = true;
                         let mut shared = self.shared.lock().unwrap();
                         shared.use_pressed = true;
+                    }
+                    (MouseButton::Right, ElementState::Released) => {
+                        self.right_held = false;
                     }
                     _ => {}
                 }
@@ -4137,6 +4354,21 @@ impl ApplicationHandler for LiveApp {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                if let Some((id, offset)) = self.module_drag {
+                    if let Some(window) = self.window.as_ref() {
+                        let size = window.inner_size();
+                        let (width, height) = (size.width as f32, size.height as f32);
+                        if width > 0.0 && height > 0.0 {
+                            self.settings.modules.set_anchor(
+                                id,
+                                [
+                                    (position.x as f32 - offset[0]) / width,
+                                    (position.y as f32 - offset[1]) / height,
+                                ],
+                            );
+                        }
+                    }
+                }
                 if !self.mouse_captured {
                     self.pointer = Some([position.x as f32, position.y as f32]);
                 } else {
@@ -4169,7 +4401,7 @@ impl ApplicationHandler for LiveApp {
 /// distance so the far view can be exercised without clicking through Options.
 fn initial_settings() -> Settings {
     settings_with_view_distance_override(
-        Settings::default(),
+        Settings::load(),
         std::env::var("NEPHELE_VIEW_DISTANCE").ok().as_deref(),
     )
 }
@@ -4361,6 +4593,9 @@ mod tests {
             inventory_clicks: Vec::new(),
             window_slots: Vec::new(),
             window_open: false,
+            window_kind: None,
+            ping: None,
+            target: None,
             window_id: None,
             local_container: LocalContainer::default(),
             close_window: false,
@@ -4371,6 +4606,17 @@ mod tests {
             prev_position: [0.5, 64.0, 0.5],
             tick_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn a_hyphenated_uuid_becomes_sixteen_bytes() {
+        let bytes = uuid_bytes("069a79f4-44e9-4726-a5be-fca90e698512").unwrap();
+        assert_eq!(bytes[0], 0x06);
+        assert_eq!(bytes[15], 0x12);
+        // Without the dashes, and a bad length, are both fine to reject.
+        assert_eq!(uuid_bytes("069a79f444e94726a5befca90e698512"), Some(bytes));
+        assert_eq!(uuid_bytes("not-a-uuid"), None);
+        assert_eq!(uuid_bytes(""), None);
     }
 
     #[test]

@@ -195,9 +195,9 @@ This is what separates a PvP client from a compatible one.
 |---|---|---|
 | Hunger / XP / armour / air HUD | M | |
 | Hotbar selection highlight, item counts, durability | S | |
-| Chat overlay + input + command suggestions | M | **Overlay + input done** (fade, `T`/`/`, Enter/Esc). Client-side `/help /gamemode /tp /setblock /give /seed`; unknown commands go to the server. No tab-completion or chat colours yet. `azalea-brigadier` and `azalea-chat` are MIT references. |
-| Scoreboard sidebar, tab player list, boss bar, titles | M | **Scoreboard/team state done** (`S3B`/`S3C`/`S3D`/`S3E` -> `GameClient::scoreboard`: objectives, scores, display slots, team prefix/suffix/members and `sidebar_rows()` in draw order, resolved through teams). Tab list is tracked as raw entries, no rendered overlay; boss bar and titles unstarted. |
-| **Client modules:** FPS, CPS, keystrokes, coordinates, ping, armour status, potion timers, reach display | M | The Lunar/Badlion basics. |
+| Chat overlay + input + command suggestions | M | **Overlay + input done** (fade, `T`/`/`, Enter/Esc). Client-side `/help /gamemode /tp /setblock /give /seed`; unknown commands go to the server. **Colours done 2026-11-06**: `chat.rs` parses both the legacy `§` dialect and JSON chat components (colour inheritance, `#rrggbb`, team-prefix-ready spans). No tab-completion. `azalea-brigadier` and `azalea-chat` are MIT references. |
+| Scoreboard sidebar, tab player list, boss bar, titles | M | **Sidebar renderer + model done 2026-11-06** (`scoreboard.rs`: objectives, scores, teams, 15-row cap, right-aligned pane, `NEPHELE_SCOREBOARD_DEMO=1` shows a hand-built model). `S3B`-`S3E` parsing landed with the net merge, so the sidebar is fed by the server. No tab list, boss bar or titles yet. |
+| **Client modules:** FPS, CPS, keystrokes, coordinates, ping, armour status, potion timers, reach display | M | **Six done 2026-11-06**: FPS, ping, LMB/RMB CPS, keystrokes with pressed states, coordinates, speed. Each toggleable and draggable in the HUD editor (Pause → Options → HUD Modules), positions stored as window fractions in `settings.json`. Ping needs `S38` rows, so it shows `--` until a server sends them. Armour status, potion timers and reach are still open. |
 | **Toggle sprint, toggle sneak** | S | |
 | **Zoom** (OptiFine-style smooth zoom) | S | |
 | **Custom crosshair, hit colour, hit delay indicator**, block outline toggle | M | |
@@ -306,7 +306,8 @@ engine work — it is UI chrome, entity detail and content breadth.
 - FOV slider plus sprint/zoom modifiers
 - GUI scale 1/2/3/auto
 - Fullbright and brightness
-- Named colour codes (`§`) and Unicode font
+- Named colour codes (`§`) and Unicode font — `§` and JSON component colours
+  done 2026-11-06 (`chat.rs`); Unicode font still open
 
 **UI**
 - Pause menu completeness
