@@ -761,10 +761,10 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `biomes` | GenLayer parity | `biomes` | **100% biome cells, every stage diff 0 — lane complete** |
 | `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) |
 | `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
-| `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | 95%: scoreboards, teams, `C02`, maps and frames all parsed |
+| `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | **merged at `f0347c1`** — scoreboards, teams, `C02`, maps, frames, keep-alive, beacon/note/debris particles |
 | `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | 20%: worktree exists, nothing landed yet |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
-| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
+| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population; **not based on `net`** — rebase before use |
 | `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
 | `audio` | everything sound | `audio` | 35%: symphonia + kira, break/place/step/hurt |
 | `product` | launcher v2, updater, installer, legal | `saves-landing` (WIP commit) | 25%, blocked on code signing |
@@ -829,6 +829,18 @@ re-serialize the chunk wholesale.
 - Never put backticks inside a double-quoted bash string.
 - `cmd1; cmd2` does **not** stop on failure — a clippy error once rode into a commit
   this way.
+
+**Build and tests**
+
+- `crates/nephele-client/tests/scoreboard_capture.rs` replays a lobby capture that is
+  gitignored (365 KB, holds real player names). It pulled the file in with
+  `include_bytes!`, so `cargo clippy --all-targets` failed on every branch without the
+  capture. It reads at runtime now and skips when the file is absent. Never bake a
+  gitignored file into the build.
+- Non-ASCII text in `live.rs` has been re-encoded repeatedly: the first doc line is
+  quadruple-mangled UTF-8. It is a comment, so it compiles, but a tool that round-trips
+  the file through `Set-Content` makes it worse. Prefer the `edit` tool, which preserves
+  bytes.
 
 **Worldgen**
 
