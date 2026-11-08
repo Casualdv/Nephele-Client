@@ -39,12 +39,14 @@ talks protocol 47, and joins offline-mode servers.
 - Chat: on-screen log and input, with client-side `/gamemode`, `/tp`, `/setblock`, `/give`
 - UI: title, multiplayer (live ping, MOTD and version), direct connect, pause, settings
   and creative screens; HUD, hotbar, hearts
+- Audio: block break and place, footsteps and the player hurt sound, from the
+  vanilla sound events, with distance attenuation and stereo panning
 
 **Not implemented yet**
 
 - Microsoft sign-in and the protocol's encryption handshake, so **online-mode
   servers cannot be joined** — Nephele only speaks to offline-mode servers
-- Sound, mob behaviour, survival gameplay, world saving and loading
+- Mob sounds, mob behaviour, survival gameplay, world saving and loading
 
 ## Requirements
 

@@ -6,6 +6,7 @@ members = [
     "crates/nephele-client",
     "crates/nephele-mock",
     "crates/nephele-assets",
+    "crates/nephele-audio",
     "crates/nephele-render",
     "crates/nephele-cli",
     "crates/nephele-prepare",

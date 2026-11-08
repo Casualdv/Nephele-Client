@@ -209,14 +209,16 @@ This is what separates a PvP client from a compatible one.
 
 ### 7. Audio
 
-No audio exists yet.
+Sound effects work as of 2026-11-05: block break, block place, footsteps and
+the player hurt sound, decoded from the player's own 1.8.9 assets and mixed
+positionally (attenuation to 16 blocks, stereo panning).
 
 | Item | Size | Notes |
 |---|---|---|
-| Sound engine + positional playback | L | `symphonia` for Ogg Vorbis decode. |
-| Block, step, break, place, mob and player sounds | M | |
+| Sound engine + positional playback | L | **Done** - `nephele-audio`: symphonia decode, kira mix, no new assets. |
+| Block, step, break, place, mob and player sounds | M | Break/place/step/hurt done; mob sounds not started. |
 | Music and records | M | |
-| Volume sliders, subtitles optional | S | |
+| Volume sliders, subtitles optional | S | `NEPHELE_VOLUME` today; the slider needs the settings screen (`client-ui`). |
 
 ### 8. Multiplayer and authentication
 

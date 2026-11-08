@@ -17,6 +17,7 @@ nephele-world = { path = "../nephele-world" }
 nephele-client = { path = "../nephele-client" }
 nephele-mock = { path = "../nephele-mock" }
 nephele-assets = { path = "../nephele-assets" }
+nephele-audio = { path = "../nephele-audio" }
 nephele-render = { path = "../nephele-render" }
 glam = { workspace = true }
 winit = { workspace = true }

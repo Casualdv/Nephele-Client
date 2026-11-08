@@ -25,6 +25,7 @@ use crate::settings::Settings;
 use crate::skins::SkinLoader;
 use crate::ui::{self, Action, HudState, Screen};
 use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
+use nephele_audio::{AudioEngine, Listener};
 use nephele_client::mining::{Aim, Miner, MiningEvent};
 use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
 use nephele_client::{Event, GameClient, LocalContainer, Vec3};
@@ -251,6 +252,9 @@ struct Shared {
     /// the renderer can interpolate between 20 Hz physics ticks.
     prev_position: [f64; 3],
     tick_at: Instant,
+    /// Sound playback. `None` when there is no audio device, no prepared
+    /// sounds, or `NEPHELE_MUTE` is set; every caller tolerates that.
+    audio: Option<AudioEngine>,
 }
 
 fn refresh_local_crafting_preview(state: &mut Shared) {
@@ -373,6 +377,7 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
     perf::start();
     let settings = initial_settings();
     let shared = Arc::new(Mutex::new(Shared {
+        audio: start_audio(),
         view_distance: configured_view_distance(&settings),
         ..Shared::default()
     }));
@@ -392,6 +397,7 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
 impl Default for Shared {
     fn default() -> Self {
         Self {
+            audio: None,
             player: PlayerState::default(),
             yaw: 0.0,
             pitch: 0.0,
@@ -482,6 +488,167 @@ fn apply_look(state: &mut Shared, dx: f32, dy: f32, sensitivity: f32) {
     state.yaw = (state.yaw + dx * MOUSE_SENSITIVITY) % std::f32::consts::TAU;
     let limit = 89f32.to_radians();
     state.pitch = (state.pitch - dy * MOUSE_SENSITIVITY).clamp(-limit, limit);
+}
+
+// ---------------------------------------------------------------------------
+// Audio
+//
+// Vanilla plays a block's break sound from `World.playAuxSFX(2001)`, its place
+// sound from `ItemBlock.onItemUse`, footsteps from `Entity.onUpdate` and the
+// hurt sound from `EntityLivingBase.playHurtSound`. Those four are the hooks
+// below; the volume/pitch arithmetic lives in `nephele_audio::materials`.
+// ---------------------------------------------------------------------------
+
+/// Opens the sound device once. Any failure - no card, no prepared sounds,
+/// `NEPHELE_MUTE` - leaves the client silent rather than broken.
+fn start_audio() -> Option<AudioEngine> {
+    if std::env::var_os("NEPHELE_MUTE").is_some() {
+        return None;
+    }
+    let root = crate::minecraft_assets_root();
+    let volume = std::env::var("NEPHELE_VOLUME")
+        .ok()
+        .and_then(|text| text.parse::<f32>().ok())
+        .unwrap_or(1.0);
+    match AudioEngine::new(&root, volume) {
+        Ok(engine) => {
+            tracing::info!(
+                events = engine.registry().len(),
+                root = %root.display(),
+                "audio ready"
+            );
+            Some(engine)
+        }
+        Err(error) => {
+            eprintln!("audio disabled: {error}");
+            None
+        }
+    }
+}
+
+/// Runs `sound` with the engine, if there is one. One lock, no clone.
+fn with_audio(shared: &Arc<Mutex<Shared>>, sound: impl FnOnce(&mut AudioEngine)) {
+    let mut state = shared.lock().unwrap();
+    if let Some(audio) = state.audio.as_mut() {
+        sound(audio);
+    }
+}
+
+/// A block's sound comes from its centre, as vanilla's `pos.getX() + 0.5F`
+/// does.
+fn block_centre(x: i32, y: i32, z: i32) -> [f32; 3] {
+    [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5]
+}
+
+/// The listener's ear, which is where a sound's distance is measured from.
+fn ear(position: Vec3) -> [f32; 3] {
+    [
+        position.x as f32,
+        (position.y + EYE_HEIGHT) as f32,
+        position.z as f32,
+    ]
+}
+
+fn play_block_break(
+    shared: &Arc<Mutex<Shared>>,
+    block: BlockState,
+    at: (i32, i32, i32),
+    listener: [f32; 3],
+    yaw: f32,
+) {
+    let Some(type_) = nephele_audio::materials::sound_type(block.id()) else {
+        return;
+    };
+    let position = block_centre(at.0, at.1, at.2);
+    with_audio(shared, |audio| {
+        audio.play_break(type_, position, Listener::from_yaw(listener, yaw));
+    });
+}
+
+fn play_block_place(
+    shared: &Arc<Mutex<Shared>>,
+    block: BlockState,
+    at: (i32, i32, i32),
+    listener: [f32; 3],
+    yaw: f32,
+) {
+    let Some(type_) = nephele_audio::materials::sound_type(block.id()) else {
+        return;
+    };
+    let position = block_centre(at.0, at.1, at.2);
+    with_audio(shared, |audio| {
+        audio.play_place(type_, position, Listener::from_yaw(listener, yaw));
+    });
+}
+
+fn play_block_step(shared: &Arc<Mutex<Shared>>, block: BlockState, listener: [f32; 3], yaw: f32) {
+    let Some(type_) = nephele_audio::materials::sound_type(block.id()) else {
+        return;
+    };
+    with_audio(shared, |audio| {
+        audio.play_step(type_, listener, Listener::from_yaw(listener, yaw));
+    });
+}
+
+fn play_player_hurt(shared: &Arc<Mutex<Shared>>) {
+    with_audio(shared, |audio| {
+        audio.play_player_hurt();
+    });
+}
+
+/// The block the player is standing on, which decides what a footstep sounds
+/// like - the same lookup vanilla's `Block.playStepSound` makes.
+fn ground_block(world: &World, feet: [f64; 3]) -> Option<BlockState> {
+    let x = feet[0].floor() as i32;
+    let y = (feet[1] - 0.1).floor() as i32;
+    let z = feet[2].floor() as i32;
+    let block = world.get_block(x, y, z);
+    (!block.is_air()).then_some(block)
+}
+
+/// Vanilla's footstep trigger.
+///
+/// `Entity.onUpdate` adds `0.6 * horizontal distance` to
+/// `distanceWalkedModified` every tick and plays a step once that passes an
+/// increasing whole-number threshold, so a step lands about every 1.67 blocks
+/// walked.
+#[derive(Debug)]
+struct StepTrigger {
+    last: Option<[f64; 3]>,
+    walked: f32,
+    next: f32,
+}
+
+impl StepTrigger {
+    fn new() -> Self {
+        Self {
+            last: None,
+            walked: 0.0,
+            next: 1.0,
+        }
+    }
+
+    /// The feet position to play a step at, when this tick crossed one.
+    fn advance(&mut self, position: [f64; 3], on_ground: bool) -> Option<[f64; 3]> {
+        let last = self.last.replace(position)?;
+        if !on_ground {
+            return None;
+        }
+        let dx = position[0] - last[0];
+        let dz = position[2] - last[2];
+        let moved = (dx * dx + dz * dz).sqrt();
+        // Respawning or teleporting is not walking.
+        if moved > 8.0 {
+            self.walked = 0.0;
+            return None;
+        }
+        self.walked += (moved * 0.6) as f32;
+        if self.walked <= self.next {
+            return None;
+        }
+        self.next = self.walked.floor() + 1.0;
+        Some(position)
+    }
 }
 
 fn fresh_world_seed() -> u64 {
@@ -658,6 +825,7 @@ fn local_loop(
     let mut sent: HashSet<(i32, i32)> = HashSet::new();
     let mut dirty: HashSet<(i32, i32)> = HashSet::new();
     let mut miner = Miner::default();
+    let mut steps = StepTrigger::new();
     let mut last_saved_player = saved_player;
     let mut autosave_deadline = Instant::now() + PLAYER_STATE_SAVE_INTERVAL;
     let mut weather_random = seed ^ 0x9E37_79B9_7F4A_7C15;
@@ -674,7 +842,8 @@ fn local_loop(
             state.food_saturation = 5.0;
             state.food_exhaustion = 0.0;
         }
-        let (position, yaw, pitch, _on_ground) = step_player(&shared, &world);
+        let (position, yaw, pitch, on_ground) = step_player(&shared, &world);
+        let listener = ear(position);
         radius = local_stream_radius(&shared.lock().unwrap());
 
         // Advance world age and weather at 20 Hz, like vanilla's WorldServer.
@@ -813,6 +982,7 @@ fn local_loop(
                         add_local_item(&mut shared.lock().unwrap(), item);
                     }
                 }
+                play_block_break(&shared, broken, target.pos(), listener, yaw);
             }
         }
         if use_pressed {
@@ -860,6 +1030,7 @@ fn local_loop(
                                         state_block,
                                     );
                                 }
+                                play_block_place(&shared, block, (bx, by, bz), listener, yaw);
                             }
                         } else if world.get_block(bx, by, bz).is_air()
                             && !placement_hits_player(&aim, player_feet)
@@ -879,11 +1050,18 @@ fn local_loop(
                                     state_block,
                                 );
                             }
+                            play_block_place(&shared, block, (bx, by, bz), listener, yaw);
                         }
                     }
                 }
             }
         }
+        if let Some(feet) = steps.advance([position.x, position.y, position.z], on_ground) {
+            if let Some(block) = ground_block(&world, feet) {
+                play_block_step(&shared, block, listener, yaw);
+            }
+        }
+
         for (cx, cz) in changed {
             dirty.insert((cx, cz));
             if let Some(column) = world.get(ChunkCoord::new(cx, cz)) {
@@ -1081,6 +1259,7 @@ async fn net_loop(
     // live lobby can be checked without a renderer.
     let dump_scoreboard = std::env::var("NEPHELE_SCOREBOARD").is_ok();
     let mut last_scoreboard_dump = Instant::now() - Duration::from_secs(1);
+    let mut steps = StepTrigger::new();
     let mut world_dirty = false;
     let mut sent_view_distance = shared.lock().unwrap().view_distance;
 
@@ -1113,6 +1292,7 @@ async fn net_loop(
                         );
                     }
                 }
+                let listener = ear(position);
                 let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode, clicks) = {
                     let mut state = shared.lock().unwrap();                    (
                         state.attacking,
@@ -1232,6 +1412,11 @@ async fn net_loop(
                             }
                             client.dig(digging::STOP_DESTROY_BLOCK, &target).await
                                 .map_err(|err| err.to_string())?;
+                            // The server has not confirmed the break yet, so the
+                            // block is still in our copy - which is what decides
+                            // which break sound this is.
+                            let broken = client.world.get_block(target.x, target.y, target.z);
+                            play_block_break(&shared, broken, target.pos(), listener, yaw);
                         }
                         MiningEvent::Abort(target) => {
                             client.dig(digging::ABORT_DESTROY_BLOCK, &target).await
@@ -1299,6 +1484,12 @@ async fn net_loop(
                                     .map_err(|err| err.to_string())?;
                             }
                         }
+                    }
+                }
+
+                if let Some(feet) = steps.advance([position.x, position.y, position.z], on_ground) {
+                    if let Some(block) = ground_block(&client.world, feet) {
+                        play_block_step(&shared, block, listener, yaw);
                     }
                 }
 
@@ -2356,6 +2547,7 @@ impl LiveApp {
         }
         if view.health + 0.01 < self.last_health {
             self.hurt_flash = 0.55;
+            play_player_hurt(&self.shared);
         }
         self.last_health = view.health;
         self.hurt_flash = (self.hurt_flash - delta * 1.8).max(0.0);
@@ -4605,6 +4797,7 @@ mod tests {
             view_distance: nephele_client::VIEW_DISTANCE,
             prev_position: [0.5, 64.0, 0.5],
             tick_at: Instant::now(),
+            audio: None,
         }
     }
 
@@ -4920,5 +5113,47 @@ mod tests {
             Some(ItemStack::new(4, 1, 0))
         );
         assert_eq!(local_block_drop(BlockState::BEDROCK), None);
+    }
+
+    #[test]
+    fn a_step_fires_about_every_block_and_a_half_walked() {
+        let mut steps = StepTrigger::new();
+        let mut position = [0.0, 64.0, 0.0];
+        // The first tick has no previous position to measure from.
+        assert!(steps.advance(position, true).is_none());
+
+        let mut fired = 0;
+        for _ in 0..30 {
+            position[0] += 0.3;
+            if steps.advance(position, true).is_some() {
+                fired += 1;
+            }
+        }
+        // Nine blocks at 0.6 per block of travel, threshold rising by one each
+        // time: the fifth step lands on tick 28.
+        assert_eq!(fired, 5);
+    }
+
+    #[test]
+    fn stepping_does_not_happen_in_the_air() {
+        let mut steps = StepTrigger::new();
+        let mut position = [0.0, 64.0, 0.0];
+        steps.advance(position, true);
+        let mut fired = 0;
+        for _ in 0..40 {
+            position[0] += 0.5;
+            if steps.advance(position, false).is_some() {
+                fired += 1;
+            }
+        }
+        assert_eq!(fired, 0);
+    }
+
+    #[test]
+    fn a_teleport_plays_no_step() {
+        let mut steps = StepTrigger::new();
+        steps.advance([0.0, 64.0, 0.0], true);
+        assert!(steps.advance([300.0, 90.0, -200.0], true).is_none());
+        assert_eq!(steps.walked, 0.0);
     }
 }
