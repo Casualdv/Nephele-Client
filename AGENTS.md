@@ -508,11 +508,17 @@ the entity pipeline, which is bound to the skin atlas — via
 - `entity::append_hand(&mut EntityMesh, &HandDraw) -> HandPose` appends **one
   skin-textured arm box** (the right arm's `(40,16)` unwrap) to the entity mesh
   and returns where the palm ended up. `HandDraw` takes the camera's world-space
-  basis, so the arm is built in camera space and placed in the world; it then
-  renders in the normal depth-tested pass with the skin pipeline. No second
-  render pass, so **the hand is occluded by walls** instead of drawing over them
-  (vanilla clears depth for the hand) - acceptable for a placeholder, worth a
-  separate pass later.
+  basis, so the arm is built in camera space and placed in the world.
+- **The hand has its own pass over a cleared depth buffer (2026-11-08).** The arm
+  and the held block are appended *last* to the entity and item buffers; `live.rs`
+  records where they start and calls `Renderer::set_hand_range(entity_start,
+  item_start)`. `draw` splits the world draw at those indices, ends the world
+  pass, then begins a second pass with `LoadOp::Load` colour and `LoadOp::Clear`
+  depth, drawing the arm (entity pipeline) and the held block (terrain pipeline)
+  before the UI. Reusing both pipelines is why no extra pipeline was needed.
+  Before this the hand was depth-tested with the world and **disappeared inside a
+  wall**; `C:\Users\dariu\Desktop\rf-hand-old.png` vs `rf-hand-new.png` shows the
+  same trunk with and without the hand.
 - `mesh::build_hand_item(&HandItem, &TextureArray)` builds the held **block**
   cube along the hand's axes; `live.rs` appends it to the same item mesh as the
   drops, at `HandPose::palm`, 0.36 blocks wide.
@@ -611,17 +617,47 @@ blending. There is no particle texture or second shader.
   untextured vertex (`in.color` straight out), which is how notes and beams carry
   their whole colour per vertex. The beam pipeline shares the entity shader,
   vertex layout and bind group; its blend is `SrcAlpha/One` and it writes no
-  depth. Geometry is vanilla's rotating 0.2-radius square plus a 0.2..0.8 halo at
-  alpha 0.08; the core uses alpha 0.35 because additive quads with no texture
-  saturate to white otherwise. The last 24 blocks fade out (`top_fade`).
-- **Verification**: `NEPHELE_DEMO=beacon view ...` builds a beacon + red pane, a
-  note block that ticks every 0.22 s and a stone puff every 0.55 s, then frames
-  them (`C:\Users\dariu\Desktop\block-entities.png`,
-  `block-entities-night.png`). Live paths were checked against the mock server:
-  breaking a log threw log-textured debris (`break-debris.png`) and three
-  `/setblock` beacons with red/blue/lime panes drew matching beams
-  (`beacon-live.png`). `NEPHELE_CMDS="/setblock ...;..."` runs startup commands
-  once chunks are loaded; it is a dev shortcut, like `NEPHELE_SCOREBOARD`.
+  depth.
+- **Each segment is one camera-facing billboard (2026-11-08).** `build_beams`
+  takes the camera position and emits a single vertical quad (plus the wider
+  0.6-block halo) perpendicular to the horizontal eye direction. The old
+  four-sided box stacked two near/far sides per layer, four layers in total, and
+  eight when the camera was inside the beam — additive saturation made it white.
+  The quad cannot stack: overlap costs at most core+halo, and alphas are 0.30 and
+  0.05. Measured with the camera 0.2 blocks from the axis: (247,213,221), i.e.
+  still pink, not clipped white (`rf-overlap.png`).
+- **Beam height** matches vanilla's scan: a clear column beams to y=255
+  (`beam.height() == 255 - beacon.y`), and a pane in the first block above costs
+  one block because vanilla starts a new zero-height segment there. Pinned by
+  `a_clear_column_beams_to_the_build_limit`.
+- **Verification**: the 2026-11-08 in-client run placed a 16-beacon row, one per
+  `DYE_COLORS` metadata entry, at x=40/y=77 in a seed-12345 single-player world
+  and captured all sixteen beams (`rf-beacons-day.png`, crop
+  `rf-beacons-crop.png`). Breaking a log against the mock server threw
+  log-textured debris (`rf-debris-new.png`). Placement uses the same
+  `NetMsg::BlockEffect` branch but the capture after a right-click did not show
+  the puff; **not visually verified**. S24 notes are pinned by
+  `a_note_spawns_above_the_block_with_its_pitch_colour` and
+  `block_action_packets_become_events`, but no reachable server emits S24, so
+  **the S24-to-screen path is not verified in a client**.
+- **Obstruction/fog audit (2026-11-08).** The scan stops on
+  `blocks_movement(state) && !is_transparent(id)`. Vanilla uses
+  `getLightOpacity() >= 15 && block != bedrock`, and `Block` derives the opacity
+  from `isOpaqueCube()` at construction (unless a class overrides it, as slabs
+  and stairs do with 255). The two agree on air, water, leaves, glass, stained
+  glass, panes, bars, plants, snow layers, slabs and stairs. They **disagree** on
+  two classes: **bedrock above a beacon** (vanilla exempts it, this client blocks
+  the beam) and **non-opaque solids** such as ice, snow blocks, slime, beds,
+  doors, trapdoors and fence gates, where vanilla's opacity is 0 but
+  `blocks_movement` is true and `is_transparent` does not list the id, so this
+  client blocks a beam vanilla would let through. The beam is deliberately
+  unfogged (vanilla disables fog for it); the same negative-UV sentinel also
+  unfogs notes, a minor deviation since vanilla particle rendering is fogged.
+- `NEPHELE_DEMO=beacon view ...` still builds the offline beacon/note/debris
+  scene (`block-entities*.png`). `NEPHELE_CMDS="/setblock ...;..."` runs startup
+  commands once chunks are loaded; it is a dev shortcut, like
+  `NEPHELE_SCOREBOARD`. `run_client.ps1 -Offline` joins an offline-mode server
+  (the mock) without `--online`.
 
 ---
 

@@ -49,7 +49,6 @@ struct Viewer {
     /// Beacons found in the generated world, rebuilt once because `view` never
     /// edits terrain.
     beams: Vec<BeaconBeam>,
-    clock: f32,
     textures: Option<Arc<TextureArray>>,
     /// `NEPHELE_DEMO=beacon`: drive a note block and some debris so the
     /// block-entity visuals can be screenshotted without a server.
@@ -82,7 +81,6 @@ impl Viewer {
             world: World::new(0),
             spawn: glam::Vec3::ZERO,
             beams: Vec::new(),
-            clock: 0.0,
             textures: None,
             demo: false,
             demo_ground: 0,
@@ -307,9 +305,8 @@ impl Viewer {
             renderer.set_overlay(&self.particles.build_debris(right, up, 1.0));
         }
 
-        self.clock += delta;
         if !self.beams.is_empty() {
-            renderer.set_beams(&build_beams(&self.beams, self.clock));
+            renderer.set_beams(&build_beams(&self.beams, self.camera.position.to_array()));
         }
         renderer.draw(&self.camera);
 

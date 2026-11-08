@@ -18,14 +18,16 @@ pub const STAINED_GLASS: u16 = 95;
 pub const STAINED_GLASS_PANE: u16 = 160;
 /// World height; a beam runs to the top of the build limit.
 const WORLD_TOP: i32 = 256;
-/// Half-width of the rotating core, in blocks (vanilla's 0.2 radius).
-const CORE_RADIUS: f32 = 0.2;
+/// Half-width of the solid core, in blocks (vanilla's 0.2 radius, so 0.4 wide).
+const CORE_HALF_WIDTH: f32 = 0.2;
+/// Half-width of the faint halo around the core (vanilla's 0.2..0.8 square).
+const GLOW_HALF_WIDTH: f32 = 0.3;
 /// Vanilla draws the core with a semi-transparent beam texture; without that
-/// texture, overlapping additive quads saturate to white unless the per-vertex
-/// alpha stays low.
-const CORE_ALPHA: f32 = 0.35;
-/// Vanilla draws a faint 0.2..0.8 halo around the core at alpha 0.125.
-const GLOW_ALPHA: f32 = 0.08;
+/// texture, the per-vertex alpha has to stay low enough that the sky behind it
+/// does not clip when the beam is additive.
+const CORE_ALPHA: f32 = 0.3;
+/// The halo is wide and very faint, so it never contributes to washout.
+const GLOW_ALPHA: f32 = 0.05;
 /// Blocks over which the beam fades out at the top instead of stopping flat.
 const TOP_FADE: f32 = 24.0;
 
@@ -158,96 +160,95 @@ pub fn find_beams(world: &World) -> Vec<BeaconBeam> {
 
 /// Build the beam geometry for this frame.
 ///
-/// `time` is seconds; vanilla rotates the core by -0.75 radians per second.
-pub fn build_beams(beams: &[BeaconBeam], time: f32) -> EntityMesh {
+/// Each segment is one camera-facing vertical quad: the brief's "translucent
+/// vertical quad", and the only shape that cannot stack a near and a far side
+/// into the additive pass. A four-sided box contributes four layers from
+/// outside and eight from inside the beam, which is what turned the colour
+/// white whenever the camera and beam overlapped.
+///
+/// `eye` is the camera position; only its horizontal offset from the beam axis
+/// matters, because the quad is vertical.
+pub fn build_beams(beams: &[BeaconBeam], eye: [f32; 3]) -> EntityMesh {
     let mut mesh = EntityMesh::default();
     for beam in beams {
         let base_y = beam.position[1] as f32;
         let total = beam.height() as f32;
         let top_y = base_y + total;
-        let angle = time * -0.75;
+        let centre = [beam.position[0] as f32 + 0.5, beam.position[2] as f32 + 0.5];
+        // Horizontal direction from the beam axis to the camera, and the width
+        // axis perpendicular to it in the XZ plane.
+        let dx = eye[0] - centre[0];
+        let dz = eye[2] - centre[1];
+        let length = (dx * dx + dz * dz).sqrt();
+        let (nx, nz) = if length < 1.0e-4 {
+            // Looking straight down the axis: any vertical plane will do.
+            (1.0, 0.0)
+        } else {
+            (dx / length, dz / length)
+        };
+        let width = [-nz, nx];
         let mut y = base_y;
         for segment in &beam.segments {
             if segment.height <= 0 {
                 continue;
             }
             let next_y = y + segment.height as f32;
-            append_segment(
-                &mut mesh,
-                beam.position[0],
-                beam.position[2],
-                y,
-                next_y,
-                top_y,
-                angle,
-                segment.color,
-            );
+            append_segment(&mut mesh, centre, width, y, next_y, top_y, segment.color);
             y = next_y;
         }
     }
     mesh
 }
 
-#[allow(clippy::too_many_arguments)]
 fn append_segment(
     mesh: &mut EntityMesh,
-    x: i32,
-    z: i32,
+    centre: [f32; 2],
+    width: [f32; 2],
     bottom: f32,
     top: f32,
     beam_top: f32,
-    angle: f32,
     color: [f32; 3],
 ) {
-    let base_x = x as f32;
-    let base_z = z as f32;
-
-    // The core is a rotating square of four quads, as vanilla draws it: the
-    // corners sit at 45, 135, 225 and 315 degrees around the beacon axis.
-    use std::f32::consts::PI;
-    let corner = |offset: f32| {
-        [
-            base_x + 0.5 + (angle + offset).cos() * CORE_RADIUS,
-            base_z + 0.5 + (angle + offset).sin() * CORE_RADIUS,
-        ]
-    };
-    let corners = [
-        corner(PI * 0.75),
-        corner(PI * 0.25),
-        corner(PI * 1.75),
-        corner(PI * 1.25),
-    ];
-    for index in 0..4 {
-        let a = corners[index];
-        let b = corners[(index + 1) % 4];
-        append_vertical_quad(mesh, a, b, bottom, top, beam_top, color, CORE_ALPHA);
-    }
-
-    // The faint halo, axis-aligned in vanilla's 0.2..0.8 square.
-    let halo = [
-        [base_x + 0.2, base_z + 0.2],
-        [base_x + 0.8, base_z + 0.2],
-        [base_x + 0.8, base_z + 0.8],
-        [base_x + 0.2, base_z + 0.8],
-    ];
-    for index in 0..4 {
-        let a = halo[index];
-        let b = halo[(index + 1) % 4];
-        append_vertical_quad(mesh, a, b, bottom, top, beam_top, color, GLOW_ALPHA);
-    }
+    append_billboard(
+        mesh,
+        centre,
+        width,
+        CORE_HALF_WIDTH,
+        bottom,
+        top,
+        beam_top,
+        color,
+        CORE_ALPHA,
+    );
+    append_billboard(
+        mesh,
+        centre,
+        width,
+        GLOW_HALF_WIDTH,
+        bottom,
+        top,
+        beam_top,
+        color,
+        GLOW_ALPHA,
+    );
 }
 
+/// One vertical quad centred on `centre`, `half_width` wide, facing the eye.
 #[allow(clippy::too_many_arguments)]
-fn append_vertical_quad(
+fn append_billboard(
     mesh: &mut EntityMesh,
-    a: [f32; 2],
-    b: [f32; 2],
+    centre: [f32; 2],
+    width: [f32; 2],
+    half_width: f32,
     bottom: f32,
     top: f32,
     beam_top: f32,
     color: [f32; 3],
     alpha: f32,
 ) {
+    let half = [width[0] * half_width, width[1] * half_width];
+    let a = [centre[0] - half[0], centre[1] - half[1]];
+    let b = [centre[0] + half[0], centre[1] + half[1]];
     let base = mesh.vertices.len() as u32;
     let vertices = [
         [a[0], bottom, a[1]],
@@ -324,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn beams_are_crossed_quads_with_untinted_uvs() {
+    fn beams_are_one_billboard_per_segment() {
         let beam = BeaconBeam {
             position: [0, 64, 0],
             segments: vec![BeaconSegment {
@@ -332,9 +333,10 @@ mod tests {
                 height: 40,
             }],
         };
-        let mesh = build_beams(&[beam], 0.0);
-        // Four core quads and four halo quads, six indices each.
-        assert_eq!(mesh.indices.len(), 8 * 6);
+        let mesh = build_beams(&[beam], [10.0, 80.0, 0.5]);
+        // One core quad and one halo quad, six indices each. A four-sided box
+        // would be 48 and would stack four additive layers.
+        assert_eq!(mesh.indices.len(), 2 * 6);
         assert!(mesh.vertices.iter().all(|vertex| vertex.uv == [-1.0, -1.0]));
         // Glow vertices are the fainter half of the mesh.
         assert!(mesh
@@ -346,6 +348,46 @@ mod tests {
             .vertices
             .iter()
             .all(|vertex| (vertex.color[0] - 0.2).abs() < 1e-6));
+    }
+
+    #[test]
+    fn the_quad_faces_the_camera_and_is_a_single_plane() {
+        let beam = BeaconBeam {
+            position: [0, 64, 0],
+            segments: vec![BeaconSegment {
+                color: [0.6, 0.2, 0.2],
+                height: 40,
+            }],
+        };
+        // Camera due east of the beam axis: the billboard's width runs along Z,
+        // so every vertex shares the same X.
+        let mesh = build_beams(&[beam], [10.0, 80.0, 0.5]);
+        for vertex in &mesh.vertices {
+            assert!(
+                (vertex.position[0] - 0.5).abs() < 1e-6,
+                "billboard should lie in the x=0.5 plane, got {:?}",
+                vertex.position
+            );
+        }
+    }
+
+    #[test]
+    fn a_clear_column_beams_to_the_build_limit() {
+        let clear = world_with_blocks(&[((0, 64, 0), BlockState::new(BEACON, 0))]);
+        let beam = beam_at(&clear, 0, 64, 0).expect("clear sky");
+        // Vanilla scans (y+1)..256 and counts every clear block.
+        assert_eq!(beam.height(), 255 - 64);
+        assert_eq!(64 + beam.height(), 255);
+
+        // A pane at the first block above replaces the seeded segment with a
+        // zero-height one, so the beam is one block shorter, as in vanilla.
+        let paned = world_with_blocks(&[
+            ((0, 64, 0), BlockState::new(BEACON, 0)),
+            ((0, 65, 0), BlockState::new(STAINED_GLASS_PANE, 14)),
+        ]);
+        let beam = beam_at(&paned, 0, 64, 0).expect("a pane is transparent");
+        assert_eq!(beam.height(), 255 - 64 - 1);
+        assert_eq!(beam.segments.last().unwrap().color, dye_color(14));
     }
 
     #[test]

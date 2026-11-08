@@ -446,6 +446,22 @@ mod tests {
     }
 
     #[test]
+    fn a_note_spawns_above_the_block_with_its_pitch_colour() {
+        let mut particles = Particles::new();
+        // One S24 is one particle, positioned like `BlockNote`: centre of the
+        // block, 1.2 above it.
+        particles.spawn_note(4, 70, -9, 12);
+        assert_eq!(particles.note_count(), 1);
+        let note = particles.notes[0];
+        assert_eq!(note.position, [4.5, 71.2, -8.5]);
+        assert_eq!(note.color, note_color(12.0 / 24.0));
+
+        // Pitches above vanilla's 0..=24 clamp to the top of the hue range.
+        particles.spawn_note(0, 0, 0, 99);
+        assert_eq!(particles.notes[1].color, note_color(1.0));
+    }
+
+    #[test]
     fn note_quads_mark_themselves_untextured() {
         let mut particles = Particles::new();
         particles.spawn_note(0, 64, 0, 3);

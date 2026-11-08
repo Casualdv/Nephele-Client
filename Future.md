@@ -111,7 +111,7 @@ biome cells (0 / 160,000, seed 12345, 625 chunks — every GenLayer stage diff 0
 | GLES/Vulkan fallback path or a GL renderer | XL | Only if the above says "support old drivers". |
 | Smooth lighting + ambient occlusion | L | We decode light but do not apply it per vertex. Biggest visual win. |
 | Block shapes from vanilla models (stairs, slabs, fences, panes, cross plants) | L | The mesher now emits the `block_shape` boxes for slabs, stairs, fence posts, panes, doors and torches. Cross plants remain crossed quads. Fence rails and pane connections are still absent, and shaped boxes are not neighbour-culled yet. |
-| First-person hand + held block | M | Done: skin-textured arm, held block, swing. Occluded by walls (no depth-clear pass). |
+| First-person hand + held block | M | Done: skin-textured arm, held block, swing, and a **depth-cleared hand pass** (2026-11-08) so it no longer clips into walls. |
 | Animated textures (`.mcmeta`, water/lava/fire/portal) | M | **Done 2026-11-03:** frame strips in a 2D atlas, tick clock in the block shader. |
 | Sky: sun, moon, stars, clouds, day-night, fog per biome/dimension | L | **Done 2026-11-03:** full-screen ray sky, server TIME_UPDATE, per-biome and underwater fog. |
 | Frustum + occlusion culling | M | **Done 2026-11-03:** frustum plus a conservative 4×4 height-field depth buffer; `NEPHELE_OCCLUSION=0` disables it. |
@@ -276,7 +276,7 @@ and worktree for each.
 
 | Lane | Done | What is left |
 |---|---:|---|
-| `render` | 95% | shape audit leftovers; first-person hand depth-clear |
+| `render` | 98% | shape audit leftovers |
 | `biomes` | 100% | nothing — every GenLayer stage diffs 0 against the oracle |
 | `worldgen` | 15% | `provide_chunk`/`populate` split landed; caves, ores, flora, structures |
 | `survival` | 90% | eating, potions, enchantments, XP orbs |

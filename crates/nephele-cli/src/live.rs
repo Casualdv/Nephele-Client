@@ -2246,9 +2246,14 @@ impl LiveApp {
             view.camera.up().to_array(),
             view.alpha as f32,
         );
+        // The arm and the held block are the tails of these two buffers. The
+        // renderer clears depth before drawing them, so record where they start.
+        let hand_entity_start = entity_mesh.indices.len() as u32;
+        let hand_item_start = item_mesh.indices.len() as u32;
         if self.screen == Screen::Game {
             // The first-person arm is built in camera space and placed in the
-            // world, so it lands in the same depth-tested pass as everything else.
+            // world; it is its own pass in the renderer, over a cleared depth
+            // buffer, so it never clips into walls.
             let camera = &view.camera;
             let swing = if view.attacking {
                 (self.time * 11.0).sin() * 0.5 + 0.5
@@ -2290,8 +2295,9 @@ impl LiveApp {
         }
         renderer.set_entities(&entity_mesh);
         renderer.set_items(&item_mesh);
+        renderer.set_hand_range(hand_entity_start, hand_item_start);
         let beams: Vec<BeaconBeam> = self.beacons.values().flatten().cloned().collect();
-        renderer.set_beams(&build_beams(&beams, self.time));
+        renderer.set_beams(&build_beams(&beams, view.camera.position.to_array()));
     }
 
     /// Recompute the beams a column contributes. A beam only depends on the

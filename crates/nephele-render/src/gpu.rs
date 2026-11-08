@@ -153,6 +153,10 @@ pub struct Renderer {
     entity_vertex_capacity: wgpu::BufferAddress,
     entity_index_capacity: wgpu::BufferAddress,
     entity_index_count: u32,
+    /// First index of the first-person arm inside the entity buffer. The hand is
+    /// drawn in its own pass with a cleared depth buffer, so it must be split
+    /// out of the world draw.
+    entity_hand_start: u32,
     /// Beacon beams: the entity shader with additive blending and no depth
     /// write, so they glow through fog and never occlude each other.
     beam_pipeline: wgpu::RenderPipeline,
@@ -167,6 +171,9 @@ pub struct Renderer {
     item_vertex_capacity: wgpu::BufferAddress,
     item_index_capacity: wgpu::BufferAddress,
     item_index_count: u32,
+    /// First index of the held block inside the item buffer; drawn with the
+    /// hand, not the dropped items.
+    item_hand_start: u32,
     panorama: Option<PanoramaGpu>,
     show_panorama: bool,
     /// Chunks that survived culling in the last [`Renderer::draw`].
@@ -1032,6 +1039,7 @@ impl Renderer {
             entity_vertex_capacity,
             entity_index_capacity,
             entity_index_count: 0,
+            entity_hand_start: 0,
             beam_pipeline,
             beam_vertices,
             beam_indices,
@@ -1043,6 +1051,7 @@ impl Renderer {
             item_vertex_capacity,
             item_index_capacity,
             item_index_count: 0,
+            item_hand_start: 0,
             panorama,
             show_panorama: false,
             drawn_chunks: 0,
@@ -1221,6 +1230,8 @@ impl Renderer {
     /// rebuilt each frame rather than tracked per entity.
     pub fn set_entities(&mut self, mesh: &EntityMesh) {
         self.entity_index_count = mesh.indices.len() as u32;
+        // No hand this frame unless the caller says otherwise.
+        self.entity_hand_start = self.entity_index_count;
         if mesh.vertices.is_empty() {
             return;
         }
@@ -1298,10 +1309,31 @@ impl Renderer {
         self.beam_index_count
     }
 
+    /// Split the first-person hand out of the world draw.
+    ///
+    /// `entity_start` is the first index of the arm inside the entity buffer and
+    /// `item_start` the first index of the held block inside the item buffer.
+    /// Both are clamped, so a caller that never appends a hand can pass the
+    /// buffer lengths (or simply not call this at all).
+    pub fn set_hand_range(&mut self, entity_start: u32, item_start: u32) {
+        self.entity_hand_start = entity_start.min(self.entity_index_count);
+        self.item_hand_start = item_start.min(self.item_index_count);
+    }
+
+    pub fn entity_hand_start(&self) -> u32 {
+        self.entity_hand_start
+    }
+
+    pub fn item_hand_start(&self) -> u32 {
+        self.item_hand_start
+    }
+
     /// Replace every dropped item's geometry. Like entities, the whole buffer
     /// is rebuilt each frame — a handful of 24-vertex cubes is nothing.
     pub fn set_items(&mut self, mesh: &MeshData) {
         self.item_index_count = mesh.indices.len() as u32;
+        // No held block this frame unless the caller says otherwise.
+        self.item_hand_start = self.item_index_count;
         if mesh.vertices.is_empty() {
             return;
         }
@@ -1600,23 +1632,25 @@ impl Renderer {
             }
 
             // Dropped items are ordinary block-textured cubes, so they share
-            // the terrain pipeline and its texture array.
-            if self.item_index_count > 0 {
+            // the terrain pipeline and its texture array. The held block is the
+            // tail of the same buffer and is drawn later, with the hand.
+            if self.item_hand_start > 0 {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.item_vertices.slice(..));
                 pass.set_index_buffer(self.item_indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.item_index_count, 0, 0..1);
+                pass.draw_indexed(0..self.item_hand_start, 0, 0..1);
             }
 
             // Entities are depth-tested against the terrain but drawn after it,
-            // so a player standing behind a hill is properly hidden.
-            if self.entity_index_count > 0 {
+            // so a player standing behind a hill is properly hidden. The arm is
+            // the tail of the buffer and goes in the hand pass instead.
+            if self.entity_hand_start > 0 {
                 pass.set_pipeline(&self.entity_pipeline);
                 pass.set_bind_group(0, &self.entity_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.entity_vertices.slice(..));
                 pass.set_index_buffer(self.entity_indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.entity_index_count, 0, 0..1);
+                pass.draw_indexed(0..self.entity_hand_start, 0, 0..1);
             }
 
             // Beams add light on top of whatever is behind them, depth-tested
@@ -1648,6 +1682,56 @@ impl Renderer {
                 pass.set_bind_group(0, &self.line_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
                 pass.draw(0..self.line_vertex_count, 0..1);
+            }
+
+            // The HUD and the hand are drawn in the second pass, below, so the
+            // depth buffer can be cleared between them and the world.
+        }
+
+        // Vanilla renders the first-person hand in its own pass after clearing
+        // depth, which is why the held item never clips into a wall. The colour
+        // buffer is loaded, not cleared, so the world stays underneath; the
+        // depth clear means the hand is depth-tested only against itself.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hand pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            // Arm first, then the held block, so the block can sit in front of
+            // the palm. Both only compete with each other now.
+            if self.entity_hand_start < self.entity_index_count {
+                pass.set_pipeline(&self.entity_pipeline);
+                pass.set_bind_group(0, &self.entity_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.entity_vertices.slice(..));
+                pass.set_index_buffer(self.entity_indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(self.entity_hand_start..self.entity_index_count, 0, 0..1);
+            }
+            if self.item_hand_start < self.item_index_count {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.item_vertices.slice(..));
+                pass.set_index_buffer(self.item_indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(self.item_hand_start..self.item_index_count, 0, 0..1);
             }
 
             // The HUD/menus sit on top of everything, with no depth test.
