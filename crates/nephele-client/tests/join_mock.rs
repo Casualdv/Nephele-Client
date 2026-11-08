@@ -128,6 +128,125 @@ async fn status_ping_reports_protocol_47() {
     assert!(status.description.contains("Nephele mock server"));
 }
 
+/// The lobby demo: bots with names/skins and a framed map with real pixels.
+#[tokio::test]
+async fn the_lobby_has_players_and_a_framed_map() {
+    let server = MockServer::start(MockConfig {
+        radius: 1,
+        greeting: false,
+        bots: true,
+        ..MockConfig::default()
+    })
+    .await
+    .unwrap();
+    let mut client = GameClient::join(&address_of(&server), "Visitor")
+        .await
+        .unwrap();
+    client
+        .pump(Duration::from_millis(1400), Duration::from_millis(50))
+        .await
+        .unwrap();
+
+    let players: Vec<_> = client
+        .entities
+        .iter()
+        .filter(|entity| matches!(entity.kind, EntityKind::Player { .. }))
+        .collect();
+    assert!(
+        players.len() >= nephele_mock::BOT_COUNT,
+        "expected the lobby bots, got {} players",
+        players.len()
+    );
+    assert!(players.iter().any(|entity| entity.shows_name()));
+    // Half the bots are slim, so both arm layouts are exercised.
+    assert!(client.skins.iter().any(|(_, info)| info.slim));
+    assert!(client.skins.iter().any(|(_, info)| !info.slim));
+
+    // Bot 0 takes its head yaw from metadata index 6, not `S19`, so its head
+    // tracks somewhere other than its body.
+    let metadata_head = client.entities.get(2).expect("bot 0");
+    assert!(
+        (metadata_head.head_yaw - metadata_head.yaw).abs() > 1.0,
+        "metadata head yaw should differ from the body yaw"
+    );
+
+    // The hologram is an invisible marker armour stand: only its plate shows.
+    let hologram = client
+        .entities
+        .iter()
+        .find(|entity| entity.is_armor_stand())
+        .expect("the mock spawns a hologram");
+    assert!(hologram.invisible(), "the hologram body is invisible");
+    let EntityKind::ArmorStand { marker, .. } = hologram.kind else {
+        panic!("expected an armour stand");
+    };
+    assert!(marker);
+    let plate = hologram
+        .nametag()
+        .expect("an invisible armour stand keeps its plate");
+    assert_eq!(plate.plate(), "CLICK TO PLAY\nJoin a game");
+
+    let frame = client
+        .entities
+        .iter()
+        .find(|entity| matches!(entity.kind, EntityKind::ItemFrame { .. }))
+        .expect("the mock spawns a framed map");
+    let EntityKind::ItemFrame { item, rotation, .. } = &frame.kind else {
+        panic!("expected an item frame");
+    };
+    let item = item.expect("the frame contains an item");
+    assert_eq!(item.id, play::ITEM_FILLED_MAP, "a filled map item");
+    assert_eq!(*rotation, 0);
+    // A filled map's damage value is its map id in 1.8.
+    let map_id = item.damage as i32;
+    let map = client.maps.ensure(map_id);
+    assert!(
+        map.patches > 0,
+        "the mock sends S34 pixels, not just the placeholder"
+    );
+    // The mock draws a brown border, so (0, 0) is the border colour rather
+    // than the placeholder's sky.
+    assert_eq!(map.color_at(0, 0), Some(41));
+    assert_eq!(map.color_at(100, 20), Some(59), "the sun");
+    let distinct: std::collections::HashSet<_> = map.colors.iter().collect();
+    assert!(
+        distinct.len() > 4,
+        "map {map_id} should be a picture, not one flat colour"
+    );
+
+    // Team formatting and tab-list ping decorate the plate, and the team's
+    // `always` visibility leaves it on screen.
+    let jeb = players
+        .iter()
+        .find(|entity| matches!(&entity.kind, EntityKind::Player { name, .. } if name == "Jeb"))
+        .expect("Jeb is in the lobby");
+    let tag = client.nametag(jeb).expect("Jeb's plate is visible");
+    assert_eq!(tag.plate(), "[BLU] Jeb [B] 83ms");
+    assert_eq!(
+        jeb.equipment[play::equipment_slot::HELD as usize].map(|item| item.id),
+        Some(276),
+        "Jeb holds a sword"
+    );
+    let grumm = players
+        .iter()
+        .find(|entity| matches!(&entity.kind, EntityKind::Player { name, .. } if name == "Grumm"))
+        .expect("Grumm is in the lobby");
+    assert!(
+        grumm.equipment[play::equipment_slot::CHESTPLATE as usize].is_some(),
+        "Grumm wears an iron chestplate"
+    );
+    let botto = players
+        .iter()
+        .find(|entity| matches!(&entity.kind, EntityKind::Player { name, .. } if name == "Botto"))
+        .expect("Botto is in the lobby");
+    assert_eq!(
+        client.nametag(botto).expect("Botto's plate").prefix,
+        "§c[RED] "
+    );
+
+    client.disconnect().await;
+}
+
 /// The whole survival drop chain against a real socket: break a block, watch
 /// the item entity arrive, then watch it be collected into the hotbar.
 #[tokio::test]

@@ -9,11 +9,13 @@ pub mod clientbound {
     pub const JOIN_GAME: i32 = 0x01;
     pub const CHAT_MESSAGE: i32 = 0x02;
     pub const TIME_UPDATE: i32 = 0x03;
+    pub const ENTITY_EQUIPMENT: i32 = 0x04;
     pub const SPAWN_POSITION: i32 = 0x05;
     pub const UPDATE_HEALTH: i32 = 0x06;
     pub const RESPAWN: i32 = 0x07;
     pub const PLAYER_POSITION_AND_LOOK: i32 = 0x08;
     pub const HELD_ITEM_CHANGE: i32 = 0x09;
+    pub const ANIMATION: i32 = 0x0B;
     pub const SPAWN_PLAYER: i32 = 0x0C;
     /// An entity was picked up or absorbed by another one.
     pub const COLLECT_ITEM: i32 = 0x0D;
@@ -35,6 +37,10 @@ pub mod clientbound {
     pub const BLOCK_CHANGE: i32 = 0x23;
     pub const BLOCK_BREAK_ANIMATION: i32 = 0x25;
     pub const MAP_CHUNK_BULK: i32 = 0x26;
+    pub const SOUND_EFFECT: i32 = 0x29;
+    pub const PARTICLE: i32 = 0x2A;
+    /// `S34`: map column data (a framed or held map's colours and markers).
+    pub const MAP: i32 = 0x34;
     pub const SET_SLOT: i32 = 0x2F;
     pub const OPEN_WINDOW: i32 = 0x2D;
     pub const CLOSE_WINDOW: i32 = 0x2E;
@@ -43,6 +49,14 @@ pub mod clientbound {
     pub const BLOCK_ENTITY_DATA: i32 = 0x35;
     pub const PLAYER_LIST_ITEM: i32 = 0x38;
     pub const PLAYER_ABILITIES: i32 = 0x39;
+    /// `S3B`: scoreboard objective create/remove/display-name update.
+    pub const SCOREBOARD_OBJECTIVE: i32 = 0x3B;
+    /// `S3C`: one scoreboard score changed or was removed.
+    pub const UPDATE_SCORE: i32 = 0x3C;
+    /// `S3D`: which objective each display slot shows.
+    pub const DISPLAY_SCOREBOARD: i32 = 0x3D;
+    /// `S3E`: scoreboard teams, their formatting and their membership.
+    pub const TEAMS: i32 = 0x3E;
     pub const PLUGIN_MESSAGE: i32 = 0x3F;
     pub const DISCONNECT: i32 = 0x40;
     pub const SERVER_DIFFICULTY: i32 = 0x41;
@@ -148,14 +162,12 @@ pub fn write_slot<'a>(
 ) -> &'a mut PacketWriter {
     match item {
         None => writer.write_i16(ItemStack::EMPTY_ID),
-        Some(item) => {
-            writer
-                .write_i16(item.id)
-                .write_i8(item.count)
-                .write_i16(item.damage)
-                // No NBT alongside the stack.
-                .write_u8(0)
-        }
+        Some(item) => writer
+            .write_i16(item.id)
+            .write_i8(item.count)
+            .write_i16(item.damage)
+            // No NBT alongside the stack.
+            .write_u8(0),
     }
 }
 
@@ -338,6 +350,489 @@ pub fn parse_block_entity_update(packet: &Packet) -> Result<BlockEntityUpdate> {
     })
 }
 
+/// One value in 1.8's `DataWatcher` metadata format.
+///
+/// The wire tags the low five bits with the field index and the high three
+/// bits with the value type. This is the 1.8 layout, not 1.9+'s type-per-entry
+/// layout.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EntityMetadataValue {
+    Byte(i8),
+    Short(i16),
+    Int(i32),
+    Float(f32),
+    String(String),
+    Slot(Option<ItemStack>),
+    Vector([i32; 3]),
+    Rotation([f32; 3]),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityMetadataUpdate {
+    pub entity_id: i32,
+    pub values: Vec<(u8, EntityMetadataValue)>,
+}
+
+impl EntityMetadataUpdate {
+    pub fn get(&self, index: u8) -> Option<&EntityMetadataValue> {
+        self.values
+            .iter()
+            .find_map(|(i, value)| (*i == index).then_some(value))
+    }
+}
+
+/// Parse `S1C Entity Metadata` in the 1.8.9 `DataWatcher` format.
+pub fn parse_entity_metadata(packet: &Packet) -> Result<EntityMetadataUpdate> {
+    let mut r = packet.reader();
+    let entity_id = r.read_varint()?;
+    let mut values = Vec::new();
+    loop {
+        let header = r.read_u8()?;
+        if header == 0x7f {
+            break;
+        }
+        let index = header & 0x1f;
+        let value = match header >> 5 {
+            0 => EntityMetadataValue::Byte(r.read_i8()?),
+            1 => EntityMetadataValue::Short(r.read_i16()?),
+            2 => EntityMetadataValue::Int(r.read_i32()?),
+            3 => EntityMetadataValue::Float(r.read_f32()?),
+            4 => EntityMetadataValue::String(r.read_string()?),
+            5 => EntityMetadataValue::Slot(parse_slot(&mut r)?),
+            6 => EntityMetadataValue::Vector([r.read_i32()?, r.read_i32()?, r.read_i32()?]),
+            7 => EntityMetadataValue::Rotation([r.read_f32()?, r.read_f32()?, r.read_f32()?]),
+            kind => {
+                return Err(Error::Protocol(format!(
+                    "unknown 1.8 metadata type {kind} for index {index}"
+                )))
+            }
+        };
+        values.push((index, value));
+    }
+    if !r.is_empty() {
+        return Err(Error::Protocol("trailing bytes in entity metadata".into()));
+    }
+    Ok(EntityMetadataUpdate { entity_id, values })
+}
+
+/// Equipment slot indices from `S04 Entity Equipment`.
+pub mod equipment_slot {
+    pub const HELD: i16 = 0;
+    pub const BOOTS: i16 = 1;
+    pub const LEGGINGS: i16 = 2;
+    pub const CHESTPLATE: i16 = 3;
+    pub const HELMET: i16 = 4;
+    pub const COUNT: usize = 5;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityEquipment {
+    pub entity_id: i32,
+    pub slot: i16,
+    pub item: Option<ItemStack>,
+}
+
+/// Parse `S04 Entity Equipment`.
+pub fn parse_entity_equipment(packet: &Packet) -> Result<EntityEquipment> {
+    let mut r = packet.reader();
+    let entity_id = r.read_varint()?;
+    let slot = r.read_i16()?;
+    let item = parse_slot(&mut r)?;
+    if !r.is_empty() {
+        return Err(Error::Protocol("trailing bytes in entity equipment".into()));
+    }
+    Ok(EntityEquipment {
+        entity_id,
+        slot,
+        item,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityAnimation {
+    pub entity_id: i32,
+    pub animation: u8,
+}
+
+/// Parse `S0B Animation` (arm swing, hurt, leave bed, ...).
+pub fn parse_entity_animation(packet: &Packet) -> Result<EntityAnimation> {
+    let mut r = packet.reader();
+    Ok(EntityAnimation {
+        entity_id: r.read_varint()?,
+        animation: r.read_u8()?,
+    })
+}
+
+/// One `S2A Particle` burst.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParticleSpawn {
+    pub particle_id: i32,
+    pub long_distance: bool,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub offset_z: f32,
+    pub speed: f32,
+    pub count: i32,
+    /// Block/item arguments used by `iconcrack_` and `blockcrack_` particles.
+    pub arguments: Vec<i32>,
+}
+
+/// Parse `S2A Particle`. The number of trailing VarInt arguments is fixed by
+/// the particle type: item crack has two, block crack/dust have one.
+pub fn parse_particle(packet: &Packet) -> Result<ParticleSpawn> {
+    let mut r = packet.reader();
+    let particle_id = r.read_i32()?;
+    let long_distance = r.read_bool()?;
+    let x = r.read_f32()?;
+    let y = r.read_f32()?;
+    let z = r.read_f32()?;
+    let offset_x = r.read_f32()?;
+    let offset_y = r.read_f32()?;
+    let offset_z = r.read_f32()?;
+    let speed = r.read_f32()?;
+    let count = r.read_i32()?;
+    let argument_count = match particle_id {
+        36 => 2,
+        37 | 38 => 1,
+        _ => 0,
+    };
+    let mut arguments = Vec::with_capacity(argument_count);
+    for _ in 0..argument_count {
+        arguments.push(r.read_varint()?);
+    }
+    if !r.is_empty() {
+        return Err(Error::Protocol("trailing bytes in particle packet".into()));
+    }
+    Ok(ParticleSpawn {
+        particle_id,
+        long_distance,
+        x,
+        y,
+        z,
+        offset_x,
+        offset_y,
+        offset_z,
+        speed,
+        count,
+        arguments,
+    })
+}
+
+/// One `S29 Sound Effect` notification.
+///
+/// Coordinates are fixed-point eighths of a block, as in 1.8.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SoundEffect {
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub volume: f32,
+    pub pitch: f32,
+}
+
+pub fn parse_sound_effect(packet: &Packet) -> Result<SoundEffect> {
+    let mut r = packet.reader();
+    let name = r.read_string()?;
+    let x = r.read_i32()? as f64 / 8.0;
+    let y = r.read_i32()? as f64 / 8.0;
+    let z = r.read_i32()? as f64 / 8.0;
+    let volume = r.read_f32()?;
+    let pitch = r.read_f32()?;
+    Ok(SoundEffect {
+        name,
+        x,
+        y,
+        z,
+        volume,
+        pitch,
+    })
+}
+
+/// A filled map item. In 1.8 the item's **damage value is the map id**; that is
+/// how an item frame's framed map is tied to the `S34` pixels.
+pub const ITEM_FILLED_MAP: i16 = 358;
+
+/// One marker drawn on a map: another player or a decoration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MapIcon {
+    /// Icon kind (0 = white arrow, 1..=10 = coloured arrows, ...).
+    pub kind: u8,
+    /// Rotation in 16ths of a turn.
+    pub direction: u8,
+    pub x: i8,
+    pub z: i8,
+}
+
+/// `S34`: a patch of a map's 128x128 colour grid, plus its markers.
+///
+/// The server only sends the rectangle that changed: `columns`x`rows` colours
+/// starting at `(start_x, start_y)` in the map's own 128x128 space. A packet
+/// with `columns == 0` carries markers only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MapUpdate {
+    pub map_id: i32,
+    /// Map scale, 0..4. Colour indexes are not scaled; this only affects how
+    /// many blocks one pixel covers.
+    pub scale: u8,
+    pub icons: Vec<MapIcon>,
+    pub columns: u8,
+    pub rows: u8,
+    pub start_x: u8,
+    pub start_y: u8,
+    /// `columns * rows` colour indexes, row-major within the patch.
+    pub colors: Vec<u8>,
+}
+
+impl MapUpdate {
+    /// Width of a full map's colour grid in 1.8.
+    pub const SIZE: usize = 128;
+}
+
+/// Parse `S34 Map Chunk`.
+pub fn parse_map_update(packet: &Packet) -> Result<MapUpdate> {
+    let mut r = packet.reader();
+    let map_id = r.read_varint()?;
+    let scale = r.read_u8()?;
+    let icon_count = r.read_varint()?.clamp(0, 1024);
+    let mut icons = Vec::with_capacity(icon_count as usize);
+    for _ in 0..icon_count {
+        // One byte packs the icon kind in the high nibble and its rotation in
+        // the low nibble (`Vec4b`'s packed form).
+        let packed = r.read_u8()?;
+        icons.push(MapIcon {
+            kind: packed >> 4,
+            direction: packed & 0x0F,
+            x: r.read_i8()?,
+            z: r.read_i8()?,
+        });
+    }
+
+    let columns = r.read_u8()?;
+    let mut rows = 0;
+    let (mut start_x, mut start_y) = (0, 0);
+    let mut colors = Vec::new();
+    if columns > 0 {
+        rows = r.read_u8()?;
+        start_x = r.read_u8()?;
+        start_y = r.read_u8()?;
+        let length = r.read_varint()?.max(0) as usize;
+        let expected = columns as usize * rows as usize;
+        // A malformed length must not let the patch wrap off the grid; the
+        // trailing bytes belong to the next packet's frame otherwise.
+        if length != expected {
+            return Err(Error::Protocol(format!(
+                "map {map_id} patch is {length} bytes, {columns}x{rows} needs {expected}"
+            )));
+        }
+        colors.extend_from_slice(r.take(expected)?);
+    }
+
+    Ok(MapUpdate {
+        map_id,
+        scale,
+        icons,
+        columns,
+        rows,
+        start_x,
+        start_y,
+        colors,
+    })
+}
+
+/// Scoreboard display slots, matching vanilla's `S3D` position byte.
+pub mod scoreboard_slot {
+    /// The tab list's objective column.
+    pub const LIST: u8 = 0;
+    /// The right-hand sidebar.
+    pub const SIDEBAR: u8 = 1;
+    /// Under a player's name tag.
+    pub const BELOW_NAME: u8 = 2;
+}
+
+/// `S3B`: an objective was created, removed or had its display name updated.
+///
+/// Mode 2 carries the render type on the wire as well as the display name, so
+/// both are kept rather than assuming the type never changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObjectiveUpdate {
+    Create {
+        name: String,
+        display_name: String,
+        render_type: String,
+    },
+    Remove {
+        name: String,
+    },
+    UpdateDisplayName {
+        name: String,
+        display_name: String,
+        render_type: String,
+    },
+}
+
+pub fn parse_scoreboard_objective(packet: &Packet) -> Result<ObjectiveUpdate> {
+    let mut r = packet.reader();
+    let name = r.read_string()?;
+    let mode = r.read_u8()?;
+    match mode {
+        0 | 2 => {
+            let display_name = r.read_string()?;
+            let render_type = r.read_string()?;
+            if mode == 0 {
+                Ok(ObjectiveUpdate::Create {
+                    name,
+                    display_name,
+                    render_type,
+                })
+            } else {
+                Ok(ObjectiveUpdate::UpdateDisplayName {
+                    name,
+                    display_name,
+                    render_type,
+                })
+            }
+        }
+        1 => Ok(ObjectiveUpdate::Remove { name }),
+        other => Err(Error::Protocol(format!(
+            "unknown scoreboard objective mode {other}"
+        ))),
+    }
+}
+
+/// `S3C`: one scoreboard score was set or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScoreUpdate {
+    /// The score holder: a player name, or any string a server picks.
+    pub entry: String,
+    /// Empty means "every objective" when removing, matching vanilla.
+    pub objective: String,
+    /// `None` when the entry is removed from the objective.
+    pub value: Option<i32>,
+}
+
+pub fn parse_update_score(packet: &Packet) -> Result<ScoreUpdate> {
+    let mut r = packet.reader();
+    let entry = r.read_string()?;
+    let action = r.read_varint()?;
+    let objective = r.read_string()?;
+    match action {
+        0 => Ok(ScoreUpdate {
+            entry,
+            objective,
+            value: Some(r.read_varint()?),
+        }),
+        1 => Ok(ScoreUpdate {
+            entry,
+            objective,
+            value: None,
+        }),
+        other => Err(Error::Protocol(format!(
+            "unknown update-score action {other}"
+        ))),
+    }
+}
+
+/// `S3D`: the objective shown in one display slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayScoreboard {
+    /// `scoreboard_slot` value; vanilla also uses 3..=18 for team-coloured
+    /// sidebar slots, which are stored but not rendered here.
+    pub position: u8,
+    /// Empty clears the slot.
+    pub objective: String,
+}
+
+pub fn parse_display_scoreboard(packet: &Packet) -> Result<DisplayScoreboard> {
+    let mut r = packet.reader();
+    Ok(DisplayScoreboard {
+        position: r.read_u8()?,
+        objective: r.read_string()?,
+    })
+}
+
+/// The formatting fields every team mode 0/2 packet carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamInfo {
+    pub display_name: String,
+    pub prefix: String,
+    pub suffix: String,
+    /// Bit 0 = friendly fire allowed, bit 1 = see friendly invisibles.
+    pub friendly_flags: u8,
+    /// `always`, `hideForOtherTeams` or `hideForOwnTeam`.
+    pub name_tag_visibility: String,
+    /// Vanilla `EnumChatFormatting` id, 0..=15, or -1 for "no colour".
+    pub color: i8,
+}
+
+/// `S3E`: a team was created, removed, re-formatted or had members changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamUpdate {
+    Create {
+        name: String,
+        info: TeamInfo,
+        players: Vec<String>,
+    },
+    Remove {
+        name: String,
+    },
+    Update {
+        name: String,
+        info: TeamInfo,
+    },
+    AddPlayers {
+        name: String,
+        players: Vec<String>,
+    },
+    RemovePlayers {
+        name: String,
+        players: Vec<String>,
+    },
+}
+
+pub fn parse_teams(packet: &Packet) -> Result<TeamUpdate> {
+    let mut r = packet.reader();
+    let name = r.read_string()?;
+    let mode = r.read_u8()?;
+    let info = if mode == 0 || mode == 2 {
+        Some(TeamInfo {
+            display_name: r.read_string()?,
+            prefix: r.read_string()?,
+            suffix: r.read_string()?,
+            friendly_flags: r.read_u8()?,
+            name_tag_visibility: r.read_string()?,
+            color: r.read_i8()?,
+        })
+    } else {
+        None
+    };
+    let players = if mode == 0 || mode == 3 || mode == 4 {
+        let count = r.read_varint()?.max(0);
+        let mut players = Vec::with_capacity(count.min(64) as usize);
+        for _ in 0..count {
+            players.push(r.read_string()?);
+        }
+        Some(players)
+    } else {
+        None
+    };
+    match (mode, info, players) {
+        (0, Some(info), Some(players)) => Ok(TeamUpdate::Create {
+            name,
+            info,
+            players,
+        }),
+        (1, _, _) => Ok(TeamUpdate::Remove { name }),
+        (2, Some(info), _) => Ok(TeamUpdate::Update { name, info }),
+        (3, _, Some(players)) => Ok(TeamUpdate::AddPlayers { name, players }),
+        (4, _, Some(players)) => Ok(TeamUpdate::RemovePlayers { name, players }),
+        (other, _, _) => Err(Error::Protocol(format!("unknown teams mode {other}"))),
+    }
+}
+
 pub fn keep_alive_response(id: i32) -> Packet {
     let mut w = PacketWriter::new();
     w.write_varint(id);
@@ -413,7 +908,7 @@ pub fn client_status(action: i32) -> Packet {
     Packet::new(serverbound::CLIENT_STATUS, w.into_bytes())
 }
 
-/// `C07 Player Digging` — start / abort / stop breaking a block.
+/// `C07 Player Digging` â€” start / abort / stop breaking a block.
 pub fn player_digging(status: u8, x: i32, y: i32, z: i32, face: u8) -> Packet {
     let mut w = PacketWriter::new();
     w.write_varint(status as i32);
@@ -444,19 +939,19 @@ pub fn block_placement(
     Packet::new(serverbound::PLAYER_BLOCK_PLACEMENT, w.into_bytes())
 }
 
-/// `C09 Held Item Change` — select a hotbar slot (0..8).
+/// `C09 Held Item Change` â€” select a hotbar slot (0..8).
 pub fn held_item_change(slot: i16) -> Packet {
     let mut w = PacketWriter::new();
     w.write_i16(slot);
     Packet::new(serverbound::HELD_ITEM_CHANGE, w.into_bytes())
 }
 
-/// `C0A Animation` — swing the arm. The 1.8 packet has no body.
+/// `C0A Animation` â€” swing the arm. The 1.8 packet has no body.
 pub fn swing_arm() -> Packet {
     Packet::new(serverbound::ANIMATION, Vec::new())
 }
 
-/// `C10 Creative Inventory Action` — put a stack into (or clear) a container slot.
+/// `C10 Creative Inventory Action` â€” put a stack into (or clear) a container slot.
 pub fn creative_set_slot(slot: i16, item: Option<&ItemStack>) -> Packet {
     let mut w = PacketWriter::new();
     w.write_i16(slot);
@@ -464,7 +959,7 @@ pub fn creative_set_slot(slot: i16, item: Option<&ItemStack>) -> Packet {
     Packet::new(serverbound::CREATIVE_INVENTORY_ACTION, w.into_bytes())
 }
 
-/// `C0E Click Window` — a single click in an open container.
+/// `C0E Click Window` â€” a single click in an open container.
 ///
 /// `action` is the client's running counter for this window; the server echoes
 /// it back in `S32 Confirm Transaction` so the client can tell which prediction
@@ -668,14 +1163,14 @@ pub fn parse_confirm_transaction(packet: &Packet) -> Result<ConfirmTransaction> 
     })
 }
 
-/// `S32` written from the server side — answers one `C0E`.
+/// `S32` written from the server side â€” answers one `C0E`.
 pub fn confirm_transaction(window_id: i8, action: i16, accepted: bool) -> Packet {
     let mut w = PacketWriter::new();
     w.write_i8(window_id).write_i16(action).write_bool(accepted);
     Packet::new(clientbound::CONFIRM_TRANSACTION, w.into_bytes())
 }
 
-/// `S2F` written from the server side — the mock server uses it when a pickup
+/// `S2F` written from the server side â€” the mock server uses it when a pickup
 /// lands in a slot.
 pub fn set_slot(window_id: i8, slot: i16, item: Option<&ItemStack>) -> Packet {
     let mut w = PacketWriter::new();
@@ -684,12 +1179,12 @@ pub fn set_slot(window_id: i8, slot: i16, item: Option<&ItemStack>) -> Packet {
     Packet::new(clientbound::SET_SLOT, w.into_bytes())
 }
 
-/// `S09 Held Item Change` — the server confirming which slot we're holding.
+/// `S09 Held Item Change` â€” the server confirming which slot we're holding.
 pub fn parse_held_item_change(packet: &Packet) -> Result<i16> {
     Ok(i16::from(packet.reader().read_i8()?))
 }
 
-/// `S1F Experience` — the XP bar, level and lifetime total.
+/// `S1F Experience` â€” the XP bar, level and lifetime total.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Experience {
     /// Progress towards the next level, 0..1.
@@ -1011,6 +1506,11 @@ pub fn parse_entity(packet: &Packet) -> Result<i32> {
 
 /// The object type used for a dropped item stack.
 pub const OBJECT_TYPE_ITEM: u8 = 2;
+/// Item frames are objects, not mobs, in 1.8. The object `data` is the facing.
+pub const OBJECT_TYPE_ITEM_FRAME: u8 = 71;
+/// Armour stands are objects too. Their pose and status arrive as metadata,
+/// and an **invisible marker** stand is the usual lobby hologram.
+pub const OBJECT_TYPE_ARMOR_STAND: u8 = 78;
 
 /// `S0E`: a non-living object. Dropped items are the only kind the client
 /// tracks; the rest are parsed so the wire format stays honest.
@@ -1070,7 +1570,7 @@ pub fn item_object_data(item: i16, meta: i16) -> i32 {
     i32::from(item as u16) | (i32::from(meta as u16) << 16)
 }
 
-/// `S0E` written from the server side — used by the mock server, and by the
+/// `S0E` written from the server side â€” used by the mock server, and by the
 /// round-trip test that keeps the writer and the parser in step.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_object(
@@ -1630,6 +2130,139 @@ mod tests {
 }
 
 #[cfg(test)]
+mod map_tests {
+    use super::*;
+
+    #[test]
+    fn item_frame_metadata_carries_item_and_rotation() {
+        let mut w = PacketWriter::new();
+        w.write_varint(1000);
+        w.write_u8((5 << 5) | 8);
+        // A filled map's damage value is its map id in 1.8.
+        write_slot(&mut w, Some(&ItemStack::new(ITEM_FILLED_MAP, 1, 7)));
+        w.write_u8(9);
+        w.write_i8(3);
+        w.write_u8(0x7F);
+        let update =
+            parse_entity_metadata(&Packet::new(clientbound::ENTITY_METADATA, w.into_bytes()))
+                .expect("metadata");
+        assert!(matches!(
+            update.get(8),
+            Some(EntityMetadataValue::Slot(Some(item)))
+                if item.id == ITEM_FILLED_MAP && item.damage == 7
+        ));
+        assert!(matches!(update.get(9), Some(EntityMetadataValue::Byte(3))));
+    }
+
+    #[test]
+    fn a_map_patch_parses_markers_and_colours() {
+        let mut w = PacketWriter::new();
+        w.write_varint(12)
+            .write_u8(2)
+            .write_varint(1)
+            .write_u8((1 << 4) | 4)
+            .write_i8(10)
+            .write_i8(-3)
+            .write_u8(2)
+            .write_u8(2)
+            .write_u8(4)
+            .write_u8(5)
+            .write_byte_array(&[1, 2, 3, 4]);
+        let update = parse_map_update(&Packet::new(clientbound::MAP, w.into_bytes())).expect("map");
+        assert_eq!(update.map_id, 12);
+        assert_eq!(update.scale, 2);
+        assert_eq!(
+            update.icons,
+            [MapIcon {
+                kind: 1,
+                direction: 4,
+                x: 10,
+                z: -3,
+            }]
+        );
+        assert_eq!(
+            (update.columns, update.rows, update.start_x, update.start_y),
+            (2, 2, 4, 5)
+        );
+        assert_eq!(update.colors, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_map_patch_with_the_wrong_length_is_rejected() {
+        let mut w = PacketWriter::new();
+        w.write_varint(3)
+            .write_u8(0)
+            .write_varint(0)
+            .write_u8(2)
+            .write_u8(2)
+            .write_u8(0)
+            .write_u8(0)
+            .write_byte_array(&[1, 2]);
+        let err = parse_map_update(&Packet::new(clientbound::MAP, w.into_bytes()))
+            .expect_err("short patch must be rejected");
+        assert!(matches!(err, Error::Protocol(_)), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod scoreboard_wire_tests {
+    use super::*;
+
+    #[test]
+    fn a_team_create_parses_prefix_suffix_and_members() {
+        let mut w = PacketWriter::new();
+        w.write_string("red")
+            .write_u8(0)
+            .write_string("Red")
+            .write_string("§c[RED] ")
+            .write_string(" §7[R]")
+            .write_u8(3)
+            .write_string("always")
+            .write_i8(12)
+            .write_varint(2)
+            .write_string("Steve")
+            .write_string("Alex");
+        let update = parse_teams(&Packet::new(clientbound::TEAMS, w.into_bytes())).expect("team");
+        let TeamUpdate::Create {
+            name,
+            info,
+            players,
+        } = update
+        else {
+            panic!("expected a team create");
+        };
+        assert_eq!(name, "red");
+        assert_eq!(info.prefix, "§c[RED] ");
+        assert_eq!(info.suffix, " §7[R]");
+        assert_eq!(info.name_tag_visibility, "always");
+        assert_eq!(info.color, 12);
+        assert_eq!(players, ["Steve", "Alex"]);
+    }
+
+    #[test]
+    fn a_score_update_parses_set_and_remove() {
+        let mut w = PacketWriter::new();
+        w.write_string("Steve")
+            .write_varint(0)
+            .write_string("board")
+            .write_varint(7);
+        let set =
+            parse_update_score(&Packet::new(clientbound::UPDATE_SCORE, w.into_bytes())).unwrap();
+        assert_eq!(set.entry, "Steve");
+        assert_eq!(set.objective, "board");
+        assert_eq!(set.value, Some(7));
+
+        let mut w = PacketWriter::new();
+        w.write_string("Steve")
+            .write_varint(1)
+            .write_string("board");
+        let remove =
+            parse_update_score(&Packet::new(clientbound::UPDATE_SCORE, w.into_bytes())).unwrap();
+        assert_eq!(remove.value, None);
+    }
+}
+
+#[cfg(test)]
 mod entity_tests {
     use super::*;
 
@@ -1677,7 +2310,7 @@ mod entity_tests {
         assert_eq!(update.entity_id, 5);
         assert_eq!((update.dx, update.dy, update.dz), (1.0, -0.5, 0.25));
         assert!((update.yaw - 180.0).abs() < 2.0);
-        // Pitch is unsigned on the wire: -90° arrives as 270°.
+        // Pitch is unsigned on the wire: -90Â° arrives as 270Â°.
         assert!((update.pitch - 270.0).abs() < 2.0);
     }
 
@@ -1868,5 +2501,83 @@ mod entity_tests {
                 collector: 1
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod entity_wire_tests {
+    use super::*;
+
+    #[test]
+    fn parses_18_metadata_flags_name_and_health() {
+        let mut w = PacketWriter::new();
+        w.write_varint(7)
+            .write_u8(0x00)
+            .write_i8(0x22)
+            .write_u8(0x82)
+            .write_string("Zombie")
+            .write_u8(0x66)
+            .write_f32(12.5)
+            .write_u8(0x7f);
+        let update =
+            parse_entity_metadata(&Packet::new(clientbound::ENTITY_METADATA, w.into_bytes()))
+                .expect("metadata");
+        assert_eq!(update.entity_id, 7);
+        assert_eq!(update.get(0), Some(&EntityMetadataValue::Byte(0x22)));
+        assert_eq!(
+            update.get(2),
+            Some(&EntityMetadataValue::String("Zombie".into()))
+        );
+        assert_eq!(update.get(6), Some(&EntityMetadataValue::Float(12.5)));
+    }
+
+    #[test]
+    fn parses_equipment_slot_and_item() {
+        let mut w = PacketWriter::new();
+        w.write_varint(7).write_i16(equipment_slot::HELMET);
+        write_slot(&mut w, Some(&ItemStack::new(310, 1, 0)));
+        let equipment =
+            parse_entity_equipment(&Packet::new(clientbound::ENTITY_EQUIPMENT, w.into_bytes()))
+                .expect("equipment");
+        assert_eq!(equipment.entity_id, 7);
+        assert_eq!(equipment.slot, 4);
+        assert_eq!(equipment.item, Some(ItemStack::new(310, 1, 0)));
+    }
+
+    #[test]
+    fn parses_particles_and_block_argument() {
+        let mut w = PacketWriter::new();
+        w.write_i32(37)
+            .write_bool(false)
+            .write_f32(1.0)
+            .write_f32(64.0)
+            .write_f32(-2.0)
+            .write_f32(0.2)
+            .write_f32(0.3)
+            .write_f32(0.4)
+            .write_f32(0.05)
+            .write_i32(12)
+            .write_varint(1 << 4);
+        let particle =
+            parse_particle(&Packet::new(clientbound::PARTICLE, w.into_bytes())).expect("particle");
+        assert_eq!(particle.particle_id, 37);
+        assert_eq!(particle.count, 12);
+        assert_eq!(particle.arguments, vec![16]);
+    }
+
+    #[test]
+    fn parses_sound_coordinates_as_eighths() {
+        let mut w = PacketWriter::new();
+        w.write_string("dig.stone")
+            .write_i32(8)
+            .write_i32(16)
+            .write_i32(-8)
+            .write_f32(0.8)
+            .write_f32(1.1);
+        let sound = parse_sound_effect(&Packet::new(clientbound::SOUND_EFFECT, w.into_bytes()))
+            .expect("sound");
+        assert_eq!(sound.name, "dig.stone");
+        assert_eq!((sound.x, sound.y, sound.z), (1.0, 2.0, -1.0));
+        assert!((sound.volume - 0.8).abs() < 1e-6);
     }
 }

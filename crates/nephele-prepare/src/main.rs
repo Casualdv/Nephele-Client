@@ -30,6 +30,11 @@ struct Cli {
     #[arg(long, value_name = "JAR")]
     jar: Option<PathBuf>,
 
+    /// The extracted Minecraft `assets` directory (contains indexes/objects/).
+    /// Discovered from --minecraft-dir or the jar path when omitted.
+    #[arg(long, value_name = "DIR")]
+    assets_dir: Option<PathBuf>,
+
     /// Where prepared resources go. Defaults to .local/prepared.
     #[arg(long, value_name = "DIR")]
     out: Option<PathBuf>,
@@ -129,7 +134,12 @@ fn run() -> Result<(), PrepareError> {
     println!("  output     {}", prepared_dir.display());
     println!();
 
-    let prepared = nephele_prepare::prepare(&jar, &prepared_dir, &lock)?;
+    let assets_dir = resolve_assets_dir(&cli, &jar);
+    if let Some(dir) = &assets_dir {
+        println!("  assets    {}", dir.display());
+    }
+    let prepared =
+        nephele_prepare::prepare_with_assets(&jar, &prepared_dir, &lock, assets_dir.as_deref())?;
     let bytes = dir_size(&prepared_dir.join("assets")).unwrap_or(0);
 
     println!(
@@ -160,6 +170,42 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
+}
+
+fn resolve_assets_dir(cli: &Cli, jar: &Path) -> Option<PathBuf> {
+    if let Some(dir) = &cli.assets_dir {
+        return Some(dir.clone());
+    }
+    let mut candidates = Vec::new();
+    if let Some(dir) = &cli.minecraft_dir {
+        candidates.push(dir.join("assets"));
+        candidates.push(dir.join("minecraft").join("assets"));
+    }
+    if let Some(version_dir) = jar.parent() {
+        if let Some(root) = version_dir.parent().and_then(Path::parent) {
+            candidates.push(root.join("assets"));
+        }
+        if let Some(root) = version_dir.parent() {
+            candidates.push(root.to_path_buf());
+        }
+    }
+    if let Some(env) = std::env::var_os("NEPHELE_MINECRAFT_ASSETS").map(PathBuf::from) {
+        candidates.push(env.clone());
+        if env.file_name().is_some_and(|name| name == "minecraft") {
+            if let Some(parent) = env.parent() {
+                candidates.push(parent.to_path_buf());
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        candidates.push(home.join(".minecraft").join("assets"));
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".minecraft").join("assets"));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.join("indexes").join("1.8.json").is_file())
 }
 
 fn resolve_jar(cli: &Cli, prepared_dir: &Path) -> Result<PathBuf, PrepareError> {

@@ -8,15 +8,17 @@ pub enum SettingId {
     Fov,
     GuiScale,
     ViewDistance,
+    Volume,
 }
 
 impl SettingId {
-    pub const ALL: [SettingId; 5] = [
+    pub const ALL: [SettingId; 6] = [
         SettingId::Vsync,
         SettingId::Sensitivity,
         SettingId::Fov,
         SettingId::GuiScale,
         SettingId::ViewDistance,
+        SettingId::Volume,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -26,6 +28,7 @@ impl SettingId {
             SettingId::Fov => "Field of View",
             SettingId::GuiScale => "GUI Scale",
             SettingId::ViewDistance => "Render Distance",
+            SettingId::Volume => "Master Volume",
         }
     }
 
@@ -45,6 +48,8 @@ pub struct Settings {
     /// 0 = automatic, 1..=4 = fixed.
     pub gui_scale: u8,
     pub view_distance: u8,
+    /// Master sound volume, 0..=1.
+    pub volume: f32,
 }
 
 impl Default for Settings {
@@ -55,6 +60,7 @@ impl Default for Settings {
             fov: 70.0,
             gui_scale: 0,
             view_distance: 8,
+            volume: 0.7,
         }
     }
 }
@@ -74,6 +80,7 @@ impl Settings {
                 }
             }
             SettingId::ViewDistance => format!("{} chunks", self.view_distance),
+            SettingId::Volume => format!("{:.0}%", self.volume * 100.0),
         }
     }
 
@@ -95,6 +102,9 @@ impl Settings {
             SettingId::ViewDistance => {
                 let distance = self.view_distance as i32 + direction;
                 self.view_distance = distance.clamp(2, 16) as u8;
+            }
+            SettingId::Volume => {
+                self.volume = (self.volume + 0.1 * direction as f32).clamp(0.0, 1.0);
             }
         }
         *self != before
@@ -156,6 +166,21 @@ mod tests {
         }
         assert_eq!(settings.view_distance, 2);
         assert!(!settings.adjust(SettingId::ViewDistance, -1));
+    }
+
+    #[test]
+    fn volume_is_a_percentage_and_clamps() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.value_label(SettingId::Volume), "70%");
+        for _ in 0..20 {
+            settings.adjust(SettingId::Volume, 1);
+        }
+        assert_eq!(settings.volume, 1.0);
+        assert!(!settings.adjust(SettingId::Volume, 1));
+        for _ in 0..20 {
+            settings.adjust(SettingId::Volume, -1);
+        }
+        assert_eq!(settings.volume, 0.0);
     }
 
     #[test]

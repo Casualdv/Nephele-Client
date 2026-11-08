@@ -39,12 +39,15 @@ param(
         "minecraft/models/",
         "minecraft/textures/blocks/",
         "minecraft/textures/items/",
+        "minecraft/textures/entity/",
         "minecraft/textures/gui/",
         "minecraft/textures/font/",
         "minecraft/textures/misc/",
+        "minecraft/texts/",
         "minecraft/font/",
         "minecraft/lang/en_US.lang",
-        "minecraft/sounds.json"
+        "minecraft/sounds.json",
+        "minecraft/sounds/"
     )
 )
 

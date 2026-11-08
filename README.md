@@ -24,7 +24,12 @@ talks protocol 47, and joins offline-mode servers.
 - Block shapes: slabs, stairs, fence posts, panes, doors and torches render with shape-aware geometry
 - Movement and interaction: vanilla travel physics, sprinting, mining, block
   placement, creative item palette, chat
-- Players: entity tracking, skins and skin loading, humanoid rendering
+- Players and mobs: entity tracking, skins, mob models and walk cycles,
+  nametags/health labels, equipment and invisibility/crouch flags
+- Entities and effects: server particle bursts, block-break particles, block
+  entities (signs, chests, banners, beacon beams, enchanting books)
+- Audio: Symphonia Ogg Vorbis decode and cpal positional playback for blocks,
+  steps, mobs and player damage; master volume in Settings
 - Items: server drops render as spinning entities; local survival adds mined
   block items to inventory
 - First person: a skin-textured arm holding the selected block, with a swing while mining
@@ -38,8 +43,9 @@ talks protocol 47, and joins offline-mode servers.
 **Not implemented yet**
 
 - Microsoft sign-in and the protocol's encryption handshake, so **online-mode
-  servers cannot be joined** — Nephele only speaks to offline-mode servers
-- Sound, mob behaviour, survival gameplay, world saving and loading
+  servers cannot be joined** - Nephele only speaks to offline-mode servers
+- Mob combat/AI depth, container GUIs for chests/furnaces, music/records,
+  survival gameplay, world saving and loading
 
 ## Requirements
 
@@ -129,7 +135,8 @@ pwsh scripts/check_public_tree.ps1
 | `nephele-world` | Chunk storage, chunk encode/decode, block states, terrain generation, raycasting |
 | `nephele-client` | Connection state machine, physics, mining, entity and skin tracking |
 | `nephele-assets` | Texture arrays, block models, GUI atlas, panorama, skin atlas |
-| `nephele-render` | wgpu renderer: terrain, entities, UI, lines, camera |
+| `nephele-render` | wgpu renderer: terrain, entities, particles, UI, lines, camera |
+| `nephele-audio` | Symphonia Ogg Vorbis decode and cpal positional sound |
 | `nephele-mock` | A fake 1.8.9 server with a deterministic world, for tests and demos |
 | `nephele-prepare` | Verified resource preparation from your own copy of the game |
 | `nephele` | The binary: `play`, `view`, `status`, `login`, `join`, `mock-server` |

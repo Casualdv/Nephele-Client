@@ -150,14 +150,14 @@ per render frame — it no longer does. Keep new simulation work inside
 
 | Item | Size | Notes |
 |---|---|---|
-| Mob models + walk animation (humanoid, quadruped, creeper, slime, squid, bat, chicken, spider, enderman) | **L** | Port from Leafish `entity/`. |
-| Entity metadata: equipment, nametags, invisibility, crouch, arm swing, health | M | |
+| Mob models + walk animation (humanoid, quadruped, creeper, slime, squid, bat, chicken, spider, enderman) | **done** | Box models in `nephele-render::entity`; textures packed into the skin atlas. |
+| Entity metadata: equipment, nametags, invisibility, crouch, arm swing, health | **partial** | Flags/name/health/equipment parsed and rendered; held blocks show, armour overlays and full arm-swing animation remain. |
 | Dropped items, XP orbs, arrows, fireworks, paintings, falling blocks | M | **Block drops done**: `SPAWN_OBJECT`/`COLLECT_ITEM` tracked, rendered, collected into the hotbar. XP orbs, arrows and the rest are parsed but not drawn. |
 | Item entities rendering with correct spin/bob | **done** | `build_item_mesh`: a 0.25-block textured cube, spinning and bobbing. Non-block items draw the missing-texture tile until the item atlas exists. |
 | Slim (Alex) player model, capes | S | |
 | Player nametags above heads | S | |
-| Particles (block break, splash, smoke, flame, crit, portal) | M | Port from Leafish `particle/`. |
-| Block entities: signs, chests, banners, beacon beam, enchanting table book | L | Port from Leafish `entity/block_entity/`. |
+| Particles (block break, splash, smoke, flame, crit, portal) | **done** | Server `S2A` bursts and local block-break/ambient particles; generated sprites + block textures. |
+| Block entities: signs, chests, banners, beacon beam, enchanting table book | **partial** | Geometry and NBT text/colour/beam decode; chest/furnace GUIs and interaction are still open. |
 
 ### 5. Inventory, containers and survival
 
@@ -197,14 +197,14 @@ This is what separates a PvP client from a compatible one.
 
 ### 7. Audio
 
-No audio exists yet.
+A Symphonia/cpal engine is in place.
 
 | Item | Size | Notes |
 |---|---|---|
-| Sound engine + positional playback | L | `symphonia` for Ogg Vorbis decode. |
-| Block, step, break, place, mob and player sounds | M | |
-| Music and records | M | |
-| Volume sliders, subtitles optional | S | |
+| Sound engine + positional playback | **done** | `nephele-audio`: Ogg Vorbis decode, distance attenuation, stereo panning, voice cache. |
+| Block, step, break, place, mob and player sounds | **done** | Local and server `S29` events; material-based `dig`/`step` families. |
+| Music and records | M | Not started. |
+| Volume sliders, subtitles optional | **partial** | Master Volume is in Settings; per-category sliders and subtitles remain. |
 
 ### 8. Multiplayer and authentication
 
@@ -282,7 +282,9 @@ laptop.
 installer. *Exit:* a stranger can download, install and play without help.
 
 **M6 — Depth.** Entities and mobs, block entities, particles, audio, singleplayer
-saving, structures.
+saving, structures. Entity metadata/models, particles, block-entity geometry
+and positional audio are in as of 2026-11-03; singleplayer saving and
+structures are still open.
 
 ---
 

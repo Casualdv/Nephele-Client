@@ -117,6 +117,7 @@ crates/
   nephele-world/        worldgen + chunk data (the parity-critical crate)
   nephele-render/       mesher, chunk mesh, shader
   nephele-assets/       texture array, atlas, resource paths
+  nephele-audio/        Symphonia Ogg Vorbis decode, cpal mixer, positional sounds
   nephele-cli/src/      lib code used by the CLI binary:
       live.rs           network + local game loops, screens, input
       viewer.rs         offline world viewer
@@ -366,6 +367,131 @@ the entity pipeline, which is bound to the skin atlas — via
   `held_slot` and the inventory) and only attaches the hand on `Screen::Game`.
 
 
+### Entities, mobs, particles and block entities (2026-11-03)
+
+- `nephele-client::entities::EntityMetadata` mirrors 1.8 `DataWatcher` fields:
+  flags (fire/crouch/sprint/use/invisible), air, custom name, name visibility,
+  silence and health. `S1C` is parsed into typed values; `S04` equipment is
+  stored in five slots; `S0B` animation sets an 8-tick swing flag.
+- `nephele-render::entity::MobModel` builds biped, enderman, creeper,
+  quadruped, slime, spider, chicken, squid and bat box models. The player model
+  keeps the 64x64 skin layout; mob textures are packed into spare
+  `SkinAtlas` slots after being padded to 64x64. Limbs use the walk phase;
+  crouch/invisible/tint and held-block equipment are applied by the draw data.
+- `BlockEntityDraw` appends sign, chest, banner, beacon-beam and enchanting-book
+  geometry to the same entity mesh. `nephele-client::block_entities` decodes
+  sign text/colour, banner base/patterns, beacon levels and enchanting tables
+  from `S35` NBT; locally placed blocks are inferred from their block id.
+- `nephele-render::particle` builds camera-facing quads through the terrain
+  pipeline. `particle_textures` generates smoke/flame/crit/portal/splash/heart
+  tiles; block-break particles reuse the broken block's side texture.
+- `nephele-cli::particles` owns particle velocity/lifetime. Local mining and
+  server `S2A` bursts feed it; the mesh is appended to the item buffer so there
+  is no extra GPU pipeline.
+- Local singleplayer advances `Shared::time_of_day`, spawns hostile mobs at
+  night (zombie/skeleton/creeper/spider), plays their idle sounds, emits block
+  break/step/player-hurt sounds, and darkens terrain/entities with
+  `Renderer::set_world_light`. `/time set day|noon|night|midnight|ticks` is a
+  client command.
+- The block/item texture array now reaches **280 layers** on a full 1.8.9
+  preparation. `Renderer::new` requests the adapter's actual
+  `max_texture_array_layers` instead of wgpu's 256 default.
+
+### Lobby rendering: skins, nametags, item frames and maps (2026-11-06)
+
+- Player skins come from the base64 `textures` property; `SkinInfo` now carries
+  the `metadata.model` flag and the renderer builds 3px **slim** arms at
+  `(44,16)`/`(36,48)` instead of Steve's 4px arms. The hat/jacket/sleeve/pants
+  unwrap is a second layer, inflated 0.5px and sampling the overlay half of the
+  skin. The default/stand-in skin leaves those overlay regions transparent; a
+  skin that does not paint them must not become an opaque grey shell.
+- Nametags are screen-space labels projected from above the head. They have a
+  translucent black background and scale by distance (`14/d`, clamped 0.55..1.5).
+  The plate is `Nametag { prefix, name, suffix, ping }`; `raw_plate()` keeps the
+  `§` codes and the CLI parses them into coloured runs (`§0`-`§f`, `§r`; style
+  codes are ignored), while `plate()` is the plain-text form for tests.
+  `GameClient::nametag` fills the team prefix/suffix from `Scoreboard`
+  (`S3B`-`S3E`) and the ping from the `S38` tab list (0 means "no measurement"
+  and is omitted). Vanilla's rules hold: a custom name is hidden when metadata
+  index 3 says not visible, an invisible player or mob hides its plate, and an
+  invisible **armour stand** keeps it. Team `name_tag_visibility` (`always`,
+  `hideForOtherTeams`, `hideForOwnTeam`) is resolved relative to the local
+  player's team, matching `RenderManager.canRenderName`.
+- Head yaw is interpolated separately from body yaw (`prev_head_yaw`/`head_yaw`
+  in `Entity`, `EntitySnapshot` and the draw path). It arrives via `S19`, via
+  metadata index 6 as either a byte (1/256 turn) or a `Rotation` in degrees, or
+  via index 11 for armour stands. Index 6 `Float` is still health.
+- `S0E Spawn Object` type 71 becomes `EntityKind::ItemFrame { direction }`.
+  Metadata index 8 is the framed stack, index 9 the 45-degree rotation.
+  `nephele-render::append_item_frame` draws the wooden frame texture
+  (`textures/blocks/itemframe_background.png`, 16x16) and the item flat in
+  front, rotated by metadata. Non-map items use a tinted placeholder; maps use
+  the cached 128x128 picture.
+- `S0E Spawn Object` type **78** becomes `EntityKind::ArmorStand`. Metadata
+  index 10 carries the status flags (0x01 small, 0x04 show arms, 0x08 no base
+  plate, 0x10 marker) and index 11 the head pose. The lobby hologram is an
+  invisible marker stand whose `custom_name` is the whole entity: the renderer
+  skips the body and draws only the plate, which is why `§6§lCLICK TO PLAY`
+  still reads after formatting codes are stripped.
+- `Entities::pick(eye, direction, reach)` ray-tests each entity's axis-aligned
+  bounds and returns `EntityPick { id, distance }`. `GameClient::pick_entity`
+  exposes it; the CLI stores the result on `Shared`/`FrameView` as
+  `entity_target`, shows it in the debug title (`ent <id>`), and only exposes
+  it when the block raycast has no nearer hit. Invisible non-hologram entities
+  are skipped.
+- In 1.8 a **filled map's damage value is its map id**. `ItemStack` stays the
+  simple id/count/damage triple; there is no NBT `map` parsing.
+- **Map data (`S34`)** is parsed by `play::parse_map_update` into a `MapUpdate`
+  patch and merged by `Maps::apply`, which clips out-of-range rectangles and
+  keeps marker-only packets from wiping the picture. The client emits
+  `Event::MapUpdated { map_id }`; `GameClient.maps` stores the result. A map
+  with no `S34` data yet falls back to `MapState::placeholder`, so a framed map
+  is never blank. The CLI assigns one `SkinAtlas` slot per map id (`map:<id>`)
+  and uploads it as a sub-rectangle. `Renderer::set_skins` drains at most four
+  dirty slots per frame, so a burst of maps/skins cannot stall one frame.
+- **Scoreboard and teams (`S3B`-`S3E`)** live in `nephele-client::scoreboard`.
+  `Scoreboard` keeps objectives, scores, display slots and teams; `team_for`
+  matches both exact and `§`-stripped player names, and `prefix_for`/`suffix_for`
+  are what the nametag uses. Respawn clears it, as vanilla builds a fresh board.
+- `SkinAtlas` is now 8x8 slots (2048x2048) with a solid-white slot 1 for tinted
+  armour. Skins/maps start at slot 2. The per-slot dirty list is what makes the
+  budgeted upload work; do not go back to whole-atlas uploads.
+- `nephele-render::humanoid_hand` exposes the main-hand pose; the CLI attaches
+  held blocks/tools (`build_hand_item` / `build_hand_sprite`) and held maps
+  (`append_hand_map`). Armour is a tinted shell per equipment slot; the helmet
+  skips its +Z face so the player's face stays visible.
+- The mock lobby (`nephele mock-server --bots`) exercises the whole path: eight
+  named bots (alternating classic/slim, hash-tinted fallback skins), iron armour
+  and a held sword on one, a held map on another, a crouched bot, a swinging
+  bot, a framed map with real `S34` pixels, two scoreboard teams with prefix and
+  suffix, a latency update, and an invisible marker armour-stand hologram
+  (`§6§lCLICK TO PLAY\n§7§oJoin a game`). Bot 0 takes its head yaw from
+  metadata index 6 while the others use `S19`, so both head paths are covered.
+  The real-socket test `the_lobby_has_players_and_a_framed_map` pins the frame,
+  the `S34` pixels, the team/ping plate, the hologram plate and the metadata
+  head yaw.
+- Known limits: armour uses material tints, not the armour layer textures;
+  framed non-map items are flat tints; the map palette is derived from the 16
+  base colours rather than copied from Mojang's table. A *visible* armour stand
+  is skipped like an invisible one, since there is no stand model yet; only its
+  plate would differ.
+
+### Audio (2026-11-03)
+
+- `nephele-audio` decodes Ogg Vorbis with Symphonia and mixes through cpal.
+  `SoundCatalog` reads `sounds.json`, resolves weighted samples, and the worker
+  caches decoded sounds. `AudioEngine` mixes up to 64 voices with distance
+  attenuation and stereo panning; a missing output device leaves a silent,
+  non-fatal engine.
+- `nephele-prepare` output version is now **2**: it extracts
+  `textures/entity/` and `texts/` from the jar and copies
+  `minecraft/sounds/**` plus `sounds.json` from the user's asset index object
+  store. `--assets-dir` overrides discovery. A jar-only preparation still works
+  but has no audio.
+- Settings has a **Master Volume** row (default 70%); `AudioEngine::play` is
+  used for local block break/place/step, mob idle, player hurt and server
+  `S29 Sound Effect` events.
+
 ### Smooth lighting — planned, not started
 
 Light **is** decoded: `Section` stores `block_light: Vec<u8>` and
@@ -524,6 +650,18 @@ slabs, stairs, fence posts, panes, doors and torches. Smooth lighting/AO, animat
 textures, plant edge cases and terrain polish remain; M1 is active again before
 the planned M2 close-out.
 
+**M6 depth (2026-11-03):** mob models/metadata, particles, block-entity
+geometry, positional audio and a night singleplayer mob loop are in. Still
+partial: chest/furnace GUIs, block-entity interaction, music and records, and
+deeper mob combat/AI. The prepared asset output version is 2.
+
+**Lobby pass (2026-11-05):** classic/slim skins with the second layer, nametags
+with backgrounds and distance scaling, held blocks/tools/maps, tinted armour
+shells, item frames with rotation, and the map interface plus placeholder
+fallback are in. `nephele mock-server --bots` is the end-to-end lobby demo.
+Still open: real armour layer textures, framed non-map item icons, and calling
+`Maps::apply` from N's `S34` parser.
+
 **M2 in progress.** The fixed 20 Hz tick, server-driven health/food/XP data path,
 network block drops and pickup, survival inventory, container click protocol,
 mock 2x2/3x3 crafting, and the death screen and respawn are implemented. Local
@@ -592,13 +730,14 @@ item icons for unmapped item ids.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
   (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
   with an ignored `debug_first_mismatch` helper for narrowing it.
-- **446 test cases across the workspace** (445 passed, 1 ignored, including two
-  doctests). `nephele-cli` has 65 passing tests; `nephele-assets` has 34;
-  `nephele-render` has 43 passing tests, including seven shape-meshing
-  regressions; `nephele-world` has 119 passing tests and one ignored. The six
-  real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,
-  compression, chat, joining/loading the mock world, drop pickup, and crafting
-  planks through `C0E`.
+- **The workspace suite is now over 500 cases** and grows with each feature;
+  run `cargo test --workspace` for the authoritative count. New coverage this
+  pass includes 1.8 metadata/equipment/particles/sounds, NBT values, block
+  entity decoding, mob model/particle meshes, audio catalog/decode/mixer tests,
+  local night-time and particle expiry. The six real-socket tests in
+  `crates/nephele-client/tests/join_mock.rs` still cover status, compression,
+  chat, joining/loading the mock world, drop pickup, and crafting planks through
+  `C0E`.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so
   in a comment, or someone will "fix" it later.
 
@@ -620,6 +759,10 @@ Respawn button). The button sets `Shared::pending_respawn`, which the network lo
 turns into `client_status(0)` (`GameClient::respawn`), and the stale zero is cleared
 so the screen cannot bounce back before the server's own update lands.
 
+0. **M6 entity/audio depth (2026-11-03).** Mob models, metadata/equipment,
+   particles, block-entity geometry and positional sound are in; the next
+   useful passes are armour overlays, chest/furnace GUIs, block-entity
+   interaction, music/records and stronger local mob combat.
 1. **Mesher consumes `block_shape` — done 2026-11-02.** `mesh_column` walks
    `block_shape(id, meta)`, scales 0..16 box corners into block coordinates and
    keeps the direct cube path. Neighbour culling only removes a whole face when

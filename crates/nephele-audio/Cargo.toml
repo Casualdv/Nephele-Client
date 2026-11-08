@@ -1,0 +1,15 @@
+[package]
+name = "nephele-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Symphonia + cpal positional sound engine for Nephele"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+symphonia = { workspace = true }
+cpal = { workspace = true }

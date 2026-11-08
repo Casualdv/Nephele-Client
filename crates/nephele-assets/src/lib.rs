@@ -14,6 +14,7 @@ pub mod atlas;
 pub mod block_models;
 pub mod block_textures;
 pub mod item_textures;
+pub mod particle_textures;
 pub mod skin_atlas;
 pub mod title;
 pub mod ui_atlas;

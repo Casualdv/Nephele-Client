@@ -89,6 +89,8 @@ impl StartupTimings {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
+    world_light: f32,
+    _pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -134,8 +136,6 @@ pub struct Renderer {
     entity_pipeline: wgpu::RenderPipeline,
     entity_bind_group: wgpu::BindGroup,
     skin_texture: wgpu::Texture,
-    /// Atlas version already uploaded, so skins only re-upload when they change.
-    skin_version: u64,
     entity_vertices: wgpu::Buffer,
     entity_indices: wgpu::Buffer,
     entity_vertex_capacity: wgpu::BufferAddress,
@@ -151,6 +151,8 @@ pub struct Renderer {
     show_panorama: bool,
     /// Chunks that survived frustum culling in the last [`Renderer::draw`].
     drawn_chunks: usize,
+    sky_color: wgpu::Color,
+    world_light: f32,
     startup_timings: StartupTimings,
 }
 
@@ -201,10 +203,15 @@ impl Renderer {
             );
         }
 
+        // A full 1.8.9 block + item texture array is larger than the conservative
+        // wgpu default of 256 layers. Ask for the adapter's actual supported
+        // limit instead of silently losing the tail of the atlas.
+        let mut limits = wgpu::Limits::default();
+        limits.max_texture_array_layers = adapter.limits().max_texture_array_layers;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("nephele device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits: limits,
             experimental_features: wgpu::ExperimentalFeatures::disabled(),
             memory_hints: wgpu::MemoryHints::Performance,
             trace: wgpu::Trace::Off,
@@ -251,7 +258,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -624,7 +631,7 @@ impl Renderer {
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -827,7 +834,6 @@ impl Renderer {
             entity_pipeline,
             entity_bind_group,
             skin_texture,
-            skin_version: 0,
             entity_vertices,
             entity_indices,
             entity_vertex_capacity,
@@ -841,6 +847,8 @@ impl Renderer {
             panorama,
             show_panorama: false,
             drawn_chunks: 0,
+            sky_color: SKY_COLOR,
+            world_light: 1.0,
             startup_timings: startup,
         })
     }
@@ -853,6 +861,21 @@ impl Renderer {
     /// Chunks submitted in the last frame, and how many are loaded at all.
     pub fn draw_stats(&self) -> (usize, usize) {
         (self.drawn_chunks, self.chunks.len())
+    }
+
+    /// Scale terrain/entity lighting for time of day (1.0 = day).
+    pub fn set_world_light(&mut self, light: f32) {
+        self.world_light = light.clamp(0.05, 1.0);
+    }
+
+    /// Colour used for the sky clear. The caller drives this from world time.
+    pub fn set_sky_color(&mut self, color: [f32; 3]) {
+        self.sky_color = wgpu::Color {
+            r: color[0] as f64,
+            g: color[1] as f64,
+            b: color[2] as f64,
+            a: 1.0,
+        };
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -933,32 +956,37 @@ impl Renderer {
         self.chunks.len()
     }
 
-    /// Push the packed skin atlas to the GPU. No-op when nothing changed.
-    pub fn set_skins(&mut self, atlas: &SkinAtlas) {
-        if atlas.version() == self.skin_version {
-            return;
+    /// Push slots that changed since the last call to the GPU.
+    ///
+    /// Uploads are per-slot sub-rectangles with a small per-frame budget, so a
+    /// burst of maps or a dozen joining players never turns into one large
+    /// blocking texture copy. Slots left over are picked up next frame.
+    pub fn set_skins(&mut self, atlas: &mut SkinAtlas) {
+        const UPLOAD_BUDGET: usize = 4;
+        let size = nephele_assets::SLOT_SIZE;
+        for slot in atlas.take_dirty(UPLOAD_BUDGET) {
+            let (x, y, _) = SkinAtlas::slot_rect(slot);
+            let pixels = atlas.slot_pixels(slot);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.skin_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * size),
+                    rows_per_image: Some(size),
+                },
+                wgpu::Extent3d {
+                    width: size,
+                    height: size,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
-        self.skin_version = atlas.version();
-        let size = nephele_assets::ATLAS_SIZE;
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.skin_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            atlas.pixels(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * size),
-                rows_per_image: Some(size),
-            },
-            wgpu::Extent3d {
-                width: size,
-                height: size,
-                depth_or_array_layers: 1,
-            },
-        );
     }
 
     /// Replace every entity's geometry. Entities are few, so the whole buffer is
@@ -1004,7 +1032,7 @@ impl Renderer {
     }
 
     /// Replace every dropped item's geometry. Like entities, the whole buffer
-    /// is rebuilt each frame — a handful of 24-vertex cubes is nothing.
+    /// is rebuilt each frame â€” a handful of 24-vertex cubes is nothing.
     pub fn set_items(&mut self, mesh: &MeshData) {
         self.item_index_count = mesh.indices.len() as u32;
         if mesh.vertices.is_empty() {
@@ -1115,6 +1143,8 @@ impl Renderer {
     pub fn draw(&mut self, camera: &Camera) -> DrawOutcome {
         let uniforms = Uniforms {
             view_proj: camera.view_projection().to_cols_array_2d(),
+            world_light: self.world_light,
+            _pad: [0.0; 3],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -1156,7 +1186,7 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(SKY_COLOR),
+                        load: wgpu::LoadOp::Clear(self.sky_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

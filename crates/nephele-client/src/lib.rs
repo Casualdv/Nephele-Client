@@ -4,10 +4,13 @@
 //! translates play-state packets into structured [`Event`]s. The renderer will
 //! consume this later; for now the CLI drives it and prints statistics.
 
+pub mod block_entities;
 pub mod container;
 pub mod entities;
+pub mod maps;
 pub mod mining;
 pub mod physics;
+pub mod scoreboard;
 pub mod skins;
 
 use std::collections::HashMap;
@@ -21,9 +24,12 @@ use nephele_world::{
     decode_chunk_bulk, decode_chunk_data, ChunkColumn, ChunkCoord, ChunkUpdate, World,
 };
 
+pub use block_entities::{BannerPattern, BlockEntity, BlockEntityKind};
 pub use container::LocalContainer;
-pub use entities::{Entities, Entity, EntityKind};
+pub use entities::{Entities, Entity, EntityKind, EntityMetadata, EntityPick, Nametag};
+pub use maps::{MapState, Maps};
 pub use mining::{Aim, Miner, MiningEvent};
+pub use scoreboard::{Objective, Scoreboard, SidebarRow, Team};
 pub use skins::{SkinInfo, Skins};
 
 /// A container window the server opened (e.g. a crafting table).
@@ -156,6 +162,32 @@ pub enum Event {
         z: i32,
         action: u8,
     },
+    /// One entity's `S1C` metadata was applied.
+    EntityMetadataUpdated {
+        entity_id: i32,
+    },
+    /// One entity's `S04` equipment slot was applied.
+    EntityEquipmentUpdated {
+        entity_id: i32,
+        slot: i16,
+    },
+    /// One entity started an animation (`S0B`).
+    EntityAnimation {
+        entity_id: i32,
+        animation: u8,
+    },
+    /// A server-triggered particle burst (`S2A`).
+    Particles(Vec<play::ParticleSpawn>),
+    /// A server-triggered positional sound (`S29`).
+    SoundEffect(play::SoundEffect),
+    /// A map's picture or markers changed (`S34`). The pixels live in
+    /// `GameClient::maps` under this id.
+    MapUpdated {
+        map_id: i32,
+    },
+    /// A scoreboard objective, score, display slot or team changed. The new
+    /// state is readable from `GameClient::scoreboard`.
+    Scoreboard,
     /// The server announced its brand on `MC|Brand`.
     ServerBrand(String),
     /// An unhandled server plugin channel was received.
@@ -240,8 +272,14 @@ pub struct GameClient {
     pub skins: Skins,
     /// Current protocol-47 tab-list rows, keyed by player UUID.
     pub player_list: HashMap<[u8; 16], TabListEntry>,
+    /// Map item pixels keyed by map id, fed by `S33` / `S34`.
+    pub maps: Maps,
+    /// Objectives, scores, display slots and teams (`S3B`-`S3E`).
+    pub scoreboard: Scoreboard,
     /// Most recent update-tile-entity NBT, keyed by block position.
     pub block_entities: HashMap<(i32, i32, i32), play::BlockEntityUpdate>,
+    /// Decoded block entities for rendering, keyed by block position.
+    pub block_entity_views: HashMap<(i32, i32, i32), BlockEntity>,
     /// The server's advertised `MC|Brand`, when it sends one.
     pub server_brand: Option<String>,
     view_distance: u8,
@@ -402,7 +440,10 @@ impl GameClient {
             entities: Entities::new(),
             skins: Skins::new(),
             player_list: HashMap::new(),
+            maps: Maps::new(),
+            scoreboard: Scoreboard::new(),
             block_entities: HashMap::new(),
+            block_entity_views: HashMap::new(),
             server_brand: None,
             view_distance: VIEW_DISTANCE,
             packets_received: 0,
@@ -557,7 +598,10 @@ impl GameClient {
                 let respawn = play::parse_respawn(&packet)?;
                 self.world.set_dimension(respawn.dimension);
                 self.entities.clear();
+                self.maps.clear();
+                self.scoreboard.clear();
                 self.block_entities.clear();
+                self.block_entity_views.clear();
                 self.info.dimension = respawn.dimension;
                 self.info.gamemode = respawn.gamemode;
                 self.info.level_type = respawn.level_type;
@@ -721,6 +765,25 @@ impl GameClient {
             }
             play::clientbound::SPAWN_OBJECT => {
                 let object = play::parse_spawn_object(&packet)?;
+                if object.kind == play::OBJECT_TYPE_ITEM_FRAME {
+                    self.entities.spawn_item_frame(
+                        object.entity_id,
+                        object.data.clamp(0, 5) as u8,
+                        [object.x, object.y, object.z],
+                    );
+                    return Ok(Event::EntitySpawned {
+                        entity_id: object.entity_id,
+                        name: String::new(),
+                    });
+                }
+                if object.kind == play::OBJECT_TYPE_ARMOR_STAND {
+                    self.entities
+                        .spawn_armor_stand(object.entity_id, [object.x, object.y, object.z]);
+                    return Ok(Event::EntitySpawned {
+                        entity_id: object.entity_id,
+                        name: String::new(),
+                    });
+                }
                 if object.kind != play::OBJECT_TYPE_ITEM {
                     // Arrows, falling blocks, boats, ... are not drawn yet, but
                     // parsing them keeps the packet stream understood.
@@ -798,11 +861,69 @@ impl GameClient {
                 let _ = play::parse_entity(&packet)?;
                 Ok(Event::Packet(packet.id))
             }
-            play::clientbound::ENTITY_METADATA => Ok(Event::Packet(packet.id)),
+            play::clientbound::ENTITY_METADATA => {
+                let update = play::parse_entity_metadata(&packet)?;
+                self.entities.apply_metadata(&update);
+                Ok(Event::EntityMetadataUpdated {
+                    entity_id: update.entity_id,
+                })
+            }
+            play::clientbound::ENTITY_EQUIPMENT => {
+                let update = play::parse_entity_equipment(&packet)?;
+                self.entities
+                    .apply_equipment(update.entity_id, update.slot, update.item);
+                Ok(Event::EntityEquipmentUpdated {
+                    entity_id: update.entity_id,
+                    slot: update.slot,
+                })
+            }
+            play::clientbound::ANIMATION => {
+                let animation = play::parse_entity_animation(&packet)?;
+                self.entities
+                    .play_animation(animation.entity_id, animation.animation);
+                Ok(Event::EntityAnimation {
+                    entity_id: animation.entity_id,
+                    animation: animation.animation,
+                })
+            }
+            play::clientbound::PARTICLE => {
+                let particle = play::parse_particle(&packet)?;
+                Ok(Event::Particles(vec![particle]))
+            }
+            play::clientbound::SOUND_EFFECT => {
+                let sound = play::parse_sound_effect(&packet)?;
+                Ok(Event::SoundEffect(sound))
+            }
+            play::clientbound::MAP => {
+                let update = play::parse_map_update(&packet)?;
+                self.maps.apply(&update);
+                Ok(Event::MapUpdated {
+                    map_id: update.map_id,
+                })
+            }
             play::clientbound::PLAYER_LIST_ITEM => {
                 let update = play::parse_player_list_item(&packet)?;
                 self.apply_player_list_update(update);
                 Ok(Event::PlayerList)
+            }
+            play::clientbound::SCOREBOARD_OBJECTIVE => {
+                self.scoreboard
+                    .apply_objective(play::parse_scoreboard_objective(&packet)?);
+                Ok(Event::Scoreboard)
+            }
+            play::clientbound::UPDATE_SCORE => {
+                self.scoreboard
+                    .apply_score(play::parse_update_score(&packet)?);
+                Ok(Event::Scoreboard)
+            }
+            play::clientbound::DISPLAY_SCOREBOARD => {
+                self.scoreboard
+                    .apply_display(play::parse_display_scoreboard(&packet)?);
+                Ok(Event::Scoreboard)
+            }
+            play::clientbound::TEAMS => {
+                self.scoreboard.apply_team(play::parse_teams(&packet)?);
+                Ok(Event::Scoreboard)
             }
             play::clientbound::BLOCK_ENTITY_DATA => {
                 let update = play::parse_block_entity_update(&packet)?;
@@ -813,6 +934,8 @@ impl GameClient {
                     z: update.z,
                     action: update.action,
                 };
+                let view = BlockEntity::from_update(&update);
+                self.block_entity_views.insert(position, view);
                 self.block_entities.insert(position, update);
                 Ok(event)
             }
@@ -882,8 +1005,13 @@ impl GameClient {
     }
 
     fn clear_block_entities_in_chunk(&mut self, coord: ChunkCoord) {
+        let in_chunk = |&(x, _y, z): &(i32, i32, i32)| {
+            x.div_euclid(16) == coord.x && z.div_euclid(16) == coord.z
+        };
         self.block_entities
-            .retain(|&(x, _y, z), _| x.div_euclid(16) != coord.x || z.div_euclid(16) != coord.z);
+            .retain(|position, _| !in_chunk(position));
+        self.block_entity_views
+            .retain(|position, _| !in_chunk(position));
     }
 
     /// Creative mode (`JoinGame.gamemode`'s low three bits).
@@ -895,6 +1023,56 @@ impl GameClient {
     pub fn held_item(&self) -> Option<ItemStack> {
         let slot = play::HOTBAR_FIRST_SLOT + self.held_slot.max(0) as usize;
         self.inventory.get(slot).copied().flatten()
+    }
+
+    /// The plate to draw above `entity`, with the team prefix/suffix and the
+    /// tab-list ping that only the client-level state knows about.
+    ///
+    /// [`Entity::nametag`] decides whether a plate exists at all (custom-name
+    /// visibility, invisibility, holograms); this only decorates it. Team
+    /// name-tag visibility is honoured the way vanilla's
+    /// `RenderManager.canRenderName` does, relative to the local player's team.
+    pub fn nametag(&self, entity: &Entity) -> Option<Nametag> {
+        let mut tag = entity.nametag()?;
+        let EntityKind::Player { name, uuid } = &entity.kind else {
+            return Some(tag);
+        };
+        if let Some(team) = self.scoreboard.team_for(name) {
+            if !self.can_see_name_tag(team) {
+                return None;
+            }
+            tag.prefix.clone_from(&team.prefix);
+            tag.suffix.clone_from(&team.suffix);
+        }
+        if let Some(entry) = self.player_list.get(uuid) {
+            // 0 means "no measurement yet" on most servers.
+            if entry.ping > 0 {
+                tag.ping = Some(entry.ping.min(u16::MAX as i32) as u16);
+            }
+        }
+        Some(tag)
+    }
+
+    fn can_see_name_tag(&self, team: &Team) -> bool {
+        let viewer = self.scoreboard.team_name_for(&self.info.username);
+        let same_team = viewer.is_some_and(|viewer| viewer == team.name);
+        match team.name_tag_visibility.as_str() {
+            "hideForOtherTeams" => !same_team,
+            "hideForOwnTeam" => same_team,
+            _ => true,
+        }
+    }
+
+    /// The entity under the crosshair along `direction` from `eye`, for the
+    /// UI to click. Blocks still win: callers should only use this when their
+    /// block raycast found nothing nearer than the returned distance.
+    pub fn pick_entity(
+        &self,
+        eye: [f64; 3],
+        direction: [f64; 3],
+        max_distance: f64,
+    ) -> Option<EntityPick> {
+        self.entities.pick(eye, direction, max_distance)
     }
 
     /// Ask the server to select a hotbar slot. The server confirms with `S09`.
@@ -1201,7 +1379,10 @@ mod tests {
             entities: Entities::new(),
             skins: Skins::new(),
             player_list: HashMap::new(),
+            maps: Maps::new(),
+            scoreboard: Scoreboard::new(),
             block_entities: HashMap::new(),
+            block_entity_views: HashMap::new(),
             server_brand: None,
             view_distance: VIEW_DISTANCE,
             packets_received: 0,

@@ -1005,6 +1005,36 @@ pub fn build_hand_item(item: &HandItem, atlas: &TextureArray) -> MeshData {
     mesh
 }
 
+/// A flat held item (tool, map, food) in the hand plane. The block atlas
+/// already carries every item icon, so this reuses the same texture array as
+/// dropped items instead of adding a second atlas.
+pub fn build_hand_sprite(item: &HandItem, atlas: &TextureArray) -> MeshData {
+    let mut mesh = MeshData::default();
+    let texture = item_texture_name(item.item, item.meta).unwrap_or(MISSING_TEXTURE);
+    let layer = atlas.layer_or_missing(texture);
+    let right = glam::Vec3::from(item.right);
+    let up = glam::Vec3::from(item.up);
+    let centre = glam::Vec3::from(item.centre);
+    let half = item.size * 0.5;
+    let corners = [
+        (-1.0, -1.0, 0.0, 1.0),
+        (1.0, -1.0, 1.0, 1.0),
+        (1.0, 1.0, 1.0, 0.0),
+        (-1.0, 1.0, 0.0, 0.0),
+    ];
+    for (x, y, u, v) in corners {
+        mesh.vertices.push(Vertex {
+            position: (centre + right * (x * half) + up * (y * half)).to_array(),
+            uv: [u, v],
+            shade: 1.0,
+            layer,
+            light: 1.0,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    mesh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
