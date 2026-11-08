@@ -14,6 +14,10 @@ pub mod clientbound {
     pub const RESPAWN: i32 = 0x07;
     pub const PLAYER_POSITION_AND_LOOK: i32 = 0x08;
     pub const HELD_ITEM_CHANGE: i32 = 0x09;
+    /// `S04`: one entity's equipment slot changed.
+    pub const ENTITY_EQUIPMENT: i32 = 0x04;
+    /// `S0B`: an entity played an animation (arm swing, hurt, ...).
+    pub const ANIMATION: i32 = 0x0B;
     pub const SPAWN_PLAYER: i32 = 0x0C;
     /// An entity was picked up or absorbed by another one.
     pub const COLLECT_ITEM: i32 = 0x0D;
@@ -1184,19 +1188,73 @@ impl FromIterator<(u8, MetadataValue)> for EntityMetadata {
     }
 }
 
+/// `S04 Entity Equipment` slot indices.
+pub mod equipment_slot {
+    pub const HELD: i16 = 0;
+    pub const BOOTS: i16 = 1;
+    pub const LEGGINGS: i16 = 2;
+    pub const CHESTPLATE: i16 = 3;
+    pub const HELMET: i16 = 4;
+    pub const COUNT: usize = 5;
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityEquipment {
+    pub entity_id: i32,
+    pub slot: i16,
+    pub item: Option<ItemStack>,
+}
+
+/// Parse `S04 Entity Equipment`.
+pub fn parse_entity_equipment(packet: &Packet) -> Result<EntityEquipment> {
+    let mut r = packet.reader();
+    let entity_id = r.read_varint()?;
+    let slot = r.read_i16()?;
+    let item = parse_slot(&mut r)?;
+    if !r.is_empty() {
+        return Err(Error::Protocol("trailing bytes in entity equipment".into()));
+    }
+    Ok(EntityEquipment {
+        entity_id,
+        slot,
+        item,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityAnimation {
+    pub entity_id: i32,
+    pub animation: u8,
+}
+
+/// Parse `S0B Animation` (arm swing, hurt, leave bed, ...).
+pub fn parse_entity_animation(packet: &Packet) -> Result<EntityAnimation> {
+    let mut r = packet.reader();
+    Ok(EntityAnimation {
+        entity_id: r.read_varint()?,
+        animation: r.read_u8()?,
+    })
+}
+
 /// Vanilla 1.8 data-watcher indices that carry meaning beyond the wire type.
 ///
 /// These are shared by every entity: `0`/`1` are the generic flags and air
-/// ticks, `2` is the custom name, `10` is the skin flags byte (cape, jacket,
-/// sleeves, pants, hat), `16` is the carried block for mobs that hold one, and
-/// `8`/`9` are the item frame's framed stack and rotation.
+/// ticks, `2` is the custom name, `3` is custom-name visibility, `6` is health
+/// (or the server's head-yaw extension), `10` is the skin flags byte for a
+/// player / armour-stand status for a stand, `11` is the armour-stand head
+/// pose, `16` is the carried block for mobs that hold one, and `8`/`9` are the
+/// item frame's framed stack and rotation.
 pub mod metadata_index {
     pub const FLAGS: u8 = 0;
     pub const AIR: u8 = 1;
     pub const CUSTOM_NAME: u8 = 2;
+    pub const NAME_VISIBLE: u8 = 3;
+    pub const HEALTH: u8 = 6;
     pub const ITEM: u8 = 8;
     pub const ITEM_ROTATION: u8 = 9;
     pub const SKIN_FLAGS: u8 = 10;
+    pub const ARMOR_STAND_STATUS: u8 = 10;
+    pub const HEAD_ROTATION: u8 = 11;
     pub const BLOCK_STATE: u8 = 16;
 }
 

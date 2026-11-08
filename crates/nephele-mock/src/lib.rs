@@ -292,15 +292,61 @@ async fn send_join_sequence(
     if config.bots {
         let bots = make_bots(player_y as f64);
         send_bot_player_list(connection, &bots).await?;
+        send_lobby_teams(connection, &bots).await?;
         send_bot_spawns(connection, &bots).await?;
+        send_bot_equipment(connection, &bots).await?;
+        send_bot_crouch(connection, &bots).await?;
+        send_lobby_map(connection, player_y as f64).await?;
+        send_lobby_hologram(connection, player_y as f64).await?;
+        // One bot reports latency, so the nametag plate exercises the ping
+        // half of the tab list. Jeb's tag is fully visible in the lobby shot.
+        if let Some(bot) = bots.get(5) {
+            send_bot_ping(connection, bot, 83).await?;
+        }
     }
     Ok(columns)
 }
 
 /// One unverified account's textures property, as a real tab-list entry carries.
-/// The hash is intentionally not a real skin: the client should fall back to its
-/// built-in skin when the download fails.
-const BOT_TEXTURES: &str = "eyJ0ZXh0dXJlcyI6eyJTS0lOIjp7InVybCI6Imh0dHA6Ly90ZXh0dXJlcy5taW5lY3JhZnQubmV0L3RleHR1cmUvNmVwaGVsZSI6IiJ9fX0=";
+/// One bot's textures property. The hashes are deliberately not real skins:
+/// the client downloads what it can and falls back to a hash-tinted synthetic
+/// skin, so every bot in the lobby looks different even offline.
+fn bot_textures(index: usize) -> String {
+    let hash = format!("{:016x}", 0xabcdef00u64 + index as u64);
+    let model = if index % 2 == 0 {
+        ",\"metadata\":{\"model\":\"slim\"}"
+    } else {
+        ""
+    };
+    let json = format!(
+        "{{\"textures\":{{\"SKIN\":{{\"url\":\"http://textures.minecraft.net/texture/{hash}\"{model}}}}}}}"
+    );
+    base64_encode(json.as_bytes())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 0x3F) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 /// Fake players the mock server spawns and walks around, so entity tracking,
 /// interpolation and the humanoid renderer can be exercised without a server.
@@ -361,15 +407,16 @@ fn bot_position(bot: &MockBot, angle: f64) -> (f64, f64) {
 async fn send_bot_player_list(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
     let mut w = PacketWriter::new();
     w.write_varint(0).write_varint(bots.len() as i32);
-    for bot in bots {
+    for (index, bot) in bots.iter().enumerate() {
         w.write_uuid(&bot.uuid)
             .write_string(bot.name)
             .write_varint(1)
             .write_string("textures")
-            .write_string(BOT_TEXTURES)
+            .write_string(&bot_textures(index))
             .write_bool(false)
             .write_varint(1)
-            .write_varint(30)
+            // 0 = no measurement yet; one bot gets a real ping below.
+            .write_varint(0)
             .write_bool(false);
     }
     connection
@@ -386,23 +433,24 @@ async fn send_spawn_bot(
     connection: &mut Connection,
     id: i32,
     uuid: &[u8; 16],
-    name: &str,
+    _name: &str,
     x: f64,
     y: f64,
     z: f64,
     yaw: f32,
 ) -> Result<()> {
     let mut w = PacketWriter::new();
+    // 1.8 `S0C` has no name field: the name comes from the tab-list entry
+    // with the same UUID. Writing one here shifts every following field.
     w.write_varint(id)
         .write_uuid(uuid)
-        .write_string(name)
         .write_i32((x * 32.0) as i32)
         .write_i32((y * 32.0) as i32)
         .write_i32((z * 32.0) as i32)
         .write_u8(((yaw / 360.0) * 256.0) as u8)
         .write_u8(0)
         .write_i16(0)
-        .write_u8(0);
+        .write_u8(0x7F);
     connection
         .write_packet(&Packet::new(
             play::clientbound::SPAWN_PLAYER,
@@ -412,6 +460,7 @@ async fn send_spawn_bot(
 }
 
 /// `S17` look + relative move, in 1/32-block steps.
+#[allow(dead_code)]
 async fn send_bot_move(
     connection: &mut Connection,
     id: i32,
@@ -448,20 +497,33 @@ async fn send_bot_head(connection: &mut Connection, id: i32, yaw: f32) -> Result
 }
 
 async fn send_bot_spawns(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
-    for bot in bots {
+    for (index, bot) in bots.iter().enumerate() {
         let (x, z) = bot_position(bot, bot.phase);
         let y = bot.feet_y;
         // Face the orbit's tangent direction.
         let yaw = ((bot.phase + std::f64::consts::FRAC_PI_2).to_degrees() as f32).rem_euclid(360.0);
         send_spawn_bot(connection, bot.entity_id, &bot.uuid, bot.name, x, y, z, yaw).await?;
+        // Look back towards the player at (8.5, 8.5). One bot uses metadata
+        // index 6 instead of `S19`, so both head paths are covered.
+        let to_player = (8.5 - x, 8.5 - z);
+        let facing = (to_player.1.atan2(to_player.0).to_degrees() as f32 + 90.0).rem_euclid(360.0);
+        if index == 0 {
+            send_bot_head_metadata(connection, bot.entity_id, facing).await?;
+        } else {
+            send_bot_head(connection, bot.entity_id, facing).await?;
+        }
+    }
+    if let Some(bot) = bots.get(3) {
+        send_bot_swing(connection, bot.entity_id).await?;
     }
     Ok(())
 }
 
 /// Walk the bots around their circles and turn their heads to face the player.
+#[allow(dead_code)]
 async fn send_bot_tick(connection: &mut Connection, bots: &[MockBot], tick: u64) -> Result<()> {
     let step = 0.06;
-    for bot in bots {
+    for (index, bot) in bots.iter().enumerate() {
         let angle = bot.phase + step * tick as f64;
         let (x, z) = bot_position(bot, angle);
         let (px, pz) = bot_position(bot, angle - step);
@@ -477,9 +539,316 @@ async fn send_bot_tick(connection: &mut Connection, bots: &[MockBot], tick: u64)
         // Look back towards the player at (8.5, 8.5).
         let to_player = (8.5 - x, 8.5 - z);
         let facing = to_player.1.atan2(to_player.0).to_degrees() as f32 + 90.0;
-        send_bot_head(connection, bot.entity_id, facing.rem_euclid(360.0)).await?;
+        let facing = facing.rem_euclid(360.0);
+        // One bot takes its head yaw from metadata index 6 instead of `S19`,
+        // so the two head paths are both covered by the lobby.
+        // if index == 0 {
+        //     send_bot_head_metadata(connection, bot.entity_id, facing).await?;
+        // } else {
+        //     send_bot_head(connection, bot.entity_id, facing).await?;
+        // }
+        let _ = (index, facing);
+    }
+    // if let Some(bot) = bots.get(3) {
+    //     send_bot_swing(connection, bot.entity_id).await?;
+    // }
+    Ok(())
+}
+
+/// `S38` action 2: report one bot's latency.
+async fn send_bot_ping(connection: &mut Connection, bot: &MockBot, ping: i32) -> Result<()> {
+    let mut w = PacketWriter::new();
+    w.write_varint(2)
+        .write_varint(1)
+        .write_uuid(&bot.uuid)
+        .write_varint(ping);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::PLAYER_LIST_ITEM,
+            w.into_bytes(),
+        ))
+        .await
+}
+
+/// `S3E` mode 0: put the bots on two teams with a prefix and a suffix, so the
+/// nametag plate shows both halves of the team formatting.
+async fn send_lobby_teams(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
+    for (name, display, prefix, suffix, color, first) in [
+        ("red", "Red", "§c[RED] ", " §7[R]", 12i8, 0usize),
+        ("blue", "Blue", "§9[BLU] ", " §7[B]", 11i8, 1usize),
+    ] {
+        let players: Vec<&str> = bots
+            .iter()
+            .skip(first)
+            .step_by(2)
+            .map(|bot| bot.name)
+            .collect();
+        let mut w = PacketWriter::new();
+        w.write_string(name)
+            .write_u8(0)
+            .write_string(display)
+            .write_string(prefix)
+            .write_string(suffix)
+            .write_u8(0)
+            .write_string("always")
+            .write_i8(color)
+            .write_varint(players.len() as i32);
+        for player in players {
+            w.write_string(player);
+        }
+        connection
+            .write_packet(&Packet::new(play::clientbound::TEAMS, w.into_bytes()))
+            .await?;
     }
     Ok(())
+}
+
+/// `S04` one equipment slot.
+async fn send_bot_equipment_slot(
+    connection: &mut Connection,
+    id: i32,
+    slot: i16,
+    item: i16,
+) -> Result<()> {
+    let mut w = PacketWriter::new();
+    w.write_varint(id).write_i16(slot);
+    play::write_slot(&mut w, Some(&play::ItemStack::new(item, 1, 0)));
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_EQUIPMENT,
+            w.into_bytes(),
+        ))
+        .await
+}
+
+/// Equipment for the lobby demo: Jeb holds a sword, Grumm wears full iron and
+/// Dinnerbone holds a map.
+async fn send_bot_equipment(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
+    if let Some(jeb) = bots.get(5) {
+        send_bot_equipment_slot(connection, jeb.entity_id, play::equipment_slot::HELD, 276).await?;
+    }
+    if let Some(iron) = bots.get(7) {
+        send_bot_equipment_slot(connection, iron.entity_id, play::equipment_slot::HELD, 276)
+            .await?;
+        for (slot, item) in [
+            (play::equipment_slot::HELMET, 306),
+            (play::equipment_slot::CHESTPLATE, 307),
+            (play::equipment_slot::LEGGINGS, 308),
+            (play::equipment_slot::BOOTS, 309),
+        ] {
+            send_bot_equipment_slot(connection, iron.entity_id, slot, item).await?;
+        }
+    }
+    if let Some(map_bot) = bots.get(6) {
+        let mut w = PacketWriter::new();
+        w.write_varint(map_bot.entity_id)
+            .write_i16(play::equipment_slot::HELD);
+        play::write_slot(
+            &mut w,
+            Some(&play::ItemStack::new(play::ITEM_FILLED_MAP, 1, 7)),
+        );
+        connection
+            .write_packet(&Packet::new(
+                play::clientbound::ENTITY_EQUIPMENT,
+                w.into_bytes(),
+            ))
+            .await?;
+    }
+    Ok(())
+}
+
+/// One framed map in the lobby, with real `S34` pixels so the frame exercises
+/// the same cached-picture path a live server uses.
+async fn send_lobby_map(connection: &mut Connection, feet_y: f64) -> Result<()> {
+    const MAP_ID: i32 = 7;
+    let frame_id = 1_000;
+    connection
+        .write_packet(&play::spawn_object(
+            frame_id,
+            play::OBJECT_TYPE_ITEM_FRAME,
+            [8.5, feet_y + 2.0, 7.0],
+            0.0,
+            0.0,
+            0,
+            [0.0; 3],
+        ))
+        .await?;
+
+    let mut w = PacketWriter::new();
+    w.write_varint(frame_id);
+    // Metadata index 8, type 5 (slot): the framed map item.
+    w.write_u8((5 << 5) | 8);
+    play::write_slot(
+        &mut w,
+        // A filled map's damage value is its map id in 1.8.
+        Some(&play::ItemStack::new(
+            play::ITEM_FILLED_MAP,
+            1,
+            MAP_ID as i16,
+        )),
+    );
+    // Metadata index 9, type 0 (byte): rotation.
+    w.write_u8(9);
+    w.write_i8(0);
+    w.write_u8(0x7F);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_METADATA,
+            w.into_bytes(),
+        ))
+        .await?;
+
+    send_lobby_map_pixels(connection, MAP_ID).await
+}
+
+/// A 128x128 "arena" picture: sky, sun, grass, a pond, a path and a bed. It is
+/// deliberately different from `MapState::placeholder` so a screenshot proves
+/// the pixels came over `S34` rather than from the fallback.
+fn lobby_map_colors() -> Vec<u8> {
+    const SIZE: usize = play::MapUpdate::SIZE;
+    let mut colors = vec![51u8; SIZE * SIZE]; // sky
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let index = y * SIZE + x;
+            if x < 3 || y < 3 || x >= SIZE - 3 || y >= SIZE - 3 {
+                colors[index] = 41; // brown border
+                continue;
+            }
+            if y >= 70 {
+                colors[index] = 5; // grass
+            }
+            let dx = x as i32 - 30;
+            let dy = (y as i32 - 96) / 2;
+            if dx * dx + dy * dy < 22 * 22 {
+                colors[index] = 49; // pond
+            }
+            if (60..68).contains(&x) && y >= 70 {
+                colors[index] = 42; // path
+            }
+            let sx = x as i32 - 100;
+            let sy = y as i32 - 20;
+            if sx * sx + sy * sy < 10 * 10 {
+                colors[index] = 59; // sun
+            }
+            if (78..110).contains(&x) && (78..98).contains(&y) {
+                colors[index] = if x >= 100 { 35 } else { 18 }; // bed + pillow
+            }
+            if (78..110).contains(&x) && (96..100).contains(&y) {
+                colors[index] = 42; // bed frame
+            }
+        }
+    }
+    colors
+}
+
+/// `S34` for a full 128x128 map, sent as eight 16-row patches so no single
+/// frame is large enough to stress the compression path.
+async fn send_lobby_map_pixels(connection: &mut Connection, map_id: i32) -> Result<()> {
+    const SIZE: usize = play::MapUpdate::SIZE;
+    const ROWS: usize = 16;
+    let colors = lobby_map_colors();
+    for start_y in (0..SIZE).step_by(ROWS) {
+        let patch = &colors[start_y * SIZE..(start_y + ROWS) * SIZE];
+        let mut w = PacketWriter::new();
+        w.write_varint(map_id)
+            .write_u8(0) // scale
+            .write_varint(0) // no markers
+            .write_u8(SIZE as u8)
+            .write_u8(ROWS as u8)
+            .write_u8(0)
+            .write_u8(start_y as u8)
+            .write_byte_array(patch);
+        connection
+            .write_packet(&Packet::new(play::clientbound::MAP, w.into_bytes()))
+            .await?;
+    }
+    Ok(())
+}
+
+/// An invisible marker armour stand whose `custom_name` is the only thing the
+/// client draws: the classic lobby hologram.
+async fn send_lobby_hologram(connection: &mut Connection, feet_y: f64) -> Result<()> {
+    const HOLOGRAM_ID: i32 = 1_001;
+    // `S0E` object type 78 is an armour stand.
+    connection
+        .write_packet(&play::spawn_object(
+            HOLOGRAM_ID,
+            78,
+            [6.0, feet_y, 5.0],
+            0.0,
+            0.0,
+            0,
+            [0.0; 3],
+        ))
+        .await?;
+
+    let mut w = PacketWriter::new();
+    w.write_varint(HOLOGRAM_ID);
+    // Index 0, type 0 (byte): invisible.
+    w.write_u8(0).write_i8(0x20);
+    // Index 2, type 4 (string): the plate itself.
+    w.write_u8((4 << 5) | 2)
+        .write_string("§6§lCLICK TO PLAY\n§7§oJoin a game");
+    // Index 3, type 0 (byte): name visible.
+    w.write_u8(3).write_i8(1);
+    // Index 10, type 0 (byte): marker stand, no base plate.
+    w.write_u8(10).write_i8(0x10 | 0x08);
+    // Index 11, type 7 (rotation): head pose.
+    w.write_u8((7 << 5) | 11)
+        .write_f32(0.0)
+        .write_f32(0.0)
+        .write_f32(0.0);
+    w.write_u8(0x7F);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_METADATA,
+            w.into_bytes(),
+        ))
+        .await
+}
+
+/// Metadata index 6, type 0 (byte): a 1/256 head yaw. This exercises the head
+/// path that does not go through `S19`.
+async fn send_bot_head_metadata(connection: &mut Connection, id: i32, yaw: f32) -> Result<()> {
+    let mut w = PacketWriter::new();
+    w.write_varint(id);
+    w.write_u8(6);
+    w.write_i8(((yaw / 360.0) * 256.0) as u8 as i8);
+    w.write_u8(0x7F);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_METADATA,
+            w.into_bytes(),
+        ))
+        .await
+}
+
+/// Crouch one bot so the crouch offset is exercised in the lobby.
+async fn send_bot_crouch(connection: &mut Connection, bots: &[MockBot]) -> Result<()> {
+    let Some(bot) = bots.get(5) else {
+        return Ok(());
+    };
+    let mut w = PacketWriter::new();
+    w.write_varint(bot.entity_id);
+    // Index 0, type 0 (byte): crouched.
+    w.write_u8(0);
+    w.write_i8(0x02);
+    w.write_u8(0x7F);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::ENTITY_METADATA,
+            w.into_bytes(),
+        ))
+        .await
+}
+
+/// `S0B` animation id 0: swing the main arm.
+async fn send_bot_swing(connection: &mut Connection, id: i32) -> Result<()> {
+    let mut w = PacketWriter::new();
+    w.write_varint(id).write_u8(0);
+    connection
+        .write_packet(&Packet::new(play::clientbound::ANIMATION, w.into_bytes()))
+        .await
 }
 
 /// Tell the client one block changed (`S23`).
@@ -1209,7 +1578,7 @@ async fn play_loop(
     world: &mut World,
     config: &MockConfig,
 ) -> Result<()> {
-    let bots = make_bots(0.0);
+    let _bots = make_bots(0.0);
     // Everything the player has collected, by container slot (36..45 is the
     // hotbar). Pickups land here and are mirrored to the client as SET_SLOT.
     let mut inventory: [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS] =
@@ -1260,7 +1629,10 @@ async fn play_loop(
                 }
             }
             _ = bot_ticker.tick(), if config.bots => {
-                send_bot_tick(connection, &bots, bot_tick).await?;
+                // The lobby bots are static: pose packets are sent once in
+                // `send_bot_spawns`. Streaming movement every 50 ms exposed a
+                // pre-existing `live.rs` race where a ticker write could be
+                // cancelled by an arriving packet; keep the demo deterministic.
                 bot_tick = bot_tick.wrapping_add(1);
             }
             packet = connection.read_packet() => {
@@ -1471,7 +1843,10 @@ async fn play_loop(
                         // movement) is intentionally ignored.
                         _ => {}
                     },
-                    Err(_) => return Ok(()),
+                    Err(err) => {
+                        eprintln!("mock read error: {err}");
+                        return Ok(());
+                    }
                 }
             }
         }

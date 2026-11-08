@@ -1039,6 +1039,35 @@ pub fn build_hand_item(item: &HandItem, atlas: &TextureArray) -> MeshData {
     mesh
 }
 
+/// A flat sprite for a non-block item (tools, armour, food) in a hand.
+pub fn build_hand_sprite(item: &HandItem, atlas: &TextureArray) -> MeshData {
+    let mut mesh = MeshData::default();
+    let texture = item_texture_name(item.item, item.meta).unwrap_or(MISSING_TEXTURE);
+    let layer = atlas.slot_or_missing(texture);
+    let right = glam::Vec3::from(item.right);
+    let up = glam::Vec3::from(item.up);
+    let centre = glam::Vec3::from(item.centre);
+    let half = item.size * 0.5;
+    let corners = [
+        (-1.0, -1.0, 0.0, 1.0),
+        (1.0, -1.0, 1.0, 1.0),
+        (1.0, 1.0, 1.0, 0.0),
+        (-1.0, 1.0, 0.0, 0.0),
+    ];
+    for (x, y, u, v) in corners {
+        mesh.vertices.push(Vertex {
+            position: (centre + right * (x * half) + up * (y * half)).to_array(),
+            uv: [u, v],
+            shade: 1.0,
+            layer,
+            anim: NO_ANIMATION,
+            light: 1.0,
+        });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    mesh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
