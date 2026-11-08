@@ -37,6 +37,11 @@ impl VanillaGenerator {
     pub fn column(&mut self, chunk_x: i32, chunk_z: i32) -> ChunkColumn {
         let mut column = self.terrain.primer(&mut self.layers, chunk_x, chunk_z);
         let biomes = self.layers.chunk_biomes(chunk_x, chunk_z);
+        // `ChunkProviderGenerate` stores the 1:1 map as `Level.Biomes`; without
+        // this the column carries no biome at all, every consumer falls back to
+        // plains, and the whole GenLayer stack never reaches the screen.
+        let biome_bytes: Vec<u8> = biomes.iter().map(|biome| *biome as u8).collect();
+        column.set_biomes(&biome_bytes);
         let stone_noise = self.terrain.stone_noise(chunk_x, chunk_z);
         let mut rand = JavaRandom::new(chunk_seed(self.seed, chunk_x, chunk_z));
         surface::apply(&mut column, &biomes, &stone_noise, &self.surface, &mut rand);
@@ -47,6 +52,41 @@ impl VanillaGenerator {
         crate::ores::decorate(&mut column);
         crate::features::decorate(&mut column, &biomes);
         column
+    }
+
+    /// A dry spawn point near the origin for a brand-new world.
+    ///
+    /// Vanilla's `WorldProvider.getRandomizedSpawnPoint` searches a small area
+    /// for a column above sea level; this keeps that intent without the world
+    /// provider. Chunks are generated once each, in ring order, so the result
+    /// stays as close to `(0, 0)` as the terrain allows.
+    pub fn spawn_position(&mut self) -> [i32; 3] {
+        const SEARCH: i32 = 32;
+        let mut current: Option<((i32, i32), ChunkColumn)> = None;
+        for radius in 0..=SEARCH {
+            for x in -radius..=radius {
+                for z in -radius..=radius {
+                    if radius > 0 && x.abs() != radius && z.abs() != radius {
+                        continue;
+                    }
+                    let coord = (x.div_euclid(16), z.div_euclid(16));
+                    if current.as_ref().map(|(c, _)| *c) != Some(coord) {
+                        current = Some((coord, self.column(coord.0, coord.1)));
+                    }
+                    let Some((_, column)) = current.as_ref() else {
+                        continue;
+                    };
+                    let local_x = x.rem_euclid(16) as usize;
+                    let local_z = z.rem_euclid(16) as usize;
+                    if let Some(top) = highest_solid(column, local_x, local_z) {
+                        if top + 1 > crate::terrain::SEA_LEVEL {
+                            return [x, top + 1, z];
+                        }
+                    }
+                }
+            }
+        }
+        [0, crate::terrain::SEA_LEVEL + 1, 0]
     }
 
     /// The y a player's feet rest at on this column.
@@ -223,6 +263,111 @@ mod tests {
         assert!(chunks > 100, "only {chunks} chunks compared");
         assert!(failures.is_empty(), "ore density off: {failures:?}");
     }
+    /// The parity suite proves the GenLayer map; this proves it reaches the
+    /// chunk. `Level.Biomes` is what the renderer, the save writer and
+    /// `biome_at` read, and generated columns used to leave it unset.
+    #[test]
+    fn generated_chunks_carry_the_biome_map() {
+        let mut generator = VanillaGenerator::new(12345);
+        let column = generator.column(-28, 4);
+        let expected = generator.biomes(-28, 4);
+        let carried: Vec<i32> = column
+            .biomes()
+            .expect("generated chunks store Level.Biomes")
+            .iter()
+            .map(|biome| *biome as i32)
+            .collect();
+        assert_eq!(carried, expected);
+        assert!(
+            carried.iter().any(|biome| *biome != 1),
+            "a whole chunk of plains means the map never landed"
+        );
+    }
+
+    /// The same 160,000-cell window as the GenLayer test, but read back out of
+    /// `ChunkColumn::biomes()` after a full `column()` pass — the exact bytes a
+    /// renderer or a save would see.
+    #[ignore = "diagnostic: generates all 625 reference chunks"]
+    #[test]
+    fn generated_chunk_biomes_match_the_reference_world() {
+        use nephele_anvil::{parse_chunk, RegionFile};
+        use std::path::PathBuf;
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../Nephele-private/parity/server/world/region");
+        if !dir.is_dir() {
+            eprintln!("skipped: no reference world at Nephele-private/parity");
+            return;
+        }
+
+        let mut generator = VanillaGenerator::new(12345);
+        let mut cells = 0usize;
+        let mut bad = 0usize;
+        let mut chunks = 0usize;
+        let mut named: std::collections::BTreeMap<i32, (i32, i32)> =
+            std::collections::BTreeMap::new();
+        for name in ["r.-1.-1.mca", "r.-1.0.mca"] {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let region = RegionFile::open(&path).expect("region opens");
+            for lz in 0..32 {
+                for lx in 0..32 {
+                    let Some(bytes) = region.chunk_nbt(lx, lz).ok().flatten() else {
+                        continue;
+                    };
+                    let Ok(stored) = parse_chunk(&bytes) else {
+                        continue;
+                    };
+                    if stored.biomes.len() != 256 {
+                        continue;
+                    }
+                    chunks += 1;
+                    let column = generator.column(stored.x, stored.z);
+                    let carried = column.biomes().expect("generated biomes");
+                    for (index, expected) in stored.biomes.iter().enumerate() {
+                        cells += 1;
+                        if carried[index] != *expected {
+                            bad += 1;
+                        }
+                    }
+                    named
+                        .entry(stored.biomes[0] as i32)
+                        .or_insert((stored.x * 16, stored.z * 16));
+                }
+            }
+        }
+        println!("{chunks} chunks, {cells} cells, {bad} mismatched");
+        for (biome, (x, z)) in &named {
+            println!("  block ({x},{z}) is biome {biome}");
+        }
+        assert!(chunks > 100, "only {chunks} chunks compared");
+        assert_eq!(bad, 0, "{bad} of {cells} generated biome cells differ");
+    }
+
+    /// `local_loop` spawns a brand-new world at whatever this returns, so it has
+    /// to be dry land in the column it names.
+    #[test]
+    fn spawn_position_is_on_dry_land() {
+        for seed in [12345i64, 7] {
+            let mut generator = VanillaGenerator::new(seed);
+            let [x, y, z] = generator.spawn_position();
+            assert!(
+                y > crate::terrain::SEA_LEVEL,
+                "seed {seed} spawns at y={y}, at or below sea level"
+            );
+            let column = generator.column(x.div_euclid(16), z.div_euclid(16));
+            let top = highest_solid(
+                &column,
+                x.rem_euclid(16) as usize,
+                z.rem_euclid(16) as usize,
+            )
+            .expect("a solid block under spawn");
+            assert_eq!(top + 1, y, "spawn sits on the surface of its own column");
+        }
+    }
+
     #[test]
     fn the_same_chunk_is_generated_twice_identically() {
         let mut generator = VanillaGenerator::new(12345);

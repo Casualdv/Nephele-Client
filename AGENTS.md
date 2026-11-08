@@ -122,14 +122,6 @@ cargo run -p nephele-launcher                    # the launcher UI
 # development shortcuts (never the only way to reach a screen):
 $env:NEPHELE_SCREEN="servers"   # title|servers|connect|settings|creative|pause|local
 $env:NEPHELE_DATA_DIR="..."     # override the user data directory
-<<<<<<< HEAD
-$env:NEPHELE_SCOREBOARD="1"     # print the resolved sidebar once a second
-$env:NEPHELE_DEMO="beacon"      # `view` only: beacon + note block + debris scene
-$env:NEPHELE_CMDS="/setblock ~3 ~ ~3 beacon;/tp 0 70 0"  # one-shot startup commands
-=======
-$env:NEPHELE_VOLUME="0.5"       # master audio gain, 0..1 (default 1)
-$env:NEPHELE_MUTE="1"           # no audio device is opened at all
->>>>>>> audio
 ```
 
 CI runs fmt, clippy with `-D warnings`, tests, and the publish gate. **A commit that
@@ -150,20 +142,15 @@ crates/
   nephele-world/        worldgen + chunk data (the parity-critical crate)
   nephele-render/       mesher, chunk mesh, shader
   nephele-assets/       texture array, atlas, resource paths
-  nephele-audio/        sound: sounds.json registry, symphonia decode, kira mix
   nephele-cli/src/      lib code used by the CLI binary:
       live.rs           network + local game loops, screens, input
       viewer.rs         offline world viewer
       ui.rs             immediate-mode UI batch + screens (draw_*)
-      chat.rs           chat colours: legacy `§` codes and JSON components
-      hud_modules.rs    HUD module toggles/anchors, CPS and speed meters
-      scoreboard.rs     scoreboard model, sidebar ordering and layout
-      interact.rs       entity click targeting and use/attack pacing
       commands.rs       client-side chat commands (/gamemode, /setblock, ...)
       paths.rs          per-user data directory + legacy `.local/` migration
       mesher.rs         CLI-side mesh helpers
       servers.rs        saved server list: entries, ordering, persistence, ping board
-      settings.rs       persisted options (settings.json), incl. HUD modules
+      settings.rs       persisted options
       skins.rs          skin fetch/cache
 ```
 
@@ -267,7 +254,7 @@ Environment: **overworld, sea level 63**, infinite generation, biome map from th
 | Caves | done | 308 air/chunk below y=56 |
 | Ravines | done | 426 vs 435 reference (98%) |
 | Ores | done, wrong stage | 5–12% above reference (caves absent when measured) |
-| **Biome map** | **done** | **0 / 160,000 blocks differ** (seed 12345, reference server world) |
+| **Biome map** | **done** | **0 / 160,000 blocks differ** (seed 12345, reference server world), and 0 / 160,000 again after a full `column()` pass, read from `ChunkColumn::biomes()` |
 | Features | partial | flowers, grass, dead bush, cactus, oak-shape trees |
 
 **Every number above except the biome map was measured per chunk, which is a
@@ -319,6 +306,34 @@ continuous generation and `debug_stage_trace` replays the same stack in Rust
 (see §7). The first differing stage was `hillNoiseZoom0` — 56 of 256 cells —
 while its input `riverInit` matched exactly, which localised the fault to the
 layer above the input rather than to any zoom arithmetic.
+
+### Where the map reaches the screen — fixed 2026-11-08
+
+A correct map is not a visible one. Two separate links were broken:
+
+1. **Singleplayer never called this generator.** `live.rs::local_loop` streamed
+   `TerrainGenerator` from `generation.rs` — the value-noise stand-in whose own
+   module docs say it "is not vanilla's generator". Singleplayer now streams
+   `VanillaGenerator`: the same code the parity harness measures.
+2. **`VanillaGenerator::column` dropped the map.** It computed the 16×16 biome
+   map, used it for the surface, cave and feature passes, then returned a
+   column with `biomes: None`. Vanilla's `ChunkProviderGenerate` stores it as
+   `Level.Biomes`, so `column()` now calls `set_biomes`. Pinned by
+   `generated_chunks_carry_the_biome_map` and
+   `generated_chunk_biomes_match_the_reference_world` — the latter reads the
+   bytes back out of `ChunkColumn::biomes()` for all 625 reference chunks
+   (160,000 cells, 0 mismatched), which is the same window as the GenLayer test
+   but one layer closer to the screen.
+
+Consumers of `ChunkColumn::biomes()`: `live.rs::biome_at` (sky/fog colour) on
+`main`, and on the unmerged `render` branch `ColumnMeshJob.biomes` +
+`atlas.tint` (grass, foliage, water, with the vanilla 3×3 neighbourhood
+average). **On `main` there is still no per-block tint**: `nephele-assets`
+bakes the plains colour into grass (`PLAINS_GRASS` / `PLAINS_FOLIAGE`), so grass
+is plains-green everywhere until `render` merges. Every consumer falls back to
+plains (1) when a column has no biomes, which is why the missing map read as
+"all plains" rather than as an error. Server-joined worlds only needed the
+render half: `decode.rs` already stores the S21 `Level.Biomes` payload.
 
 ---
 
@@ -423,42 +438,6 @@ nothing writes there any more.
 - Order matters: **Mojang join call happens before** the encryption response is sent.
 - `Connection::send_encryption_response` + `read_login_outcome`;
   `GameClient::join_online` runs the HTTP join on `spawn_blocking`.
-
-### Scoreboard and teams (`S3B`, `S3C`, `S3D`, `S3E`)
-
-`GameClient::scoreboard` is a port of vanilla's `Scoreboard`/`ScorePlayerTeam`:
-objectives, scores keyed `(objective, entry)`, the display-slot map (including slots
-3..=18), teams with prefix/suffix/colour/membership, and a resolver. Nothing renders
-it yet; `Event::Scoreboard` just says the state moved.
-
-- `sidebar_rows()` returns rows in **draw order** (highest score first, ties by name
-  ascending) after dropping `#`-prefixed entries and keeping the top 15 — the two
-  things vanilla's `GuiIngame.renderScoreboard` does that a naive sort misses.
-- Each row carries its team's `prefix`/`suffix`/`colour`; `text()` is
-  `formatPlayerName` (prefix + entry + suffix).
-- `team_for(entry)` tries an exact match and then a match with `§` codes stripped,
-  because servers (Hypixel included) put formatted names in team member lists while
-  callers ask about the plain name. `prefix_for`/`format_entry` sit on top.
-- Score removal with an empty objective name clears that entry from every objective.
-- Respawn clears the whole scoreboard, matching vanilla's fresh `Scoreboard` per world.
-- Captured fixture: `crates/nephele-client/tests/fixtures/hypixel_play_frames.bin`
-  (653 frames) is replayed by `tests/scoreboard_capture.rs`; it asserts the real
-  Hypixel lobby sidebar's 14 emoji rows, their order, scores and team colours.
-
-### `C02 Use Entity`
-
-`play::use_entity::{INTERACT, ATTACK, INTERACT_AT}` are **0, 1, 2** — vanilla's
-enum order, not "attack first". Builders: `attack_entity`, `interact_entity`,
-`interact_entity_at(id, target)`; `parse_use_entity` for the local server/tests.
-`GameClient::{use_entity, attack_entity, interact_entity_at}` send the packet and,
-for the two click helpers, the `C0A` swing that follows it.
-
-The multiplayer loop picks entities with `Entities::raycast` (view ray vs the same
-boxes vanilla uses: 0.6x1.8 players/mobs, small cube for items, one block for item
-frames). When an entity is nearer than the block hit it wins the pick: right click
-sends `INTERACT_AT` with the click point **relative to the entity's origin**, left
-click sends `ATTACK` (throttled to `ENTITY_ATTACK_INTERVAL` while held), and the
-block behind it is not mined.
 
 ---
 
@@ -577,52 +556,6 @@ samples the four tangent corners and applies the ambient-occlusion table; the
 it. Caves are dark, corners shade, and the shader multiplies the sampled texel
 by `shade * light`.
 
-### Block-entity visuals: debris, notes, beacons (2026-11-06)
-
-Three visuals, no new geometry path: debris is block-textured [`MeshData`] in the
-existing break-overlay buffer, notes are camera-facing quads in the existing
-entity buffer, and beams are the same entity vertex format drawn by one extra
-blend-state pipeline (additive) because no existing pipeline can express additive
-blending. There is no particle texture or second shader.
-
-- **Block debris** (`nephele-render::particles`): 14 quads per broken/placed
-  block, each a random 4x4 texel window of the block's side texture, billboarded
-  with the camera basis and counter-clockwise (the block pipeline culls back
-  faces; a clockwise billboard is invisible). Physics is display-rate: gravity,
-  0.98/tick drag, it stops on `blocks_movement && !is_transparent`. Spawns are
-  sent from the loops as `NetMsg::BlockEffect` — creative on `MiningEvent::Start`,
-  survival on `Stop`, and after a successful placement (both loops).
-- **Note particles**: `S24 Block Action` (0x24) with block id 25 carries
-  instrument + note; `GameClient` turns it into `Event::BlockAction`, the network
-  loop forwards `NetMsg::NoteBlock`, and `Particles::spawn_note` builds the
-  vanilla note colour (`sin` hue from `note/24`, `EntityNoteFX`) and a two-quad
-  note glyph. They rise 0.2 blocks/tick, live six ticks, and grow.
-  **Texture gap:** the real note glyph lives in `textures/particle/particles.png`,
-  which `nephele-prepare` does not extract, so the glyph is drawn as coloured
-  quads.
-- **Beacon beams** (`nephele-render::beacon`): derived from the world, not from
-  tile-entity NBT (which the client skips). `beam_at` scans upward from a beacon
-  (id 138), recolours through stained glass/panes using `DYE_COLORS`
-  (`EntitySheep.getDyeRgb` order = metadata order), averages later tints like
-  vanilla, and returns `None` when an opaque block is in the way. The live client
-  rescans per loaded column (`beams_in_column`) so `/setblock` and chunk loads
-  both update it; the offline viewer calls `find_beams` once.
-- **Beams are additive and unfogged.** `entity.wgsl` treats a negative U as an
-  untextured vertex (`in.color` straight out), which is how notes and beams carry
-  their whole colour per vertex. The beam pipeline shares the entity shader,
-  vertex layout and bind group; its blend is `SrcAlpha/One` and it writes no
-  depth. Geometry is vanilla's rotating 0.2-radius square plus a 0.2..0.8 halo at
-  alpha 0.08; the core uses alpha 0.35 because additive quads with no texture
-  saturate to white otherwise. The last 24 blocks fade out (`top_fade`).
-- **Verification**: `NEPHELE_DEMO=beacon view ...` builds a beacon + red pane, a
-  note block that ticks every 0.22 s and a stone puff every 0.55 s, then frames
-  them (`C:\Users\dariu\Desktop\block-entities.png`,
-  `block-entities-night.png`). Live paths were checked against the mock server:
-  breaking a log threw log-textured debris (`break-debris.png`) and three
-  `/setblock` beacons with red/blue/lime panes drew matching beams
-  (`beacon-live.png`). `NEPHELE_CMDS="/setblock ...;..."` runs startup commands
-  once chunks are loaded; it is a dev shortcut, like `NEPHELE_SCOREBOARD`.
-
 ---
 
 ## 11. Gameplay state
@@ -735,13 +668,14 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   `MISSING_TEXTURE`, and held first-person rendering remains block-only.
 
 **Chat and client-side commands** (added 2026-11-01):
+
 - `T` opens the chat line, `/` opens it with a slash prefilled, `Enter` sends,
   `Esc` closes. While it is open it owns the keyboard, the mouse is released and
   movement keys are dropped; the HUD's "click to look around" hint is suppressed
   via `HudState.chatting`.
 - Recent chat is drawn bottom-left and fades after 10 s (`draw_chat` in `ui.rs`,
-  14 s hard expiry in `LiveApp::draw_chat`). **Colours are parsed** — see the
-  client-UI section below.
+  14 s hard expiry in `LiveApp::draw_chat`). Colour codes are **not** parsed yet —
+  chat arrives as plain text.
 - `commands.rs` parses `/help`, `/gamemode`, `/tp`, `/setblock`, `/give`, `/seed`.
   `~` relative coordinates and `~5` offsets work; `setblock`/`give` take block
   names through `nephele_world::blocks::by_name` (names are per-variant:
@@ -756,117 +690,6 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   `start_local` sets it true, so `/gamemode survival` changes mining timing in
   singleplayer without breaking the old default.
 
-<<<<<<< HEAD
-**Client HUD: chat colours, modules, scoreboard, containers** (added 2026-11-06,
-lane `client-ui`). Four new modules in `nephele-cli/src` carry it:
-
-- **`chat.rs` — colours.** `chat::parse` accepts both dialects: a line that
-  starts with `{`/`[` and parses as JSON is treated as a chat component
-  (`text`/`translate`/`with`/`extra`, colour inherited down the tree, named and
-  `#rrggbb` colours), anything else as the legacy `§` dialect. `§k`–`§o` are
-  consumed and dropped (the bitmap font has one weight), `§r` resets to white,
-  and a `§` swallows the next character even when it is not a code — matching the
-  client font renderer. Adjacent runs of one colour merge. **`S02` is still
-  flattened by `flatten_chat` before the client sees it, so today only the `§`
-  path fires in practice** (Hypixel embeds `§` inside its `text` fields, which is
-  exactly the bug the old code showed as `§b[MVP§c+§b]`). Handing the raw
-  component through `Event::Chat` needs a `net`-lane change; `chat::parse` already
-  handles it the day that lands. Team prefixes are composed server-side in 1.8;
-  the scoreboard's team prefixes decorate sidebar rows instead.
-- **`scoreboard.rs` — the sidebar.** `Objective`/`ScoreEntry`/`Team` model with
-  `set_score` (upsert), `remove`, and `sidebar_rows()`: score-descending, ties in
-  insertion order, **capped at vanilla's 15 rows** (a 16th is dropped), each entry
-  wrapped in its team's prefix/suffix. `layout()` is pure geometry — pane flush to
-  the right edge, vertically centred, title strip on top, scores right-aligned —
-  and is pinned by tests at several window sizes. **No packet feeds this yet**
-  (`S3B`–`S3E` are the net lane's); `NEPHELE_SCOREBOARD_DEMO=1` shows
-  `Scoreboard::demo()`, a hand-built 16-row model used for layout work and the
-  acceptance screenshot.
-- **`hud_modules.rs` + the HUD editor — modules.** FPS, ping, LMB/RMB CPS,
-  keystrokes (W/A/S/D/space/shift/LMB/RMB with pressed states), coordinates and
-  speed. Each is individually toggleable and draggable; the anchor is stored as a
-  **fraction of the window** so a layout set at 1280x720 lands in the same corner
-  at 1920x1080. Reached from Pause → Options → **HUD Modules...** (toggle rows,
-  drag the live modules, Reset/Done); `NEPHELE_SCREEN=modules` is the dev
-  shortcut. Defaults: five modules stacked in one left column at 0.062 vertical
-  steps (fits GUI scale 3, the tallest a 720p window picks), keystrokes at
-  `(0.48, 0.02)` so it clears both the sidebar and the hotbar — a test pins that
-  at 1280x720, 1366x768, 1600x900 and 1920x1080. **At 1024x768 a fifteen-row
-  sidebar takes 438 of 1024 px and nothing fits beside it**; that resolution is
-  deliberately not covered by the default layout.
-  - CPS counts clicks in the last second per mouse button, recorded on
-    `MouseInput`, so it measures presses rather than the held state.
-  - Speed is horizontal blocks/second from a position sample per frame with a
-    ~0.2 s exponential smoothing; samples closer than 4 ms are ignored.
-  - Ping comes from our own row in the `S38` tab list (`own_ping`, matching
-    `info.uuid` against `player_list`); 0/absent renders `--`.
-  - The old one-line debug readout (`Nephele 1.8.9 … fps xyz … chunks`) is now
-    behind `NEPHELE_DEBUG=1`; the modules carry that information by default.
-- **`settings.rs` — persistence.** `settings.json` in
-  `paths::user_data_dir()` (beside `servers.json`/`auth.json`): video settings plus
-  every module's `enabled`/`anchor`, keyed by the stable `ModuleId::key`.
-  Missing/corrupt/partial files fall back to defaults field by field, unknown keys
-  are ignored, and hand-edited values are clamped on load. Saved on every change
-  (adjust, toggle, drag-release, Done).
-- **Generic server windows.** A container window is now drawn for **any slot
-  count**: `window_rows`/`container_panel_size`/`server_window_origin` lay the
-  container slots nine to a row above the player's 36, so a hopper, a single chest,
-  a double chest or a furnace all render without a bespoke screen, titled from
-  `S2D`'s inventory type (`window_kind_label`). The 46-slot crafting table keeps
-  its vanilla 3x3-plus-output layout.
-- **`interact.rs` — entity clicks.** Ray–AABB targeting over `Entities` (0.6 wide;
-  1.8 tall for players, 1.5 for mobs), nearest hit inside reach, and only when it
-  is **nearer than the block** behind it. Click pacing is vanilla-flavoured:
-  `ATTACK_COOLDOWN = 125 ms` (a debounce — 1.8 has no attack-strength meter) and
-  `USE_COOLDOWN = 200 ms` (`rightClickDelayTimer = 4` ticks). While an entity is
-  targeted, mining and block placement are suppressed, as vanilla's
-  `objectMouseOver` priority does. **The packet is not sent:** `C02 Use Entity`
-  needs a constant/builder in `nephele-protocol` and a send path in
-  `nephele-client`, both `net`-lane files. The net loop records the decision in
-  `Shared.entity_actions` (capped at 16) and `Shared.target`; that queue is the
-  seam to complete the feature, and nothing drains it yet.
-=======
-**Audio** (added 2026-11-05):
-
-`crates/nephele-audio` decodes with symphonia and mixes with kira. The split is
-deliberate: `decode.rs` turns Ogg Vorbis into interleaved `f32` and needs no
-device, so it is testable; `engine.rs` owns the device and hands kira
-`StaticSoundData`; `registry.rs` parses `sounds.json`; `materials.rs` maps a
-block id to its vanilla `SoundType`.
-
-- **Nothing ships.** Sound files and `sounds.json` itself are *not* in the
-  client jar — they live in the asset object store, addressed by content hash.
-  `nephele-prepare` now takes a `SoundSource` (`prepare_with_sounds`): it
-  verifies the player's own `assets/indexes/1.8.json` against
-  `research-lock.json`, copies `minecraft/sounds/**` and `minecraft/sounds.json`
-  into the prepared tree, and checks every object against its hash. Sounds are
-  additive — no asset store, no audio, but the preparation still succeeds
-  (`--no-sounds` forces that deliberately). `OUTPUT_VERSION` is now 2.
-- **Four hooks, all in `live.rs`:** block break (`MiningEvent::Stop`; in the
-  network loop the block is read from our own copy before the server confirms),
-  block place (the position `client.place(..)` returns, or the local
-  `set_block`), footsteps (`StepTrigger`, vanilla's `0.6 * distance` accumulator,
-  one step per ~1.67 blocks, never while airborne, reset by a teleport) and the
-  hurt sound (the same health-drop edge that drives the damage vignette).
-- **Positional, but the arithmetic is ours.** `attenuation()` ramps linearly to
-  silence at 16 blocks and `stereo_pan()` uses the source's offset along the
-  listener's right ear (`Listener::from_yaw`, matching the camera's
-  `forward = (sin yaw, 0, -cos yaw)`). kira's spatial tracks are deliberately
-  unused: they need one track per sound position.
-- **Volume and pitch are vanilla's:** break/place `(volume+1)/2` at
-  `frequency*0.8`, steps `volume*0.15` at `frequency`, hurt at 0.5 with the
-  `1.0 ± 0.2` jitter. `materials.rs` carries the `SoundType` table read off the
-  reference source's `registerBlock` calls — dirt sounds like gravel, metal is
-  stone 1.5× frequency, glass breaks as glass but places as stone.
-- **Master gain is `NEPHELE_VOLUME` (0..1); `NEPHELE_MUTE=1` skips the device
-  entirely.** There is deliberately no slider yet: the settings screen belongs
-  to `client-ui`. Events 1.8's own `sounds.json` has no entry for
-  (`step.anvil`, `dig.ladder`) stay silent exactly like vanilla;
-  `AudioEngine::silent_events()` counts them.
-- **Not done:** mob sounds, music and records, subtitles, and anything driven by
-  a packet we do not parse. Only the four hooks above fire.
->>>>>>> audio
-
 ---
 
 ## 12. Milestones
@@ -877,31 +700,18 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 
 | Lane | Owns | Branch | State |
 |---|---|---|---|
-<<<<<<< HEAD
 | `render` | shapes, tinting, sky, fog | `render` | 95%: bars, fire, plant culling and biome tint landed; audit leftovers |
 | `biomes` | GenLayer parity | `biomes` | **100% biome cells, every stage diff 0 — lane complete** |
+| `biome-vis` | singleplayer generator + biome data path | `biome-vis` | done: `local_loop` streams `VanillaGenerator`, columns carry `Level.Biomes`; needs merge |
 | `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) |
 | `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
-| `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | **merged at `f0347c1`** — scoreboards, teams, `C02`, maps, frames, keep-alive, beacon/note/debris particles |
-| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** — chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, generic server windows; tab list, boss bar, titles and the loading screen still open |
+| `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | **merged at `f0347c1`** - scoreboards, teams, `C02`, maps, frames, keep-alive, beacon/note/debris particles |
+| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, generic server windows; tab list, boss bar, titles and the loading screen still open |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
-| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population; **not based on `net`** — rebase before use |
+| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
 | `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
-| `audio` | everything sound | `audio` | **merged** — `nephele-audio` (symphonia + kira), break/place/step/hurt wired; music, mob sounds and the fifth volume bus still open |
+| `audio` | everything sound | `audio` | **merged** - `nephele-audio` (symphonia + kira), break/place/step/hurt wired; music, mob sounds and the fifth volume bus still open |
 | `product` | launcher v2, updater, installer, legal | `saves-landing` (WIP commit) | 25%, blocked on code signing |
-=======
-| `render` | shapes, tinting, sky, fog | `render` | bars/fire/flowers left |
-| `biomes` | GenLayer parity (92.8%) | `biomes` | active, isolated |
-| `worldgen` | two-stage generation, caves, ores, flora, structures (phases W1–W5) | `w-worldgen` | not started |
-| `survival` | inventory, containers, HUD art | `survival` | 85%, HUD art left |
-| `net` | protocol, real servers, maps, frames, metadata | `net` | needs rebase, then merge |
-| `client-ui` | chat colours, settings, loading screen, modules | — | not started |
-| `saves` | `level.dat`, player data, region writing | `saves` | 90%, needs landing |
-| `entities` | players, skins, nametags, frames, maps on screen | `entities` | 35% |
-| `perf` | startup, view distance, baseline gate | `perf` | done, needs merge |
-| `audio` | everything sound | `audio` | first slice: break/place/step/hurt wired end to end |
-| `product` | launcher v2, updater, installer, legal | `saves` (WIP commit) | 25%, blocked on signing |
->>>>>>> audio
 
 Rules that hold across all of them: one worktree per lane (never edit the main
 checkout), its own `target/`, and `scripts/run_client.ps1 -Session <lane>` for
@@ -955,12 +765,6 @@ re-serialize the chunk wholesale.
 **PowerShell**
 
 - `.Replace()` with CRLF fails on LF files → use the `edit` tool.
-- **Never round-trip a source file through `Get-Content -Raw` / `Set-Content`.**
-  `live.rs`'s first line is mojibake (non-ASCII bytes), and a PowerShell rewrite
-  re-encodes it *and* adds a UTF-8 BOM — the diff then shows an unreadable line 1
-  that has nothing to do with the change. Use the `edit` tool for text edits;
-  if it happens, splice the original first line back byte-for-byte with
-  `[System.IO.File]` APIs and `git show HEAD:<path>`.
 - `[System.IO.File]::ReadAllText` with a relative path resolves against the process
   CWD, not the PS location → always use absolute paths.
 - `-replace` needs `${1}_${2}` — `$1_$2` silently misbehaves.
@@ -969,18 +773,6 @@ re-serialize the chunk wholesale.
 - Never put backticks inside a double-quoted bash string.
 - `cmd1; cmd2` does **not** stop on failure — a clippy error once rode into a commit
   this way.
-
-**Build and tests**
-
-- `crates/nephele-client/tests/scoreboard_capture.rs` replays a lobby capture that is
-  gitignored (365 KB, holds real player names). It pulled the file in with
-  `include_bytes!`, so `cargo clippy --all-targets` failed on every branch without the
-  capture. It reads at runtime now and skips when the file is absent. Never bake a
-  gitignored file into the build.
-- Non-ASCII text in `live.rs` has been re-encoded repeatedly: the first doc line is
-  quadruple-mangled UTF-8. It is a comment, so it compiles, but a tool that round-trips
-  the file through `Set-Content` makes it worse. Prefer the `edit` tool, which preserves
-  bytes.
 
 **Worldgen**
 
@@ -1000,7 +792,11 @@ re-serialize the chunk wholesale.
   `[Biome; 40]` table.
 - Hills surface rule is three rules, not one: mutations get gravel when noise
   ∉ (−1..=2); stone appears above noise 1.0 unless the biome is Extreme Hills+ (34).
-- **`GenLayerHills` never seeds its variance layer, and that is correct.** Vanilla
+- **Generated columns must carry `Level.Biomes`.** `ChunkColumn::set_biomes` is
+  what `biome_at`, `ColumnMeshJob`, the save writer and `biome_at`'s fog read.
+  Every one of them falls back to plains when it is absent, so a missing map
+  looks like "this world is all plains", not like an error.
+- `GenLayerHills` never seeds its variance layer, and that is correct. Vanilla
   keeps the hill-noise layer in `field_151628_d`, outside `parent`, so
   `initWorldGenSeed` never reaches it and the two zooms above it run with
   `worldGenSeed == 0` for the whole world. Seeding it changes the
@@ -1035,15 +831,6 @@ re-serialize the chunk wholesale.
 
 **Tooling**
 
-- **`1.8.9`'s client jar contains no sounds and no `sounds.json`.** They are
-  asset *objects*, addressed by SHA-1, and only the asset index knows which
-  object is `sounds/dig/stone1.ogg`. That is why `ASSET_PREFIXES` cannot list
-  them and why `prepare_with_sounds` copies from the object store instead. A
-  jar-only preparation is valid and simply silent.
-- `minecraft/texts/` is **not** in `ASSET_PREFIXES`, so a prepared-only tree has
-  no `splashes.txt` and `title::tests::loads_splashes_and_picks_stably` panics
-  unless a development `assets/vanilla` cache supplies it. Found while adding
-  audio; not fixed here because it belongs to the title/prepare side.
 - `.gitattributes` sets `* text=auto eol=lf`. Keep it.
 - Git identity is repo-local: `Casualdv <Casualdv@users.noreply.github.com>`.
 - `project_root()` walks up from the executable and prefers a `[workspace]` Cargo.toml
@@ -1056,26 +843,13 @@ re-serialize the chunk wholesale.
 
 - Parity claims are **measured**, never asserted. Every number in §6 came from a run
   against the reference world.
-<<<<<<< HEAD
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`;
   `chunk_biomes_match_a_world_the_real_server_generated` passes and
   `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **695 test cases across the workspace** (683 passed, 12 ignored). `nephele-world`
+- **698 test cases across the workspace** (685 passed, 13 ignored). `nephele-world`
   carries the parity suite, including `debug_stage_trace` and
   `debug_first_mismatch`. The six real-socket tests in
   `crates/nephele-client/tests/join_mock.rs` cover status,
-=======
-- Reference-world checks live in `genlayer.rs` and `worldgen.rs`; the biome one
-  (`chunk_biomes_match_a_world_the_real_server_generated`) is the active failing one,
-  with an ignored `debug_first_mismatch` helper for narrowing it.
-- **548 test cases across the workspace** (545 passed, 3 ignored, including two
-  doctests). `nephele-cli` has 83 passing tests; `nephele-assets` has 39;
-  `nephele-audio` has 24 plus one that opens the real sound device and is
-  ignored by default; `nephele-render` has 50 passing tests, including seven
-  shape-meshing regressions; `nephele-world` has 131 passing tests and one
-  ignored. The six
-  real-socket tests in `crates/nephele-client/tests/join_mock.rs` cover status,
->>>>>>> audio
   compression, chat, joining/loading the mock world, drop pickup, and crafting
   planks through `C0E`.
 - A test that pins a quirk (signed hex, `func_151607_a`, x-on-both-axes) should say so

@@ -18,7 +18,9 @@ talks protocol 47, and joins offline-mode servers.
 **Working**
 
 - Protocol 47: handshake, status ping, login and play, with zlib compression
-- World: chunk decoding, block states, lighting, raycasting, terrain generation
+- World: chunk decoding, block states, lighting, raycasting, and vanilla terrain
+  generation (GenLayer biomes, density height field, per-biome surface), used by
+  both singleplayer and the offline viewer
 - Rendering: wgpu 30 with worker-threaded chunk meshing, vanilla block models,
   `.mcmeta` animations, mipmapped textures, procedural sky and per-biome fog,
   frustum + height-field occlusion culling and a per-frame upload budget

@@ -777,7 +777,8 @@ fn local_loop(
     tx: Sender<NetMsg>,
 ) -> Result<(), String> {
     use nephele_protocol::packets::play::HOTBAR_FIRST_SLOT;
-    use nephele_world::{BlockState, ChunkCoord, TerrainGenerator};
+    use nephele_world::worldgen::VanillaGenerator;
+    use nephele_world::{BlockState, ChunkCoord};
 
     let seed = save.metadata().seed;
     let mode = save.metadata().mode;
@@ -785,10 +786,13 @@ fn local_loop(
         .load_player_state()
         .map_err(|error| error.to_string())?;
     let mut world_state = save.world_state();
-    let generator = TerrainGenerator::new(seed);
-    let spawn_y = generator.spawn_height();
+    // Singleplayer is the same world the parity harness measures: the biome
+    // GenLayer stack, the density height field and the per-biome surface pass.
+    // It used to stream `TerrainGenerator`, a value-noise stand-in that carries
+    // no biome data at all.
+    let mut generator = VanillaGenerator::new(seed as i64);
     if world_state.spawn_position == WorldState::default().spawn_position {
-        world_state.spawn_position = [0, spawn_y, 0];
+        world_state.spawn_position = generator.spawn_position();
     }
     let mut world = World::new(0);
     // Honour the render-distance setting; `radius` is re-read every tick so
