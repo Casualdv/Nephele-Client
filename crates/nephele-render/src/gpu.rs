@@ -153,6 +153,14 @@ pub struct Renderer {
     entity_vertex_capacity: wgpu::BufferAddress,
     entity_index_capacity: wgpu::BufferAddress,
     entity_index_count: u32,
+    /// Beacon beams: the entity shader with additive blending and no depth
+    /// write, so they glow through fog and never occlude each other.
+    beam_pipeline: wgpu::RenderPipeline,
+    beam_vertices: wgpu::Buffer,
+    beam_indices: wgpu::Buffer,
+    beam_vertex_capacity: wgpu::BufferAddress,
+    beam_index_capacity: wgpu::BufferAddress,
+    beam_index_count: u32,
     /// Dropped items, drawn with the terrain pipeline (same texture array).
     item_vertices: wgpu::Buffer,
     item_indices: wgpu::Buffer,
@@ -878,6 +886,80 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // Beacon beams reuse the entity shader and vertex layout, but blend
+        // additively and write no depth: a beam is light added to the scene,
+        // not a surface in it. Additive is also what keeps it readable through
+        // fog at distance, where an alpha-blended quad would wash out.
+        const ADDITIVE_BLEND: wgpu::BlendState = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::SrcAlpha,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::One,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+        let beam_pipeline = timed_pipeline(
+            &device,
+            &wgpu::RenderPipelineDescriptor {
+                label: Some("beacon beam pipeline"),
+                layout: Some(&entity_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &entity_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(EntityVertex::layout())],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &entity_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(ADDITIVE_BLEND),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            },
+            startup_origin,
+            &mut startup,
+        );
+        let (beam_vertex_capacity, beam_index_capacity) = (4096, 4096);
+        let beam_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("beam vertices"),
+            size: beam_vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let beam_indices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("beam indices"),
+            size: beam_index_capacity,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Item buffers start small: a dropped stack is six quads.
         let (item_vertex_capacity, item_index_capacity) = (1024, 1024);
         let item_vertices = device.create_buffer(&wgpu::BufferDescriptor {
@@ -950,6 +1032,12 @@ impl Renderer {
             entity_vertex_capacity,
             entity_index_capacity,
             entity_index_count: 0,
+            beam_pipeline,
+            beam_vertices,
+            beam_indices,
+            beam_vertex_capacity,
+            beam_index_capacity,
+            beam_index_count: 0,
             item_vertices,
             item_indices,
             item_vertex_capacity,
@@ -1169,6 +1257,45 @@ impl Renderer {
 
     pub fn entity_index_count(&self) -> u32 {
         self.entity_index_count
+    }
+
+    /// Replace every beacon beam's geometry. Same layout as the entity buffer;
+    /// the difference is entirely in the pipeline it is drawn with.
+    pub fn set_beams(&mut self, mesh: &EntityMesh) {
+        self.beam_index_count = mesh.indices.len() as u32;
+        if mesh.vertices.is_empty() {
+            return;
+        }
+
+        let vertex_bytes = std::mem::size_of_val(mesh.vertices.as_slice()) as wgpu::BufferAddress;
+        if vertex_bytes > self.beam_vertex_capacity {
+            self.beam_vertex_capacity = allocate_size(vertex_bytes);
+            self.beam_vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("beam vertices"),
+                size: self.beam_vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue
+            .write_buffer(&self.beam_vertices, 0, bytemuck::cast_slice(&mesh.vertices));
+
+        let index_bytes = std::mem::size_of_val(mesh.indices.as_slice()) as wgpu::BufferAddress;
+        if index_bytes > self.beam_index_capacity {
+            self.beam_index_capacity = allocate_size(index_bytes);
+            self.beam_indices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("beam indices"),
+                size: self.beam_index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue
+            .write_buffer(&self.beam_indices, 0, bytemuck::cast_slice(&mesh.indices));
+    }
+
+    pub fn beam_index_count(&self) -> u32 {
+        self.beam_index_count
     }
 
     /// Replace every dropped item's geometry. Like entities, the whole buffer
@@ -1490,6 +1617,16 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.entity_vertices.slice(..));
                 pass.set_index_buffer(self.entity_indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.entity_index_count, 0, 0..1);
+            }
+
+            // Beams add light on top of whatever is behind them, depth-tested
+            // but not depth-written.
+            if self.beam_index_count > 0 {
+                pass.set_pipeline(&self.beam_pipeline);
+                pass.set_bind_group(0, &self.entity_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.beam_vertices.slice(..));
+                pass.set_index_buffer(self.beam_indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.beam_index_count, 0, 0..1);
             }
 
             if self.overlay_index_count > 0 {

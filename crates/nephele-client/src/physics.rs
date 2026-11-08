@@ -9,6 +9,8 @@
 //! Velocities are stored in blocks per second (`vx`, `vy`, `vz`) so callers can
 //! reason in real units; the tick maths converts at the boundary.
 
+use nephele_world::block::ids as block_ids;
+use nephele_world::shapes::{block_shape, has_collision};
 use nephele_world::World;
 
 pub const WIDTH: f64 = 0.6;
@@ -26,12 +28,19 @@ pub const FLY_SPRINT_SPEED: f64 = 21.8;
 const MOVEMENT_SPEED: f64 = 0.1;
 /// Default block slipperiness; friction is `slipperiness * 0.91`.
 const SLIPPERINESS: f64 = 0.6;
+/// `BlockSlime.slipperiness` (1.8): 0.8, so you keep sliding on a pad.
+const SLIME_SLIPPERINESS: f64 = 0.8;
+/// `BlockIce.slipperiness` (1.8), shared by packed ice.
+const ICE_SLIPPERINESS: f64 = 0.98;
 /// `jumpMovementFactor`: the much smaller acceleration available in the air.
 const AIR_ACCEL: f64 = 0.02;
 /// 0.08 blocks/tick of gravity.
 const GRAVITY_TICK: f64 = 0.08;
 /// `0.42` blocks/tick launch velocity: a ~1.25 block jump.
 pub const JUMP_VELOCITY_TICK: f64 = 0.42;
+/// Vanilla's `stepHeight`: the tallest ledge a walking player climbs without
+/// jumping (slabs, single stair steps, pressure plates).
+pub const STEP_HEIGHT: f64 = 0.6;
 /// `3.92` blocks/tick terminal velocity.
 pub const TERMINAL_VELOCITY_TICK: f64 = 3.92;
 
@@ -99,6 +108,34 @@ impl PlayerState {
         self.vz = 0.0;
     }
 
+    /// An S08 correction cancels motion only on axes with absolute coordinates.
+    pub fn correct_position(&mut self, pos: crate::Vec3, relative_flags: u8) {
+        self.x = pos.x;
+        self.y = pos.y;
+        self.z = pos.z;
+        if relative_flags & 1 == 0 {
+            self.vx = 0.0;
+        }
+        if relative_flags & 2 == 0 {
+            self.vy = 0.0;
+        }
+        if relative_flags & 4 == 0 {
+            self.vz = 0.0;
+        }
+    }
+
+    /// Replace the current motion, in blocks per second.
+    ///
+    /// The server owns launches, knockback and falls, and expresses them as a
+    /// velocity on our own entity. Setting it here (rather than waiting for the
+    /// next physics tick) is what makes a launch pad feel instant.
+    pub fn set_velocity(&mut self, vx: f64, vy: f64, vz: f64) {
+        self.vx = vx;
+        self.vy = vy;
+        self.vz = vz;
+        self.on_ground = false;
+    }
+
     /// Advance by `dt` seconds. `yaw` uses the camera convention (0 = -Z).
     pub fn step(&mut self, dt: f64, input: &Input, yaw: f32, world: &World) {
         let dt = dt.clamp(0.0, 0.1);
@@ -159,7 +196,7 @@ impl PlayerState {
         let mut vy = self.vy * dt;
         let mut vz = self.vz * dt;
 
-        let ground_friction = SLIPPERINESS * 0.91;
+        let ground_friction = self.ground_slipperiness(world) * 0.91;
         let ai_speed = MOVEMENT_SPEED
             * if input.sneak {
                 0.3
@@ -195,22 +232,33 @@ impl PlayerState {
         }
 
         self.on_ground = false;
+        let falling = vy < 0.0;
         if self.move_axis(world, 1, vy) {
-            vy = 0.0;
+            if falling && !input.sneak && self.standing_on_slime(world) {
+                // `BlockSlime.onLanded` (1.8): motion is reflected with the
+                // speed it arrived at, so a pad throws you as high as you fell
+                // instead of stopping you dead. Sneaking opts out, which is how
+                // vanilla lets you get off a pad without bouncing.
+                vy = -vy;
+                self.on_ground = false;
+            } else {
+                vy = 0.0;
+            }
         }
+        let grounded = self.on_ground;
 
         // Vanilla's sneak edge protection: a crouched player on the ground
         // refuses a step that would put them over a drop, rather than walking
         // off the edge of the block.
-        if input.sneak && self.on_ground {
+        if input.sneak && grounded {
             vx = self.edge_clamped(world, 0, vx);
             vz = self.edge_clamped(world, 2, vz);
         }
 
-        if self.move_axis(world, 0, vx) {
+        if self.move_axis(world, 0, vx) && (!grounded || !self.try_step(world, 0, vx)) {
             vx = 0.0;
         }
-        if self.move_axis(world, 2, vz) {
+        if self.move_axis(world, 2, vz) && (!grounded || !self.try_step(world, 2, vz)) {
             vz = 0.0;
         }
 
@@ -267,6 +315,96 @@ impl PlayerState {
         false
     }
 
+    /// Try the same horizontal move from [`STEP_HEIGHT`] higher up, then settle
+    /// back down onto the ledge.
+    ///
+    /// This is vanilla's auto-step: walking into a slab or a single stair step climbs it instead of stopping dead.
+    fn try_step(&mut self, world: &World, axis: usize, delta: f64) -> bool {
+        let saved = *self;
+        self.y += STEP_HEIGHT;
+        if self.collides(world) || self.move_axis(world, axis, delta) {
+            *self = saved;
+            return false;
+        }
+
+        if !self.settle_down(world, STEP_HEIGHT) {
+            // Nothing to land on: keep the lift and let gravity do the rest.
+            self.y = saved.y + STEP_HEIGHT;
+        }
+        true
+    }
+
+    /// Drop the player onto the first surface within `max_drop`.
+    ///
+    /// Returns `false` when the air below is clear all the way down, which
+    /// means there is no ledge to stand on at this height.
+    fn settle_down(&mut self, world: &World, max_drop: f64) -> bool {
+        let top = self.y;
+        let bottom = self.y - max_drop;
+        self.y = bottom;
+        if !self.collides(world) {
+            self.y = top;
+            return false;
+        }
+
+        let mut free = top;
+        let mut blocked = bottom;
+        for _ in 0..10 {
+            let mid = 0.5 * (free + blocked);
+            self.y = mid;
+            if self.collides(world) {
+                blocked = mid;
+            } else {
+                free = mid;
+            }
+        }
+        self.y = free;
+        self.on_ground = true;
+        true
+    }
+
+    /// `Block.slipperiness` for the block the player is standing on.
+    ///
+    /// Vanilla 1.8 makes slime and ice slippery, which is what turns a slime
+    /// pad into a launch instead of a wall of friction. Anything else uses the
+    /// default 0.6.
+    fn ground_slipperiness(&self, world: &World) -> f64 {
+        let layer = (self.y - 0.05).floor() as i32;
+        let min_x = self.x - WIDTH / 2.0 + EPS;
+        let max_x = self.x + WIDTH / 2.0 - EPS;
+        let min_z = self.z - WIDTH / 2.0 + EPS;
+        let max_z = self.z + WIDTH / 2.0 - EPS;
+        let mut slipperiness: f64 = SLIPPERINESS;
+        for block_x in (min_x.floor() as i32)..=(max_x.floor() as i32) {
+            for block_z in (min_z.floor() as i32)..=(max_z.floor() as i32) {
+                let candidate = match world.get_block(block_x, layer, block_z).id() {
+                    block_ids::SLIME => SLIME_SLIPPERINESS,
+                    block_ids::ICE | block_ids::PACKED_ICE => ICE_SLIPPERINESS,
+                    _ => SLIPPERINESS,
+                };
+                slipperiness = slipperiness.max(candidate);
+            }
+        }
+        slipperiness
+    }
+
+    /// Whether any block directly under the player's feet is slime.
+    fn standing_on_slime(&self, world: &World) -> bool {
+        let layer = (self.y - 0.05).floor() as i32;
+        let min_x = self.x - WIDTH / 2.0 + EPS;
+        let max_x = self.x + WIDTH / 2.0 - EPS;
+        let min_z = self.z - WIDTH / 2.0 + EPS;
+        let max_z = self.z + WIDTH / 2.0 - EPS;
+        for block_x in (min_x.floor() as i32)..=(max_x.floor() as i32) {
+            for block_z in (min_z.floor() as i32)..=(max_z.floor() as i32) {
+                if world.get_block(block_x, layer, block_z).id() == block_ids::SLIME {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// The largest part of `delta` that still leaves ground under the player.
     ///
     /// Failing every step means the player is already at the edge, so nothing
@@ -301,7 +439,7 @@ impl PlayerState {
 
         for block_x in (min_x.floor() as i32)..=(max_x.floor() as i32) {
             for block_z in (min_z.floor() as i32)..=(max_z.floor() as i32) {
-                if is_solid_block(world, block_x, layer, block_z) {
+                if has_collision(world.get_block(block_x, layer, block_z)) {
                     return true;
                 }
             }
@@ -343,19 +481,40 @@ impl PlayerState {
         for bx in x0..=x1 {
             for by in y0..=y1 {
                 for bz in z0..=z1 {
-                    if is_solid_block(world, bx, by, bz) {
-                        return true;
+                    let state = world.get_block(bx, by, bz);
+                    if !has_collision(state) {
+                        continue;
+                    }
+                    // Partial blocks (slabs, stairs, doors, fences) collide as
+                    // their real boxes rather than as a full cube. Vanilla
+                    // tests these with strict inequalities, so resting exactly
+                    // on a surface is not an overlap.
+                    for shape in block_shape(state.id(), state.meta()) {
+                        let min = [
+                            bx as f64 + shape.min[0] as f64 / 16.0,
+                            by as f64 + shape.min[1] as f64 / 16.0,
+                            bz as f64 + shape.min[2] as f64 / 16.0,
+                        ];
+                        let max = [
+                            bx as f64 + shape.max[0] as f64 / 16.0,
+                            by as f64 + shape.max[1] as f64 / 16.0,
+                            bz as f64 + shape.max[2] as f64 / 16.0,
+                        ];
+                        if min_x < max[0]
+                            && max_x > min[0]
+                            && min_y < max[1]
+                            && max_y > min[1]
+                            && min_z < max[2]
+                            && max_z > min[2]
+                        {
+                            return true;
+                        }
                     }
                 }
             }
         }
         false
     }
-}
-
-fn is_solid_block(world: &World, x: i32, y: i32, z: i32) -> bool {
-    let id = world.get_block(x, y, z).id();
-    !matches!(id, 0 | 8 | 9 | 10 | 11 | 31 | 78 | 101 | 102 | 160)
 }
 
 #[cfg(test)]
@@ -365,13 +524,18 @@ mod tests {
 
     /// A 5x5-chunk stone plane, so long walks don't run off the edge.
     fn flat_world(floor_y: usize) -> World {
+        floor_of(block_ids::STONE, floor_y)
+    }
+
+    /// A 5x5-chunk plane of one block id, for surface-friction and bounce tests.
+    fn floor_of(id: u16, floor_y: usize) -> World {
         let mut world = World::new(0);
         for cx in -2..=2 {
             for cz in -2..=2 {
                 let mut column = ChunkColumn::empty(cx, cz);
                 for x in 0..16 {
                     for z in 0..16 {
-                        column.set_block(x, floor_y, z, BlockState::STONE);
+                        column.set_block(x, floor_y, z, BlockState::new(id, 0));
                     }
                 }
                 world.insert(column);
@@ -703,5 +867,179 @@ mod tests {
     fn eye_height_is_above_the_feet() {
         let player = PlayerState::at(1.0, 2.0, 3.0);
         assert_eq!(player.eye(), [1.0, 2.0 + EYE_HEIGHT, 3.0]);
+    }
+
+    #[test]
+    fn landing_on_a_slime_pad_bounces_back_up() {
+        // A 3x3 pad is what Hypixel's lobby actually has; one block is enough
+        // for the physics, but the model is the same.
+        let world = floor_of(block_ids::SLIME, 64);
+        let mut player = PlayerState::at(8.5, 69.5, 8.5);
+        player.on_ground = false;
+
+        let mut bounced = false;
+        let mut apex: f64 = 0.0;
+        for _ in 0..80 {
+            player.step(0.05, &Input::default(), 0.0, &world);
+            if player.vy > 1.0 {
+                bounced = true;
+            }
+            if bounced {
+                apex = apex.max(player.y);
+            }
+        }
+
+        assert!(bounced, "the pad did not reflect the fall");
+        // 1.8 reflects the landing speed, so the ballpark is the fall height.
+        // The per-tick 0.98 damping in this integrator bites hardest on the
+        // way up, which is why it is not an exact return.
+        assert!(apex > 67.0, "bounce only reached {apex}");
+    }
+
+    #[test]
+    fn a_stone_floor_stops_a_fall_instead_of_bouncing() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 69.5, 8.5);
+        player.on_ground = false;
+
+        run_ticks(&mut player, &Input::default(), 40, &world);
+
+        assert!(player.on_ground);
+        assert!((player.y - 65.0).abs() < 1e-3, "y = {}", player.y);
+        // A resting player still reports one tick of gravity on the wire
+        // (vanilla sends the same), so the check is "not moving upward".
+        assert!(player.vy <= 0.0);
+    }
+
+    #[test]
+    fn slime_and_ice_have_their_own_slipperiness() {
+        let slime = PlayerState::at(8.5, 65.0, 8.5);
+        assert_eq!(
+            slime.ground_slipperiness(&floor_of(block_ids::SLIME, 64)),
+            SLIME_SLIPPERINESS
+        );
+
+        let ice = PlayerState::at(8.5, 65.0, 8.5);
+        assert_eq!(
+            ice.ground_slipperiness(&floor_of(block_ids::ICE, 64)),
+            ICE_SLIPPERINESS
+        );
+
+        let stone = PlayerState::at(8.5, 65.0, 8.5);
+        assert_eq!(stone.ground_slipperiness(&flat_world(64)), SLIPPERINESS);
+    }
+
+    #[test]
+    fn a_server_velocity_launches_the_player() {
+        let world = flat_world(64);
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        // 20 blocks/second is 1 block/tick upward: a launch pad, not a hop.
+        player.set_velocity(0.0, 20.0, 0.0);
+
+        player.step(0.05, &Input::default(), 0.0, &world);
+
+        assert!(!player.on_ground);
+        assert!(player.y > 65.5, "launch height was {}", player.y);
+        assert!(
+            player.vy > 0.0,
+            "gravity ate the launch: vy = {}",
+            player.vy
+        );
+    }
+
+    #[test]
+    fn walking_into_a_slab_steps_up_onto_it() {
+        let mut column = ChunkColumn::empty(0, 0);
+        for x in 0..16 {
+            for z in 0..16 {
+                column.set_block(x, 64, z, BlockState::STONE);
+            }
+            // A four-deep half-slab platform in front of the player.
+            for z in 3..=6 {
+                column.set_block(x, 65, z, BlockState::new(44, 0));
+            }
+        }
+        let mut world = World::new(0);
+        world.insert(column);
+
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        let input = Input {
+            forward: 1.0,
+            ..Input::default()
+        };
+        // 20 ticks keeps the player on the four-deep platform; 30 would walk
+        // off its far edge.
+        run_ticks(&mut player, &input, 20, &world);
+
+        assert!(player.z < 7.0, "stopped at the slab edge, z = {}", player.z);
+        assert!(
+            (player.y - 65.5).abs() < 1e-2,
+            "should stand on the slab at 65.5, y = {}",
+            player.y
+        );
+    }
+
+    #[test]
+    fn pressure_plates_are_walked_over() {
+        let mut column = ChunkColumn::empty(0, 0);
+        for x in 0..16 {
+            for z in 0..16 {
+                column.set_block(x, 64, z, BlockState::STONE);
+            }
+            column.set_block(x, 65, 4, BlockState::new(72, 0));
+        }
+        let mut world = World::new(0);
+        world.insert(column);
+
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        let input = Input {
+            forward: 1.0,
+            ..Input::default()
+        };
+        for _ in 0..40 {
+            player.step(0.05, &input, 0.0, &world);
+            assert!(
+                (player.y - 65.0).abs() < 1e-3,
+                "plate raised feet at z={}",
+                player.z
+            );
+        }
+
+        assert!(
+            player.z < 4.0,
+            "the plate blocked the player at z = {}",
+            player.z
+        );
+        assert!(
+            (player.y - 65.0).abs() < 1e-3,
+            "walking over a plate lifted y to {}",
+            player.y
+        );
+    }
+
+    #[test]
+    fn a_bottom_slab_is_half_a_block_high() {
+        let mut column = ChunkColumn::empty(0, 0);
+        for x in 0..16 {
+            for z in 0..16 {
+                column.set_block(x, 64, z, BlockState::STONE);
+            }
+        }
+        column.set_block(8, 65, 8, BlockState::new(44, 0));
+        let mut world = World::new(0);
+        world.insert(column);
+
+        let mut player = PlayerState::at(8.5, 66.5, 8.5);
+        run_ticks(&mut player, &Input::default(), 120, &world);
+
+        assert!(player.on_ground);
+        assert!(
+            (player.y - 65.5).abs() < 1e-3,
+            "slab floor is at 65.5, player rests at {}",
+            player.y
+        );
     }
 }

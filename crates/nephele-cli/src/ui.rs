@@ -537,6 +537,25 @@ fn draw_button_state(
     );
 }
 
+/// A full-screen dim with a centred title, used for terrain loading and for a
+/// disconnect reason. `detail` may be empty.
+pub fn draw_status_banner(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    title: &str,
+    detail: &str,
+    scale: f32,
+    width: f32,
+    height: f32,
+) {
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.0, 0.0, 0.0, 0.45]);
+    let cx = width / 2.0;
+    fg.text_centered(title, cx, height * 0.42, scale * 2.0, TEXT);
+    if !detail.is_empty() {
+        fg.text_centered(detail, cx, height * 0.52, scale * 1.25, TEXT_DIM);
+    }
+}
+
 /// The pause menu: title, "Back to Game", "Disconnect".
 /// Vanilla's death screen: a red wash over the frozen game.
 pub fn draw_death(

@@ -5,9 +5,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nephele_assets::{TextureArray, UiAtlas};
-use nephele_render::{build_world_mesh, Camera, Environment, Renderer};
+use nephele_render::{
+    build_beams, build_world_mesh, find_beams, BeaconBeam, Camera, EntityMesh, Environment,
+    Particles, Renderer,
+};
 use nephele_world::worldgen::VanillaGenerator;
-use nephele_world::World;
+use nephele_world::{BlockState, World};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -43,6 +46,19 @@ struct Viewer {
     camera: Camera,
     world: World,
     spawn: glam::Vec3,
+    /// Beacons found in the generated world, rebuilt once because `view` never
+    /// edits terrain.
+    beams: Vec<BeaconBeam>,
+    clock: f32,
+    textures: Option<Arc<TextureArray>>,
+    /// `NEPHELE_DEMO=beacon`: drive a note block and some debris so the
+    /// block-entity visuals can be screenshotted without a server.
+    demo: bool,
+    demo_ground: i32,
+    demo_timer: f32,
+    demo_note: u8,
+    demo_beat: u32,
+    particles: Particles,
     keys: HashSet<KeyCode>,
     mouse_captured: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
@@ -65,6 +81,15 @@ impl Viewer {
             camera,
             world: World::new(0),
             spawn: glam::Vec3::ZERO,
+            beams: Vec::new(),
+            clock: 0.0,
+            textures: None,
+            demo: false,
+            demo_ground: 0,
+            demo_timer: 0.0,
+            demo_note: 0,
+            demo_beat: 0,
+            particles: Particles::new(),
             keys: HashSet::new(),
             mouse_captured: false,
             last_cursor: None,
@@ -155,6 +180,43 @@ impl Viewer {
         self.camera.position = glam::Vec3::new(8.5, spawn_height + 9.0, 8.5);
         self.camera.set_aspect(size.width, size.height);
 
+        // Dev scene for the block-entity visuals: a beacon with a coloured pane
+        // and a note block beside it. `NEPHELE_DEMO=beacon`.
+        if std::env::var("NEPHELE_DEMO").as_deref() == Ok("beacon") {
+            self.demo = true;
+            let ground = generator.height_at(8, 8) + 1;
+            self.demo_ground = ground;
+            for x in 5..=11 {
+                for z in 5..=11 {
+                    self.world.set_block(x, ground - 1, z, BlockState::STONE);
+                }
+            }
+            self.world.set_block(8, ground, 8, BlockState::new(138, 0));
+            // 160 = stained glass pane, metadata 14 = red.
+            self.world
+                .set_block(8, ground + 1, 8, BlockState::new(160, 14));
+            self.world.set_block(5, ground, 9, BlockState::new(25, 0));
+            // Debris target: a block in front of the camera that the demo
+            // breaks over and over.
+            self.world.set_block(7, ground, 10, BlockState::STONE);
+            self.beams = find_beams(&self.world);
+            let mesh = build_world_mesh(&self.world, &textures);
+            renderer.set_mesh(&mesh);
+
+            let target = glam::Vec3::new(6.8, ground as f32 + 1.5, 8.5);
+            self.camera.position = glam::Vec3::new(8.5, ground as f32 + 3.5, 14.0);
+            let look = target - self.camera.position;
+            self.camera.yaw = look.x.atan2(-look.z);
+            self.camera.pitch = (look.y / look.length()).asin();
+            println!(
+                "Beacon demo: ground {ground}, red pane, {} beam(s)",
+                self.beams.len()
+            );
+        } else {
+            self.beams = find_beams(&self.world);
+        }
+        self.textures = Some(Arc::new(textures));
+
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.last_frame = Instant::now();
@@ -214,6 +276,41 @@ impl Viewer {
             self.camera.fly(forward, strafe, up, delta);
         }
 
+        if self.demo {
+            // A note every 0.22 s (they live 0.3 s, so one is always visible)
+            // and a puff of stone debris every 0.55 s.
+            self.demo_timer += delta;
+            if self.demo_timer >= 0.22 {
+                self.demo_timer = 0.0;
+                self.demo_note = (self.demo_note + 3) % 25;
+                self.particles
+                    .spawn_note(5, self.demo_ground, 9, self.demo_note);
+                self.demo_beat += 1;
+                if self.demo_beat % 3 == 0 {
+                    if let Some(textures) = self.textures.as_ref() {
+                        self.particles.spawn_block(
+                            textures,
+                            BlockState::STONE,
+                            7,
+                            self.demo_ground + 2,
+                            10,
+                        );
+                    }
+                }
+            }
+            self.particles.update(delta, &self.world);
+            let right = self.camera.right().to_array();
+            let up = self.camera.up().to_array();
+            let mut notes = EntityMesh::default();
+            self.particles.append_notes(&mut notes, right, up, 1.0);
+            renderer.set_entities(&notes);
+            renderer.set_overlay(&self.particles.build_debris(right, up, 1.0));
+        }
+
+        self.clock += delta;
+        if !self.beams.is_empty() {
+            renderer.set_beams(&build_beams(&self.beams, self.clock));
+        }
         renderer.draw(&self.camera);
 
         self.frames += 1;

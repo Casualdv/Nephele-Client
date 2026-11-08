@@ -19,6 +19,17 @@ pub enum EntityKind {
     Mob { kind: u8 },
     /// A dropped item stack (`S0E` with object type 2).
     Item { id: i16, meta: i16 },
+    /// An item frame (`S0E` with object type 71). The framed stack and its
+    /// rotation only exist as `S1C` metadata, so they start empty.
+    ///
+    /// `direction` is the spawn packet's `data` field: 0 = down, 1 = up,
+    /// 2 = north, 3 = south, 4 = west, 5 = east.
+    ItemFrame {
+        direction: u8,
+        item: Option<nephele_protocol::packets::play::ItemStack>,
+        /// Rotation in 45-degree steps, 0..=7 (vanilla's `getRotation`).
+        rotation: u8,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +234,58 @@ impl Entities {
         );
     }
 
+    /// Track an item frame (`S0E`, object type 71).
+    ///
+    /// The frame's `data` field is `EnumFacing.getHorizontalIndex()`
+    /// (0 = south, 1 = west, 2 = north, 3 = east), which maps straight onto
+    /// vanilla yaw in 90-degree steps.
+    pub fn spawn_item_frame(&mut self, id: i32, direction: u8, position: [f64; 3]) {
+        let yaw = (direction & 3) as f32 * 90.0;
+        self.map.insert(
+            id,
+            Entity::new(
+                id,
+                EntityKind::ItemFrame {
+                    direction: direction & 3,
+                    item: None,
+                    rotation: 0,
+                },
+                position,
+                yaw,
+                0.0,
+                self.tick,
+            ),
+        );
+    }
+
+    /// Apply the two metadata entries an item frame uses: index 8 is the framed
+    /// stack and index 9 is its rotation. Anything else is ignored.
+    pub fn set_item_frame(
+        &mut self,
+        id: i32,
+        item: Option<Option<nephele_protocol::packets::play::ItemStack>>,
+        rotation: Option<u8>,
+    ) {
+        let Some(entity) = self.map.get_mut(&id) else {
+            return;
+        };
+        let EntityKind::ItemFrame {
+            item: framed,
+            rotation: current,
+            ..
+        } = &mut entity.kind
+        else {
+            return;
+        };
+        // `Some(None)` is a real update: the frame was emptied.
+        if let Some(item) = item {
+            *framed = item;
+        }
+        if let Some(rotation) = rotation {
+            *current = rotation & 7;
+        }
+    }
+
     pub fn relative_move(&mut self, id: i32, dx: f64, dy: f64, dz: f64) {
         if let Some(entity) = self.map.get_mut(&id) {
             entity.move_to(dx, dy, dz);
@@ -292,6 +355,119 @@ impl Entities {
             .filter(|(_, distance)| *distance <= max_distance)
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .map(|(entity, _)| entity)
+    }
+
+    /// The closest entity the ray crosses, within `max_distance`.
+    ///
+    /// This is what turns a crosshair into a `C02 Use Entity` target. Vanilla
+    /// walks the same boxes: 0.6 by 1.8 for players and mobs, a small cube for
+    /// a dropped item, one block for an item frame.
+    pub fn raycast(
+        &self,
+        origin: [f64; 3],
+        direction: [f64; 3],
+        max_distance: f64,
+    ) -> Option<EntityHit> {
+        let length = (direction[0] * direction[0]
+            + direction[1] * direction[1]
+            + direction[2] * direction[2])
+            .sqrt();
+        if length <= f64::EPSILON {
+            return None;
+        }
+        let direction = [
+            direction[0] / length,
+            direction[1] / length,
+            direction[2] / length,
+        ];
+        let mut best: Option<EntityHit> = None;
+        for entity in self.map.values() {
+            let [min, max] = entity.box_bounds();
+            let Some(distance) = ray_box(origin, direction, min, max) else {
+                continue;
+            };
+            if distance > max_distance {
+                continue;
+            }
+            if best.is_some_and(|hit| hit.distance <= distance) {
+                continue;
+            }
+            best = Some(EntityHit {
+                id: entity.id,
+                point: [
+                    origin[0] + direction[0] * distance,
+                    origin[1] + direction[1] * distance,
+                    origin[2] + direction[2] * distance,
+                ],
+                distance,
+            });
+        }
+        best
+    }
+}
+
+/// A ray/entity intersection, in absolute world coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityHit {
+    pub id: i32,
+    pub point: [f64; 3],
+    /// Distance from the ray origin.
+    pub distance: f64,
+}
+
+impl Entity {
+    /// The axis-aligned box vanilla would hit-test, `[min, max]`.
+    pub fn box_bounds(&self) -> [[f64; 3]; 2] {
+        // `position` is the feet for living entities, so lift the box by half
+        // its height; objects are already at their centre.
+        let (half_width, height, centre_y) = match self.kind {
+            EntityKind::Player { .. } | EntityKind::Mob { .. } => {
+                (0.3, 1.8, self.position[1] + 0.9)
+            }
+            EntityKind::Item { .. } => (0.125, 0.25, self.position[1] + 0.125),
+            EntityKind::ItemFrame { .. } => (0.5, 1.0, self.position[1] + 0.5),
+        };
+        [
+            [
+                self.position[0] - half_width,
+                centre_y - height / 2.0,
+                self.position[2] - half_width,
+            ],
+            [
+                self.position[0] + half_width,
+                centre_y + height / 2.0,
+                self.position[2] + half_width,
+            ],
+        ]
+    }
+}
+
+/// Slab test. Returns the distance along `direction` to the entry point.
+fn ray_box(origin: [f64; 3], direction: [f64; 3], min: [f64; 3], max: [f64; 3]) -> Option<f64> {
+    let mut near = f64::NEG_INFINITY;
+    let mut far = f64::INFINITY;
+    for axis in 0..3 {
+        if direction[axis].abs() < 1.0e-9 {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return None;
+            }
+            continue;
+        }
+        let mut first = (min[axis] - origin[axis]) / direction[axis];
+        let mut second = (max[axis] - origin[axis]) / direction[axis];
+        if first > second {
+            std::mem::swap(&mut first, &mut second);
+        }
+        near = near.max(first);
+        far = far.min(second);
+        if near > far {
+            return None;
+        }
+    }
+    if far < 0.0 {
+        None
+    } else {
+        Some(near.max(0.0))
     }
 }
 
@@ -412,5 +588,25 @@ mod tests {
         entities.spawn_player(2, [0; 16], "b".into(), [2.0, 0.0, 0.0], 0.0, 0.0);
         assert_eq!(entities.nearest([1.9, 0.0, 0.0], 5.0).unwrap().id, 2);
         assert!(entities.nearest([40.0, 0.0, 0.0], 5.0).is_none());
+    }
+
+    #[test]
+    fn raycast_picks_the_closest_entity_in_front_only() {
+        let mut entities = Entities::new();
+        entities.spawn_player(1, [0; 16], "near".into(), [0.0, 64.0, 3.0], 0.0, 0.0);
+        entities.spawn_player(2, [0; 16], "far".into(), [0.0, 64.0, 5.0], 0.0, 0.0);
+        entities.spawn_player(3, [0; 16], "behind".into(), [0.0, 64.0, -2.0], 0.0, 0.0);
+
+        let hit = entities
+            .raycast([0.0, 65.0, 0.0], [0.0, 0.0, 1.0], 4.0)
+            .expect("a player is in front");
+        assert_eq!(hit.id, 1);
+        assert!((hit.distance - 2.7).abs() < 0.2, "hit at {}", hit.distance);
+        assert!((hit.point[2] - 2.7).abs() < 0.2);
+
+        // Beyond reach: nothing.
+        assert!(entities
+            .raycast([0.0, 65.0, 0.0], [0.0, 0.0, 1.0], 1.0)
+            .is_none());
     }
 }

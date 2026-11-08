@@ -42,6 +42,13 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    // A negative U marks a vertex the caller built itself: note particles and
+    // beacon beams carry their whole colour per vertex, and a beam must not be
+    // fogged or it fades into the sky it is meant to stand out against.
+    if (in.uv.x < 0.0) {
+        return in.color;
+    }
+
     let texel = textureSample(skin_atlas, skin_sampler, in.uv);
     // Fully transparent pixels on a skin are the "no part here" marker.
     if (texel.a < 0.1) {

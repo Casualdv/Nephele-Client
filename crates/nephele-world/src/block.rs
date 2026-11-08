@@ -57,6 +57,8 @@ pub mod ids {
     pub const SANDSTONE: u16 = 24;
     pub const SNOW_LAYER: u16 = 78;
     pub const ICE: u16 = 79;
+    pub const PACKED_ICE: u16 = 174;
+    pub const SLIME: u16 = 165;
     pub const CLAY: u16 = 82;
     pub const MYCELIUM: u16 = 110;
     pub const WATER_LILY: u16 = 111;

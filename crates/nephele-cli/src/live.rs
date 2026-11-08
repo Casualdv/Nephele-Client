@@ -4,7 +4,7 @@
 //! (a small tokio runtime); the window thread only renders and feeds input.
 //! Chunks travel between them as plain messages.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -26,9 +26,10 @@ use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
 use nephele_render::{
-    append_hand, biome_fog_color, block_outline, break_overlay_texture, build_break_overlay,
-    build_entities, build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw,
-    Environment, HandDraw, HandItem, ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
+    append_hand, beams_in_column, biome_fog_color, block_outline, break_overlay_texture,
+    build_beams, build_break_overlay, build_entities, build_hand_item, build_item_mesh, BeaconBeam,
+    Camera, ColumnMeshJob, EntityDraw, Environment, HandDraw, HandItem, ItemDraw, LineMesh,
+    MeshData, Particles, Renderer, UiBatch,
 };
 use nephele_world::save::{
     self, SavedItemStack, SavedPlayerState, WorldMetadata, WorldMode, WorldSave, WorldState,
@@ -49,6 +50,8 @@ const PLAYER_STATE_SAVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Vanilla's `PlayerControllerMP.getBlockReachDistance`.
 const REACH_CREATIVE: f64 = 5.0;
 const REACH_SURVIVAL: f64 = 4.5;
+/// Minimum gap between entity attacks while the left button is held.
+const ENTITY_ATTACK_INTERVAL: Duration = Duration::from_millis(250);
 /// Selection outline colour, matching vanilla's black wireframe.
 const OUTLINE_COLOR: [f32; 3] = [0.0, 0.0, 0.0];
 /// How long a status ping may take before the row is shown as offline.
@@ -79,11 +82,31 @@ pub struct PlayOptions {
 enum NetMsg {
     Chunks(Vec<ChunkColumn>),
     Unload(i32, i32),
+    /// The client world was rebuilt for another dimension. Everything the
+    /// renderer cached is keyed by chunk coordinate, and those coordinates are
+    /// reused, so the whole cache has to go.
+    WorldReset {
+        dimension: i8,
+    },
     Chat(String),
     /// The full entity table, replaced wholesale. Cheap enough at 20 Hz.
     Entities(Vec<EntitySnapshot>),
     /// Tab-list skin hashes (uuid, texture hash).
     Skins(Vec<([u8; 16], String)>),
+    /// A block was destroyed (or placed) near the player; throw debris.
+    BlockEffect {
+        x: i32,
+        y: i32,
+        z: i32,
+        state: u16,
+    },
+    /// A note block played; `pitch` is its note (0..=24).
+    NoteBlock {
+        x: i32,
+        y: i32,
+        z: i32,
+        pitch: u8,
+    },
     Error(String),
 }
 
@@ -114,17 +137,21 @@ struct EntitySnapshot {
 }
 
 impl EntitySnapshot {
-    fn from_entity(entity: &nephele_client::Entity) -> Self {
+    fn from_entity(entity: &nephele_client::Entity) -> Option<Self> {
         let (player, uuid, kind) = match &entity.kind {
             nephele_client::EntityKind::Player { uuid, .. } => (true, *uuid, 0),
             nephele_client::EntityKind::Mob { kind } => (false, [0; 16], *kind),
             nephele_client::EntityKind::Item { .. } => (false, [0; 16], 0),
+            // Item frames are parsed and tracked for the renderer that will
+            // consume them; nothing draws them yet, so they stay out of the
+            // snapshot rather than showing up as a tinted box.
+            nephele_client::EntityKind::ItemFrame { .. } => return None,
         };
         let item = match entity.kind {
             nephele_client::EntityKind::Item { id, meta } => Some((id, meta)),
             _ => None,
         };
-        Self {
+        Some(Self {
             player,
             uuid,
             prev: entity.prev,
@@ -136,7 +163,7 @@ impl EntitySnapshot {
             pitch: entity.pitch,
             kind,
             item,
-        }
+        })
     }
 }
 
@@ -145,7 +172,6 @@ struct Shared {
     yaw: f32,
     pitch: f32,
     input: Input,
-    teleport: Option<[f64; 3]>,
     status: String,
     spawned: bool,
     error: Option<String>,
@@ -157,6 +183,8 @@ struct Shared {
     pending_slot: Option<i16>,
     /// Set by the death screen, drained by the network loop.
     pending_respawn: bool,
+    pack_offer: Option<String>,
+    pack_choice: Option<(String, bool)>,
     /// Written by the network thread, read by the renderer.
     aim: Option<Aim>,
     break_stage: Option<u8>,
@@ -333,53 +361,8 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
     perf::start();
     let settings = initial_settings();
     let shared = Arc::new(Mutex::new(Shared {
-        player: PlayerState::default(),
-        yaw: 0.0,
-        pitch: 0.0,
-        input: Input::default(),
-        teleport: None,
-        status: String::new(),
-        spawned: false,
-        error: None,
-        attacking: false,
-        use_pressed: false,
-        pending_slot: None,
-        pending_respawn: false,
-        aim: None,
-        break_stage: None,
-        held_slot: 0,
-        creative: false,
-        inventory: vec![None; 45],
-        health: 20.0,
-        food: 20,
-        food_saturation: 5.0,
-        food_exhaustion: 0.0,
-        xp_bar: 0.0,
-        xp_level: 0,
-        xp_total: 0,
-        xp_seed: 0,
-        time_of_day: 6000.0,
-        spawn_point: None,
-        raining: false,
-        thundering: false,
-        lightning: 0.0,
-        chunks: 0,
-        give_item: None,
-        chat_out: Vec::new(),
-        world_edits: Vec::new(),
-        creative_override: None,
-        inventory_clicks: Vec::new(),
-        window_slots: Vec::new(),
-        window_open: false,
-        window_id: None,
-        local_container: LocalContainer::default(),
-        close_window: false,
-        local: false,
-        local_shutdown: false,
-        local_stopped: true,
         view_distance: configured_view_distance(&settings),
-        prev_position: [0.5, 80.0, 0.5],
-        tick_at: Instant::now(),
+        ..Shared::default()
     }));
 
     let (tx, rx) = mpsc::channel::<NetMsg>();
@@ -394,12 +377,73 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
     }
 }
 
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            player: PlayerState::default(),
+            yaw: 0.0,
+            pitch: 0.0,
+            input: Input::default(),
+            status: String::new(),
+            spawned: false,
+            error: None,
+            attacking: false,
+            use_pressed: false,
+            pending_slot: None,
+            pending_respawn: false,
+            pack_offer: None,
+            pack_choice: None,
+            aim: None,
+            break_stage: None,
+            held_slot: 0,
+            creative: false,
+            inventory: vec![None; 45],
+            health: 20.0,
+            food: 20,
+            food_saturation: 5.0,
+            food_exhaustion: 0.0,
+            xp_bar: 0.0,
+            xp_level: 0,
+            xp_total: 0,
+            xp_seed: 0,
+            time_of_day: 6000.0,
+            spawn_point: None,
+            raining: false,
+            thundering: false,
+            lightning: 0.0,
+            chunks: 0,
+            give_item: None,
+            chat_out: Vec::new(),
+            world_edits: Vec::new(),
+            creative_override: None,
+            inventory_clicks: Vec::new(),
+            window_slots: Vec::new(),
+            window_open: false,
+            window_id: None,
+            local_container: LocalContainer::default(),
+            close_window: false,
+            local: false,
+            local_shutdown: false,
+            local_stopped: true,
+            view_distance: nephele_client::VIEW_DISTANCE,
+            prev_position: [0.5, 80.0, 0.5],
+            tick_at: Instant::now(),
+        }
+    }
+}
+
+impl Shared {
+    fn reset_session(&mut self) {
+        *self = Self {
+            view_distance: self.view_distance,
+            ..Self::default()
+        };
+    }
+}
+
 /// One 20 Hz simulation step, shared by the network and single-player loops.
 fn step_player(shared: &Arc<Mutex<Shared>>, world: &World) -> (Vec3, f32, f32, bool) {
     let mut state = shared.lock().unwrap();
-    if let Some([x, y, z]) = state.teleport.take() {
-        state.player.teleport(x, y, z);
-    }
     state.prev_position = [state.player.x, state.player.y, state.player.z];
     let input = state.input;
     let yaw = state.yaw;
@@ -411,6 +455,18 @@ fn step_player(shared: &Arc<Mutex<Shared>>, world: &World) -> (Vec3, f32, f32, b
         state.pitch,
         state.player.on_ground,
     )
+}
+
+/// Apply a look delta, in raw device pixels, to the shared camera angles.
+fn apply_look(state: &mut Shared, dx: f32, dy: f32, sensitivity: f32) {
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    let dx = dx * sensitivity;
+    let dy = dy * sensitivity;
+    state.yaw = (state.yaw + dx * MOUSE_SENSITIVITY) % std::f32::consts::TAU;
+    let limit = 89f32.to_radians();
+    state.pitch = (state.pitch - dy * MOUSE_SENSITIVITY).clamp(-limit, limit);
 }
 
 fn fresh_world_seed() -> u64 {
@@ -729,6 +785,12 @@ fn local_loop(
         for event in miner.tick(&world, aim, attacking, creative) {
             if let MiningEvent::Stop(target) = event {
                 let broken = world.get_block(target.x, target.y, target.z);
+                let _ = tx.send(NetMsg::BlockEffect {
+                    x: target.x,
+                    y: target.y,
+                    z: target.z,
+                    state: broken.raw(),
+                });
                 world.set_block(target.x, target.y, target.z, BlockState::AIR);
                 changed.insert((target.x.div_euclid(16), target.z.div_euclid(16)));
                 if !creative {
@@ -788,6 +850,12 @@ fn local_loop(
                             && !placement_hits_player(&aim, player_feet)
                         {
                             world.set_block(bx, by, bz, block);
+                            let _ = tx.send(NetMsg::BlockEffect {
+                                x: bx,
+                                y: by,
+                                z: bz,
+                                state: state_block,
+                            });
                             changed.insert((bx.div_euclid(16), bz.div_euclid(16)));
                             if !creative {
                                 consume_held_block(
@@ -893,6 +961,36 @@ fn look_direction(yaw: f32, pitch: f32) -> [f64; 3] {
     ]
 }
 
+/// Tell the UI thread to throw debris for the block at `target`, using the
+/// state the world still has (before the server's change lands).
+fn send_block_effect(world: &World, tx: &Sender<NetMsg>, target: &Aim) {
+    let state = world.get_block(target.x, target.y, target.z).raw();
+    if state != 0 {
+        let _ = tx.send(NetMsg::BlockEffect {
+            x: target.x,
+            y: target.y,
+            z: target.z,
+            state,
+        });
+    }
+}
+
+/// Drop every cached chunk column when the client world is rebuilt for another
+/// dimension. Chunk coordinates are reused between dimensions, so keeping any
+/// column would mesh new blocks against old neighbours.
+fn reset_chunk_caches(
+    world: &mut World,
+    dimension: i8,
+    dirty_chunks: &mut Vec<(i32, i32)>,
+    queued: &mut HashSet<(i32, i32)>,
+    stale: &mut HashSet<(i32, i32)>,
+) {
+    *world = World::new(dimension);
+    dirty_chunks.clear();
+    queued.clear();
+    stale.clear();
+}
+
 async fn net_loop(
     address: ServerAddress,
     username: String,
@@ -904,9 +1002,15 @@ async fn net_loop(
         Some(path) => {
             let stored = nephele_auth::StoredSession::load(path)
                 .map_err(|err| format!("no Microsoft session ({err}); run `nephele auth` first"))?;
+            if stored.is_expired() {
+                return Err(
+                    "your cached Microsoft session expired; run `nephele auth` to sign in again"
+                        .into(),
+                );
+            }
             GameClient::join_online(&address, &stored.session())
                 .await
-                .map_err(|err| err.to_string())?
+                .map_err(|err| format!("{err}; if this persists, run `nephele auth`"))?
         }
         None => GameClient::join(&address, &username)
             .await
@@ -926,6 +1030,11 @@ async fn net_loop(
     }
 
     let mut miner = Miner::default();
+    let mut attack_cooldown = Instant::now();
+    // `NEPHELE_SCOREBOARD=1` dumps the resolved sidebar once a second, so a
+    // live lobby can be checked without a renderer.
+    let dump_scoreboard = std::env::var("NEPHELE_SCOREBOARD").is_ok();
+    let mut last_scoreboard_dump = Instant::now() - Duration::from_secs(1);
     let mut world_dirty = false;
     let mut sent_view_distance = shared.lock().unwrap().view_distance;
 
@@ -939,9 +1048,27 @@ async fn net_loop(
         tokio::select! {
             _ = ticker.tick() => {
                 let (position, yaw, pitch, on_ground) = step_player(&shared, &client.world);
+                if dump_scoreboard && last_scoreboard_dump.elapsed() >= Duration::from_secs(1) {
+                    last_scoreboard_dump = Instant::now();
+                    match client.scoreboard.sidebar() {
+                        Some(objective) => eprintln!(
+                            "[scoreboard] sidebar {:?} ({:?})",
+                            objective.display_name, objective.name
+                        ),
+                        None => eprintln!("[scoreboard] no sidebar objective"),
+                    }
+                    for row in client.scoreboard.sidebar_rows() {
+                        eprintln!(
+                            "[scoreboard] {:>3} {} team={:?} colour={:?}",
+                            row.score,
+                            row.text(),
+                            row.team,
+                            row.color
+                        );
+                    }
+                }
                 let (attacking, use_pressed, pending_slot, give, chat, edits, gamemode, clicks) = {
-                    let mut state = shared.lock().unwrap();
-                    (
+                    let mut state = shared.lock().unwrap();                    (
                         state.attacking,
                         std::mem::take(&mut state.use_pressed),
                         state.pending_slot.take(),
@@ -952,6 +1079,13 @@ async fn net_loop(
                         std::mem::take(&mut state.inventory_clicks),
                     )
                 };
+                let pack_choice = shared.lock().unwrap().pack_choice.take();
+                if let Some((hash, accept)) = pack_choice {
+                    client.answer_resource_pack(&hash, accept).await.map_err(|err| err.to_string())?;
+                    if accept {
+                        let _ = tx.send(NetMsg::Chat("Server pack could not be loaded by this client.".into()));
+                    }
+                }
                 for (slot, button, mode, clicked) in clicks {
                     client
                         .click_slot_with(slot, button, mode, clicked)
@@ -1009,7 +1143,8 @@ async fn net_loop(
                 let eye = [position.x, position.y + EYE_HEIGHT, position.z];
                 let direction = look_direction(yaw, pitch);
                 let reach = if creative { REACH_CREATIVE } else { REACH_SURVIVAL };
-                let aim = raycast(&client.world, eye, direction, reach).map(|hit| Aim {
+                let block_hit = raycast(&client.world, eye, direction, reach);
+                let aim = block_hit.map(|hit| Aim {
                     x: hit.x,
                     y: hit.y,
                     z: hit.z,
@@ -1020,15 +1155,35 @@ async fn net_loop(
                         (hit.point[2] - hit.z as f64).clamp(0.0, 1.0) as f32,
                     ],
                 });
+                // A player in front of the crosshair wins over the block behind
+                // them, exactly as vanilla's object pick does.
+                let entity_hit = client.entities.raycast(eye, direction, reach);
+                let entity_in_front = match (&block_hit, &entity_hit) {
+                    (Some(block), Some(entity)) => block.distance > entity.distance,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                let entity_hit = entity_hit.filter(|_| entity_in_front);
 
-                for event in miner.tick(&client.world, aim, attacking, creative) {
+                // Aiming at an entity must not also mine the block behind it.
+                let mining_aim = if entity_in_front { None } else { aim };
+                for event in miner.tick(&client.world, mining_aim, attacking, creative) {
                     match event {
                         MiningEvent::Start(target) => {
+                            // Creative removes the block on the click; survival
+                            // waits for the break to finish, so only one of the
+                            // two produces the debris.
+                            if creative {
+                                send_block_effect(&client.world, &tx, &target);
+                            }
                             client.dig(digging::START_DESTROY_BLOCK, &target).await
                                 .map_err(|err| err.to_string())?;
                             client.swing().await.map_err(|err| err.to_string())?;
                         }
                         MiningEvent::Stop(target) => {
+                            if !creative {
+                                send_block_effect(&client.world, &tx, &target);
+                            }
                             client.dig(digging::STOP_DESTROY_BLOCK, &target).await
                                 .map_err(|err| err.to_string())?;
                         }
@@ -1039,18 +1194,58 @@ async fn net_loop(
                     }
                 }
 
+                if attacking {
+                    if let Some(hit) = entity_hit {
+                        // Vanilla auto-attacks while the button is held, but
+                        // not twenty times a second.
+                        if attack_cooldown.elapsed() >= ENTITY_ATTACK_INTERVAL {
+                            attack_cooldown = Instant::now();
+                            client
+                                .attack_entity(hit.id)
+                                .await
+                                .map_err(|err| err.to_string())?;
+                        }
+                    }
+                } else {
+                    attack_cooldown = Instant::now();
+                }
+
                 if use_pressed {
-                    if let Some(target) = aim {
+                    if let Some(hit) = entity_hit {
+                        // Right click on an entity is `INTERACT_AT`, with the
+                        // click point relative to the entity's own origin.
+                        let origin = client
+                            .entities
+                            .get(hit.id)
+                            .map(|entity| entity.position)
+                            .unwrap_or_default();
+                        let target = [
+                            (hit.point[0] - origin[0]) as f32,
+                            (hit.point[1] - origin[1]) as f32,
+                            (hit.point[2] - origin[2]) as f32,
+                        ];
+                        client
+                            .interact_entity_at(hit.id, target)
+                            .await
+                            .map_err(|err| err.to_string())?;
+                    } else if let Some(target) = aim {
                         if !placement_hits_player(&target, [position.x, position.y, position.z]) {
                             let placeable = client
                                 .held_item()
                                 .and_then(|item| item.block_state())
                                 .is_some();
                             if placeable {
-                                client
+                                let state = client
+                                    .held_item()
+                                    .and_then(|item| item.block_state())
+                                    .unwrap_or_default();
+                                let placed = client
                                     .place(&target)
                                     .await
                                     .map_err(|err| err.to_string())?;
+                                if let Some((x, y, z)) = placed {
+                                    let _ = tx.send(NetMsg::BlockEffect { x, y, z, state });
+                                }
                             } else {
                                 client
                                     .use_block(&target)
@@ -1061,10 +1256,10 @@ async fn net_loop(
                     }
                 }
 
-                client
-                    .send_move(position, yaw, pitch, on_ground)
-                    .await
-                    .map_err(|err| err.to_string())?;
+                if client.spawned {
+                    client.send_movement_tick(position, yaw, pitch, on_ground)
+                        .await.map_err(|err| err.to_string())?;
+                }
 
                 // One client tick: snapshot every entity's interpolation start,
                 // then hand the whole table to the renderer.
@@ -1072,7 +1267,7 @@ async fn net_loop(
                 let snapshot: Vec<EntitySnapshot> = client
                     .entities
                     .iter()
-                    .map(EntitySnapshot::from_entity)
+                    .filter_map(EntitySnapshot::from_entity)
                     .collect();
                 if std::mem::take(&mut shared.lock().unwrap().pending_respawn) {
                     client.respawn().await.map_err(|err| err.to_string())?;
@@ -1137,20 +1332,63 @@ async fn net_loop(
                     let _ = tx.send(NetMsg::Unload(x, z));
                 }
             }
-            event = client.tick(Duration::from_millis(100)) => {
-                match event {
-                    Ok(Event::Position { position, yaw, pitch }) => {
+            packet = client.receive_frame() => {
+                let packet = packet.map_err(|err| err.to_string())?;
+                match client.handle(packet).await {
+                    Ok(Event::Position { position, yaw, pitch, relative_flags }) => {
+                        // Apply the server's placement on arrival. Queuing it
+                        // for the next tick leaves the camera up to 50 ms
+                        // behind and smears a teleport across the map.
                         let mut state = shared.lock().unwrap();
-                        state.teleport = Some([position.x, position.y, position.z]);
+                        state.player.correct_position(position, relative_flags);
+                        state.prev_position = [position.x, position.y, position.z];
                         state.yaw = yaw;
                         state.pitch = pitch;
                         state.spawned = true;
+                    }
+                    Ok(Event::Velocity { vx, vy, vz }) => {
+                        let mut state = shared.lock().unwrap();
+                        state.player.set_velocity(vx, vy, vz);
                     }
                     Ok(Event::Chat(text)) => {
                         let _ = tx.send(NetMsg::Chat(text));
                     }
                     Ok(Event::BlocksChanged(_)) => {
                         world_dirty = true;
+                    }
+                    Ok(Event::BlockAction {
+                        x,
+                        y,
+                        z,
+                        data,
+                        block_id,
+                        ..
+                    }) => {
+                        // Vanilla `BlockNote.onBlockEventReceived`: a note block
+                        // (id 25) spawns the note particle on every event.
+                        if block_id == 25 {
+                            let _ = tx.send(NetMsg::NoteBlock { x, y, z, pitch: data });
+                        }
+                    }
+                    Ok(Event::Respawn { dimension }) => {
+                        // Chunk coordinates are reused across dimensions, so
+                        // nothing the renderer already has can be trusted. Drop
+                        // the record of what was sent; the next tick re-streams
+                        // every column of the new world.
+                        sent.clear();
+                        world_dirty = false;
+                        miner = Miner::default();
+                        creative = client.is_creative();
+                        {
+                            let mut state = shared.lock().unwrap();
+                            state.reset_session();
+                            state.creative = creative;
+                            state.status = format!("{} @ {}", client.info.username, address);
+                        }
+                        let _ = tx.send(NetMsg::WorldReset { dimension });
+                    }
+                    Ok(Event::ResourcePack { hash, .. }) => {
+                        shared.lock().unwrap().pack_offer = Some(hash);
                     }
                     Ok(Event::PlayerList) => {
                         let skins: Vec<([u8; 16], String)> = client
@@ -1237,6 +1475,12 @@ struct LiveApp {
     skin_atlas: SkinAtlas,
     skin_slots: std::collections::HashMap<[u8; 16], u32>,
     skin_loader: SkinLoader,
+    /// Break debris and note particles, simulated at display rate.
+    particles: Particles,
+    /// Beacon beams per loaded column; a resent column replaces its beams.
+    beacons: HashMap<(i32, i32), Vec<BeaconBeam>>,
+    /// Dev-only commands run once the world has loaded (`NEPHELE_CMDS`).
+    startup_cmds: Vec<String>,
     /// Per-phase frame timings, printed once a second under `NEPHELE_PROFILE=1`.
     profile: bool,
     prof_ui: f32,
@@ -1249,6 +1493,10 @@ struct LiveApp {
     /// True once the platform started reporting raw mouse deltas; from then on
     /// CursorMoved is only used for the menu pointer.
     raw_motion: bool,
+    /// Look deltas accumulated since the last frame, in raw device pixels.
+    /// Applying them in `frame()` keeps the camera on the display clock
+    /// instead of the 20 Hz simulation clock.
+    pending_look: (f32, f32),
     last_frame: Instant,
     title_timer: f32,
     frames: u32,
@@ -1308,6 +1556,11 @@ struct LiveApp {
     /// Previous health value, so a drop can flash the damage vignette.
     last_health: f32,
     hurt_flash: f32,
+    /// Set when the network thread reports a disconnect. Shown over the game
+    /// and cleared by the reconnect key.
+    disconnect_reason: Option<String>,
+    /// Address of the last connection, kept so `R` can reconnect.
+    last_address: Option<ServerAddress>,
     error: Option<Box<dyn Error>>,
 }
 
@@ -1358,6 +1611,11 @@ impl LiveApp {
             skin_atlas: SkinAtlas::new(),
             skin_slots: std::collections::HashMap::new(),
             skin_loader: SkinLoader::new(),
+            particles: Particles::new(),
+            beacons: HashMap::new(),
+            startup_cmds: std::env::var("NEPHELE_CMDS")
+                .map(|value| value.split(';').map(str::to_string).collect())
+                .unwrap_or_default(),
             profile: std::env::var("NEPHELE_PROFILE").is_ok(),
             prof_ui: 0.0,
             prof_mesh: 0.0,
@@ -1367,6 +1625,7 @@ impl LiveApp {
             mouse_captured: false,
             last_cursor: None,
             raw_motion: false,
+            pending_look: (0.0, 0.0),
             last_frame: Instant::now(),
             title_timer: 0.0,
             frames: 0,
@@ -1418,6 +1677,8 @@ impl LiveApp {
             last_fps: 0.0,
             last_health: 20.0,
             hurt_flash: 0.0,
+            disconnect_reason: None,
+            last_address: None,
             error: None,
         };
 
@@ -1596,6 +1857,11 @@ impl LiveApp {
     }
 
     fn upload_chunk(&mut self, key: (i32, i32), mesh: &MeshData) {
+        // A mesh that finished after the world was reset for another dimension
+        // belongs to a column this world no longer has.
+        if !self.world.contains(ChunkCoord::new(key.0, key.1)) {
+            return;
+        }
         let min = [key.0 as f32 * 16.0, 0.0, key.1 as f32 * 16.0];
         let max = [min[0] + 16.0, 256.0, min[2] + 16.0];
         if let Some(renderer) = self.renderer.as_mut() {
@@ -1604,6 +1870,36 @@ impl LiveApp {
             if !mesh.is_empty() {
                 perf::record_chunk_upload(upload_start, upload_start.elapsed());
             }
+        }
+    }
+
+    /// Throw away every chunk the renderer, the mesher and the world cache hold.
+    ///
+    /// `Event::Respawn` can move the player between dimensions, and chunk
+    /// coordinates are reused: an overworld column left in the cache would be
+    /// meshed under the Nether's blocks instead of being replaced.
+    fn reset_for_dimension(&mut self, dimension: i8) {
+        reset_chunk_caches(
+            &mut self.world,
+            dimension,
+            &mut self.dirty_chunks,
+            &mut self.queued,
+            &mut self.stale,
+        );
+        self.entities.clear();
+        // Old workers may still be meshing coordinates reused in the new world.
+        self.mesh_pool = self
+            .textures
+            .as_ref()
+            .map(|layers| MeshPool::new(Arc::clone(layers)));
+        self.keys.clear();
+        self.pending_look = (0.0, 0.0);
+        self.inventory_cursor = None;
+        self.chat_open = false;
+        self.chat_input.clear();
+        self.update_highlights(None, None, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 0.0);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.clear_chunks();
         }
     }
 
@@ -1674,6 +1970,14 @@ impl LiveApp {
         }
         let mut entity_mesh = build_entities(&draws);
         let mut item_mesh = build_item_mesh(&items, textures, self.time);
+        // Note particles ride in the entity buffer: same shader, per-vertex
+        // colour, no extra pipeline.
+        self.particles.append_notes(
+            &mut entity_mesh,
+            view.camera.right().to_array(),
+            view.camera.up().to_array(),
+            view.alpha as f32,
+        );
         if self.screen == Screen::Game {
             // The first-person arm is built in camera space and placed in the
             // world, so it lands in the same depth-tested pass as everything else.
@@ -1718,8 +2022,26 @@ impl LiveApp {
         }
         renderer.set_entities(&entity_mesh);
         renderer.set_items(&item_mesh);
+        let beams: Vec<BeaconBeam> = self.beacons.values().flatten().cloned().collect();
+        renderer.set_beams(&build_beams(&beams, self.time));
     }
 
+    /// Recompute the beams a column contributes. A beam only depends on the
+    /// blocks in its own column, so a resent column replaces its entry.
+    fn refresh_beacons(&mut self, key: (i32, i32)) {
+        let beams = self
+            .world
+            .get(ChunkCoord::new(key.0, key.1))
+            .map(|column| beams_in_column(&self.world, column))
+            .unwrap_or_default();
+        if beams.is_empty() {
+            self.beacons.remove(&key);
+        } else {
+            self.beacons.insert(key, beams);
+        }
+    }
+
+    /// Every loaded beacon, flattened for the beam pass.
     fn drain_network(&mut self) {
         loop {
             match self.rx.try_recv() {
@@ -1727,6 +2049,7 @@ impl LiveApp {
                     for column in columns {
                         let key = (column.x, column.z);
                         self.world.insert(column);
+                        self.refresh_beacons(key);
                         self.mark_dirty(key);
                         // A new column changes what its neighbours' border faces
                         // must cull, so they need re-meshing too.
@@ -1735,6 +2058,7 @@ impl LiveApp {
                 }
                 Ok(NetMsg::Unload(x, z)) => {
                     self.world.remove(ChunkCoord::new(x, z));
+                    self.beacons.remove(&(x, z));
                     self.queued.remove(&(x, z));
                     self.stale.remove(&(x, z));
                     self.pending_uploads.retain(|(key, _)| *key != (x, z));
@@ -1742,6 +2066,21 @@ impl LiveApp {
                         renderer.remove_chunk((x, z));
                     }
                     self.mark_neighbours_dirty((x, z));
+                }
+                Ok(NetMsg::WorldReset { dimension }) => {
+                    self.particles.clear();
+                    self.beacons.clear();
+                    self.reset_for_dimension(dimension);
+                    self.enter_game();
+                }
+                Ok(NetMsg::BlockEffect { x, y, z, state }) => {
+                    if let Some(textures) = self.textures.as_ref() {
+                        self.particles
+                            .spawn_block(textures, BlockState::from_raw(state), x, y, z);
+                    }
+                }
+                Ok(NetMsg::NoteBlock { x, y, z, pitch }) => {
+                    self.particles.spawn_note(x, y, z, pitch);
                 }
                 Ok(NetMsg::Chat(text)) => {
                     println!("[chat] {text}");
@@ -1761,6 +2100,14 @@ impl LiveApp {
                 }
                 Ok(NetMsg::Error(err)) => {
                     eprintln!("network error: {err}");
+                    self.screen = Screen::Game;
+                    self.set_mouse_capture(false);
+                    self.chat_open = false;
+                    self.reset_for_dimension(0);
+                    self.chat_log.clear();
+                    self.skin_slots.clear();
+                    self.shared.lock().unwrap().reset_session();
+                    self.disconnect_reason = Some(err.clone());
                     let mut state = self.shared.lock().unwrap();
                     state.error = Some(err);
                 }
@@ -1798,10 +2145,17 @@ impl LiveApp {
         }
     }
 
-    /// Rebuild the selection outline and the crack overlay when they move.
-    fn update_highlights(&mut self, aim: Option<Aim>, stage: Option<u8>) {
-        if aim != self.drawn_aim {
-            self.drawn_aim = aim;
+    /// Rebuild the selection outline, then the crack overlay plus any debris.
+    fn update_highlights(
+        &mut self,
+        aim: Option<Aim>,
+        stage: Option<u8>,
+        right: [f32; 3],
+        up: [f32; 3],
+        alpha: f32,
+    ) {
+        let aim_moved = aim != self.drawn_aim;
+        if aim_moved {
             let lines = match aim {
                 Some(aim) => block_outline(aim.x, aim.y, aim.z, OUTLINE_COLOR),
                 None => LineMesh::default(),
@@ -1811,19 +2165,25 @@ impl LiveApp {
             }
         }
 
-        if stage != self.drawn_stage || (stage.is_some() && aim != self.drawn_aim) {
-            self.drawn_stage = stage;
-            let overlay = match (aim, stage, self.textures.as_ref()) {
+        // Debris moves every frame, so the overlay buffer is rebuilt while any
+        // is alive; otherwise it only changes when the crack stage or target
+        // does.
+        let animated = !self.particles.is_empty();
+        if stage != self.drawn_stage || (stage.is_some() && aim_moved) || animated {
+            let mut overlay = match (aim, stage, self.textures.as_ref()) {
                 (Some(aim), Some(stage), Some(textures)) => {
                     let layer = textures.slot_or_missing(break_overlay_texture(stage));
                     build_break_overlay(aim.x, aim.y, aim.z, layer)
                 }
                 _ => MeshData::default(),
             };
+            overlay.append(self.particles.build_debris(right, up, alpha));
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_overlay(&overlay);
             }
         }
+        self.drawn_stage = stage;
+        self.drawn_aim = aim;
     }
 
     fn frame(&mut self) {
@@ -1843,9 +2203,23 @@ impl LiveApp {
         self.drain_network();
         self.drain_pings();
         self.push_input();
+        self.particles.update(delta, &self.world);
+        if self.screen == Screen::Game
+            && !self.startup_cmds.is_empty()
+            && self.world.loaded_chunks() >= 16
+        {
+            let commands = std::mem::take(&mut self.startup_cmds);
+            for command in commands {
+                self.run_command(command.trim_start_matches('/'));
+            }
+        }
 
+        let look = std::mem::take(&mut self.pending_look);
         let view = {
             let mut state = self.shared.lock().unwrap();
+            // Look is display-rate input: apply everything the mouse produced
+            // since the last frame, not once per physics tick.
+            apply_look(&mut state, look.0, look.1, self.settings.sensitivity);
             // Physics runs at 20 Hz; render between ticks so motion is smooth
             // instead of stepping, like vanilla's `lastTickPos` interpolation.
             let alpha = ((Instant::now() - state.tick_at).as_secs_f64() / TICK.as_secs_f64())
@@ -1908,7 +2282,7 @@ impl LiveApp {
         self.hurt_flash = (self.hurt_flash - delta * 1.8).max(0.0);
 
         // Right-clicking a crafting table opens a server window; show it.
-        if view.window_open && self.screen == Screen::Game {
+        if view.window_open && self.screen == Screen::Game && self.disconnect_reason.is_none() {
             self.screen = Screen::Inventory;
             self.inventory_cursor = None;
             self.set_mouse_capture(false);
@@ -2019,7 +2393,13 @@ impl LiveApp {
 
         self.time += delta;
         let ui_start = Instant::now();
-        self.update_highlights(view.aim, view.stage);
+        self.update_highlights(
+            view.aim,
+            view.stage,
+            view.camera.right().to_array(),
+            view.camera.up().to_array(),
+            view.alpha as f32,
+        );
         self.draw_ui(&view);
         self.prof_ui += ui_start.elapsed().as_secs_f32() * 1000.0;
 
@@ -2293,7 +2673,7 @@ impl LiveApp {
                 width,
                 height,
             ),
-            Screen::Game if hud.health <= 0.0 => {
+            Screen::Game if hud.health <= 0.0 && self.disconnect_reason.is_none() => {
                 self.screen = Screen::Death;
                 ui::draw_death(
                     &mut self.ui_bg,
@@ -2374,6 +2754,40 @@ impl LiveApp {
 
         if self.screen == Screen::Game {
             ui::draw_damage_vignette(&mut self.ui_bg, width, height, self.hurt_flash);
+            if let Some(reason) = self.disconnect_reason.as_deref() {
+                ui::draw_status_banner(
+                    &mut self.ui_bg,
+                    &mut self.ui_fg,
+                    "Disconnected",
+                    &format!("{reason}  —  R: reconnect   Esc: servers"),
+                    scale,
+                    width,
+                    height,
+                );
+            } else if self.shared.lock().unwrap().pack_offer.is_some() && !self.chat_open {
+                ui::draw_status_banner(
+                    &mut self.ui_bg,
+                    &mut self.ui_fg,
+                    "Server resource pack",
+                    "Y: Accept   N: Decline",
+                    scale,
+                    width,
+                    height,
+                );
+            } else if view.chunks == 0 {
+                ui::draw_status_banner(
+                    &mut self.ui_bg,
+                    &mut self.ui_fg,
+                    "Building terrain...",
+                    "",
+                    scale,
+                    width,
+                    height,
+                );
+            }
+        }
+
+        if self.screen == Screen::Game {
             self.draw_chat(scale, width, height);
         }
 
@@ -2382,20 +2796,42 @@ impl LiveApp {
         }
     }
 
-    /// Apply a look delta, in raw device pixels.
-    fn look(&mut self, dx: f32, dy: f32) {
-        let mut state = self.shared.lock().unwrap();
-        let dx = dx * self.settings.sensitivity;
-        let dy = dy * self.settings.sensitivity;
-        state.yaw = (state.yaw + dx * MOUSE_SENSITIVITY) % std::f32::consts::TAU;
-        let limit = 89f32.to_radians();
-        state.pitch = (state.pitch - dy * MOUSE_SENSITIVITY).clamp(-limit, limit);
+    /// Accumulate a look delta, in raw device pixels.
+    ///
+    /// Device events can arrive many times between frames; the camera consumes
+    /// the sum in `frame()`, so rotation is never quantised to the 20 Hz
+    /// simulation tick.
+    fn queue_look(&mut self, dx: f32, dy: f32) {
+        self.pending_look.0 += dx;
+        self.pending_look.1 += dy;
+    }
+
+    /// Start a fresh session after a disconnect.
+    ///
+    /// Everything the renderer and the world cache hold is keyed by chunk or
+    /// entity id and would otherwise be meshed into the new server's world, so
+    /// the reset is the same one a dimension change uses.
+    fn reconnect(&mut self) {
+        let Some(address) = self.last_address.clone() else {
+            return;
+        };
+        self.reset_for_dimension(0);
+        self.chat_log.clear();
+        self.skin_slots.clear();
+        self.disconnect_reason = None;
+        {
+            let mut state = self.shared.lock().unwrap();
+            state.reset_session();
+            state.status = "reconnecting...".into();
+        }
+        self.start_network(address);
     }
 
     /// Spawn the network thread for `address` and switch to the game screen.
     fn start_network(&mut self, address: ServerAddress) {
         self.screen = Screen::Game;
         self.set_mouse_capture(false);
+        self.last_address = Some(address.clone());
         let shared = Arc::clone(&self.shared);
         let username = self.options.username.clone();
         let session_path = if self.options.online {
@@ -2834,7 +3270,10 @@ impl LiveApp {
                 });
             }
             Command::Teleport { x, y, z } => {
-                self.shared.lock().unwrap().teleport = Some([x, y, z]);
+                let mut state = self.shared.lock().unwrap();
+                state.player.teleport(x, y, z);
+                state.prev_position = [x, y, z];
+                drop(state);
                 self.push_chat(format!("Teleported to {x:.1} {y:.1} {z:.1}"));
             }
             Command::SetBlock { x, y, z, id, meta } => {
@@ -3317,7 +3756,7 @@ impl ApplicationHandler for LiveApp {
         if let DeviceEvent::MouseMotion { delta } = event {
             if self.mouse_captured && self.screen == Screen::Game {
                 self.raw_motion = true;
-                self.look(delta.0 as f32, delta.1 as f32);
+                self.queue_look(delta.0 as f32, delta.1 as f32);
             }
         }
     }
@@ -3359,6 +3798,34 @@ impl ApplicationHandler for LiveApp {
                         "key {:?} {:?} screen={:?} captured={}",
                         event.physical_key, event.state, self.screen, self.mouse_captured
                     );
+                }
+                if self.disconnect_reason.is_some() {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        match event.physical_key {
+                            PhysicalKey::Code(KeyCode::KeyR) => self.reconnect(),
+                            PhysicalKey::Code(KeyCode::Escape) => {
+                                self.disconnect_reason = None;
+                                self.open_servers();
+                            }
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+                if self.screen == Screen::Game
+                    && !self.chat_open
+                    && !event.repeat
+                    && event.state == ElementState::Pressed
+                {
+                    if let PhysicalKey::Code(key @ (KeyCode::KeyY | KeyCode::KeyN)) =
+                        event.physical_key
+                    {
+                        let mut state = self.shared.lock().unwrap();
+                        if let Some(hash) = state.pack_offer.take() {
+                            state.pack_choice = Some((hash, key == KeyCode::KeyY));
+                            return;
+                        }
+                    }
                 }
                 // While the chat line is open it owns the keyboard.
                 if self.chat_open && event.state == ElementState::Pressed {
@@ -3513,6 +3980,13 @@ impl ApplicationHandler for LiveApp {
                     && event.physical_key == PhysicalKey::Code(KeyCode::Enter)
                 {
                     self.confirm_delete_selected_world();
+                    return;
+                }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyR)
+                    && self.disconnect_reason.is_some()
+                {
+                    self.reconnect();
                     return;
                 }
                 if let PhysicalKey::Code(code) = event.physical_key {
@@ -3671,7 +4145,10 @@ impl ApplicationHandler for LiveApp {
                     // send raw motion (see `device_event`).
                     if !self.raw_motion {
                         if let Some(last) = self.last_cursor {
-                            self.look((position.x - last.x) as f32, (position.y - last.y) as f32);
+                            self.queue_look(
+                                (position.x - last.x) as f32,
+                                (position.y - last.y) as f32,
+                            );
                         }
                     }
                     self.last_cursor = Some(position);
@@ -3849,7 +4326,6 @@ mod tests {
             yaw: 0.0,
             pitch: 0.0,
             input: Input::default(),
-            teleport: None,
             status: String::new(),
             spawned: false,
             error: None,
@@ -3857,6 +4333,8 @@ mod tests {
             use_pressed: false,
             pending_slot: None,
             pending_respawn: false,
+            pack_offer: None,
+            pack_choice: None,
             aim: None,
             break_stage: None,
             held_slot: 0,
@@ -3980,6 +4458,45 @@ mod tests {
     }
 
     #[test]
+    fn look_clamps_pitch_and_wraps_yaw() {
+        let mut state = local_state_for_test();
+        apply_look(&mut state, 100.0, 0.0, 1.0);
+        assert!((state.yaw - 0.22).abs() < 1e-5, "yaw = {}", state.yaw);
+
+        apply_look(&mut state, 0.0, 10_000.0, 1.0);
+        assert!(
+            (state.pitch + 89f32.to_radians()).abs() < 1e-5,
+            "pitch = {}",
+            state.pitch
+        );
+
+        state.yaw = 0.0;
+        apply_look(
+            &mut state,
+            std::f32::consts::TAU / MOUSE_SENSITIVITY,
+            0.0,
+            1.0,
+        );
+        assert!(state.yaw.abs() < 1e-3, "yaw did not wrap: {}", state.yaw);
+    }
+
+    #[test]
+    fn look_deltas_accumulate_across_events() {
+        // Many small device events must produce the same rotation as their sum;
+        // that is what keeps the camera on the frame clock.
+        let mut whole = local_state_for_test();
+        apply_look(&mut whole, 30.0, 20.0, 1.0);
+
+        let mut split = local_state_for_test();
+        for _ in 0..3 {
+            apply_look(&mut split, 10.0, 20.0 / 3.0, 1.0);
+        }
+
+        assert!((whole.yaw - split.yaw).abs() < 1e-5);
+        assert!((whole.pitch - split.pitch).abs() < 1e-5);
+    }
+
+    #[test]
     fn local_crafting_table_opens_window_one_and_projects_its_slots() {
         let mut state = local_state_for_test();
         state.inventory[9] = Some(ItemStack::new(17, 2, 0));
@@ -4040,6 +4557,24 @@ mod tests {
         assert_eq!(hotbar_digit(KeyCode::Digit1), Some(0));
         assert_eq!(hotbar_digit(KeyCode::Digit9), Some(8));
         assert_eq!(hotbar_digit(KeyCode::KeyW), None);
+    }
+
+    #[test]
+    fn a_dimension_change_forgets_every_cached_chunk() {
+        let mut world = World::new(0);
+        world.insert(ChunkColumn::empty(0, 0));
+        world.insert(ChunkColumn::empty(1, -2));
+        let mut dirty = vec![(0, 0), (1, -2)];
+        let mut queued: HashSet<(i32, i32)> = [(0, 0), (1, -2)].into_iter().collect();
+        let mut stale: HashSet<(i32, i32)> = [(1, -2)].into_iter().collect();
+
+        reset_chunk_caches(&mut world, -1, &mut dirty, &mut queued, &mut stale);
+
+        assert_eq!(world.dimension(), -1);
+        assert_eq!(world.loaded_chunks(), 0, "no overworld column may survive");
+        assert!(dirty.is_empty(), "pending meshes must be dropped");
+        assert!(queued.is_empty());
+        assert!(stale.is_empty());
     }
 
     /// A player standing on the block at (0, 63, 0), so their feet are at y = 64.
