@@ -31,6 +31,9 @@ talks protocol 47, and joins offline-mode servers.
 - Client HUD: toggleable, draggable modules (FPS, ping, CPS, keystrokes,
   coordinates, speed), a scoreboard sidebar and coloured chat, with settings
   saved to `settings.json`
+- Options tree: Video Settings, rebindable controls with conflict handling,
+  volumes, chat settings, language and resource packs — all persisted and applied
+  without a restart (where the renderer has a hook)
 - Players: entity tracking, skins and skin loading, humanoid rendering
 - Items: server drops render as spinning entities; local survival adds mined
   block items to inventory

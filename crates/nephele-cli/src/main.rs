@@ -2,6 +2,7 @@ mod chat;
 mod commands;
 mod hud_modules;
 mod inventory;
+mod keybinds;
 mod live;
 mod mesher;
 mod paths;

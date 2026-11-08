@@ -11,9 +11,12 @@ use std::sync::OnceLock;
 
 use crate::chat::Span;
 use crate::hud_modules::{KeyBox, ModuleConfig, ModuleId, Values as ModuleValues};
+use crate::keybinds::Action as BindableAction;
 use crate::scoreboard::{self, Row as ScoreboardRow};
 use crate::servers::{Ping, PingBoard, ServerList};
-use crate::settings::{SettingId, Settings};
+use crate::settings::{
+    Brightness, ChatRow, Language, OptionRow, ResourcePack, Settings, SkinPart, SoundRow,
+};
 use nephele_assets::{
     face_textures, font, item_texture_name, sprites, TextureArray, UiAtlas, MISSING_TEXTURE,
 };
@@ -60,7 +63,16 @@ pub enum Screen {
     Connect,
     Game,
     Pause,
-    Settings,
+    /// The options tree root.
+    Options,
+    VideoSettings,
+    Controls,
+    /// Music & Sounds.
+    Sounds,
+    ChatSettings,
+    Language,
+    ResourcePacks,
+    SkinCustomization,
     Creative,
     /// The survival player inventory (2x2 crafting, armour, storage, hotbar).
     Inventory,
@@ -110,9 +122,22 @@ pub enum Action {
     ConnectCancel,
     Resume,
     OpenSettings,
-    SettingsDone,
     Disconnect,
-    SettingAdjust(SettingId, i32),
+    /// Open one of the options screens.
+    Open(Screen),
+    /// Leave the options tree, back to whatever opened it.
+    OptionsDone,
+    /// Nudge (or flip) one option row.
+    OptionAdjust(OptionRow, i32),
+    /// Start listening for a key or mouse button for this action.
+    BeginRebind(BindableAction),
+    /// Restore one action's default binding.
+    ResetBind(BindableAction),
+    /// Restore every default binding.
+    ResetAllBinds,
+    SelectLanguage(Language),
+    SelectResourcePack(ResourcePack),
+    ToggleSkinPart(SkinPart),
     CreativePage(i32),
     CreativeItem(usize),
     SelectSlot(usize),
@@ -472,6 +497,19 @@ pub fn draw_damage_vignette(bg: &mut UiBatch, width: f32, height: f32, strength:
 
 /// Draw coloured runs left to right. Returns the width drawn.
 pub fn draw_spans(fg: &mut UiBatch, spans: &[Span], x: f32, y: f32, scale: f32, alpha: f32) -> f32 {
+    draw_spans_clipped(fg, spans, x, y, scale, alpha, f32::INFINITY)
+}
+
+/// As [`draw_spans`], stopping once the run would pass `max_width` pixels.
+pub fn draw_spans_clipped(
+    fg: &mut UiBatch,
+    spans: &[Span],
+    x: f32,
+    y: f32,
+    scale: f32,
+    alpha: f32,
+    max_width: f32,
+) -> f32 {
     let mut cursor = x;
     for span in spans {
         let color = [
@@ -480,8 +518,24 @@ pub fn draw_spans(fg: &mut UiBatch, spans: &[Span], x: f32, y: f32, scale: f32, 
             span.color[2],
             span.color[3] * alpha,
         ];
-        fg.text(&span.text, cursor, y, scale, color);
-        cursor += UiBatch::text_width(&span.text, scale);
+        let mut run = String::new();
+        for ch in span.text.chars() {
+            let next = cursor
+                + UiBatch::text_width(&run, scale)
+                + nephele_assets::font::advance(ch) * scale;
+            if next - x > max_width {
+                if !run.is_empty() {
+                    fg.text(&run, cursor, y, scale, color);
+                    cursor += UiBatch::text_width(&run, scale);
+                }
+                return cursor - x;
+            }
+            run.push(ch);
+        }
+        if !run.is_empty() {
+            fg.text(&run, cursor, y, scale, color);
+            cursor += UiBatch::text_width(&run, scale);
+        }
     }
     cursor - x
 }
@@ -500,21 +554,27 @@ pub fn spans_width(spans: &[Span], scale: f32) -> f32 {
 /// the input line sits just above the hotbar so the two never overlap. Chat
 /// arrives coloured (§ codes and JSON components, see [`crate::chat`]), so each
 /// line is drawn run by run.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_chat(
     bg: &mut UiBatch,
     fg: &mut UiBatch,
     lines: &[(&[Span], f32)],
     input: Option<&str>,
+    chat: &crate::settings::ChatOptions,
     scale: f32,
     width: f32,
     height: f32,
 ) {
+    // Chat Settings owns three of these numbers: opacity, text size and width.
+    let opacity = chat.opacity as f32 / 100.0;
+    let scale = scale * (chat.scale as f32 / 100.0);
+    let max_width = width * (chat.width as f32 / 100.0) - 4.0 * scale;
     let s = |v: f32| v * scale;
     let line_h = s(9.0);
 
     if let Some(input) = input {
         let strip = Rect::new(0.0, height - s(34.0), width, s(12.0));
-        bg.rect(strip, [0.0, 0.0, 0.0, 0.62]);
+        bg.rect(strip, [0.0, 0.0, 0.0, 0.62 * opacity]);
         let text = format!("> {input}");
         fg.text(&text, s(4.0), height - s(31.0), scale, TEXT);
         let caret_x = s(4.0) + UiBatch::text_width(&text, scale) + s(1.0);
@@ -534,12 +594,12 @@ pub fn draw_chat(
         if y < 0.0 {
             break;
         }
-        let text_w = spans_width(spans, scale);
+        let text_w = spans_width(spans, scale).min(max_width);
         bg.rect(
             Rect::new(s(2.0), y - s(1.0), text_w + s(4.0), line_h),
-            [0.0, 0.0, 0.0, 0.35 * alpha],
+            [0.0, 0.0, 0.0, 0.35 * alpha * opacity],
         );
-        draw_spans(fg, spans, s(4.0), y, scale, *alpha);
+        draw_spans_clipped(fg, spans, s(4.0), y, scale, *alpha * opacity, max_width);
     }
 }
 
@@ -1105,8 +1165,65 @@ pub fn draw_pause(
     ]
 }
 
-/// Settings screen: one row per setting with `<` / `>` nudge buttons.
-pub fn draw_settings(
+/// What an options screen drew: clickable rows plus the slider tracks the caller
+/// hit-tests for click-and-drag.
+#[derive(Debug, Default)]
+pub struct ScreenOutput {
+    pub buttons: Vec<Button>,
+    pub sliders: Vec<(OptionRow, Rect)>,
+    /// Rows the screen laid out, so the caller can clamp its scroll offset.
+    pub scroll_rows: usize,
+}
+
+impl ScreenOutput {
+    fn push(&mut self, action: Action, rect: Rect) {
+        self.buttons.push(Button { action, rect });
+    }
+}
+
+/// A vanilla slider: a button-shaped track, the label and value across it, and a
+/// knob at `fraction`.
+#[allow(clippy::too_many_arguments)]
+fn draw_slider(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    rect: Rect,
+    label: &str,
+    value: &str,
+    fraction: f32,
+    scale: f32,
+    hover: bool,
+) {
+    let s = |v: f32| v * scale;
+    bg.rect(rect, if hover { SLOT_HOVER } else { SLOT_BG });
+    bg.rect_outline(rect, scale.max(1.0), BUTTON_BORDER);
+    let text = format!("{label}: {value}");
+    fg.text_centered(
+        &text,
+        rect.x + rect.w / 2.0,
+        rect.y + (rect.h - s(9.0)) / 2.0,
+        scale,
+        TEXT,
+    );
+    let knob_w = s(8.0);
+    let travel = (rect.w - knob_w - s(2.0)).max(1.0);
+    let knob = Rect::new(
+        rect.x + s(1.0) + travel * fraction.clamp(0.0, 1.0),
+        rect.y + s(1.0),
+        knob_w,
+        rect.h - s(2.0),
+    );
+    bg.rect(knob, [0.85, 0.85, 0.85, 1.0]);
+    bg.rect_outline(knob, scale.max(1.0), BUTTON_BORDER);
+}
+
+/// Title bar shared by every options screen.
+fn options_title(fg: &mut UiBatch, title: &str, cx: f32, y: f32, scale: f32) {
+    fg.text_centered(title, cx, y, scale * 1.5, TEXT);
+}
+
+/// Options: the root of the tree. FOV and difficulty on top, then the submenus.
+pub fn draw_options(
     bg: &mut UiBatch,
     fg: &mut UiBatch,
     hud: &HudState<'_>,
@@ -1114,90 +1231,634 @@ pub fn draw_settings(
     scale: f32,
     width: f32,
     height: f32,
-) -> Vec<Button> {
+) -> ScreenOutput {
     let s = |v: f32| v * scale;
     bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
     let cx = width / 2.0;
+    let mut out = ScreenOutput::default();
+    options_title(fg, "Options", cx, s(16.0), scale);
 
-    let rows = SettingId::ALL.len() as f32;
-    let panel_w = s(320.0);
-    let panel_h = s(30.0 + rows * 22.0 + 52.0);
-    let panel = Rect::new(
-        cx - panel_w / 2.0,
-        height / 2.0 - panel_h / 2.0,
-        panel_w,
-        panel_h,
+    let col_w = s(150.0);
+    let left = cx - col_w - s(4.0);
+    let right = cx + s(4.0);
+    let mut y = s(34.0);
+
+    // FOV slider and difficulty, side by side.
+    let fov = Rect::new(left, y, col_w, s(20.0));
+    draw_slider(
+        bg,
+        fg,
+        fov,
+        "FOV",
+        &settings.value_label(OptionRow::Fov),
+        (settings.fov - 30.0) / 80.0,
+        scale,
+        hovered(hud.pointer, &fov),
     );
-    bg.rect(panel, PANEL);
-    bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
+    out.sliders.push((OptionRow::Fov, fov));
 
-    fg.text_centered("Settings", cx, panel.y + s(8.0), scale, TEXT);
-
-    let label_x = panel.x + s(12.0);
-    let mut buttons = Vec::new();
-    for (index, id) in SettingId::ALL.iter().enumerate() {
-        let y = panel.y + s(28.0) + index as f32 * s(22.0);
-        fg.text(id.label(), label_x, y + s(3.0), scale, TEXT);
-
-        let value = settings.value_label(*id);
-        fg.text_centered(
-            &value,
-            panel.x + panel_w - s(60.0),
-            y + s(3.0),
-            scale,
-            [1.0, 0.86, 0.35, 1.0],
-        );
-
-        let prev = Rect::new(panel.x + panel_w - s(112.0), y, s(18.0), s(16.0));
-        let next = Rect::new(panel.x + panel_w - s(26.0), y, s(18.0), s(16.0));
-        draw_button(
-            bg,
-            fg,
-            prev,
-            "<",
-            scale,
-            hovered(hud.pointer, &prev) && id.can_adjust(settings, -1),
-        );
-        draw_button(
-            bg,
-            fg,
-            next,
-            ">",
-            scale,
-            hovered(hud.pointer, &next) && id.can_adjust(settings, 1),
-        );
-        buttons.push(Button {
-            action: Action::SettingAdjust(*id, -1),
-            rect: prev,
-        });
-        buttons.push(Button {
-            action: Action::SettingAdjust(*id, 1),
-            rect: next,
-        });
-    }
-
-    let modules = Rect::new(cx - s(90.0), panel.y + panel_h - s(52.0), s(180.0), s(20.0));
+    let difficulty = Rect::new(right, y, col_w, s(20.0));
     draw_button(
         bg,
         fg,
-        modules,
-        "HUD Modules...",
+        difficulty,
+        &format!("Difficulty: {}", settings.difficulty.label()),
         scale,
-        hovered(hud.pointer, &modules),
+        hovered(hud.pointer, &difficulty),
     );
-    buttons.push(Button {
-        action: Action::OpenModules,
-        rect: modules,
-    });
+    out.push(Action::OptionAdjust(OptionRow::Difficulty, 1), difficulty);
 
-    let done = Rect::new(cx - s(60.0), panel.y + panel_h - s(26.0), s(120.0), s(20.0));
+    y += s(28.0);
+    let entries: [(Action, &str); 8] = [
+        (
+            Action::Open(Screen::SkinCustomization),
+            "Skin Customization...",
+        ),
+        (Action::Open(Screen::Sounds), "Music & Sounds..."),
+        (Action::Open(Screen::VideoSettings), "Video Settings..."),
+        (Action::Open(Screen::Controls), "Controls..."),
+        (Action::Open(Screen::Language), "Language..."),
+        (Action::Open(Screen::ChatSettings), "Chat Settings..."),
+        (Action::Open(Screen::ResourcePacks), "Resource Packs..."),
+        (Action::OpenModules, "HUD Modules..."),
+    ];
+    for (index, (action, label)) in entries.into_iter().enumerate() {
+        let column = index % 2;
+        let row = index / 2;
+        let rect = Rect::new(
+            if column == 0 { left } else { right },
+            y + row as f32 * s(24.0),
+            col_w,
+            s(20.0),
+        );
+        draw_button(bg, fg, rect, label, scale, hovered(hud.pointer, &rect));
+        out.push(action, rect);
+    }
+
+    let done = Rect::new(
+        cx - s(100.0),
+        s(34.0) + s(24.0) * 4.0 + s(20.0),
+        s(200.0),
+        s(20.0),
+    );
     draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
-    buttons.push(Button {
-        action: Action::SettingsDone,
-        rect: done,
-    });
+    out.push(Action::OptionsDone, done);
+    out
+}
 
-    buttons
+/// Video Settings: two columns of graphics rows.
+pub fn draw_video_settings(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    hud: &HudState<'_>,
+    settings: &Settings,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> ScreenOutput {
+    let s = |v: f32| v * scale;
+    bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
+    let cx = width / 2.0;
+    let mut out = ScreenOutput::default();
+    options_title(fg, "Video Settings", cx, s(12.0), scale);
+
+    let col_w = s(150.0);
+    let left = cx - col_w - s(4.0);
+    let right = cx + s(4.0);
+    let top = s(30.0);
+    let step = s(24.0);
+
+    let rows: [(OptionRow, bool); 12] = [
+        (OptionRow::Graphics, false),
+        (OptionRow::SmoothLighting, false),
+        (OptionRow::SmoothLightingLevel, false),
+        (OptionRow::GuiScale, false),
+        (OptionRow::Brightness, false),
+        (OptionRow::DynamicLights, false),
+        (OptionRow::RenderDistance, false),
+        (OptionRow::MaxFramerate, false),
+        (OptionRow::ViewBobbing, false),
+        (OptionRow::Vsync, false),
+        (OptionRow::AlternateBlocks, false),
+        (OptionRow::Fov, false),
+    ];
+    let mut pending_any = false;
+    for (index, (row, _)) in rows.into_iter().enumerate() {
+        let column = index % 2;
+        let line = index / 2;
+        let rect = Rect::new(
+            if column == 0 { left } else { right },
+            top + line as f32 * step,
+            col_w,
+            s(20.0),
+        );
+        let label = match row {
+            OptionRow::Fov => "FOV",
+            OptionRow::Graphics => "Graphics",
+            OptionRow::SmoothLighting => "Smooth Lighting",
+            OptionRow::SmoothLightingLevel => "Smooth Lighting Level",
+            OptionRow::GuiScale => "GUI Scale",
+            OptionRow::Brightness => "Brightness",
+            OptionRow::DynamicLights => "Dynamic Lights",
+            OptionRow::RenderDistance => "Render Distance",
+            OptionRow::MaxFramerate => "Max Framerate",
+            OptionRow::ViewBobbing => "View Bobbing",
+            OptionRow::Vsync => "Use VSync",
+            OptionRow::AlternateBlocks => "Alternate Blocks",
+            _ => "",
+        };
+        let value = settings.value_label(row);
+        let live = row.takes_effect();
+        if !live {
+            pending_any = true;
+        }
+        if row == OptionRow::Brightness {
+            let fraction = Brightness::ALL
+                .iter()
+                .position(|value| *value == settings.brightness)
+                .unwrap_or(2) as f32
+                / (Brightness::ALL.len() - 1) as f32;
+            draw_slider(
+                bg,
+                fg,
+                rect,
+                label,
+                &value,
+                fraction,
+                scale,
+                hovered(hud.pointer, &rect),
+            );
+            out.sliders.push((row, rect));
+        } else {
+            draw_option_button(bg, fg, rect, label, &value, live, scale, hud.pointer);
+            out.push(Action::OptionAdjust(row, 1), rect);
+        }
+    }
+
+    let note_y = top + step * 6.0;
+    if pending_any {
+        fg.text_centered(
+            "* Graphics, Smooth Lighting, Dynamic Lights and Alternate Blocks need the renderer half (see AGENTS.md)",
+            cx,
+            note_y,
+            scale,
+            TEXT_DIM,
+        );
+    }
+    let done = Rect::new(cx - s(100.0), note_y + s(14.0), s(200.0), s(20.0));
+    draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
+    out.push(Action::Open(Screen::Options), done);
+    out
+}
+
+/// One "Label: Value" cycle button. Rows whose effect is not implemented yet are
+/// dimmed and get a trailing asterisk, so they cannot pass for working controls.
+#[allow(clippy::too_many_arguments)]
+fn draw_option_button(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    rect: Rect,
+    label: &str,
+    value: &str,
+    live: bool,
+    scale: f32,
+    pointer: Option<[f32; 2]>,
+) {
+    let text = if live {
+        format!("{label}: {value}")
+    } else {
+        format!("{label}*: {value}")
+    };
+    bg.rect(
+        rect,
+        if hovered(pointer, &rect) {
+            SLOT_HOVER
+        } else {
+            SLOT_BG
+        },
+    );
+    bg.rect_outline(rect, scale.max(1.0), BUTTON_BORDER);
+    let text_w = UiBatch::text_width(&text, scale);
+    fg.text(
+        &text,
+        rect.x + (rect.w - text_w) / 2.0,
+        rect.y + (rect.h - 9.0 * scale) / 2.0,
+        scale,
+        if live { TEXT } else { TEXT_DIM },
+    );
+}
+
+/// The controls screen: every binding, grouped, scrollable, click to rebind.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_controls(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    hud: &HudState<'_>,
+    settings: &Settings,
+    scroll: usize,
+    rebinding: Option<BindableAction>,
+    warning: Option<&str>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> ScreenOutput {
+    let s = |v: f32| v * scale;
+    bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
+    let cx = width / 2.0;
+    let mut out = ScreenOutput::default();
+    options_title(fg, "Controls", cx, s(8.0), scale);
+
+    let hint_y = s(22.0);
+    let hint = match rebinding {
+        Some(action) => format!(
+            "Press a key or mouse button for {}.  Esc cancels.",
+            action.label()
+        ),
+        None => "Click a binding to change it.".to_string(),
+    };
+    fg.text_centered(&hint, cx, hint_y, scale, TEXT_DIM);
+    if let Some(warning) = warning {
+        fg.text_centered(warning, cx, hint_y + s(11.0), scale, OFFLINE);
+    }
+
+    // List viewport.
+    let list = Rect::new(cx - s(160.0), s(46.0), s(320.0), height - s(104.0));
+    bg.rect(list, [0.0, 0.0, 0.0, 0.45]);
+    bg.rect_outline(list, scale.max(1.0), BUTTON_BORDER);
+
+    let row_h = s(20.0);
+    let header_h = s(16.0);
+    let label_x = list.x + s(6.0);
+    let bind_w = s(110.0);
+    let reset_w = s(40.0);
+    let bind_x = list.x + list.w - s(6.0) - reset_w - s(4.0) - bind_w;
+    let reset_x = list.x + list.w - s(6.0) - reset_w;
+
+    // Lay rows out in one pass so scrolling can be clamped to the content.
+    let mut y = list.y + s(4.0) - scroll as f32 * row_h;
+    let mut row_count = 0usize;
+    for (category, actions) in settings.keys.by_category() {
+        if y + header_h > list.y && y < list.y + list.h {
+            fg.text(category.label(), label_x, y + s(3.0), scale, STAR);
+        }
+        y += header_h;
+        row_count += 1;
+        for action in actions {
+            row_count += 1;
+            if y + row_h > list.y && y < list.y + list.h {
+                fg.text(action.label(), label_x, y + s(5.0), scale, TEXT);
+
+                let bind_rect = Rect::new(bind_x, y, bind_w, s(18.0));
+                let label = if rebinding == Some(action) {
+                    "> ? <".to_string()
+                } else {
+                    settings.keys.get(action).name().to_string()
+                };
+                draw_button(
+                    bg,
+                    fg,
+                    bind_rect,
+                    &label,
+                    scale,
+                    hovered(hud.pointer, &bind_rect),
+                );
+                out.push(Action::BeginRebind(action), bind_rect);
+
+                let reset_rect = Rect::new(reset_x, y, reset_w, s(18.0));
+                draw_button(
+                    bg,
+                    fg,
+                    reset_rect,
+                    "Reset",
+                    scale,
+                    hovered(hud.pointer, &reset_rect),
+                );
+                out.push(Action::ResetBind(action), reset_rect);
+            }
+            y += row_h;
+        }
+        y += s(2.0);
+    }
+    out.scroll_rows = row_count;
+
+    // Scrollbar.
+    let content = row_count as f32 * row_h;
+    if content > list.h {
+        let track = Rect::new(list.x + list.w - s(2.0), list.y, s(2.0), list.h);
+        bg.rect(track, [0.0, 0.0, 0.0, 0.5]);
+        let visible = list.h / content;
+        let thumb_h = (track.h * visible).max(s(10.0));
+        let max_scroll = (content - list.h).max(1.0);
+        let progress = (scroll as f32 * row_h / max_scroll).clamp(0.0, 1.0);
+        bg.rect(
+            Rect::new(
+                track.x,
+                track.y + (track.h - thumb_h) * progress,
+                track.w,
+                thumb_h,
+            ),
+            [0.7, 0.7, 0.7, 0.8],
+        );
+    }
+
+    let done = Rect::new(cx - s(110.0), height - s(28.0), s(105.0), s(20.0));
+    draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
+    out.push(Action::Open(Screen::Options), done);
+
+    let reset_all = Rect::new(cx + s(5.0), height - s(28.0), s(105.0), s(20.0));
+    draw_button(
+        bg,
+        fg,
+        reset_all,
+        "Reset Keys",
+        scale,
+        hovered(hud.pointer, &reset_all),
+    );
+    out.push(Action::ResetAllBinds, reset_all);
+    out
+}
+
+/// Music & Sounds: four volume sliders.
+pub fn draw_sounds(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    hud: &HudState<'_>,
+    settings: &Settings,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> ScreenOutput {
+    let s = |v: f32| v * scale;
+    bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
+    let cx = width / 2.0;
+    let mut out = ScreenOutput::default();
+    options_title(fg, "Music & Sounds", cx, s(16.0), scale);
+
+    let top = s(40.0);
+    for (index, row) in SoundRow::ALL.into_iter().enumerate() {
+        let rect = Rect::new(
+            cx - s(100.0),
+            top + index as f32 * s(28.0),
+            s(200.0),
+            s(20.0),
+        );
+        let value = settings.sounds.get(row);
+        draw_slider(
+            bg,
+            fg,
+            rect,
+            row.label(),
+            &format!("{value}%"),
+            value as f32 / 100.0,
+            scale,
+            hovered(hud.pointer, &rect),
+        );
+        out.sliders.push((OptionRow::Volume(row), rect));
+    }
+
+    fg.text_centered(
+        "No sound engine yet - these are the mix the audio lane will read.",
+        cx,
+        top + s(118.0),
+        scale,
+        TEXT_DIM,
+    );
+    let done = Rect::new(cx - s(100.0), top + s(134.0), s(200.0), s(20.0));
+    draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
+    out.push(Action::Open(Screen::Options), done);
+    out
+}
+
+/// Chat Settings: opacity, text size and width, all applied to the chat overlay.
+pub fn draw_chat_settings(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    hud: &HudState<'_>,
+    settings: &Settings,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> ScreenOutput {
+    let s = |v: f32| v * scale;
+    bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
+    let cx = width / 2.0;
+    let mut out = ScreenOutput::default();
+    options_title(fg, "Chat Settings", cx, s(16.0), scale);
+
+    let top = s(40.0);
+    let mut y = top;
+    for row in ChatRow::ALL {
+        let rect = Rect::new(cx - s(100.0), y, s(200.0), s(20.0));
+        let label = row.label();
+        let value = settings.chat.label(row);
+        match row {
+            ChatRow::Links => {
+                draw_button(
+                    bg,
+                    fg,
+                    rect,
+                    &format!("{label}: {value}"),
+                    scale,
+                    hovered(hud.pointer, &rect),
+                );
+                out.push(Action::OptionAdjust(OptionRow::Chat(row), 1), rect);
+            }
+            ChatRow::Opacity => {
+                draw_slider(
+                    bg,
+                    fg,
+                    rect,
+                    label,
+                    &value,
+                    settings.chat.opacity as f32 / 100.0,
+                    scale,
+                    hovered(hud.pointer, &rect),
+                );
+                out.sliders.push((OptionRow::Chat(row), rect));
+            }
+            ChatRow::Scale => {
+                draw_slider(
+                    bg,
+                    fg,
+                    rect,
+                    label,
+                    &value,
+                    (settings.chat.scale as f32 - 50.0) / 100.0,
+                    scale,
+                    hovered(hud.pointer, &rect),
+                );
+                out.sliders.push((OptionRow::Chat(row), rect));
+            }
+            ChatRow::Width => {
+                draw_slider(
+                    bg,
+                    fg,
+                    rect,
+                    label,
+                    &value,
+                    (settings.chat.width as f32 - 30.0) / 70.0,
+                    scale,
+                    hovered(hud.pointer, &rect),
+                );
+                out.sliders.push((OptionRow::Chat(row), rect));
+            }
+        }
+        y += s(28.0);
+    }
+
+    fg.text_centered("Chat preview:", cx, y + s(6.0), scale, TEXT_DIM);
+    let preview_alpha = settings.chat.opacity as f32 / 100.0;
+    bg.rect(
+        Rect::new(cx - s(100.0), y + s(18.0), s(200.0), s(12.0)),
+        [0.0, 0.0, 0.0, 0.5 * preview_alpha],
+    );
+    fg.text(
+        "Steve: gg",
+        cx - s(96.0),
+        y + s(20.0),
+        scale * (settings.chat.scale as f32 / 100.0),
+        [1.0, 1.0, 1.0, preview_alpha],
+    );
+
+    let done = Rect::new(cx - s(100.0), y + s(40.0), s(200.0), s(20.0));
+    draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
+    out.push(Action::Open(Screen::Options), done);
+    out
+}
+
+/// Language: a list with one honest entry.
+pub fn draw_language(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    hud: &HudState<'_>,
+    settings: &Settings,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> ScreenOutput {
+    let s = |v: f32| v * scale;
+    bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
+    let cx = width / 2.0;
+    let mut out = ScreenOutput::default();
+    options_title(fg, "Language", cx, s(16.0), scale);
+
+    let mut y = s(40.0);
+    for language in Language::ALL {
+        let rect = Rect::new(cx - s(100.0), y, s(200.0), s(20.0));
+        let selected = settings.language == language;
+        let label = if selected {
+            format!("{}  (selected)", language.label())
+        } else {
+            language.label().to_string()
+        };
+        draw_button(bg, fg, rect, &label, scale, hovered(hud.pointer, &rect));
+        out.push(Action::SelectLanguage(language), rect);
+        y += s(24.0);
+    }
+    fg.text_centered(
+        "Only English is translated so far.",
+        cx,
+        y + s(6.0),
+        scale,
+        TEXT_DIM,
+    );
+
+    let done = Rect::new(cx - s(100.0), y + s(24.0), s(200.0), s(20.0));
+    draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
+    out.push(Action::Open(Screen::Options), done);
+    out
+}
+
+/// Resource Packs: the built-in pack, with the selection remembered.
+pub fn draw_resource_packs(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    hud: &HudState<'_>,
+    settings: &Settings,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> ScreenOutput {
+    let s = |v: f32| v * scale;
+    bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
+    let cx = width / 2.0;
+    let mut out = ScreenOutput::default();
+    options_title(fg, "Resource Packs", cx, s(16.0), scale);
+
+    let mut y = s(40.0);
+    for pack in ResourcePack::ALL {
+        let rect = Rect::new(cx - s(100.0), y, s(200.0), s(20.0));
+        let selected = settings.resource_pack == pack;
+        let label = if selected {
+            format!("{}  (selected)", pack.label())
+        } else {
+            pack.label().to_string()
+        };
+        draw_button(bg, fg, rect, &label, scale, hovered(hud.pointer, &rect));
+        out.push(Action::SelectResourcePack(pack), rect);
+        y += s(24.0);
+    }
+    fg.text_centered(
+        "Only the built-in pack: external packs are not loadable yet.",
+        cx,
+        y + s(10.0),
+        scale,
+        TEXT_DIM,
+    );
+
+    let done = Rect::new(cx - s(100.0), y + s(28.0), s(200.0), s(20.0));
+    draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
+    out.push(Action::Open(Screen::Options), done);
+    out
+}
+
+/// Skin Customization: which skin parts to draw.
+pub fn draw_skin_customization(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    hud: &HudState<'_>,
+    settings: &Settings,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> ScreenOutput {
+    let s = |v: f32| v * scale;
+    bg.rect(Rect::new(0.0, 0.0, width, height), SHADOW_PANEL);
+    let cx = width / 2.0;
+    let mut out = ScreenOutput::default();
+    options_title(fg, "Skin Customization", cx, s(16.0), scale);
+
+    let top = s(40.0);
+    for (index, part) in SkinPart::ALL.into_iter().enumerate() {
+        let rect = Rect::new(
+            cx - s(100.0),
+            top + index as f32 * s(24.0),
+            s(200.0),
+            s(20.0),
+        );
+        let on = settings.skin_parts.get(part);
+        draw_button(
+            bg,
+            fg,
+            rect,
+            &format!("{}: {}", part.label(), if on { "ON" } else { "OFF" }),
+            scale,
+            hovered(hud.pointer, &rect),
+        );
+        out.push(Action::ToggleSkinPart(part), rect);
+    }
+    fg.text_centered(
+        "Stored for the entity renderer, which does not read them yet.",
+        cx,
+        top + s(174.0),
+        scale,
+        TEXT_DIM,
+    );
+
+    let done = Rect::new(cx - s(100.0), top + s(190.0), s(200.0), s(20.0));
+    draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
+    out.push(Action::Open(Screen::Options), done);
+    out
 }
 
 /// The creative inventory: a paged grid of every block.
@@ -2868,12 +3529,12 @@ mod tests {
     }
 
     #[test]
-    fn settings_screen_has_a_control_per_setting() {
+    fn the_options_root_opens_every_submenu() {
         let inventory = vec![None; 45];
         let hud = hud_state(&inventory);
         let mut bg = UiBatch::default();
         let mut fg = UiBatch::default();
-        let buttons = draw_settings(
+        let output = draw_options(
             &mut bg,
             &mut fg,
             &hud,
@@ -2882,15 +3543,167 @@ mod tests {
             1280.0,
             720.0,
         );
-        assert_eq!(
-            buttons.len(),
-            SettingId::ALL.len() * 2 + 2,
-            "two arrows per setting, then HUD Modules and Done"
-        );
-        assert!(buttons.iter().any(|b| b.action == Action::SettingsDone));
-        assert!(buttons.iter().any(|b| b.action == Action::OpenModules));
+        for screen in [
+            Screen::SkinCustomization,
+            Screen::Sounds,
+            Screen::VideoSettings,
+            Screen::Controls,
+            Screen::Language,
+            Screen::ChatSettings,
+            Screen::ResourcePacks,
+        ] {
+            assert!(
+                output
+                    .buttons
+                    .iter()
+                    .any(|b| b.action == Action::Open(screen)),
+                "{screen:?} has no button"
+            );
+        }
+        assert!(output
+            .buttons
+            .iter()
+            .any(|b| b.action == Action::OptionAdjust(OptionRow::Difficulty, 1)));
+        assert_eq!(output.sliders.len(), 1, "the FOV slider");
+        assert_eq!(output.sliders[0].0, OptionRow::Fov);
+        assert!(output
+            .buttons
+            .iter()
+            .any(|b| b.action == Action::OptionsDone));
         assert!(!bg.is_empty());
         assert!(!fg.is_empty());
+    }
+
+    #[test]
+    fn video_settings_draws_every_row_with_its_sliders() {
+        let inventory = vec![None; 45];
+        let hud = hud_state(&inventory);
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let output = draw_video_settings(
+            &mut bg,
+            &mut fg,
+            &hud,
+            &Settings::default(),
+            2.0,
+            1280.0,
+            720.0,
+        );
+        for row in [
+            OptionRow::Graphics,
+            OptionRow::SmoothLighting,
+            OptionRow::SmoothLightingLevel,
+            OptionRow::GuiScale,
+            OptionRow::DynamicLights,
+            OptionRow::RenderDistance,
+            OptionRow::MaxFramerate,
+            OptionRow::ViewBobbing,
+            OptionRow::Vsync,
+            OptionRow::AlternateBlocks,
+        ] {
+            assert!(
+                output
+                    .buttons
+                    .iter()
+                    .any(|b| b.action == Action::OptionAdjust(row, 1)),
+                "{row:?} has no button"
+            );
+        }
+        assert!(output
+            .sliders
+            .iter()
+            .any(|(row, _)| *row == OptionRow::Brightness));
+
+        // Buttons must not overlap each other.
+        for (index, a) in output.buttons.iter().enumerate() {
+            for b in &output.buttons[index + 1..] {
+                assert!(!overlaps(a.rect, b.rect), "{:?} overlaps", a.action);
+            }
+        }
+    }
+
+    #[test]
+    fn the_controls_screen_lists_every_binding_and_scrolls() {
+        let inventory = vec![None; 45];
+        let hud = hud_state(&inventory);
+        let mut bg = UiBatch::default();
+        let mut fg = UiBatch::default();
+        let settings = Settings::default();
+        let output = draw_controls(
+            &mut bg, &mut fg, &hud, &settings, 0, None, None, 2.0, 1280.0, 720.0,
+        );
+        let rows = crate::keybinds::Action::ALL.len();
+        assert!(output.scroll_rows > rows, "category headers count too");
+        assert!(
+            output
+                .buttons
+                .iter()
+                .any(|b| matches!(b.action, Action::BeginRebind(_))),
+            "no rebind buttons at all"
+        );
+        assert!(output
+            .buttons
+            .iter()
+            .any(|b| b.action == Action::ResetAllBinds));
+        assert!(output
+            .buttons
+            .iter()
+            .any(|b| b.action == Action::Open(Screen::Options)));
+
+        // Scrolling down must reveal a different set of rows.
+        let mut bg2 = UiBatch::default();
+        let mut fg2 = UiBatch::default();
+        let scrolled = draw_controls(
+            &mut bg2,
+            &mut fg2,
+            &hud,
+            &settings,
+            output.scroll_rows / 2,
+            None,
+            None,
+            2.0,
+            1280.0,
+            720.0,
+        );
+        let first: Vec<Action> = output.buttons.iter().map(|b| b.action).collect();
+        let later: Vec<Action> = scrolled.buttons.iter().map(|b| b.action).collect();
+        assert_ne!(first, later, "the list did not scroll");
+        assert!(scrolled
+            .buttons
+            .iter()
+            .any(|b| matches!(b.action, Action::BeginRebind(_))));
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn every_options_screen_draws_something() {
+        let inventory = vec![None; 45];
+        let hud = hud_state(&inventory);
+        let settings = Settings::default();
+        let screens: [fn(
+            &mut UiBatch,
+            &mut UiBatch,
+            &HudState<'_>,
+            &Settings,
+            f32,
+            f32,
+            f32,
+        ) -> ScreenOutput; 6] = [
+            draw_sounds,
+            draw_chat_settings,
+            draw_language,
+            draw_resource_packs,
+            draw_skin_customization,
+            draw_video_settings,
+        ];
+        for draw in screens {
+            let mut bg = UiBatch::default();
+            let mut fg = UiBatch::default();
+            let output = draw(&mut bg, &mut fg, &hud, &settings, 2.0, 1280.0, 720.0);
+            assert!(!output.buttons.is_empty());
+            assert!(!bg.is_empty());
+            assert!(!fg.is_empty());
+        }
     }
 
     #[test]
@@ -3180,6 +3993,7 @@ mod tests {
             &mut fg,
             &lines,
             Some("/gamemode creative"),
+            &crate::settings::ChatOptions::default(),
             2.0,
             1280.0,
             720.0,
@@ -3192,7 +4006,16 @@ mod tests {
 
         let mut quiet = UiBatch::default();
         let mut quiet_fg = UiBatch::default();
-        draw_chat(&mut quiet, &mut quiet_fg, &[], None, 2.0, 1280.0, 720.0);
+        draw_chat(
+            &mut quiet,
+            &mut quiet_fg,
+            &[],
+            None,
+            &crate::settings::ChatOptions::default(),
+            2.0,
+            1280.0,
+            720.0,
+        );
         assert!(
             quiet.is_empty(),
             "nothing to draw with no lines and no input"

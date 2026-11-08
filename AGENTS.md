@@ -146,6 +146,11 @@ crates/
       live.rs           network + local game loops, screens, input
       viewer.rs         offline world viewer
       ui.rs             immediate-mode UI batch + screens (draw_*)
+      chat.rs           chat colours: legacy `§` codes and JSON components
+      hud_modules.rs    HUD module toggles/anchors, CPS and speed meters
+      keybinds.rs       bindable actions, defaults, encode/decode, conflicts
+      scoreboard.rs     scoreboard model, sidebar ordering and layout
+      keybinds.rs       bindable actions, defaults, encode/decode, conflicts
       commands.rs       client-side chat commands (/gamemode, /setblock, ...)
       paths.rs          per-user data directory + legacy `.local/` migration
       mesher.rs         CLI-side mesh helpers
@@ -690,6 +695,120 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   `start_local` sets it true, so `/gamemode survival` changes mining timing in
   singleplayer without breaking the old default.
 
+**Client HUD: chat colours, modules, scoreboard, containers** (added 2026-11-06,
+lane `client-ui`). Four new modules in `nephele-cli/src` carry it:
+
+- **`chat.rs` — colours.** `chat::parse` accepts both dialects: a line that
+  starts with `{`/`[` and parses as JSON is treated as a chat component
+  (`text`/`translate`/`with`/`extra`, colour inherited down the tree, named and
+  `#rrggbb` colours), anything else as the legacy `§` dialect. `§k`–`§o` are
+  consumed and dropped (the bitmap font has one weight), `§r` resets to white,
+  and a `§` swallows the next character even when it is not a code — matching the
+  client font renderer. Adjacent runs of one colour merge. **`S02` is still
+  flattened by `flatten_chat` before the client sees it, so today only the `§`
+  path fires in practice** (Hypixel embeds `§` inside its `text` fields, which is
+  exactly the bug the old code showed as `§b[MVP§c+§b]`). Handing the raw
+  component through `Event::Chat` needs a `net`-lane change; `chat::parse` already
+  handles it the day that lands. Team prefixes are composed server-side in 1.8;
+  the scoreboard's team prefixes decorate sidebar rows instead.
+- **`scoreboard.rs` — the sidebar.** `Objective`/`ScoreEntry`/`Team` model with
+  `set_score` (upsert), `remove`, and `sidebar_rows()`: score-descending, ties in
+  insertion order, **capped at vanilla's 15 rows** (a 16th is dropped), each entry
+  wrapped in its team's prefix/suffix. `layout()` is pure geometry — pane flush to
+  the right edge, vertically centred, title strip on top, scores right-aligned —
+  and is pinned by tests at several window sizes. **No packet feeds this yet**
+  (`S3B`–`S3E` are the net lane's); `NEPHELE_SCOREBOARD_DEMO=1` shows
+  `Scoreboard::demo()`, a hand-built 16-row model used for layout work and the
+  acceptance screenshot.
+- **`hud_modules.rs` + the HUD editor — modules.** FPS, ping, LMB/RMB CPS,
+  keystrokes (W/A/S/D/space/shift/LMB/RMB with pressed states), coordinates and
+  speed. Each is individually toggleable and draggable; the anchor is stored as a
+  **fraction of the window** so a layout set at 1280x720 lands in the same corner
+  at 1920x1080. Reached from Pause → Options → **HUD Modules...** (toggle rows,
+  drag the live modules, Reset/Done); `NEPHELE_SCREEN=modules` is the dev
+  shortcut. Defaults: five modules stacked in one left column at 0.062 vertical
+  steps (fits GUI scale 3, the tallest a 720p window picks), keystrokes at
+  `(0.48, 0.02)` so it clears both the sidebar and the hotbar — a test pins that
+  at 1280x720, 1366x768, 1600x900 and 1920x1080. **At 1024x768 a fifteen-row
+  sidebar takes 438 of 1024 px and nothing fits beside it**; that resolution is
+  deliberately not covered by the default layout.
+  - CPS counts clicks in the last second per mouse button, recorded on
+    `MouseInput`, so it measures presses rather than the held state.
+  - Speed is horizontal blocks/second from a position sample per frame with a
+    ~0.2 s exponential smoothing; samples closer than 4 ms are ignored.
+  - Ping comes from our own row in the `S38` tab list (`own_ping`, matching
+    `info.uuid` against `player_list`); 0/absent renders `--`.
+  - The old one-line debug readout (`Nephele 1.8.9 … fps xyz … chunks`) is now
+    behind `NEPHELE_DEBUG=1`; the modules carry that information by default.
+- **`settings.rs` — persistence.** `settings.json` in
+  `paths::user_data_dir()` (beside `servers.json`/`auth.json`): video settings plus
+  every module's `enabled`/`anchor`, keyed by the stable `ModuleId::key`.
+  Missing/corrupt/partial files fall back to defaults field by field, unknown keys
+  are ignored, and hand-edited values are clamped on load. Saved on every change
+  (adjust, toggle, drag-release, Done).
+- **Generic server windows.** A container window is now drawn for **any slot
+  count**: `window_rows`/`container_panel_size`/`server_window_origin` lay the
+  container slots nine to a row above the player's 36, so a hopper, a single chest,
+  a double chest or a furnace all render without a bespoke screen, titled from
+  `S2D`'s inventory type (`window_kind_label`). The 46-slot crafting table keeps
+  its vanilla 3x3-plus-output layout.
+- **Entity clicks are the `net` lane's.** `client.entities.raycast` picks the target,
+  mining is gated on it, and `C02 ATTACK`/`INTERACT_AT` are sent directly from the net
+  loop. A parallel `interact.rs` prototype (Candidate/pick + a `Shared::entity_actions`
+  queue nothing drained) was written on `client-ui` and deleted during its merge; do not
+  resurrect it.
+
+**Options tree and keybinds** (added 2026-11-08, same lane). Eight screens behind
+`Screen::Options`: Options, Video Settings, Controls, Music & Sounds, Chat Settings,
+Language, Resource Packs, Skin Customization. Every row is a field in
+`settings.rs`; the whole tree is reachable by mouse, and `NEPHELE_SCREEN` accepts
+`settings|video|controls|sounds|chat_settings|language|resource_packs|skin` as a
+development shortcut (never the only route).
+
+- **Keybinds (`keybinds.rs`, new).** 24 actions in five categories (Movement,
+  Gameplay, Inventory, Multiplayer, Miscellaneous), vanilla 1.8 defaults. Stored as
+  text (`key:R`, `mouse:Left`, `none`) so `settings.json` stays readable and an
+  unknown key degrades to `NONE`. `assign` **displaces** any action already holding
+  the binding and returns it, which is what the Controls screen's conflict warning
+  reports; the old owner becomes unbound (vanilla would silently allow the
+  duplicate). `Reset` per row and `Reset Keys` for all. Escape is deliberately not
+  bindable − it is the cancel/menu key.
+- **Input goes through the table.** `push_input` asks the binding table which held
+  keys mean forward/back/left/right/jump/sneak/**attack** and writes
+  `Shared.attacking` from that, so rebinding attack to a key drives the same mining
+  path left-click does. Edge-triggered actions (use, drop, pick block, inventory,
+  hotbar 1–9, chat, command, fullscreen) are resolved from the pressed key/button
+  in one place, `trigger_action`.
+- **Controls screen.** Scrollable list (wheel; `controls_rows` clamps the offset),
+  category headers, one bind button + one Reset per row, click-to-rebind with a
+  "Press a key or mouse button" hint, conflict warning line, and `Reset Keys`.
+- **Video Settings, and what is actually live.** Live and verified: **FOV** (slider,
+  per-frame camera), **GUI scale** (per-frame `draw_ui`), **render distance**
+  (streamed + `C16` client settings), **max framerate** (frame pacing sleeps out the
+  budget at the end of `frame()`), **vsync** (`Renderer::set_vsync`), **view
+  bobbing** (camera sway from horizontal speed), **brightness** (light values
+  rewritten in the `ColumnMeshJob` before meshing, then `remesh_everything()`;
+  `Brightness::Normal` is the identity so the default look is unchanged).
+  **Persisted but not yet rendered**, because the renderer has no hook for them:
+  **Graphics Fast/Fancy**, **Smooth Lighting** (+level), **Dynamic Lights**,
+  **Alternate Blocks**. Those four are drawn with a trailing `*`, dimmed, and a
+  footnote on the screen names the gap; `OptionRow::takes_effect()` is the single
+  place that classifies a row. Do not let them pass for working controls.
+- **Music & Sounds** reads and writes the one `SoundOptions { master, music,
+  blocks, weather }` model. No audio engine exists yet (`audio` is unassigned), so
+  the sliders persist and the screen says so; the engine reads this struct.
+- **Chat Settings** is real: opacity, text size and width are applied by
+  `ui::draw_chat` (width clips runs mid-line), plus a live preview.
+- **Language** has one honest entry ("English (US)"); **Resource Packs** has the
+  built-in pack only; **Skin Customization** stores seven part toggles for the
+  entity renderer, which does not read them yet. All three persist.
+- **Persistence.** Everything lives in `settings.json` and every change saves
+  immediately (adjust, toggle, drag-release, Done). Missing/partial/corrupt files
+  fall back field by field; hand-edited numbers are clamped (the stored integer
+  knobs are read as `u32` and clamped, so a `"scale": 999` cannot nuke the file).
+- Difficulty is stored and shown; single-player has nothing that spawns yet and a
+  server owns it in multiplayer, so it changes no behaviour.
+
 ---
 
 ## 12. Milestones
@@ -706,7 +825,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) |
 | `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
 | `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | **merged at `f0347c1`** - scoreboards, teams, `C02`, maps, frames, keep-alive, beacon/note/debris particles |
-| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, generic server windows; tab list, boss bar, titles and the loading screen still open |
+| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, options tree with a live Video Settings page, `keybinds.rs` (26 actions, click-to-rebind, conflict handling); tab list, boss bar, titles and the loading screen still open |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
 | `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
 | `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
@@ -832,6 +951,17 @@ re-serialize the chunk wholesale.
 **Tooling**
 
 - `.gitattributes` sets `* text=auto eol=lf`. Keep it.
+- **Synthetic input into the game window is unreliable and needs three things at
+  once.** (1) The window must be the foreground window (`AppActivate` or
+  `SetForegroundWindow`, then *verify* with `GetForegroundWindow`), or a posted
+  `WM_KEYDOWN`/`WM_LBUTTONDOWN` is dropped. (2) `SetCursorPos` only updates
+  winit's pointer while the cursor is not grabbed, so after a match has held the
+  mouse you must leave the game screen first. (3) Take screenshots with
+  `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)` — `CopyFromScreen` reads stale
+  or partial frames from a DXGI flip-model swapchain and produces ghost windows.
+  Menu clicks hit-test against the *last published* pointer position, so a click
+  can land on the previously hovered button; verify the hover highlight in a
+  screenshot before trusting a click.
 - Git identity is repo-local: `Casualdv <Casualdv@users.noreply.github.com>`.
 - `project_root()` walks up from the executable and prefers a `[workspace]` Cargo.toml
   over a stray `.local/prepared` — that stray-directory case used to break asset
@@ -846,7 +976,7 @@ re-serialize the chunk wholesale.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`;
   `chunk_biomes_match_a_world_the_real_server_generated` passes and
   `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **698 test cases across the workspace** (685 passed, 13 ignored). `nephele-world`
+- **719 test cases across the workspace** (706 passed, 13 ignored). `nephele-world`
   carries the parity suite, including `debug_stage_trace` and
   `debug_first_mismatch`. The six real-socket tests in
   `crates/nephele-client/tests/join_mock.rs` cover status,
