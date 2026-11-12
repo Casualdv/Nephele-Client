@@ -49,9 +49,7 @@ talks protocol 47, and joins offline-mode servers.
 
 **Not implemented yet**
 
-- Microsoft sign-in and the protocol's encryption handshake, so **online-mode
-  servers cannot be joined** — Nephele only speaks to offline-mode servers
-- Mob sounds, mob behaviour, survival gameplay, world saving and loading
+- Mob sounds, mob behaviour and deeper survival gameplay
 
 ## Requirements
 
