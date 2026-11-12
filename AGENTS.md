@@ -230,11 +230,39 @@ and the split is load-bearing (source-verified against MCP 1.8.9):
   big mushrooms, flowers, grass, dead bushes, lilies, mushrooms, reeds, cacti,
   springs) → animal spawns → ice/snow.
 
-Consequences we have not implemented:
+The split is implemented. `worldgen::VanillaGenerator::provide_chunk` is the
+terrain stage and `populate` is the population stage; `column()` remains only as
+the terrain-stage name the spawn search and the biome tests use.
 
-- **Ore placement belongs to the population pass**, not `provideChunk`; it uses
-  the population seed and `+8` offsets, so per-chunk ore generation can never
-  match.
+**The population `Random` is one stream per owner chunk, and every feature shares
+it.** That is the single fact that dictates the port order: a feature added late
+but drawn early shifts every block after it. `decorate.rs` therefore opens with
+the draws that come before `BiomeDecorator` — structure pieces, the water and lava
+lakes, eight dungeon attempts (each accepted chest consumes 24 loot draws), then
+the per-biome `decorate` overrides — before handing the same stream to
+`ores::generate_ores`.
+
+Ported so far, in `decorate.rs` and `ores.rs`:
+
+- `WorldGenLakes` (both liquids, rim rejection, the lava variant's stone shell)
+- `WorldGenDungeons` (room carve, mossy floor, up to two chests and their
+  `WeightedRandomChestContent` draws)
+- the taiga family's seven `WorldGenDoublePlant` sweeps and the savanna's
+  equivalent — they run *before* `super.decorate`, so about 2,700 draws gate
+  every ore in those biomes
+- `generateOres`: dirt, gravel, diorite, granite, andesite, coal, iron, gold,
+  redstone, diamond, and lapis (`genStandardOre2`), with `WorldGenMinable`
+- the underwater sand, clay and gravel patches
+
+**Not yet ported, in vanilla's order:** structure pieces, `WorldGenSand`'s
+siblings in the surface half of `genDecorations` (trees and their per-biome
+`genBigTreeChance`, big mushrooms, flowers, tall grass, dead bushes, lilies,
+mushrooms, sugar cane, cacti, springs), animal spawns, the ice/snow sweep, and
+`BiomeGenHills`' emerald and silverfish passes. `features.rs` still holds the old
+single-pass approximations; it is no longer called from the pipeline.
+
+Rules that still hold:
+
 - Population is a **2×2 rule**: owner `(x,z)` runs only once `(x,z)`,
   `(x+1,z)`, `(x,z+1)`, `(x+1,z+1)` exist, and eligibility is checked in the
   order `(x,z)`, `(x-1,z)`, `(x,z-1)`, `(x-1,z-1)`. Writes cross the boundary.
@@ -246,35 +274,66 @@ Consequences we have not implemented:
   (village 10387312, scattered 14357617, monument 10387313) with floor division
   for negative regions.
 
-
 Environment: **overworld, sea level 63**, infinite generation, biome map from the
 1.8 `GenLayer` stack.
 
+### The two traps that cost the most time
+
+**`MaterialLiquid.blocksMovement()` is false.** `World.getTopSolidOrLiquidBlock`
+therefore walks *past* water and lava and returns the first cell above the
+seabed, which is what makes the sand/clay patches land underwater at all.
+`block::is_solid` has to mirror `Material.isSolid()`'s actual split (liquid,
+`MaterialLogic` and `MaterialTransparent` are false; leaves, torches and rails
+are true) — a "not air and not replaceable" shortcut counts plants, saplings and
+snow cover as solid and quietly misfiles every lake rim and dungeon shell.
+`block::blocks_movement` is a *different* predicate (the renderer's ray trace) and
+must not be reused for this.
+
+**Rejected features still consume draws — but only sometimes.** `WorldGenSand`
+draws its radius after the water test, so a dry column consumes nothing while a
+wet one consumes one more value. Anything that keys a draw off a world query must
+be ported exactly; approximating the placement is safe, approximating the draw
+count is not.
+
 ### Parity status (measure against the reference world, never by eyeball)
+
+All numbers below are from `cargo test -p nephele-world --test block_parity`,
+which compares 289 chunks / 18,939,904 blocks of `parity/blocks-random.bin.gz`
+(structures on, seed 12345) through `provide_chunk` + `populate`.
 
 | Stage | State | Number |
 |---|---|---|
-| Terrain height field | done | 96% of columns match |
-| Surface blocks | done | 98.8% match (1.2% mismatch) |
-| Caves | done | 308 air/chunk below y=56 |
-| Ravines | done | 426 vs 435 reference (98%) |
-| Ores | done, wrong stage | 5–12% above reference (caves absent when measured) |
-| **Biome map** | **done** | **0 / 160,000 blocks differ** (seed 12345, reference server world), and 0 / 160,000 again after a full `column()` pass, read from `ChunkColumn::biomes()` |
-| Features | partial | flowers, grass, dead bush, cactus, oak-shape trees |
+| Terrain height field | done | 97.88% of comparable columns |
+| Biome map | **done** | **0 / 73,984 cells differ** |
+| Population: lakes, dungeons, chest draws, taiga/savanna pre-pass | done | — |
+| Population: ores (all eleven entries) | done | — |
+| Population: underwater sand/clay/gravel patches | done | 422 mismatched blocks |
+| Population: trees, plants, snow | **not ported** | ~50,400 (leaves 44,763 + logs 5,615 alone) |
+| Population bucket, total | — | 220,545 of 18,939,904 blocks (1.164%) |
+| Terrain-only residue | regression guard | 7,319 (0.039% of blocks) |
 
-**Every number above except the biome map was measured per chunk, which is a
-different pipeline than vanilla's.** Treat them as "our implementation is close"
-rather than parity until the population pass exists and they are re-measured on
-a populated world.
+Attribution is by block id, not by reference state (see `bucket()` in
+`block_parity.rs`), so a population block misplaced where vanilla has stone is
+filed as population rather than inflating the terrain guard.
 
-**The oracle cannot settle this yet.** The second reference world now exists at
+**Where the remaining population error actually is.** It is not spread evenly.
+The per-chunk distribution is bimodal: the median chunk has 245 population
+mismatches (sediment from the missing trees and plants) while about fifty chunks
+carry four to six thousand each. Those chunks are the ones a **structure**
+intersects — `MapGenStructure.generateStructure` draws from the same population
+`Random`, and the fixture is structures-on, so every ore in them is shifted. That
+floor cannot be removed without porting village and mineshaft piece generation,
+which is why the oracle's 90%-of-mismatches assertion still passes while the
+absolute number does not reach parity.
+
+**The oracle cannot settle this yet.** The second reference world exists at
 `Nephele-private/parity/server-random` (level `random`, seed 12345, DEFAULT,
 empty generator settings, **structures on**, 625 chunks / 25×25 from spawn).
-`parity/server` stays as-is for the structures-off comparison. Neither answers a
-block-level question yet: the oracle emits surface heights, not block arrays, so
-a 65,536-state per-chunk export is still the prerequisite. Compare only the
-inner area (roughly ±8 chunks): the outermost ring lacks its populated
-neighbours and is not expected to match.
+`parity/server` stays as-is for the structures-off comparison. Compare only the
+inner area of the fixture: it is 25×25 and the compared window is its inner
+17×17, so the four-chunk margin is exactly the neighbour support a chunk's
+population writes need.
+
 
 
 ### The biome bug — solved 2026-11-05

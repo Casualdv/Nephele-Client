@@ -232,20 +232,21 @@ impl VanillaGenerator {
 
     /// The decoration pass itself.
     ///
-    /// None of it is ported yet: every stage below writes blocks, so an empty
-    /// body is the only honest state. They are listed in vanilla's order because
-    /// the order is what a port must preserve — the lakes and dungeons draw from
-    /// the same `Random` as the biome decorator, so adding them later shifts every
-    /// subsequent draw unless they are inserted exactly here.
+    /// The order below is the contract, not a suggestion: lakes and dungeons
+    /// draw from the same `Random` as the biome decorator, so a stage inserted
+    /// one slot early or late shifts every block after it. The draws are
+    /// implemented in [`crate::decorate`]; the stages listed as not ported still
+    /// need to be added *at their position*, never appended.
     ///
     /// ```text
-    /// for kind in STRUCTURE_KINDS      MapGenStructure.generateStructure
+    /// for kind in STRUCTURE_KINDS      MapGenStructure.generateStructure  (not ported)
     /// water lake                       WorldGenLakes(water), skipped in deserts
     /// lava lake                        WorldGenLakes(lava)
     /// dungeons                         8 x WorldGenDungeons
     /// biome.decorate                   BiomeDecorator; ores first (see crate::ores)
-    /// animal spawns                    SpawnerAnimals.performWorldGenSpawning
-    /// ice / snow                       per-column freeze and snowfall
+    ///   ...                            trees, plants, springs                (not ported)
+    /// animal spawns                    SpawnerAnimals.performWorldGenSpawning (draws only)
+    /// ice / snow                       per-column freeze and snowfall  (no draws)
     /// ```
     fn decorate<W: GenWorld>(
         &mut self,
