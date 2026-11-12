@@ -45,6 +45,13 @@ fn vs_main(in: VertexIn) -> VertexOut {
     return out;
 }
 
+/// sRGB -> linear, the same curve the texture view applies on sample.
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let low = c / 12.92;
+    let high = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
+    return select(high, low, c <= vec3<f32>(0.04045));
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // `in.anim` packs the animation row, the tint-mask flag and the biome tint:
@@ -52,11 +59,16 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // = 0xRRGGBB. White is the no-op tint.
     let anim_code = in.anim & 0x7Fu;
     let tint_masked = (in.anim & 0x80u) != 0u;
-    let tint = vec3<f32>(
+    // The tint is an sRGB colour. The texture is sampled through an sRGB view,
+    // so `texel.rgb` arrives linearised; 1.8's fixed-function pipeline
+    // multiplied the two in gamma space. Linearise the tint as well, or the
+    // product is brighter and more washed out than vanilla's.
+    let tint_srgb = vec3<f32>(
         f32((in.anim >> 24u) & 255u),
         f32((in.anim >> 16u) & 255u),
         f32((in.anim >> 8u) & 255u),
     ) / 255.0;
+    let tint = srgb_to_linear(tint_srgb);
 
     // `in.layer` is a packed tile slot: 16 tiles per 64×64 layer, 4×4 inside.
     let local = in.layer % 16u;

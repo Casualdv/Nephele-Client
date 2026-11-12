@@ -8,6 +8,7 @@
 # Usage:
 #   .\scripts\run_client.ps1 -Session m3 -Server mc.hypixel.net
 #   .\scripts\run_client.ps1 -Session m6 -Local
+#   .\scripts\run_client.ps1 -Session m3 -Server 127.0.0.1:25565 -Offline
 #   .\scripts\run_client.ps1 -Session m3 -DryRun
 #
 # Each session gets its own NEPHELE_DATA_DIR, so worlds, saves and the auth
@@ -16,6 +17,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Session,
     [string]$Server = "mc.hypixel.net",
     [switch]$Local,
+    [switch]$Offline,
     [switch]$Trace,
     [switch]$DryRun
 )
@@ -55,10 +57,15 @@ $arguments = @('play')
 if ($Local) {
     $arguments += '--seed'
     $arguments += '12345'
+    # `play --seed` only stores the seed for the world-create screen; the
+    # single-player world is entered through NEPHELE_SCREEN=local.
+    $env:NEPHELE_SCREEN = 'local'
 }
 else {
     $arguments += $Server
-    $arguments += '--online'
+    if (-not $Offline) {
+        $arguments += '--online'
+    }
 }
 
 $env:NEPHELE_DATA_DIR = $dataDir

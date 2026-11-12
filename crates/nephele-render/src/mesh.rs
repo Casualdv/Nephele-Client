@@ -748,7 +748,14 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                         face,
                         layers[face.slot],
                         anims[face.slot],
-                        block_tint,
+                        // Grass is the one block whose faces disagree: the top
+                        // is the colormap colour, the sides only tint the
+                        // overlay pixels (mask), and the bottom is dirt.
+                        if id == 2 && face.slot == 1 {
+                            NO_TINT
+                        } else {
+                            block_tint
+                        },
                         id == 2 && face.slot == 2,
                         positions,
                         lights,
@@ -1139,6 +1146,8 @@ fn is_cross_plant(id: u16) -> bool {
 
 const FOLIAGE_PINE: u32 = 0x619961;
 const FOLIAGE_BIRCH: u32 = 0x80A755;
+/// `BlockLilyPad.colorMultiplier` is a constant, not a biome resolver.
+const LILY_PAD: u32 = 0x208030;
 
 /// Vanilla `BiomeColorHelper`: average the 3x3 biome neighbourhood so grass
 /// and foliage do not switch colour at a biome edge.
@@ -1146,17 +1155,43 @@ fn tint_for_block(atlas: &TextureArray, job: &ColumnMeshJob, raw: u16, x: i32, z
     let id = raw >> 4;
     let meta = (raw & 0x0f) as u8;
     let kind = match id {
-        2 | 31 => TintKind::Grass,
+        2 => TintKind::Grass,
+        // Tall grass and ferns. Meta 0 is the dead bush, which vanilla leaves
+        // untinted (`BlockTallGrass.getRenderColor` returns white for it).
+        31 => {
+            if meta & 7 == 0 {
+                return NO_TINT;
+            }
+            TintKind::Grass
+        }
+        // `BlockReed.colorMultiplier` is the grass resolver, not a fixed colour.
+        83 => TintKind::Grass,
+        // `BlockDoublePlant`: only the grass and fern variants are tinted.
+        175 => {
+            if !matches!(meta & 7, 2 | 3) {
+                return NO_TINT;
+            }
+            TintKind::Grass
+        }
+        // `BlockLiquid` water, white except the swamp multiplier.
         8 | 9 => TintKind::Water,
+        // `BlockVine.colorMultiplier` is the foliage resolver.
+        106 => TintKind::Foliage,
         18 => {
-            if meta == 1 {
+            // `BlockOldLeaf`: spruce and birch are fixed, everything else is
+            // the per-biome foliage colour.
+            if meta & 3 == 1 {
                 return FOLIAGE_PINE;
             }
-            if meta == 2 {
+            if meta & 3 == 2 {
                 return FOLIAGE_BIRCH;
             }
             TintKind::Foliage
         }
+        // `BlockNewLeaf` inherits `BlockLeaves.colorMultiplier` for both
+        // acacia and dark oak.
+        161 => TintKind::Foliage,
+        111 => return LILY_PAD,
         _ => return NO_TINT,
     };
 
@@ -1834,6 +1869,123 @@ mod tests {
                 .any(|vertex| vertex.anim & TINT_MASK != 0),
             "grass sides must mark the overlay mask"
         );
+    }
+
+    #[test]
+    fn plant_and_leaf_tints_match_the_vanilla_resolvers() {
+        let mut column = ChunkColumn::empty(0, 0);
+        let mut biomes = [1u8; 256];
+        biomes.fill(1); // plains
+        column.set_biomes(&biomes);
+        let placed: [(i32, i32, u16, u8); 6] = [
+            (1, 1, 111, 0),   // lily pad
+            (3, 3, 83, 0),    // sugar cane
+            (5, 5, 31, 0),    // dead bush
+            (7, 7, 31, 1),    // tall grass
+            (9, 9, 175, 2),   // double plant, grass
+            (11, 11, 175, 0), // sunflower
+        ];
+        for (x, z, id, meta) in placed {
+            column.set_block(x as usize, 64, z as usize, BlockState::new(id, meta));
+        }
+        column.set_block(13, 64, 1, BlockState::new(18, 1)); // spruce leaves
+        column.set_block(1, 64, 13, BlockState::new(18, 2)); // birch leaves
+        let world = world_with(column.clone());
+        let atlas = atlas();
+        let mesh = build_column_mesh(&column, &world, &atlas);
+
+        let tints_at = |x: i32, z: i32| -> Vec<u32> {
+            mesh.vertices
+                .iter()
+                .filter(|vertex| {
+                    vertex.position[0].floor() as i32 == x && vertex.position[2].floor() as i32 == z
+                })
+                .map(|vertex| vertex.anim >> 8)
+                .collect()
+        };
+        let packed = |color: [f32; 3]| {
+            ((color[0] * 255.0) as u32) << 16
+                | ((color[1] * 255.0) as u32) << 8
+                | (color[2] * 255.0) as u32
+        };
+        let grass = packed(atlas.tint(TintKind::Grass, 1));
+
+        assert!(tints_at(1, 1).iter().all(|tint| *tint == LILY_PAD));
+        assert!(
+            tints_at(3, 3).iter().all(|tint| *tint == grass),
+            "sugar cane: {:x?} != {grass:x}",
+            tints_at(3, 3)
+        );
+        assert!(tints_at(5, 5).iter().all(|tint| *tint == NO_TINT));
+        assert!(tints_at(7, 7).iter().all(|tint| *tint == grass));
+        assert!(tints_at(9, 9).iter().all(|tint| *tint == grass));
+        assert!(tints_at(11, 11).iter().all(|tint| *tint == NO_TINT));
+        assert!(tints_at(13, 1).iter().all(|tint| *tint == FOLIAGE_PINE));
+        assert!(tints_at(1, 13).iter().all(|tint| *tint == FOLIAGE_BIRCH));
+    }
+
+    #[test]
+    fn grass_tint_averages_the_three_by_three_neighbourhood() {
+        let mut column = ChunkColumn::empty(0, 0);
+        let mut biomes = [1u8; 256];
+        biomes.fill(1); // plains everywhere
+        biomes[5 * 16 + 5] = 2; // one desert column in the middle
+        column.set_biomes(&biomes);
+        column.set_block(5, 64, 5, BlockState::new(2, 0));
+        let world = world_with(column.clone());
+        let atlas = atlas();
+        let mesh = build_column_mesh(&column, &world, &atlas);
+
+        let top = mesh
+            .vertices
+            .iter()
+            .find(|vertex| {
+                vertex.position[1] == 65.0
+                    && (5.0..6.0).contains(&vertex.position[0])
+                    && (5.0..6.0).contains(&vertex.position[2])
+            })
+            .expect("grass top face");
+        let channels = |color: [f32; 3]| {
+            [
+                (color[0] * 255.0) as u32,
+                (color[1] * 255.0) as u32,
+                (color[2] * 255.0) as u32,
+            ]
+        };
+        let desert = channels(atlas.tint(TintKind::Grass, 2));
+        let plains = channels(atlas.tint(TintKind::Grass, 1));
+        let expected = (((desert[0] + plains[0] * 8) / 9) << 16)
+            | (((desert[1] + plains[1] * 8) / 9) << 8)
+            | ((desert[2] + plains[2] * 8) / 9);
+        assert_eq!(top.anim >> 8, expected);
+        assert_ne!(expected, (plains[0] << 16) | (plains[1] << 8) | plains[2]);
+    }
+
+    #[test]
+    fn grass_dirt_bottom_is_not_tinted() {
+        let mut column = ChunkColumn::empty(0, 0);
+        let mut biomes = [1u8; 256];
+        biomes.fill(21); // jungle, a strong green
+        column.set_biomes(&biomes);
+        column.set_block(3, 64, 3, BlockState::new(2, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+
+        // The bottom face is the only quad whose four corners all sit on y=64.
+        let bottom = mesh.indices.chunks(6).find_map(|window| {
+            let vertices: Vec<&Vertex> = window
+                .iter()
+                .map(|index| &mesh.vertices[*index as usize])
+                .collect();
+            vertices
+                .iter()
+                .all(|vertex| vertex.position[1] == 64.0)
+                .then_some(vertices)
+        });
+        let bottom = bottom.expect("grass must still draw its bottom face");
+        for vertex in bottom {
+            assert_eq!(vertex.anim >> 8, NO_TINT);
+        }
     }
 
     #[test]

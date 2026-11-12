@@ -162,7 +162,11 @@ pub fn face_textures(state: BlockState) -> Option<FaceTextures> {
         28 => same("rail_detector"),
         29 => split("piston_top_sticky", "piston_bottom", "piston_side"),
         30 => same("web"),
-        31 => same(if meta == 2 { "fern" } else { "tallgrass" }),
+        31 => same(match meta & 7 {
+            0 => "deadbush",
+            2 => "fern",
+            _ => "tallgrass",
+        }),
         32 => same("deadbush"),
         33 | 34 | 36 => split("piston_top_normal", "piston_bottom", "piston_side"),
         37 => same("flower_dandelion"),
@@ -274,7 +278,11 @@ pub fn face_textures(state: BlockState) -> Option<FaceTextures> {
         157 => same("rail_activator"),
         158 => split("furnace_top", "furnace_top", "dropper_front_horizontal"),
         160 => pane(meta),
-        161 => same("leaves_acacia"),
+        161 => same(if meta & 3 == 1 {
+            "leaves_big_oak"
+        } else {
+            "leaves_acacia"
+        }),
         163 => same("planks_acacia"),
         164 => same("planks_big_oak"),
         165 => same("slime"),

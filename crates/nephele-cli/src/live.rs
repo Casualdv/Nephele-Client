@@ -25,7 +25,7 @@ use crate::servers::{Ping, PingBoard, ServerEntry, ServerList, Status};
 use crate::settings::{Brightness, OptionRow, Settings};
 use crate::skins::SkinLoader;
 use crate::ui::{self, Action, HudState, Screen};
-use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
+use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas, MISSING_TEXTURE};
 use nephele_audio::{AudioEngine, Listener};
 use nephele_client::mining::{Aim, Miner, MiningEvent};
 use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
@@ -1791,8 +1791,6 @@ struct LiveApp {
     startup_cmds: Vec<String>,
     /// Per-phase frame timings, printed once a second under `NEPHELE_PROFILE=1`.
     profile: bool,
-    /// Dev-only commands applied once the world has arrived (NEPHELE_CMDS).
-    startup_cmds: Vec<String>,
     prof_ui: f32,
     prof_mesh: f32,
     prof_draw: f32,
@@ -1974,9 +1972,6 @@ impl LiveApp {
                 .map(|value| value.split(';').map(str::to_string).collect())
                 .unwrap_or_default(),
             profile: std::env::var("NEPHELE_PROFILE").is_ok(),
-            startup_cmds: std::env::var("NEPHELE_CMDS")
-                .map(|value| value.split(';').map(str::to_string).collect())
-                .unwrap_or_default(),
             prof_ui: 0.0,
             prof_mesh: 0.0,
             prof_draw: 0.0,
@@ -2105,6 +2100,20 @@ impl LiveApp {
             Err(err) => return self.fail(event_loop, err),
         };
         let missing = textures.unresolved_names();
+        // A texture that resolves to the generated magenta/black tile draws a
+        // cross of the wrong colour exactly where a plant should be, so report
+        // the names every boot and fail loudly if the common cases regress.
+        println!(
+            "Block textures: {} tiles in {} layers; unresolved: {:?}",
+            textures.tile_count(),
+            textures.layer_count(),
+            missing
+        );
+        assert_ne!(
+            textures.slot_or_missing("tallgrass"),
+            textures.slot_or_missing(MISSING_TEXTURE),
+            "`tallgrass` resolved to the missing tile: the atlas or the prepared tree is wrong"
+        );
         tracing::info!(
             tiles = textures.tile_count(),
             layers = textures.layer_count(),
@@ -5522,6 +5531,7 @@ mod tests {
             south: Vec::new(),
             light_levels: vec![0, 4, 15],
             has_skylight: true,
+            biomes: vec![1; 18 * 18],
             corners: Default::default(),
             corner_lights: [vec![4], vec![4], vec![4], vec![4]],
             west_lights: vec![4],

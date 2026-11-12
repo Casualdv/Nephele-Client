@@ -177,6 +177,91 @@ const SNOW_LAYERS: [&[ShapeBox]; 8] = [
     &[b([0.0, 0.0, 0.0], [16.0, 16.0, 16.0])],
 ];
 
+/// Rails: vanilla's flat plane, given a pixel of thickness so it survives
+/// grazing angles. Slopes (`meta & 7` 2..5) are drawn flat as well; the mesher
+/// has no per-vertex ramp support and a flat rail reads better than a cube.
+const RAIL: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 1.0, 16.0])];
+
+/// Redstone wire and tripwire: the same flat plane, below the feet.
+const WIRE: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 1.0, 16.0])];
+
+/// A tripwire hook's post; the arm that points at the string is cosmetic here.
+const TRIPWIRE_HOOK: &[ShapeBox] = &[b([6.0, 0.0, 6.0], [10.0, 10.0, 10.0])];
+
+/// Ladders: a one-pixel plate against the wall the metadata names.
+const LADDER_NORTH: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 16.0, 1.0])];
+const LADDER_SOUTH: &[ShapeBox] = &[b([0.0, 0.0, 15.0], [16.0, 16.0, 16.0])];
+const LADDER_WEST: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [1.0, 16.0, 16.0])];
+const LADDER_EAST: &[ShapeBox] = &[b([15.0, 0.0, 0.0], [16.0, 16.0, 16.0])];
+
+/// A bed is 9/16 tall in vanilla; the model's corner posts are cosmetic.
+const BED: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 9.0, 16.0])];
+
+/// Button: 6x6 pixels on a wall, 2 pixels proud of it. Meta 0 is the floor,
+/// 5 the ceiling, 1..4 the four walls (`BlockButton.getFacing`).
+const BUTTON_DOWN: &[ShapeBox] = &[b([5.0, 0.0, 5.0], [11.0, 2.0, 11.0])];
+const BUTTON_UP: &[ShapeBox] = &[b([5.0, 14.0, 5.0], [11.0, 16.0, 11.0])];
+const BUTTON_EAST: &[ShapeBox] = &[b([14.0, 5.0, 5.0], [16.0, 11.0, 11.0])];
+const BUTTON_WEST: &[ShapeBox] = &[b([0.0, 5.0, 5.0], [2.0, 11.0, 11.0])];
+const BUTTON_SOUTH: &[ShapeBox] = &[b([5.0, 5.0, 14.0], [11.0, 11.0, 16.0])];
+const BUTTON_NORTH: &[ShapeBox] = &[b([5.0, 5.0, 0.0], [11.0, 11.0, 2.0])];
+
+/// Lever: the cobblestone base plus a centred handle. Vanilla tilts the handle
+/// and flips it for powered levers; the box keeps the silhouette.
+const LEVER: &[ShapeBox] = &[
+    b([5.0, 0.0, 4.0], [11.0, 3.0, 12.0]),
+    b([7.0, 3.0, 7.0], [9.0, 10.0, 9.0]),
+];
+
+/// Anvil: a 12-pixel base with a narrower top. `meta & 1` swaps the long axis.
+const ANVIL_X: &[ShapeBox] = &[
+    b([2.0, 0.0, 2.0], [14.0, 4.0, 14.0]),
+    b([3.0, 4.0, 5.0], [13.0, 10.0, 11.0]),
+];
+const ANVIL_Z: &[ShapeBox] = &[
+    b([2.0, 0.0, 2.0], [14.0, 4.0, 14.0]),
+    b([5.0, 4.0, 3.0], [11.0, 10.0, 13.0]),
+];
+
+/// Enchanting table and daylight detector: full footprint, shorter body.
+const ENCHANTING_TABLE: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 12.0, 16.0])];
+const DAYLIGHT_DETECTOR: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 6.0, 16.0])];
+
+/// Cake: 14x8x14 on the plate, bites not modelled.
+const CAKE: &[ShapeBox] = &[b([1.0, 0.0, 1.0], [15.0, 8.0, 15.0])];
+
+/// Cauldron: four 4-pixel walls around a 2-pixel floor.
+const CAULDRON: &[ShapeBox] = &[
+    b([0.0, 0.0, 0.0], [16.0, 4.0, 2.0]),
+    b([0.0, 0.0, 14.0], [16.0, 4.0, 16.0]),
+    b([0.0, 0.0, 2.0], [2.0, 4.0, 14.0]),
+    b([14.0, 0.0, 2.0], [16.0, 4.0, 14.0]),
+    b([2.0, 0.0, 2.0], [14.0, 2.0, 14.0]),
+];
+
+/// A flower pot's bowl.
+const FLOWER_POT: &[ShapeBox] = &[b([5.0, 0.0, 5.0], [11.0, 6.0, 11.0])];
+
+/// A skull sitting on the block.
+const SKULL: &[ShapeBox] = &[b([4.0, 0.0, 4.0], [12.0, 8.0, 12.0])];
+
+/// Piston head: a 4-pixel cap on the side the metadata faces.
+const PISTON_HEAD_DOWN: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 4.0, 16.0])];
+const PISTON_HEAD_UP: &[ShapeBox] = &[b([0.0, 12.0, 0.0], [16.0, 16.0, 16.0])];
+const PISTON_HEAD_NORTH: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 16.0, 4.0])];
+const PISTON_HEAD_SOUTH: &[ShapeBox] = &[b([0.0, 0.0, 12.0], [16.0, 16.0, 16.0])];
+const PISTON_HEAD_WEST: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [4.0, 16.0, 16.0])];
+const PISTON_HEAD_EAST: &[ShapeBox] = &[b([12.0, 0.0, 0.0], [16.0, 16.0, 16.0])];
+
+/// A closed trapdoor, bottom or top half; an open one is a 3-pixel plate on
+/// the facing side.
+const TRAPDOOR_BOTTOM: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 3.0, 16.0])];
+const TRAPDOOR_TOP: &[ShapeBox] = &[b([0.0, 13.0, 0.0], [16.0, 16.0, 16.0])];
+const TRAPDOOR_NORTH: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 16.0, 3.0])];
+const TRAPDOOR_SOUTH: &[ShapeBox] = &[b([0.0, 0.0, 13.0], [16.0, 16.0, 16.0])];
+const TRAPDOOR_WEST: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [3.0, 16.0, 16.0])];
+const TRAPDOOR_EAST: &[ShapeBox] = &[b([13.0, 0.0, 0.0], [16.0, 16.0, 16.0])];
+
 /// Horizontal pane connections around one block.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PaneConnections {
@@ -360,6 +445,62 @@ pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
                 PLATE_PRESSED
             } else {
                 PLATE
+            }
+        }
+        // Rails: powered, detector and activator variants share the shape.
+        27 | 28 | 66 | 157 => RAIL,
+        55 | 132 => WIRE,
+        131 => TRIPWIRE_HOOK,
+        65 => match meta {
+            2 => LADDER_NORTH,
+            3 => LADDER_SOUTH,
+            4 => LADDER_WEST,
+            _ => LADDER_EAST,
+        },
+        26 => BED,
+        143 | 77 => match meta & 7 {
+            0 => BUTTON_DOWN,
+            1 => BUTTON_EAST,
+            2 => BUTTON_WEST,
+            3 => BUTTON_SOUTH,
+            4 => BUTTON_NORTH,
+            _ => BUTTON_UP,
+        },
+        69 => LEVER,
+        145 => {
+            if meta & 1 == 0 {
+                ANVIL_X
+            } else {
+                ANVIL_Z
+            }
+        }
+        116 => ENCHANTING_TABLE,
+        151 | 178 => DAYLIGHT_DETECTOR,
+        92 => CAKE,
+        118 => CAULDRON,
+        140 => FLOWER_POT,
+        144 => SKULL,
+        34 | 36 => match meta & 7 {
+            0 => PISTON_HEAD_DOWN,
+            1 => PISTON_HEAD_UP,
+            2 => PISTON_HEAD_NORTH,
+            3 => PISTON_HEAD_SOUTH,
+            4 => PISTON_HEAD_WEST,
+            _ => PISTON_HEAD_EAST,
+        },
+        96 | 167 => {
+            if meta & 4 != 0 {
+                // Open: the panel swings to the side the metadata faces.
+                match meta & 3 {
+                    0 => TRAPDOOR_NORTH,
+                    1 => TRAPDOOR_EAST,
+                    2 => TRAPDOOR_SOUTH,
+                    _ => TRAPDOOR_WEST,
+                }
+            } else if meta & 8 != 0 {
+                TRAPDOOR_TOP
+            } else {
+                TRAPDOOR_BOTTOM
             }
         }
         // Cross-quad plants and crops occupy no solid volume. The mesher draws
@@ -626,5 +767,65 @@ mod tests {
         assert_eq!(block_shape(1, 0), FULL);
         assert!(is_full_cube(block_shape(1, 0)));
         assert_eq!(block_shape(0, 0), EMPTY);
+    }
+
+    /// The second pass over the shape audit: flat plates and simple boxes that
+    /// used to fall through to the cube path.
+    #[test]
+    fn the_remaining_audit_boxes_are_not_cubes() {
+        for (id, meta) in [
+            (26u16, 0u8), // bed
+            (27, 0),      // powered rail
+            (28, 0),      // detector rail
+            (34, 2),      // piston head
+            (55, 0),      // redstone wire
+            (65, 2),      // ladder
+            (66, 0),      // rail
+            (69, 0),      // lever
+            (77, 0),      // stone button
+            (92, 0),      // cake
+            (96, 0),      // trapdoor
+            (116, 0),     // enchanting table
+            (118, 0),     // cauldron
+            (131, 0),     // tripwire hook
+            (132, 0),     // tripwire
+            (140, 0),     // flower pot
+            (143, 0),     // button
+            (144, 0),     // skull
+            (145, 0),     // anvil
+            (151, 0),     // daylight detector
+            (157, 0),     // activator rail
+            (167, 0),     // iron trapdoor
+            (178, 0),     // inverted daylight detector
+        ] {
+            let shape = block_shape(id, meta);
+            assert!(!shape.is_empty(), "block {id}:{meta} has no shape");
+            assert!(!is_full_cube(shape), "block {id}:{meta} is still a cube");
+        }
+    }
+
+    #[test]
+    fn ladders_hug_the_wall_their_metadata_names() {
+        assert_eq!(block_shape(65, 2), LADDER_NORTH);
+        assert_eq!(block_shape(65, 3), LADDER_SOUTH);
+        assert_eq!(block_shape(65, 4), LADDER_WEST);
+        assert_eq!(block_shape(65, 5), LADDER_EAST);
+    }
+
+    #[test]
+    fn trapdoors_flip_between_halves_and_walls() {
+        assert_eq!(block_shape(96, 0), TRAPDOOR_BOTTOM);
+        assert_eq!(block_shape(96, 8), TRAPDOOR_TOP);
+        assert_eq!(block_shape(96, 4), TRAPDOOR_NORTH);
+        assert_eq!(block_shape(96, 5), TRAPDOOR_EAST);
+        assert_eq!(block_shape(96, 12), TRAPDOOR_NORTH);
+    }
+
+    #[test]
+    fn anvils_turn_with_their_metadata() {
+        assert_eq!(block_shape(145, 0), ANVIL_X);
+        assert_eq!(block_shape(145, 1), ANVIL_Z);
+        // The top sits on the base either way.
+        assert_eq!(block_shape(145, 0)[1].min[1], 4.0);
     }
 }

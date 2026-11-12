@@ -462,7 +462,7 @@ nothing writes there any more.
   6, 31, 32, 37, 38, 39, 40, 59, 83, 141, 142, 175, emitting two diagonals each drawn
   twice with opposite winding. Pinned by `plants_are_crossed_quads_not_cubes`.
 
-### Shape-aware meshing - bars, fences and fire (2026-11-05)
+### Shape-aware meshing - bars, fences, fire, plants and the flat-shape pass (2026-11-12)
 
 `mesh_column` now consumes `nephele_world::shapes::block_shape(id, meta)`. Full
 cubes keep the direct unit-cube path; each non-full `ShapeBox` emits its six faces
@@ -498,22 +498,70 @@ pane or other small shape. Cross-plants stay on their separate crossed-quad path
   report their real height. They are also in `is_transparent`. The mesher still
   draws the crossed quads; the shape table is what stops culling/AO.
 - **Biome grass/foliage tint** is per block position and blended 3x3 at biome
-  edges (`tint_for_block` + `BiomeColorizer`). There is no extra vertex
-  attribute: `Vertex.anim` packs `animation index + 1` in bits 0..6, a tint-mask
-  bit 7 and 0xRRGGBB in bits 8..31, so `NO_ANIMATION` is `0xFFFFFF00`. Grass
-  sides store the overlay coverage in their alpha channel and set the mask bit,
-  which lets the shader tint the grass pixels without tinting the dirt below.
-  The shader decodes the word and multiplies before fog.
-- **Still on the cube path** (audited 2026-11-05; vanilla renders these as
-  non-cubes but the table has no model for them yet): bed 26; rails 27/28/66;
-  cobweb 30; piston head 34; redstone wire 55; signs 63/68; ladder 65; levers
-  69; pressure plates 70/72/147/148; buttons 77/143; nether portal 90; cake 92;
-  repeaters 93/94; trapdoors 96/167; vines 106; fence gates 107; enchanting
-  table 116; brewing stand 117; cauldron 118; end portal 119 and its frame 120;
-  cocoa 127; tripwire 132; flower pot 140; skull 144; anvil 145; comparators
-  149/150; daylight detector 151; hopper 154; banners 176/177; end rod 198;
-  chorus plant/flower 199/200. Double slabs (43/125/181/204) and the beacon (138)
+  edges (`tint_for_block` + `BiomeColorizer`), exactly vanilla's
+  `BiomeColorHelper.getColorAtPos` (a 3x3 loop over `pos.add(-1,0,-1)` to
+  `pos.add(1,0,1)`). There is no extra vertex attribute: `Vertex.anim` packs
+  `animation index + 1` in bits 0..6, a tint-mask bit 7 and 0xRRGGBB in bits
+  8..31, so `NO_ANIMATION` is `0xFFFFFF00`. Grass sides store the overlay
+  coverage in their alpha channel and set the mask bit, which lets the shader
+  tint the grass pixels without tinting the dirt below; the grass block's own
+  bottom face gets `NO_TINT` because it is dirt. A block's tint is the average
+  of nine colormap lookups, one per biome in the neighbourhood.
+- **Tint kinds are vanilla's three resolvers, not one per block.** Grass (grass
+  block, tall grass/fern, sugar cane, double-plant grass/fern), foliage (oak /
+  jungle / acacia / dark oak leaves and vines) and the water multiplier. The
+  fixed block colours are constants in the mesher: spruce leaves `0x619961`,
+  birch `0x80A755`, lily pad `0x208030` (`BlockLilyPad.colorMultiplier`), and a
+  dead bush (31:0) is untinted. `BiomeColorizer` also carries the per-biome
+  overrides the base colormap does not model: swamp grass and foliage
+  `0x6A7039` and water `0xE0FFAE`, mesa grass `0x90814D` / foliage `0x9E814D`,
+  and roofed forest's halved grass `(c & 0xFEFEFE) + 0x28340A >> 1`. (Swamp
+  grass is noisy in vanilla; only the common branch is modelled.)
+- **The tint is multiplied in gamma space.** The block texture array is
+  `Rgba8UnormSrgb`, so `textureSample` returns linearised values; the shader
+  linearises the packed tint with the same curve before multiplying. Without
+  that, tinted grass measured `R/G 0.856 B/G 0.845` instead of vanilla's
+  `0.732/0.716` for taiga - visibly washed out. This matches 1.8's
+  fixed-function pipeline, which multiplied the two 8-bit colours directly.
+- `nephele-prepare` copies `textures/colormap/{grass,foliage}.png` (the
+  `ASSET_PREFIXES` entry) and `OUTPUT_VERSION` is 3; a tree prepared at 2 has no
+  colormaps and `BiomeColorizer` silently falls back to an approximation. On
+  boot the client prints every unresolved block-texture name and asserts
+  `slot_or_missing("tallgrass")` is not the generated missing tile, because a
+  plant that resolves to it draws a magenta/black cross exactly where a flower
+  should be.
+- **Shape audit, second pass (2026-11-12).** Beds (26), rails (27/28/66/157),
+  piston heads (34/36), redstone wire (55), ladders (65), levers (69), buttons
+  (77/143), cake (92), trapdoors (96/167), enchanting tables (116), cauldrons
+  (118), tripwire hook/wire (131/132), flower pots (140), skulls (144), anvils
+  (145) and daylight detectors (151/178) are now real boxes/plates instead of
+  full cubes. Each is a `ShapeBox` list in `nephele-world::shapes`, so it goes
+  through the existing non-full-cube path and inherits its culling rules.
+  Slopes and multi-part models are still approximations (rails are flat).
+- **Still on the cube path** (audited 2026-11-12): cobweb 30 (a cube in
+  vanilla too), signs 63/68, nether portal 90, repeaters 93/94, vines 106, fence
+  gates 107, brewing stand 117, end portal 119 and its frame 120, cocoa 127,
+  comparators 149/150, hopper 154, banners 176/177, end rod 198 and chorus
+  plant/flower 199/200. Double slabs (43/125/181/204) and the beacon (138)
   intentionally stay cubes because their visible bulk is a full block.
+
+**Verified 2026-11-12** (single-player, seed 12345, and the mock server). Grass
+tops were measured as mean channel ratios over a clean patch and compared with
+the colormap value: taiga `(0,0)` `R/G 0.711 B/G 0.688` vs vanilla
+`0.732/0.716`; forest `(200,-72)` `0.598/0.415` vs `0.630/0.469`; desert
+`(-584,-760)` `1.045/0.427` vs `1.044/0.464`; mock-server plains `(8,8)`
+`0.756/0.439` vs `0.767/0.471`. Forest oak-leaf pixels measured `0.474/0.205`
+vs foliage `0.516/0.281`. Swamp water at `(400,428)` measured `B/G 1.66` against
+`3.66` for plains water, which is the `0xE0FFAE` multiplier. The residual gap in
+every pair is the sRGB-vs-gamma-space difference above, not a wrong lookup.
+Screenshots: `rl-pad-taiga.png`, `rl-pad-forest.png`, `rl-pad-desert.png`,
+`rl-server-plains.png`, `rl-swamp.png`, `rl-forest-grass-foliage.png` and
+`rl-garden-final.png` (plants textured: tall grass, fern, poppy, dandelion,
+dead bush, lily pads, four leaf types).
+
+`play --seed <n>` on its own opens the title screen: the seed is only stored for
+the world-create screen, and single-player is entered through
+`NEPHELE_SCREEN=local`. `run_client.ps1 -Local` now sets that itself.
 
 
 ### Dropped items — done
