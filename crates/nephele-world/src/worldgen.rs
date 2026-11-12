@@ -249,12 +249,13 @@ impl VanillaGenerator {
     /// ```
     fn decorate<W: GenWorld>(
         &mut self,
-        _world: &mut W,
-        _rand: &mut JavaRandom,
-        _biome: i32,
-        _chunk_x: i32,
-        _chunk_z: i32,
+        world: &mut W,
+        rand: &mut JavaRandom,
+        biome: i32,
+        chunk_x: i32,
+        chunk_z: i32,
     ) {
+        crate::decorate::decorate(world, rand, biome, chunk_x, chunk_z);
     }
 
     /// `provideChunk`'s five `MapGenStructure.generate` calls, in order.

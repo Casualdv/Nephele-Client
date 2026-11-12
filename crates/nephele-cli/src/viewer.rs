@@ -189,7 +189,11 @@ impl Viewer {
         // and a note block beside it. `NEPHELE_DEMO=beacon`.
         if std::env::var("NEPHELE_DEMO").as_deref() == Ok("beacon") {
             self.demo = true;
-            let ground = generator.height_at(8, 8) + 1;
+            let ground = self
+                .world
+                .height_at(8, 8)
+                .map(|y| y as i32 + 1)
+                .unwrap_or(64);
             self.demo_ground = ground;
             for x in 5..=11 {
                 for z in 5..=11 {

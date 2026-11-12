@@ -60,6 +60,7 @@ pub mod ids {
     pub const ICE: u16 = 79;
     pub const PACKED_ICE: u16 = 174;
     pub const SLIME: u16 = 165;
+    pub const FARMLAND: u16 = 60;
     pub const CLAY: u16 = 82;
     pub const MYCELIUM: u16 = 110;
     pub const WATER_LILY: u16 = 111;
@@ -82,6 +83,11 @@ pub mod ids {
     pub const GLOWSTONE: u16 = 89;
     pub const END_STONE: u16 = 121;
     pub const QUARTZ_ORE: u16 = 153;
+    // Decoration and population-pass blocks.
+    pub const MOSSY_COBBLESTONE: u16 = 48;
+    pub const MOB_SPAWNER: u16 = 52;
+    pub const CHEST: u16 = 54;
+    pub const DOUBLE_PLANT: u16 = 175;
 }
 
 impl BlockState {
@@ -116,6 +122,23 @@ impl BlockState {
 /// both their flowing and stationary forms (ids 8..=11).
 pub fn is_liquid(state: BlockState) -> bool {
     matches!(state.id(), 8..=11)
+}
+
+/// `Material.water`: still and flowing water.
+pub fn is_water(state: BlockState) -> bool {
+    matches!(state.id(), 8 | 9)
+}
+
+/// An approximation of `Material.isSolid()`.
+///
+/// Vanilla asks the block's material; this crate has no material table, so the
+/// predicate is "not air, not a liquid, not one of the blocks vanilla marks
+/// replaceable, and not fire". That matches every block worldgen can meet
+/// (stone, dirt, grass, sand, gravel, clay, ores, wood, netherrack, end stone)
+/// and is only wrong for exotic blocks generation never places. Used by the
+/// lake, dungeon and sand passes.
+pub fn is_solid(state: BlockState) -> bool {
+    !state.is_air() && !is_liquid(state) && !is_replaceable(state) && state.id() != ids::FIRE
 }
 
 /// `Block.isReplaceable(world, pos)`.

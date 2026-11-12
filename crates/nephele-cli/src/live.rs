@@ -888,7 +888,17 @@ fn local_loop(
                 }
                 let column = match save.load_chunk(coord.0, coord.1) {
                     Ok(Some(column)) => column,
-                    Ok(None) => generator.column(coord.0, coord.1),
+                    Ok(None) => {
+                        // Same two stages as the parity harness and the server:
+                        // generate, insert, then let the 2x2 rule populate.
+                        let column = generator.provide_chunk(coord.0, coord.1);
+                        world.insert(column.clone());
+                        generator.populate(&mut world, coord.0, coord.1);
+                        world
+                            .get(ChunkCoord::new(coord.0, coord.1))
+                            .cloned()
+                            .unwrap_or(column)
+                    }
                     Err(error) => return Err(error.to_string()),
                 };
                 world.insert(column.clone());

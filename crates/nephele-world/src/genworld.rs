@@ -66,6 +66,28 @@ pub trait GenWorld {
     fn is_replaceable(&self, x: i32, y: i32, z: i32) -> bool {
         block::is_replaceable(self.get_block(x, y, z))
     }
+
+    /// `Material.water` — what `WorldGenSand`/`WorldGenClay` require.
+    fn is_water(&self, x: i32, y: i32, z: i32) -> bool {
+        block::is_water(self.get_block(x, y, z))
+    }
+
+    /// An approximation of `Material.isSolid()` for the lake/dungeon passes.
+    fn is_solid(&self, x: i32, y: i32, z: i32) -> bool {
+        block::is_solid(self.get_block(x, y, z))
+    }
+
+    /// `World.getTopSolidOrLiquidBlock(pos)`: one above the highest solid
+    /// block, ignoring liquids and leaves. Unlike [`Self::height`] this can land
+    /// inside water, which the underwater sand/clay pass expects.
+    fn solid_top(&self, x: i32, z: i32) -> i32 {
+        for y in (0..256).rev() {
+            if self.is_solid(x, y, z) {
+                return y + 1;
+            }
+        }
+        0
+    }
 }
 
 /// A `GenWorld` backed by nothing but a map of chunks.

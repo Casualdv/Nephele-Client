@@ -21,6 +21,7 @@ pub mod caves;
 pub mod chunk;
 pub mod crafting;
 pub mod decode;
+pub mod decorate;
 pub mod dimension;
 pub mod encode;
 pub mod end;
