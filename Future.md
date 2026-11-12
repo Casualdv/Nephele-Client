@@ -148,7 +148,7 @@ per render frame — it no longer does. Keep new simulation work inside
 | Item | Size | Notes |
 |---|---|---|
 | 20 Hz fixed tick + interpolation | **done** | `step_player`, `TICK`, `alpha` interpolation. |
-| Movement constants parity | S | Walk `0.1`, sprint `×1.3`, sneak `×0.3`, gravity `0.08/tick²`, drag `0.98`, ground friction `0.546`, air `0.91`, jump `0.42`, terminal `3.92`, width `0.6`, height `1.8` (sneak `1.65`), eye `1.62`, reach `4.5`/`5.0` |
+| Movement constants parity | S | **Done 2026-11-12:** the tick *order* matches `EntityLivingBase` as well as the constants — `moveStrafing/moveForward *= 0.98` before `moveFlying`, and the end-of-tick friction taken from the ground state the tick began in (so the launch tick is damped at 0.546, the landing tick at 0.91). Measured: walk 4.317, sprint 5.612, sneak 1.295, sprint-jump chain 7.13 m/s. Walk `0.1`, sprint `×1.3`, sneak `×0.3`, gravity `0.08/tick²`, drag `0.98`, ground friction `0.546`, air `0.91`, jump `0.42`, terminal `3.92`, width `0.6`, height `1.8` (sneak `1.65`), eye `1.62`, reach `4.5`/`5.0` |
 | Sprint rules: only forward, not while sneaking, cancels on hit | S | |
 | Sprint FOV modifier | S | |
 | Ladders, vines, cobwebs | M | |

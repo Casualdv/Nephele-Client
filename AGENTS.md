@@ -578,6 +578,10 @@ and produced the "pushing me up" bug.
 
 **Physics** (`physics.rs`): sneak edge protection via `edge_clamped` + `has_ground`,
 per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards drift.
+The movement tick is vanilla's `EntityLivingBase.travel` order end to end: input
+scaled by 0.98, acceleration *and* the end-of-tick friction both chosen from the
+ground state the tick began in, the move, then friction and gravity (see §13
+"Gameplay numbers").
 
 **Items and drops** (M2, first slice):
 
@@ -932,12 +936,29 @@ re-serialize the chunk wholesale.
   server validates `C02` against the victim's box plus a 0.1 cushion and drops
   anything further without a reply, so using the block distance for entities
   produced hits that looked real locally and never landed.
-- **Ground speeds run ~2% above vanilla**: this model measures walk 4.405,
-  sprint 5.727, sneak 1.322 against vanilla's 4.317/5.612/1.30, and the
-  sprint-jump chain measures 8.99 against ~7.13. The jump overshoot being larger
-  than the ground delta points at airtime, not the +0.2 boost. Pinned by
-  `ground_speeds_and_sprint_jump_match_the_model`; do not "fix" it by tuning the
-  constants, which are descriptions of what the simulation produces.
+- **Movement speeds match vanilla as of 2026-11-12: walk 4.317, sprint 5.612,
+  sneak 1.295, sprint-jump chain 7.13 m/s** (they were 4.405 / 5.727 / 1.322 /
+  8.99). Two independent causes, both in `physics.rs::step` and both checked
+  against the decompiled `EntityLivingBase`:
+  - The +2% on every ground speed was a **missing input scale**:
+    `onLivingUpdate` does `moveStrafing *= 0.98F; moveForward *= 0.98F` before
+    `moveFlying`, so the steady speed is `accel * 0.98 / (1 - 0.546)`, not
+    `accel / (1 - 0.546)`. One factor, one cause, all three speeds.
+  - The +26% jump chain was **friction read from the post-move ground state**.
+    `moveEntityWithHeading` picks `f4` from the `onGround` the tick *began* in
+    (it recomputes `f4` at line 1630, before the `moveEntity` at 1657), so the
+    launch tick is damped by ground friction 0.546 and the landing tick by 0.91.
+    Reading `self.on_ground` after the move swapped those: the +0.2 impulse
+    survived the launch tick at 0.91. **The arc was never wrong** — apex 1.2522
+    and 12 ticks of airtime matched vanilla before and after this fix, so the
+    old "airtime too short" guess recorded here was wrong; more landings was
+    never the mechanism.
+  Pinned by `a_single_jump_matches_the_vanilla_tick_sequence` (apex 1.2522 ±
+  0.02, 12 ticks airborne, 3.629 blocks from a settled sprint),
+  `the_jump_tick_is_damped_with_ground_friction`, and
+  `ground_speeds_and_sprint_jump_match_the_model` (2% on every ground speed,
+  chain 7.13 ± 0.2). Measure the chain over a whole number of 12-tick jumps —
+  a 40-tick window is 3⅓ jumps and reads 7.25 from phase bias.
 
 **Worldgen**
 
@@ -1022,7 +1043,7 @@ re-serialize the chunk wholesale.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`;
   `chunk_biomes_match_a_world_the_real_server_generated` passes and
   `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **719 test cases across the workspace** (706 passed, 13 ignored). `nephele-world`
+- **724 test cases across the workspace** (711 passed, 13 ignored). `nephele-world`
   carries the parity suite, including `debug_stage_trace` and
   `debug_first_mismatch`. The six real-socket tests in
   `crates/nephele-client/tests/join_mock.rs` cover status,

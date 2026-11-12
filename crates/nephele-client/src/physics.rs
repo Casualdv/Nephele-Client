@@ -2,9 +2,21 @@
 //!
 //! This is vanilla 1.8's `EntityLivingBase.travel`, reimplemented in blocks per
 //! tick: input adds `aiMoveSpeed * 0.16277136 / friction^3` of velocity on the
-//! ground (0.02 in the air), the move happens, then friction and gravity are
-//! applied. That acceleration curve is what makes walking feel like Minecraft
-//! rather than a teleport.
+//! ground (0.02 in the air, 0.026 sprinting), the move happens, then friction
+//! and gravity are applied. That acceleration curve is what makes walking feel
+//! like Minecraft rather than a teleport.
+//!
+//! Two details of that tick order are load-bearing, and both were missing once:
+//!
+//! - `EntityLivingBase.onLivingUpdate` scales the movement input by **0.98**
+//!   (`moveStrafing *= 0.98F; moveForward *= 0.98F`) before `moveFlying`, which
+//!   is why every steady speed ends up 2% below `accel / (1 - friction)`.
+//! - The friction coefficient is chosen from the ground state the tick *began*
+//!   in (`moveEntityWithHeading` reads `onGround` and recomputes `f4` before
+//!   `moveEntity`, at line 1630 of the 1.8.9 source), not the state after the
+//!   move. On the jump tick that means **ground** friction (0.546) is applied to
+//!   the whole jump impulse; using air friction there keeps the +0.2 boost
+//!   alive and inflates a sprint-jump chain by ~26%.
 //!
 //! Velocities are stored in blocks per second (`vx`, `vy`, `vz`) so callers can
 //! reason in real units; the tick maths converts at the boundary.
@@ -18,16 +30,26 @@ pub const HEIGHT: f64 = 1.8;
 pub const EYE_HEIGHT: f64 = 1.62;
 
 /// Steady-state speeds the vanilla constants below produce, for reference.
-pub const WALK_SPEED: f64 = 4.405;
-pub const SPRINT_SPEED: f64 = 5.726;
-pub const SNEAK_SPEED: f64 = 1.322;
+///
+/// These are the speeds a real 1.8.9 client measures on flat ground:
+/// `0.098 / (1 - 0.546) = 0.21586` blocks/tick walking, `×1.3` sprinting and
+/// `×0.3` sneaking. They are a *description* of the model, not a tuning knob.
+pub const WALK_SPEED: f64 = 4.317;
+pub const SPRINT_SPEED: f64 = 5.612;
+pub const SNEAK_SPEED: f64 = 1.295;
 pub const FLY_SPEED: f64 = 10.9;
 pub const FLY_SPRINT_SPEED: f64 = 21.8;
 
 /// Vanilla's player movement-speed attribute.
 const MOVEMENT_SPEED: f64 = 0.1;
+/// `EntityLivingBase.onLivingUpdate`: `moveStrafing *= 0.98F; moveForward *= 0.98F`
+/// before `moveFlying`. This is the 2% by which a naive `accel / (1 - friction)`
+/// overstates every ground speed.
+const MOVE_INPUT_SCALE: f64 = 0.98;
 /// Default block slipperiness; friction is `slipperiness * 0.91`.
 const SLIPPERINESS: f64 = 0.6;
+/// `f4 = 0.91F`: the friction of a tick spent in the air.
+const AIR_FRICTION: f64 = 0.91;
 /// `BlockSlime.slipperiness` (1.8): 0.8, so you keep sliding on a pad.
 const SLIME_SLIPPERINESS: f64 = 0.8;
 /// `BlockIce.slipperiness` (1.8), shared by packed ice.
@@ -206,6 +228,12 @@ impl PlayerState {
         let mut vy = self.vy * dt;
         let mut vz = self.vz * dt;
 
+        // `moveEntityWithHeading` reads `onGround` *before* `moveEntity`, and
+        // that snapshot drives both the acceleration branch and the friction
+        // coefficient applied at the end of the tick. Taking it here is what
+        // makes the jump tick damp with ground friction.
+        let on_ground = self.on_ground;
+
         let ground_friction = self.ground_slipperiness(world) * 0.91;
         let ai_speed = MOVEMENT_SPEED
             * if input.sneak {
@@ -215,7 +243,7 @@ impl PlayerState {
             } else {
                 1.0
             };
-        let accel = if self.on_ground {
+        let accel = if on_ground {
             ai_speed * 0.16277136 / (ground_friction * ground_friction * ground_friction)
         } else if input.sprint {
             SPRINT_AIR_ACCEL
@@ -223,8 +251,8 @@ impl PlayerState {
             AIR_ACCEL
         };
 
-        let mut fwd = input.forward;
-        let mut strafe = input.strafe;
+        let mut fwd = input.forward * MOVE_INPUT_SCALE;
+        let mut strafe = input.strafe * MOVE_INPUT_SCALE;
         let length_sq = fwd * fwd + strafe * strafe;
         if length_sq >= 1.0e-4 {
             // Vanilla's `moveFlying`: normalise, then scale by the acceleration.
@@ -239,7 +267,7 @@ impl PlayerState {
             vz += forward.1 * fwd + right.1 * strafe;
         }
 
-        if input.jump && self.on_ground {
+        if input.jump && on_ground {
             vy = JUMP_VELOCITY_TICK;
             if input.sprint {
                 vx += forward.0 * SPRINT_JUMP_BOOST;
@@ -278,10 +306,13 @@ impl PlayerState {
             vz = 0.0;
         }
 
-        let friction = if self.on_ground {
+        // Vanilla picks the end-of-tick friction from the tick's starting ground
+        // state, so the jump tick is damped at 0.546 and the landing tick at
+        // 0.91 — the opposite of reading `self.on_ground` here.
+        let friction = if on_ground {
             ground_friction
         } else {
-            0.91
+            AIR_FRICTION
         };
         vx *= friction;
         vz *= friction;
@@ -736,17 +767,124 @@ mod tests {
         assert!(sprint > walk && walk > sneak);
     }
 
-    /// Pin the speeds the movement model actually produces, and record where
-    /// they sit against vanilla 1.8.9 on flat stone.
+    /// The whole jump arc, measured against vanilla's tick sequence.
     ///
-    /// Vanilla measures walk 4.317 / sprint 5.612 / sneak 1.30 m/s and a
-    /// sprint-jump chain around 7.13. This model produces 4.405 / 5.727 /
-    /// 1.322 / 8.99: every ground speed is ~2% high, and the jump chain is
-    /// ~26% high. The ground delta is a single consistent factor, so it is one
-    /// wrong constant rather than three; the jump chain being further out
-    /// suggests the airborne phase is too short (more landings, more +0.2
-    /// boosts), which is the next thing to measure. Pinned as-is so a change
-    /// shows up as a diff instead of a feeling.
+    /// Vertical, from a 0.42 launch: `y += vy` then `vy = (vy - 0.08) * 0.98`
+    /// every tick. The six upward steps sum to **1.2522028**, and the twelfth
+    /// tick lands, so a jump is **12 ticks** (0.6 s) of airtime.
+    ///
+    /// Horizontal: the launch tick takes the +0.2 sprint impulse plus
+    /// `0.13 * 0.98` of ground acceleration, and is damped by **ground**
+    /// friction (0.546) because the tick began on the ground; the remaining
+    /// eleven ticks accelerate at `0.026 * 0.98` and drag at 0.91. Carrying a
+    /// 5.612 m/s sprint through that arc covers **3.629** blocks.
+    #[test]
+    fn a_single_jump_matches_the_vanilla_tick_sequence() {
+        let world = flat_world(64);
+        let sprinting = Input {
+            forward: 1.0,
+            sprint: true,
+            ..Input::default()
+        };
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        run_ticks(&mut player, &sprinting, 60, &world);
+
+        let start_z = player.z;
+        let ground_y = player.y;
+        let jump_tick = Input {
+            jump: true,
+            ..sprinting
+        };
+        player.step(0.05, &jump_tick, 0.0, &world);
+        assert!(!player.on_ground, "the jump must leave the ground");
+
+        let mut apex = player.y - ground_y;
+        let mut air_ticks = 1;
+        while !player.on_ground && air_ticks < 50 {
+            player.step(0.05, &sprinting, 0.0, &world);
+            apex = apex.max(player.y - ground_y);
+            air_ticks += 1;
+        }
+        let distance = start_z - player.z;
+
+        assert!(
+            (apex - 1.2522).abs() < 0.02,
+            "apex = {apex} blocks (vanilla 1.2522)"
+        );
+        assert_eq!(air_ticks, 12, "airtime = {air_ticks} ticks (vanilla 12)");
+        assert!(
+            (distance - 3.629).abs() < 0.01,
+            "single-jump distance = {distance} blocks (vanilla 3.629)"
+        );
+        assert!(
+            (player.y - ground_y).abs() < 1e-4,
+            "landed at {} above the floor, not on it",
+            player.y - ground_y
+        );
+    }
+
+    /// The tick a player leaves the ground is a **ground** tick.
+    ///
+    /// `EntityLivingBase.moveEntityWithHeading` picks the friction coefficient
+    /// from the `onGround` state the tick began in (it recomputes `f4` at line
+    /// 1630, before the `moveEntity` at 1657). So the +0.2 sprint impulse is
+    /// damped by the ground friction 0.546 on that very tick, not by the air
+    /// friction 0.91 that applies once the player is airborne.
+    ///
+    /// Reading the post-move `on_ground` instead kept the whole boost alive
+    /// and inflated the sprint-jump chain from 7.13 to 8.99 m/s — more jumps
+    /// was not the cause; the launch tick was simply not being dragged.
+    #[test]
+    fn the_jump_tick_is_damped_with_ground_friction() {
+        let world = flat_world(64);
+        let sprinting = Input {
+            forward: 1.0,
+            sprint: true,
+            ..Input::default()
+        };
+        let mut player = PlayerState::at(8.5, 65.0, 8.5);
+        player.on_ground = true;
+        run_ticks(&mut player, &sprinting, 60, &world);
+        // Stored in blocks/second; forward is -Z at yaw 0.
+        let sprint_per_tick = -player.vz * 0.05;
+
+        player.step(
+            0.05,
+            &Input {
+                jump: true,
+                ..sprinting
+            },
+            0.0,
+            &world,
+        );
+
+        let expected =
+            (sprint_per_tick + MOVEMENT_SPEED * 1.3 * MOVE_INPUT_SCALE + SPRINT_JUMP_BOOST)
+                * SLIPPERINESS
+                * 0.91;
+        let actual = -player.vz * 0.05;
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "the launch tick moved {actual} blocks: vanilla damps (sprint + accel + 0.2) with \
+             ground friction 0.546 and leaves {expected}. Air friction 0.91 would leave {:.3} \
+             and is what made the chain 26% too fast.",
+            (sprint_per_tick + MOVEMENT_SPEED * 1.3 * MOVE_INPUT_SCALE + SPRINT_JUMP_BOOST) * 0.91
+        );
+    }
+
+    /// Pin the speeds the movement model produces against vanilla 1.8.9 on flat
+    /// stone, to 2%.
+    ///
+    /// Vanilla: walk 4.317, sprint 5.612, sneak 1.295, sprint-jump chain ~7.13
+    /// m/s. All three ground speeds are `accel * 0.98 / (1 - 0.546)` — the 0.98
+    /// is `moveStrafing *= 0.98F; moveForward *= 0.98F` in
+    /// `EntityLivingBase.onLivingUpdate`, the single factor behind the old
+    /// consistent +2%.
+    ///
+    /// **Measure the chain over a whole number of 12-tick jumps.** A 40-tick
+    /// window is 3⅓ jumps and lands on the fast part of the cycle, reading
+    /// 7.25; 60 ticks is exactly five jumps.
     #[test]
     fn ground_speeds_and_sprint_jump_match_the_model() {
         let world = flat_world(64);
@@ -791,18 +929,22 @@ mod tests {
                 jump: true,
                 ..Input::default()
             },
-            40,
+            60,
         );
 
-        assert!((walk - WALK_SPEED).abs() < 0.05, "walk = {walk} b/s");
+        let within_two_percent = |measured: f64, expected: f64, name: &str| {
+            let tolerance = expected * 0.02;
+            assert!(
+                (measured - expected).abs() <= tolerance,
+                "{name} = {measured} b/s, more than 2% from vanilla's {expected}"
+            );
+        };
+        within_two_percent(walk, WALK_SPEED, "walk");
+        within_two_percent(sprint, SPRINT_SPEED, "sprint");
+        within_two_percent(sneak, SNEAK_SPEED, "sneak");
         assert!(
-            (sprint - SPRINT_SPEED).abs() < 0.05,
-            "sprint = {sprint} b/s"
-        );
-        assert!((sneak - SNEAK_SPEED).abs() < 0.05, "sneak = {sneak} b/s");
-        assert!(
-            sprint_jump > sprint * 1.15,
-            "sprint-jumping ({sprint_jump}) must beat sprinting ({sprint})"
+            (sprint_jump - 7.13).abs() <= 0.2,
+            "sprint-jump chain = {sprint_jump} b/s (vanilla ~7.13)"
         );
         assert!(sprint > walk && walk > sneak);
     }
