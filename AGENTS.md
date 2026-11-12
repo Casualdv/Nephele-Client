@@ -703,6 +703,20 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   tools, armour, materials and common food as flat icons; dropped-item cubes use
   the same item texture on each face. Unmapped item ids still use
   `MISSING_TEXTURE`, and held first-person rendering remains block-only.
+- **Eating, armour absorption and block entities (added 2026-11-12).**
+  `nephele_world::food` carries the 1.8 food table (steak is 8 hunger / 12.8
+  saturation) and `EAT_TICKS = 32`; the local loop and the mock both start a
+  32-tick bite on `C08` with food, consume one item, and apply
+  `FoodStats.addStats` (hunger capped at 20, saturation at the resulting
+  hunger). `nephele_world::armour` has vanilla's 4%-per-point absorption
+  (capped at 20 points / 80%) and `fall_damage` starts after three blocks;
+  singleplayer applies it on landing. The mock now opens
+  `minecraft:furnace` (39 slots) and `minecraft:chest` (63 slots) on right-click,
+  ticks the furnace at 20 Hz with `smelting::{smelt, fuel_ticks, COOK_TICKS}`,
+  and resolves clicks in both halves; `LocalFurnace` and the mock share the fuel
+  table. **The furnace progress bar is still local-only:** the mock sends the
+  three slots via `S2F` but no progress packet, so an online furnace shows its
+  panel and items without a live flame/arrow.
 
 **Chat and client-side commands** (added 2026-11-01):
 
@@ -855,7 +869,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `biomes` | GenLayer parity | `biomes` | **100% biome cells, every stage diff 0 — lane complete** |
 | `biome-vis` | singleplayer generator + biome data path | `biome-vis` | done: `local_loop` streams `VanillaGenerator`, columns carry `Level.Biomes`; needs merge |
 | `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) |
-| `survival` | inventory, containers, HUD art | `survival` | 95%: rebuilt on main; `ContainerKind` generic windows (header slot, furnace, local chest), durability bars, 203 item sprites, HUD/armour sprites |
+| `survival` | inventory, containers, HUD art | `survival` | 95%: rebuilt on main; `ContainerKind` generic windows (header slot, furnace, local chest), durability bars, 203 item sprites, HUD/armour sprites, eating, armour absorption, furnace/chest block entities |
 | `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | **merged at `f0347c1`** - scoreboards, teams, `C02`, maps, frames, keep-alive, beacon/note/debris particles |
 | `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, options tree with a live Video Settings page, `keybinds.rs` (26 actions, click-to-rebind, conflict handling); its generic-window layout (`window_rows`/`server_window_origin`) was **replaced by `survival`'s `ContainerKind` model**; tab list, boss bar, titles and the loading screen still open |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
@@ -882,9 +896,10 @@ mock 2x2/3x3 crafting, and the death screen and respawn are implemented. Local
 singleplayer now evaluates the shared recipe book in both the 2x2 inventory grid
 and a usable 3x3 crafting-table window, awards basic block items when mining, and
 consumes block stacks when placing in survival. The tree-to-pickaxe chain still
-needs an interactive hand check. **Still missing:** eating, armour equip and
-damage reduction, hunger effects, XP orbs, furnace/chest block entities, and
-item icons for unmapped item ids.
+needs an interactive hand check. **Done 2026-11-12:** eating (32-tick use,
+hunger/saturation), armour absorption on local fall damage, and furnace/chest
+block entities with mock support. **Still missing:** hunger drain over time,
+XP orbs, and item icons for unmapped item ids.
 
 **M5 singleplayer saves (2026-11-04).** World storage is vanilla-shaped now:
 `nephele.dat` remains as a compatibility mirror, but `level.dat` is the source

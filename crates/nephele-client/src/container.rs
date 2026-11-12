@@ -59,23 +59,9 @@ impl ContainerLayout {
     }
 }
 
-/// Ticks a furnace needs per smelted item (10 s at 20 tps).
-pub const FURNACE_COOK_TICKS: u32 = 200;
-
-/// Fuel burn times, in ticks, for the fuels 1.8 accepts.
-pub fn fuel_ticks(id: u16) -> Option<u32> {
-    Some(match id {
-        263 => 1600,  // coal
-        173 => 16000, // coal block
-        327 => 20000, // lava bucket
-        // Planks, logs, wood stairs/slabs/fences, chests, crafting tables.
-        5 | 17 | 25 | 47 | 54 | 58 | 85 | 126 | 134 | 135 | 136 | 163 | 164 => 300,
-        280 => 100, // stick
-        50 => 80,   // torch
-        81 => 20,   // cactus
-        _ => return None,
-    })
-}
+/// Ticks a furnace needs per smelted item and the fuel table, shared with the
+/// mock and any other server-side furnace so the two cannot drift.
+pub use nephele_world::smelting::{fuel_ticks, COOK_TICKS as FURNACE_COOK_TICKS};
 
 /// A local furnace: input, fuel and output plus the two progress timers.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

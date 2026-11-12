@@ -1378,7 +1378,11 @@ impl GameClient {
     /// this to open crafting tables, furnaces and chests.
     /// Right-click `aim`: use the block (or empty hand) rather than place.
     pub async fn use_block(&mut self, aim: &Aim) -> Result<()> {
-        let packet = play::block_placement(aim.x, aim.y, aim.z, aim.face, aim.cursor, None);
+        // `C08` carries the held stack; the server uses it to decide between a
+        // block action and using the item (eating, for example).
+        let held = self.held_item();
+        let packet =
+            play::block_placement(aim.x, aim.y, aim.z, aim.face, aim.cursor, held.as_ref());
         self.connection.write_packet(&packet).await?;
         self.connection.write_packet(&play::swing_arm()).await?;
         Ok(())

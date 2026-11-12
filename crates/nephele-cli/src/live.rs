@@ -819,6 +819,13 @@ fn ground_block(world: &World, feet: [f64; 3]) -> Option<BlockState> {
 /// increasing whole-number threshold, so a step lands about every 1.67 blocks
 /// walked.
 #[derive(Debug)]
+/// An in-progress food bite: which hotbar slot is being eaten and for how many
+/// ticks. Vanilla's `ItemFood` use duration is 32 ticks.
+struct Eating {
+    slot: usize,
+    ticks: u32,
+}
+
 struct StepTrigger {
     last: Option<[f64; 3]>,
     walked: f32,
@@ -1039,6 +1046,16 @@ fn local_loop(
     let mut last_saved_player = saved_player;
     let mut autosave_deadline = Instant::now() + PLAYER_STATE_SAVE_INTERVAL;
     let mut weather_random = seed ^ 0x9E37_79B9_7F4A_7C15;
+    // A food item is consumed after 32 ticks of use (`ItemFood`). The slot is
+    // kept so switching hotbar slots cancels the bite, like vanilla.
+    let mut eating: Option<Eating> = None;
+    // Fall damage tracking: vanilla starts at three blocks and armour absorbs it.
+    let mut fall_distance = 0.0f64;
+    let mut was_on_ground = true;
+    let mut last_position = {
+        let state = shared.lock().unwrap();
+        (state.player.x, state.player.y, state.player.z)
+    };
 
     loop {
         if std::mem::take(&mut shared.lock().unwrap().pending_respawn) {
@@ -1051,8 +1068,28 @@ fn local_loop(
             state.food = 20;
             state.food_saturation = 5.0;
             state.food_exhaustion = 0.0;
+            eating = None;
         }
         let (position, yaw, pitch, on_ground) = step_player(&shared, &world);
+        {
+            let mut state = shared.lock().unwrap();
+            if !state.creative {
+                if on_ground {
+                    if !was_on_ground && fall_distance > 3.0 {
+                        let armour = crate::ui::armour_points(&state.inventory);
+                        let damage = nephele_world::armour::fall_damage(fall_distance, armour);
+                        if damage > 0.0 {
+                            state.health = (state.health - damage).max(0.0);
+                        }
+                    }
+                    fall_distance = 0.0;
+                } else if position.y < last_position.1 {
+                    fall_distance += last_position.1 - position.y;
+                }
+            }
+        }
+        was_on_ground = on_ground;
+        last_position = (position.x, position.y, position.z);
         let listener = ear(position);
         radius = local_stream_radius(&shared.lock().unwrap());
 
@@ -1208,7 +1245,52 @@ fn local_loop(
                 play_block_break(&shared, broken, target.pos(), listener, yaw);
             }
         }
+        if let Some(mut bite) = eating.take() {
+            let mut state = shared.lock().unwrap();
+            let held_slot = HOTBAR_FIRST_SLOT + (state.held_slot.clamp(0, 8) as usize);
+            let held = state.inventory.get(bite.slot).copied().flatten();
+            let food = held.and_then(|item| nephele_world::food::food(item.id, item.damage));
+            if bite.slot == held_slot {
+                if let Some(food) = food {
+                    bite.ticks += 1;
+                    if bite.ticks >= nephele_world::food::EAT_TICKS {
+                        let (hunger, saturation) =
+                            nephele_world::food::apply(state.food, state.food_saturation, food);
+                        state.food = hunger;
+                        state.food_saturation = saturation;
+                        if let Some(stack) = state.inventory[bite.slot].as_mut() {
+                            stack.count -= 1;
+                            if stack.count <= 0 {
+                                state.inventory[bite.slot] = None;
+                            }
+                        }
+                    } else {
+                        eating = Some(bite);
+                    }
+                }
+            }
+        }
         if use_pressed {
+            // Food starts a 32-tick use unless the click is on a block that
+            // consumes it (door, crafting table, furnace or chest).
+            let interactive = aim
+                .map(|aim| {
+                    let id = world.get_block(aim.x, aim.y, aim.z).id();
+                    nephele_world::shapes::is_door(id) || matches!(id, 54 | 58 | 61)
+                })
+                .unwrap_or(false);
+            if !interactive {
+                let state = shared.lock().unwrap();
+                let slot = HOTBAR_FIRST_SLOT + (state.held_slot.clamp(0, 8) as usize);
+                let held = state.inventory.get(slot).copied().flatten();
+                if let Some(item) = held {
+                    if nephele_world::food::food(item.id, item.damage).is_some()
+                        && state.food < nephele_world::food::MAX_HUNGER
+                    {
+                        eating = Some(Eating { slot, ticks: 0 });
+                    }
+                }
+            }
             if let Some(aim) = aim {
                 let targeted = world.get_block(aim.x, aim.y, aim.z);
                 if nephele_world::shapes::is_door(targeted.id()) {
@@ -1795,6 +1877,7 @@ async fn net_loop(
                     state.held_slot = client.held_slot;
                     state.health = client.health;
                     state.food = client.food;
+                    state.food_saturation = client.saturation;
                     state.xp_bar = client.xp_bar;
                     state.xp_level = client.xp_level;
                     state.time_of_day = (client.time_of_day.rem_euclid(24000) as f32).max(0.0);

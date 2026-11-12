@@ -14,6 +14,7 @@
 //! `Map Chunk Bulk` (0x26) reuses that payload per column, with the column
 //! sizes derived from each column's bitmask.
 
+pub mod armour;
 pub mod biome;
 pub mod block;
 pub mod blocks;
@@ -23,6 +24,7 @@ pub mod crafting;
 pub mod decode;
 pub mod encode;
 pub mod features;
+pub mod food;
 pub mod generation;
 pub mod genlayer;
 pub mod mesa;

@@ -15,6 +15,24 @@ const fn out(id: u16, damage: u16, count: u8) -> Smelt {
     Smelt { id, damage, count }
 }
 
+/// Ticks a furnace needs per smelted item (10 s at 20 tps).
+pub const COOK_TICKS: u32 = 200;
+
+/// Fuel burn times, in ticks, for the fuels 1.8 accepts.
+pub fn fuel_ticks(id: u16) -> Option<u32> {
+    Some(match id {
+        263 => 1600,  // coal
+        173 => 16000, // coal block
+        327 => 20000, // lava bucket
+        // Planks, logs, wood stairs/slabs/fences, chests, crafting tables.
+        5 | 17 | 25 | 47 | 54 | 58 | 85 | 126 | 134 | 135 | 136 | 163 | 164 => 300,
+        280 => 100, // stick
+        50 => 80,   // torch
+        81 => 20,   // cactus
+        _ => return None,
+    })
+}
+
 /// The result of smelting `(id, damage)`, if it has one.
 pub fn smelt(id: u16, damage: u16) -> Option<Smelt> {
     Some(match id {

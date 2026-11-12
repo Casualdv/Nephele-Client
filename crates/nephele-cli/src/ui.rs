@@ -310,29 +310,7 @@ fn draw_weather(bg: &mut UiBatch, hud: &HudState<'_>, scale: f32, width: f32, he
 pub fn armour_points(inventory: &[Option<ItemStack>]) -> i32 {
     (5..=8)
         .filter_map(|slot| inventory.get(slot).copied().flatten())
-        .map(|item| match item.id {
-            298 => 1, // leather
-            299 => 3,
-            300 => 2,
-            301 => 1,
-            302 => 2, // chainmail
-            303 => 5,
-            304 => 4,
-            305 => 1,
-            306 => 2, // iron
-            307 => 6,
-            308 => 5,
-            309 => 2,
-            310 => 3, // diamond
-            311 => 8,
-            312 => 6,
-            313 => 3,
-            314 => 2, // gold
-            315 => 5,
-            316 => 3,
-            317 => 1,
-            _ => 0,
-        })
+        .map(|item| nephele_world::armour::points(item.id).unwrap_or(0))
         .sum()
 }
 

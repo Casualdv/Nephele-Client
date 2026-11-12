@@ -1203,6 +1203,271 @@ async fn send_drop(
     Ok(())
 }
 
+// ---- furnace and chest block entities -------------------------------------
+
+/// Slots in a furnace window: input, fuel, output, then the 36 player slots.
+const FURNACE_SLOTS: usize = 39;
+/// Slots in a chest window: 27 chest cells, then the 36 player slots.
+const CHEST_SLOTS: usize = 63;
+
+/// One furnace block entity. Ticks at 20 Hz from `play_loop`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct MockFurnace {
+    input: Option<play::ItemStack>,
+    fuel: Option<play::ItemStack>,
+    output: Option<play::ItemStack>,
+    burn: u32,
+    burn_total: u32,
+    cook: u32,
+}
+
+impl MockFurnace {
+    fn result(&self) -> Option<nephele_world::smelting::Smelt> {
+        self.input.and_then(|item| {
+            nephele_world::smelting::smelt(item.id.max(0) as u16, item.damage.max(0) as u16)
+        })
+    }
+
+    fn can_accept(&self, result: nephele_world::smelting::Smelt) -> bool {
+        match self.output {
+            None => true,
+            Some(out) => {
+                out.id == result.id as i16
+                    && out.damage == result.damage as i16
+                    && out.count < MAX_STACK
+            }
+        }
+    }
+
+    /// One 20 Hz tick, mirroring vanilla's `TileEntityFurnace.update`.
+    fn tick(&mut self) {
+        let result = self.result();
+        let can_accept = result.is_some_and(|result| self.can_accept(result));
+
+        if self.burn > 0 {
+            self.burn -= 1;
+        }
+
+        if self.burn == 0 && can_accept {
+            if let Some(fuel) = self.fuel {
+                if let Some(ticks) = nephele_world::smelting::fuel_ticks(fuel.id.max(0) as u16) {
+                    self.burn = ticks;
+                    self.burn_total = ticks;
+                    self.fuel = if fuel.count > 1 {
+                        Some(play::ItemStack::new(fuel.id, fuel.count - 1, fuel.damage))
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+
+        if self.burn > 0 && can_accept {
+            self.cook += 1;
+            if self.cook >= nephele_world::smelting::COOK_TICKS {
+                self.cook = 0;
+                if let Some(result) = result {
+                    self.output = Some(match self.output {
+                        Some(out) => play::ItemStack::new(out.id, out.count + 1, out.damage),
+                        None => play::ItemStack::new(
+                            result.id as i16,
+                            result.count as i8,
+                            result.damage as i16,
+                        ),
+                    });
+                    self.input = self.input.and_then(|item| {
+                        (item.count > 1).then_some(play::ItemStack::new(
+                            item.id,
+                            item.count - 1,
+                            item.damage,
+                        ))
+                    });
+                }
+            }
+        } else {
+            self.cook = 0;
+        }
+    }
+
+    fn window(
+        &self,
+        inventory: &[Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+    ) -> Vec<Option<play::ItemStack>> {
+        let mut slots = vec![None; FURNACE_SLOTS];
+        slots[0] = self.input;
+        slots[1] = self.fuel;
+        slots[2] = self.output;
+        slots[3..39].copy_from_slice(&inventory[9..45]);
+        slots
+    }
+
+    fn apply_window(&mut self, slots: &[Option<play::ItemStack>]) {
+        self.input = slots[0];
+        self.fuel = slots[1];
+        self.output = slots[2];
+    }
+}
+
+/// The non-crafting container the mock currently has open. Vanilla only opens
+/// one window at a time, and the mock reuses window id 1 for all of them.
+enum OpenContainer {
+    Furnace {
+        pos: (i32, i32, i32),
+        slots: Vec<Option<play::ItemStack>>,
+    },
+    Chest {
+        pos: (i32, i32, i32),
+        slots: Vec<Option<play::ItemStack>>,
+    },
+}
+
+impl OpenContainer {
+    fn slots(&self) -> &[Option<play::ItemStack>] {
+        match self {
+            Self::Furnace { slots, .. } | Self::Chest { slots, .. } => slots,
+        }
+    }
+
+    fn slots_mut(&mut self) -> &mut [Option<play::ItemStack>] {
+        match self {
+            Self::Furnace { slots, .. } | Self::Chest { slots, .. } => slots,
+        }
+    }
+
+    /// Index of the first player slot in the window.
+    fn player_offset(&self) -> usize {
+        match self {
+            Self::Furnace { .. } => 3,
+            Self::Chest { .. } => 27,
+        }
+    }
+}
+
+/// Put `stack` into `targets`, merging before taking an empty slot.
+fn insert_into_slots(
+    slots: &mut [Option<play::ItemStack>],
+    targets: std::ops::Range<usize>,
+    stack: play::ItemStack,
+) -> Option<play::ItemStack> {
+    let mut stack = stack;
+    for target in targets.clone() {
+        if let Some(mut existing) = slots[target] {
+            if same_item(&existing, &stack) && existing.count < MAX_STACK {
+                let take = stack.count.min(MAX_STACK - existing.count);
+                existing.count += take;
+                slots[target] = Some(existing);
+                stack.count -= take;
+                if stack.count == 0 {
+                    return None;
+                }
+            }
+        }
+    }
+    for target in targets {
+        if slots[target].is_none() {
+            slots[target] = Some(stack);
+            return None;
+        }
+    }
+    Some(stack)
+}
+
+/// Resolve one click in a furnace/chest window. Player-half changes are mirrored
+/// into `inventory`; the caller persists the container slots afterwards.
+fn click_mock_container(
+    container: &mut OpenContainer,
+    inventory: &mut [Option<play::ItemStack>; PLAY_CONTAINER_SLOTS],
+    cursor: &mut Option<play::ItemStack>,
+    slot: i16,
+    button: i8,
+    mode: i8,
+) -> ClickResult {
+    let mut changed = Vec::new();
+    let Ok(index) = usize::try_from(slot) else {
+        return ClickResult {
+            accepted: false,
+            changed,
+        };
+    };
+    let offset = container.player_offset();
+    let slot_count = container.slots().len();
+    if index >= slot_count {
+        return ClickResult {
+            accepted: false,
+            changed,
+        };
+    }
+
+    if mode == play::click_mode::SHIFT_CLICK {
+        let Some(stack) = container.slots()[index] else {
+            return ClickResult {
+                accepted: true,
+                changed,
+            };
+        };
+        let range = if index < offset {
+            offset..slot_count
+        } else {
+            match container {
+                OpenContainer::Chest { .. } => 0..27,
+                OpenContainer::Furnace { .. } => {
+                    let item_id = stack.id.max(0) as u16;
+                    if nephele_world::smelting::smelt(item_id, stack.damage.max(0) as u16).is_some()
+                    {
+                        0..1
+                    } else if nephele_world::smelting::fuel_ticks(item_id).is_some() {
+                        1..2
+                    } else {
+                        0..2
+                    }
+                }
+            }
+        };
+        let slots = container.slots_mut();
+        let rest = insert_into_slots(slots, range.clone(), stack);
+        slots[index] = rest;
+        for target in range {
+            mark(&mut changed, target);
+        }
+        mark(&mut changed, index);
+    } else {
+        let slots = container.slots_mut();
+        let (new_cursor, new_slot) = click_pair(*cursor, slots[index], button);
+        *cursor = new_cursor;
+        if new_slot != slots[index] {
+            slots[index] = new_slot;
+            mark(&mut changed, index);
+        }
+    }
+
+    let slots = container.slots();
+    for &changed_index in &changed {
+        if changed_index >= offset {
+            inventory[9 + changed_index - offset] = slots[changed_index];
+        }
+    }
+    ClickResult {
+        accepted: true,
+        changed,
+    }
+}
+
+async fn send_health(
+    connection: &mut Connection,
+    health: f32,
+    food: i32,
+    saturation: f32,
+) -> Result<()> {
+    let mut w = PacketWriter::new();
+    w.write_f32(health).write_varint(food).write_f32(saturation);
+    connection
+        .write_packet(&Packet::new(
+            play::clientbound::UPDATE_HEALTH,
+            w.into_bytes(),
+        ))
+        .await
+}
+
 async fn play_loop(
     connection: &mut Connection,
     username: &str,
@@ -1219,6 +1484,17 @@ async fn play_loop(
     let mut cursor: Option<play::ItemStack> = None;
     // The open crafting-table window (id 1), if any.
     let mut table: Option<Vec<Option<play::ItemStack>>> = None;
+    // Furnace/chest block entities, plus the one non-table window that may be open.
+    let mut furnaces: std::collections::HashMap<(i32, i32, i32), MockFurnace> =
+        std::collections::HashMap::new();
+    let mut chests: std::collections::HashMap<(i32, i32, i32), Vec<Option<play::ItemStack>>> =
+        std::collections::HashMap::new();
+    let mut container: Option<OpenContainer> = None;
+    // Food state and the 32-tick bite in progress (hotbar slot, ticks).
+    let mut held_slot: usize = 0;
+    let mut food: i32 = 20;
+    let mut food_saturation: f32 = 5.0;
+    let mut eating: Option<(usize, u32)> = None;
     let mut next_drop_id: i32 = 1_000;
     let mut picks_up_at: std::collections::VecDeque<PendingPickup> =
         std::collections::VecDeque::new();
@@ -1233,6 +1509,9 @@ async fn play_loop(
     // milliseconds is plenty for a demo server.
     let mut pickup_ticker = tokio::time::interval(Duration::from_millis(100));
     pickup_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Furnace smelting, food use and other 20 Hz block-entity work.
+    let mut entity_ticker = tokio::time::interval(Duration::from_millis(50));
+    entity_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -1263,12 +1542,82 @@ async fn play_loop(
                 send_bot_tick(connection, &bots, bot_tick).await?;
                 bot_tick = bot_tick.wrapping_add(1);
             }
+            _ = entity_ticker.tick() => {
+                if let Some((slot, ticks)) = eating {
+                    if ticks + 1 >= nephele_world::food::EAT_TICKS {
+                        eating = None;
+                        if let Some(item) = inventory[slot] {
+                            if let Some(value) =
+                                nephele_world::food::food(item.id, item.damage)
+                            {
+                                let (hunger, saturation) =
+                                    nephele_world::food::apply(food, food_saturation, value);
+                                food = hunger;
+                                food_saturation = saturation;
+                                inventory[slot] = if item.count > 1 {
+                                    Some(play::ItemStack::new(
+                                        item.id,
+                                        item.count - 1,
+                                        item.damage,
+                                    ))
+                                } else {
+                                    None
+                                };
+                                connection
+                                    .write_packet(&play::set_slot(
+                                        0,
+                                        slot as i16,
+                                        inventory[slot].as_ref(),
+                                    ))
+                                    .await?;
+                                send_health(connection, 20.0, food, food_saturation).await?;
+                            }
+                        }
+                    } else {
+                        eating = Some((slot, ticks + 1));
+                    }
+                }
+
+                let mut changed_furnaces = Vec::new();
+                for (pos, furnace) in furnaces.iter_mut() {
+                    let before = furnace.clone();
+                    furnace.tick();
+                    if *furnace != before {
+                        changed_furnaces.push(*pos);
+                    }
+                }
+                if let Some(OpenContainer::Furnace { pos, slots }) = container.as_mut() {
+                    if changed_furnaces.contains(pos) {
+                        if let Some(furnace) = furnaces.get(pos) {
+                            let window = furnace.window(&inventory);
+                            for index in 0..3 {
+                                if slots[index] != window[index] {
+                                    slots[index] = window[index];
+                                    connection
+                                        .write_packet(&play::set_slot(
+                                            1,
+                                            index as i16,
+                                            slots[index].as_ref(),
+                                        ))
+                                        .await?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             packet = connection.read_packet() => {
                 match packet {
                     Ok(packet) => match packet.id {
                         play::serverbound::CHAT_MESSAGE => {
                             let text = packet.reader().read_string()?;
                             send_chat(connection, &format!("<{username}> {text}")).await?;
+                        }
+                        play::serverbound::HELD_ITEM_CHANGE => {
+                            let slot = packet.reader().read_i16()?;
+                            if (0..play::HOTBAR_SLOTS as i16).contains(&slot) {
+                                held_slot = slot as usize;
+                            }
                         }
                         play::serverbound::PLAYER_DIGGING => {
                             let mut r = packet.reader();
@@ -1321,6 +1670,59 @@ async fn play_loop(
                                 table = Some(slots);
                                 continue;
                             }
+                            // Furnaces and chests are block entities: the window
+                            // shows their own slots above the player half.
+                            let block_id = world.get_block(x, y, z).id() as i16;
+                            if block_id == 61
+                                && held.and_then(|item| item.block_state()).is_none()
+                            {
+                                let furnace = furnaces.entry((x, y, z)).or_default();
+                                let slots = furnace.window(&inventory);
+                                connection
+                                    .write_packet(&play::open_window(
+                                        1,
+                                        "minecraft:furnace",
+                                        "{\"text\":\"Furnace\"}",
+                                        FURNACE_SLOTS as u8,
+                                    ))
+                                    .await?;
+                                connection
+                                    .write_packet(&play::window_items(1, &slots))
+                                    .await?;
+                                container = Some(OpenContainer::Furnace {
+                                    pos: (x, y, z),
+                                    slots,
+                                });
+                                table = None;
+                                continue;
+                            }
+                            if block_id == 54
+                                && held.and_then(|item| item.block_state()).is_none()
+                            {
+                                let chest = chests
+                                    .entry((x, y, z))
+                                    .or_insert_with(|| vec![None; 27]);
+                                let mut slots = vec![None; CHEST_SLOTS];
+                                slots[0..27].copy_from_slice(chest);
+                                slots[27..63].copy_from_slice(&inventory[9..45]);
+                                connection
+                                    .write_packet(&play::open_window(
+                                        1,
+                                        "minecraft:chest",
+                                        "{\"text\":\"Chest\"}",
+                                        CHEST_SLOTS as u8,
+                                    ))
+                                    .await?;
+                                connection
+                                    .write_packet(&play::window_items(1, &slots))
+                                    .await?;
+                                container = Some(OpenContainer::Chest {
+                                    pos: (x, y, z),
+                                    slots,
+                                });
+                                table = None;
+                                continue;
+                            }
                             if let Some(item) = held {
                                 if let Some(state) = item.block_state() {
                                     let normal = Face::from_protocol_id(face)
@@ -1333,6 +1735,17 @@ async fn play_loop(
                                         world.set_block(tx, ty, tz, BlockState::from_raw(state));
                                         send_block_change(connection, tx, ty, tz, state).await?;
                                     }
+                                }
+                            }
+                            if let Some(item) = inventory
+                                .get(play::HOTBAR_FIRST_SLOT + held_slot)
+                                .copied()
+                                .flatten()
+                            {
+                                if nephele_world::food::food(item.id, item.damage).is_some()
+                                    && food < nephele_world::food::MAX_HUNGER
+                                {
+                                    eating = Some((play::HOTBAR_FIRST_SLOT + held_slot, 0));
                                 }
                             }
                         }
@@ -1358,6 +1771,82 @@ async fn play_loop(
                             let clicked = play::parse_slot(&mut r)?;
 
                             if window_id == 1 {
+                                if table.is_none() {
+                                    if let Some(open) = container.as_mut() {
+                                        let offset = open.player_offset();
+                                        let slot_count = open.slots().len();
+                                        let stale = usize::try_from(slot)
+                                            .ok()
+                                            .filter(|&index| index < slot_count)
+                                            .is_some_and(|index| open.slots()[index] != clicked);
+                                        let mut accepted = !stale;
+                                        let mut changed = Vec::new();
+                                        if accepted {
+                                            let outcome = click_mock_container(
+                                                open,
+                                                &mut inventory,
+                                                &mut cursor,
+                                                slot,
+                                                button,
+                                                mode,
+                                            );
+                                            accepted = outcome.accepted;
+                                            changed = outcome.changed;
+                                        }
+                                        match open {
+                                            OpenContainer::Furnace { pos, slots } => {
+                                                if let Some(furnace) = furnaces.get_mut(pos) {
+                                                    furnace.apply_window(slots);
+                                                }
+                                            }
+                                            OpenContainer::Chest { pos, slots } => {
+                                                if let Some(chest) = chests.get_mut(pos) {
+                                                    chest.copy_from_slice(&slots[0..27]);
+                                                }
+                                            }
+                                        }
+                                        for index in changed {
+                                            let item = open.slots()[index];
+                                            connection
+                                                .write_packet(&play::set_slot(
+                                                    1,
+                                                    index as i16,
+                                                    item.as_ref(),
+                                                ))
+                                                .await?;
+                                            if index >= offset {
+                                                let inventory_index = 9 + index - offset;
+                                                connection
+                                                    .write_packet(&play::set_slot(
+                                                        0,
+                                                        inventory_index as i16,
+                                                        inventory[inventory_index].as_ref(),
+                                                    ))
+                                                    .await?;
+                                            }
+                                        }
+                                        if !accepted {
+                                            if let Ok(index) = usize::try_from(slot) {
+                                                if index < slot_count {
+                                                    let item = open.slots()[index];
+                                                    connection
+                                                        .write_packet(&play::set_slot(
+                                                            1,
+                                                            slot,
+                                                            item.as_ref(),
+                                                        ))
+                                                        .await?;
+                                                }
+                                            }
+                                        }
+                                        connection
+                                            .write_packet(&play::confirm_transaction(
+                                                1, action, accepted,
+                                            ))
+                                            .await?;
+                                    }
+                                    continue;
+                                }
                                 let Some(slots) = table.as_mut() else {
                                     continue;
                                 };
@@ -1465,6 +1954,29 @@ async fn play_loop(
                                         .write_packet(&play::close_window(1, false))
                                         .await?;
                                 }
+                                if let Some(open) = container.take() {
+                                    let slots = open.slots().to_vec();
+                                    let offset = open.player_offset();
+                                    inventory[9..45].copy_from_slice(&slots[offset..offset + 36]);
+                                    match open {
+                                        OpenContainer::Furnace { pos, .. } => {
+                                            if let Some(furnace) = furnaces.get_mut(&pos) {
+                                                furnace.apply_window(&slots);
+                                            }
+                                        }
+                                        OpenContainer::Chest { pos, .. } => {
+                                            if let Some(chest) = chests.get_mut(&pos) {
+                                                chest.copy_from_slice(&slots[0..27]);
+                                            }
+                                        }
+                                    }
+                                    connection
+                                        .write_packet(&play::window_items(0, &inventory))
+                                        .await?;
+                                    connection
+                                        .write_packet(&play::close_window(1, false))
+                                        .await?;
+                                }
                             }
                         }
                         // Everything else (keep-alive echoes, settings,
@@ -1529,6 +2041,106 @@ pub fn fake_uuid(username: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn furnace_smelts_iron_ore_into_an_ingot() {
+        let mut furnace = MockFurnace {
+            input: Some(play::ItemStack::new(15, 1, 0)),
+            fuel: Some(play::ItemStack::new(263, 1, 0)),
+            ..MockFurnace::default()
+        };
+        for _ in 0..=nephele_world::smelting::COOK_TICKS {
+            furnace.tick();
+        }
+        assert_eq!(furnace.output, Some(play::ItemStack::new(265, 1, 0)));
+        assert_eq!(furnace.input, None);
+    }
+
+    #[test]
+    fn furnace_without_fuel_does_not_smelt() {
+        let mut furnace = MockFurnace {
+            input: Some(play::ItemStack::new(15, 1, 0)),
+            ..MockFurnace::default()
+        };
+        for _ in 0..nephele_world::smelting::COOK_TICKS * 2 {
+            furnace.tick();
+        }
+        assert_eq!(furnace.output, None);
+        assert_eq!(furnace.input, Some(play::ItemStack::new(15, 1, 0)));
+    }
+
+    #[test]
+    fn a_furnace_window_click_moves_ore_from_the_player_half_to_the_input() {
+        let mut inventory = [None; PLAY_CONTAINER_SLOTS];
+        inventory[9] = Some(play::ItemStack::new(15, 1, 0));
+        let mut container = OpenContainer::Furnace {
+            pos: (1, 64, 1),
+            slots: MockFurnace::default().window(&inventory),
+        };
+        let mut cursor = None;
+        // Window slot 3 is the first player storage slot (inventory 9).
+        assert!(
+            click_mock_container(
+                &mut container,
+                &mut inventory,
+                &mut cursor,
+                3,
+                0,
+                play::click_mode::CLICK
+            )
+            .accepted
+        );
+        assert!(
+            click_mock_container(
+                &mut container,
+                &mut inventory,
+                &mut cursor,
+                0,
+                0,
+                play::click_mode::CLICK
+            )
+            .accepted
+        );
+        assert_eq!(container.slots()[0], Some(play::ItemStack::new(15, 1, 0)));
+        assert_eq!(inventory[9], None);
+    }
+
+    #[test]
+    fn a_chest_window_click_stores_a_stack_in_the_chest_half() {
+        let mut inventory = [None; PLAY_CONTAINER_SLOTS];
+        inventory[9] = Some(play::ItemStack::new(4, 5, 0));
+        let mut slots = vec![None; CHEST_SLOTS];
+        slots[27..63].copy_from_slice(&inventory[9..45]);
+        let mut container = OpenContainer::Chest {
+            pos: (2, 64, 2),
+            slots,
+        };
+        let mut cursor = None;
+        assert!(
+            click_mock_container(
+                &mut container,
+                &mut inventory,
+                &mut cursor,
+                27,
+                0,
+                play::click_mode::CLICK
+            )
+            .accepted
+        );
+        assert!(
+            click_mock_container(
+                &mut container,
+                &mut inventory,
+                &mut cursor,
+                0,
+                0,
+                play::click_mode::CLICK
+            )
+            .accepted
+        );
+        assert_eq!(container.slots()[0], Some(play::ItemStack::new(4, 5, 0)));
+        assert_eq!(inventory[9], None);
+    }
 
     #[test]
     fn uuid_is_stable_and_shaped() {
