@@ -11,11 +11,15 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
-# kira mixes; it never decodes for us. `nephele-audio` feeds it frames that came
-# out of symphonia, so the codec features are deliberately not enabled.
+# kira mixes; `nephele-audio` decodes one-shot effects itself with symphonia so
+# the decoder is testable without a mixer. Music is the exception: a three-minute
+# track is streamed through kira's own decoder so it is never held in RAM.
 kira = { version = "0.12", default-features = false, features = [
     "cpal",
     "cpal-realtime",
+    "symphonia",
+    "ogg",
+    "vorbis",
 ] }
 symphonia = { version = "0.5", default-features = false, features = [
     "ogg",

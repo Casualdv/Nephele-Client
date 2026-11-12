@@ -17,7 +17,7 @@ pub mod materials;
 pub mod registry;
 
 pub use decode::{decode_ogg, DecodeError, DecodedSound};
-pub use engine::{AudioEngine, AudioError, Listener};
+pub use engine::{AudioEngine, AudioError, Bus, BusGains, Listener};
 pub use materials::SoundType;
 pub use registry::{SoundEvent, SoundRegistry, SoundVariant};
 

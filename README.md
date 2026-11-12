@@ -44,8 +44,9 @@ talks protocol 47, and joins offline-mode servers.
 - Chat: on-screen log and input, with client-side `/gamemode`, `/tp`, `/setblock`, `/give`
 - UI: title, multiplayer (live ping, MOTD and version), direct connect, pause, settings
   and creative screens; HUD, hotbar, hearts
-- Audio: block break and place, footsteps and the player hurt sound, from the
-  vanilla sound events, with distance attenuation and stereo panning
+- Audio: block break and place, footsteps, the player hurt sound and streamed
+  menu music, from the vanilla sound events, with distance attenuation, stereo
+  panning and five volume sliders
 
 **Not implemented yet**
 

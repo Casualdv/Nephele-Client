@@ -257,15 +257,18 @@ impl ChatRow {
     }
 }
 
-/// Volume sliders, percent. Nothing consumes these yet â€” the audio lane owns
-/// the sound engine â€” but they are stored, shown and changed like any other
-/// option, so the engine has one place to read its mix from.
+/// Volume sliders, percent. The engine reads this struct; `live.rs` maps it to
+/// [`nephele_audio::BusGains`] on every change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoundOptions {
     pub master: u8,
     pub music: u8,
     pub blocks: u8,
     pub weather: u8,
+    /// Entity sounds. Vanilla splits these into hostile/neutral/player; this
+    /// client ships one entity bus, so mobs and the player's own hurt sound
+    /// share a slider.
+    pub mobs: u8,
 }
 
 impl Default for SoundOptions {
@@ -275,6 +278,7 @@ impl Default for SoundOptions {
             music: 100,
             blocks: 100,
             weather: 100,
+            mobs: 100,
         }
     }
 }
@@ -286,14 +290,16 @@ pub enum SoundRow {
     Music,
     Blocks,
     Weather,
+    Mobs,
 }
 
 impl SoundRow {
-    pub const ALL: [SoundRow; 4] = [
+    pub const ALL: [SoundRow; 5] = [
         SoundRow::Master,
         SoundRow::Music,
         SoundRow::Blocks,
         SoundRow::Weather,
+        SoundRow::Mobs,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -302,6 +308,7 @@ impl SoundRow {
             SoundRow::Music => "Music",
             SoundRow::Blocks => "Blocks",
             SoundRow::Weather => "Weather",
+            SoundRow::Mobs => "Mobs",
         }
     }
 }
@@ -313,6 +320,7 @@ impl SoundOptions {
             SoundRow::Music => self.music,
             SoundRow::Blocks => self.blocks,
             SoundRow::Weather => self.weather,
+            SoundRow::Mobs => self.mobs,
         }
     }
 
@@ -323,6 +331,7 @@ impl SoundOptions {
             SoundRow::Music => self.music = value,
             SoundRow::Blocks => self.blocks = value,
             SoundRow::Weather => self.weather = value,
+            SoundRow::Mobs => self.mobs = value,
         }
     }
 
@@ -753,6 +762,7 @@ impl Settings {
                 music: Some(self.sounds.music as u32),
                 blocks: Some(self.sounds.blocks as u32),
                 weather: Some(self.sounds.weather as u32),
+                mobs: Some(self.sounds.mobs as u32),
             }),
             language: Some(self.language.key().to_string()),
             resource_pack: Some(self.resource_pack.key().to_string()),
@@ -845,6 +855,9 @@ impl Settings {
             }
             if let Some(value) = sounds.weather {
                 settings.sounds.weather = value.min(100) as u8;
+            }
+            if let Some(value) = sounds.mobs {
+                settings.sounds.mobs = value.min(100) as u8;
             }
         }
         if let Some(value) = stored.language.as_deref().and_then(Language::from_key) {
@@ -974,6 +987,8 @@ struct StoredSounds {
     blocks: Option<u32>,
     #[serde(default)]
     weather: Option<u32>,
+    #[serde(default)]
+    mobs: Option<u32>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1113,6 +1128,9 @@ mod tests {
         let mut settings = Settings::default();
         assert!(settings.set_slider(OptionRow::Volume(SoundRow::Master), 0.3));
         assert_eq!(settings.sounds.master, 30);
+        // The fifth bus is addressable like the rest.
+        assert!(settings.set_slider(OptionRow::Volume(SoundRow::Mobs), 0.7));
+        assert_eq!(settings.sounds.mobs, 70);
         settings.set_slider(OptionRow::Fov, 0.0);
         assert_eq!(settings.fov, 30.0);
         settings.set_slider(OptionRow::Fov, 1.0);
@@ -1161,6 +1179,7 @@ mod tests {
                 music: 20,
                 blocks: 100,
                 weather: 0,
+                mobs: 40,
             },
             language: Language::EnglishUs,
             resource_pack: ResourcePack::Vanilla,
@@ -1219,7 +1238,7 @@ mod tests {
             r#"{"fov": 500.0, "sensitivity": -1.0, "view_distance": 99, "gui_scale": 9,
                 "smooth_lighting_level": 250, "max_framerate": 37,
                 "chat": {"opacity": 0, "scale": 999},
-                "sounds": {"master": 200},
+                "sounds": {"master": 200, "mobs": 150},
                 "language": "klingon", "difficulty": "nightmare",
                 "keys": {"attack": "key:NotAKey", "forward": "key:Q"},
                 "modules": {"fps": {"anchor": [-2.0, 4.0]}}}"#,
@@ -1238,6 +1257,7 @@ mod tests {
         assert_eq!(loaded.chat.opacity, 10);
         assert_eq!(loaded.chat.scale, 150);
         assert_eq!(loaded.sounds.master, 100);
+        assert_eq!(loaded.sounds.mobs, 100, "mobs clamps like the others");
         assert_eq!(loaded.language, Language::EnglishUs);
         assert_eq!(loaded.difficulty, Difficulty::Normal);
         assert_eq!(loaded.keys.get(BindableAction::Attack), Bind::Unbound);

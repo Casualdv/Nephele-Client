@@ -211,16 +211,16 @@ This is what separates a PvP client from a compatible one.
 
 ### 7. Audio
 
-Sound effects work as of 2026-11-05: block break, block place, footsteps and
-the player hurt sound, decoded from the player's own 1.8.9 assets and mixed
-positionally (attenuation to 16 blocks, stereo panning).
+Five volume buses (`master`, `music`, `blocks`, `weather`, `mobs`), all live and
+saved in `settings.json`. Block break/place/footsteps, the player hurt sound,
+streamed menu music, and rain/thunder ambience.
 
 | Item | Size | Notes |
 |---|---|---|
-| Sound engine + positional playback | L | **Done** - `nephele-audio`: symphonia decode, kira mix, no new assets. |
-| Block, step, break, place, mob and player sounds | M | Break/place/step/hurt done; mob sounds not started. |
-| Music and records | M | |
-| Volume sliders, subtitles optional | S | `NEPHELE_VOLUME` today; the slider needs the settings screen (`client-ui`). |
+| Sound engine + positional playback | L | **Done** - `nephele-audio`: symphonia decode, kira mix, five buses. |
+| Block, step, break, place, mob and player sounds | M | Break/place/step/hurt done; mob sounds still need entity hooks. |
+| Music and records | M | Menu music streams and loops; records and in-game music not started. |
+| Volume sliders, subtitles optional | S | **Done** - five sliders, measured per bus. Subtitles not started. |
 
 ### 8. Multiplayer and authentication
 

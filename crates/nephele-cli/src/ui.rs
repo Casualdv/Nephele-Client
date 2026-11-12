@@ -1617,13 +1617,18 @@ pub fn draw_sounds(
     }
 
     fg.text_centered(
-        "No sound engine yet - these are the mix the audio lane will read.",
+        "Sliders apply live and are saved with the other options.",
         cx,
-        top + s(118.0),
+        top + s(28.0 * SoundRow::ALL.len() as f32 + 6.0),
         scale,
         TEXT_DIM,
     );
-    let done = Rect::new(cx - s(100.0), top + s(134.0), s(200.0), s(20.0));
+    let done = Rect::new(
+        cx - s(100.0),
+        top + s(28.0 * SoundRow::ALL.len() as f32 + 24.0),
+        s(200.0),
+        s(20.0),
+    );
     draw_button(bg, fg, done, "Done", scale, hovered(hud.pointer, &done));
     out.push(Action::Open(Screen::Options), done);
     out

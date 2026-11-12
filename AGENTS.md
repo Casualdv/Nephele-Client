@@ -795,8 +795,11 @@ development shortcut (never the only route).
   footnote on the screen names the gap; `OptionRow::takes_effect()` is the single
   place that classifies a row. Do not let them pass for working controls.
 - **Music & Sounds** reads and writes the one `SoundOptions { master, music,
-  blocks, weather }` model. No audio engine exists yet (`audio` is unassigned), so
-  the sliders persist and the screen says so; the engine reads this struct.
+  blocks, weather, mobs }` model, and the engine consumes it live: `live.rs` maps
+  the sliders to `nephele_audio::BusGains` on every change, so moving one slider
+  re-tunes sounds that are already playing. `Mobs` is the fifth bus — vanilla
+  splits entity volume into hostile/neutral/player, this client ships one entity
+  bus for all of them (see §11 Audio).
 - **Chat Settings** is real: opacity, text size and width are applied by
   `ui::draw_chat` (width clips runs mid-line), plus a live preview.
 - **Language** has one honest entry ("English (US)"); **Resource Packs** has the
@@ -808,6 +811,45 @@ development shortcut (never the only route).
   knobs are read as `u32` and clamped, so a `"scale": 999` cannot nuke the file).
 - Difficulty is stored and shown; single-player has nothing that spawns yet and a
   server owns it in multiplayer, so it changes no behaviour.
+
+**Audio: the bus model, music and weather** (added 2026-11-12, lane `audio`):
+
+`crates/nephele-audio` is the whole engine: symphonia decodes one-shot effects,
+kira mixes, and the kira dependency is now generic over `Backend` so tests can
+capture the mix. `SoundOptions` drives it — `live.rs` converts the sliders to
+`BusGains` in one function and pushes them on every change, including under a
+sound that is already playing.
+
+- **Five buses, `Master × bus`.** `Bus::{Master, Music, Blocks, Weather, Mobs}`.
+  Break/place/footsteps are `Blocks`; the player's hurt sound and every future
+  entity sound are `Mobs`; `music.menu` is `Music`; rain and thunder are
+  `Weather`. `Master` multiplies the rest and is not applied twice to itself.
+- **Vanilla splits entity volume three ways (`HOSTILE`, `NEUTRAL`, `PLAYER`); we
+  ship one entity bus.** The settings screen has five sliders for that reason;
+  `SoundRow::Mobs` is the fifth and `StoredSounds.mobs` persists it (0–100,
+  clamped on load like the others).
+- **Music streams.** `play_music` uses kira's `StreamingSoundData`, not a decode
+  into RAM: a three-minute track would otherwise be tens of megabytes of `f32`.
+  It loops (`loop_region(..)`), is idempotent for the track already playing, and
+  is stopped when a world loads. Menu music is `music.menu` on every screen that
+  is not "in a world" (`in_world` = columns loaded, or the game/pause/creative
+  screens).
+- **Weather ambience is real but its producer is not.** `update_weather` starts
+  and stops the looping `ambient.weather.rain` (0.35 of the `Weather` bus) and
+  rolls `ambient.weather.thunder` every 6–24 s while thundering, driven from
+  `Shared.raining`/`Shared.thundering`. **Those flags are only produced by the
+  debug toggle today**: `S2B Change Game State` — the packet a server uses to
+  start rain — is parsed by nobody, so a server storm is currently invisible to
+  the client. That is the `net` lane's to add; the audio side needs no change
+  when it lands.
+- **Measured ownership.** `each_bus_gain_only_silences_its_own_bus` renders the
+  real mixer through a capture backend (kira's own mock backend does not expose
+  its buffer): per bus, full gain is audible (RMS > 0.05) and 0 is inaudible
+  (RMS < 0.001), and muting one bus leaves every other bus's gain at 1.0.
+  `master_silences_every_bus` covers the product. No device is involved.
+- **`NEPHELE_VOLUME` is gone** — it was a second volume model next to the
+  settings. `NEPHELE_MUTE=1` stays as a hard kill switch (it never opens the
+  device).
 
 ---
 
@@ -829,7 +871,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
 | `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
 | `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
-| `audio` | everything sound | `audio` | **merged** - `nephele-audio` (symphonia + kira), break/place/step/hurt wired; music, mob sounds and the fifth volume bus still open |
+| `audio` | everything sound | `audio` | five-bus mix, streamed menu music, rain/thunder ambience; mob sounds still need entity hooks |
 | `product` | launcher v2, updater, installer, legal | `saves-landing` (WIP commit) | 25%, blocked on code signing |
 
 Rules that hold across all of them: one worktree per lane (never edit the main
@@ -1022,9 +1064,11 @@ re-serialize the chunk wholesale.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`;
   `chunk_biomes_match_a_world_the_real_server_generated` passes and
   `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **719 test cases across the workspace** (706 passed, 13 ignored). `nephele-world`
+- **727 test cases across the workspace** (714 passed, 13 ignored). `nephele-world`
   carries the parity suite, including `debug_stage_trace` and
-  `debug_first_mismatch`. The six real-socket tests in
+  `debug_first_mismatch`; `nephele-audio` carries the per-bus mixer measurement
+  (`each_bus_gain_only_silences_its_own_bus`) plus one device test that is
+  ignored by default. The six real-socket tests in
   `crates/nephele-client/tests/join_mock.rs` cover status,
   compression, chat, joining/loading the mock world, drop pickup, and crafting
   planks through `C0E`.

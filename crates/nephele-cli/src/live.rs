@@ -26,7 +26,7 @@ use crate::settings::{Brightness, OptionRow, Settings};
 use crate::skins::SkinLoader;
 use crate::ui::{self, Action, HudState, Screen};
 use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
-use nephele_audio::{AudioEngine, Listener};
+use nephele_audio::{AudioEngine, BusGains, Listener};
 use nephele_client::mining::{Aim, Miner, MiningEvent};
 use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
 use nephele_client::{Event, GameClient, LocalContainer, Vec3};
@@ -386,7 +386,7 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
     perf::start();
     let settings = initial_settings();
     let shared = Arc::new(Mutex::new(Shared {
-        audio: start_audio(),
+        audio: start_audio(&settings.sounds),
         view_distance: configured_view_distance(&settings),
         ..Shared::default()
     }));
@@ -509,18 +509,26 @@ fn apply_look(state: &mut Shared, dx: f32, dy: f32, sensitivity: f32) {
 // below; the volume/pitch arithmetic lives in `nephele_audio::materials`.
 // ---------------------------------------------------------------------------
 
+/// The five sliders as engine bus gains. `Master` multiplies the others inside
+/// the engine, so this is a straight percentage conversion.
+fn bus_gains(sounds: &crate::settings::SoundOptions) -> BusGains {
+    BusGains::from_percent(
+        sounds.master,
+        sounds.music,
+        sounds.blocks,
+        sounds.weather,
+        sounds.mobs,
+    )
+}
+
 /// Opens the sound device once. Any failure - no card, no prepared sounds,
 /// `NEPHELE_MUTE` - leaves the client silent rather than broken.
-fn start_audio() -> Option<AudioEngine> {
+fn start_audio(sounds: &crate::settings::SoundOptions) -> Option<AudioEngine> {
     if std::env::var_os("NEPHELE_MUTE").is_some() {
         return None;
     }
     let root = crate::minecraft_assets_root();
-    let volume = std::env::var("NEPHELE_VOLUME")
-        .ok()
-        .and_then(|text| text.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    match AudioEngine::new(&root, volume) {
+    match AudioEngine::new(&root, bus_gains(sounds)) {
         Ok(engine) => {
             tracing::info!(
                 events = engine.registry().len(),
@@ -534,6 +542,28 @@ fn start_audio() -> Option<AudioEngine> {
             None
         }
     }
+}
+
+/// Per-frame audio: menu music in the menus, weather ambience in a world.
+///
+/// `in_world` stays true on the pause screen and on options opened from it, so
+/// the menu music does not come back mid-game.
+fn audio_tick(
+    shared: &Arc<Mutex<Shared>>,
+    delta: f32,
+    raining: bool,
+    thundering: bool,
+    in_world: bool,
+) {
+    with_audio(shared, |audio| {
+        if in_world {
+            audio.stop_music();
+            audio.update_weather(raining, thundering, delta);
+        } else {
+            audio.play_music("music.menu");
+            audio.update_weather(false, false, delta);
+        }
+    });
 }
 
 /// Runs `sound` with the engine, if there is one. One lock, no clone.
@@ -2779,6 +2809,12 @@ impl LiveApp {
             self.bob_phase = 0.0;
         }
 
+        // Menu music until a world is loaded; the pause screen and options
+        // opened from it still count as "in a world".
+        let in_world = view.chunks > 0
+            || matches!(self.screen, Screen::Game | Screen::Pause | Screen::Creative);
+        audio_tick(&self.shared, delta, view.raining, view.thundering, in_world);
+
         // The framerate cap sleeps out whatever is left of the frame's budget
         // at the end of `frame()`, once the picture is presented.
 
@@ -4105,6 +4141,10 @@ impl LiveApp {
         {
             let mut shared = self.shared.lock().unwrap();
             shared.view_distance = self.settings.view_distance;
+            // Volume sliders take effect under sounds that are already playing.
+            if let Some(audio) = shared.audio.as_mut() {
+                audio.set_gains(bus_gains(&self.settings.sounds));
+            }
         }
         // Brightness is baked into each mesh's per-vertex light, so changing it
         // means rebuilding what is already on screen. Normal is the identity, so
