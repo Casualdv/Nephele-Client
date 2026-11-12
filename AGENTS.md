@@ -824,7 +824,9 @@ continuation of `client-ui`). Both are in `ui.rs` + `live.rs` and need no other 
   vanilla's five-bar latency icon (`ping_bars`: 5/4/3/2/1 at 150/300/600/1000 ms, no
   bars when the server reports no latency). The pane is clamped to the **left edge of
   the scoreboard sidebar**, so a 15-row sidebar and an 80-player list cannot overlap;
-  names are truncated to the column with `..`.
+  names are truncated to the column with `..`. It draws the **profile name**, not
+  `S38`'s `display_name` JSON component, so team-coloured tab names are not shown yet;
+  `chat::parse` can already parse that JSON if `TabEntry` grows a span list.
 - **Join screen.** `Screen::Loading` covers the window (dark-brown, like
   `GuiDownloadTerrain`) with the world name (singleplayer) or address (multiplayer),
   "Joining world..." until the first column then "Building terrain", and a bar from
