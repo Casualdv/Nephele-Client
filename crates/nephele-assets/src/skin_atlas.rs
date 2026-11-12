@@ -190,6 +190,16 @@ impl SkinAtlas {
         SOLID_SLOT
     }
 
+    /// UV of the middle of the solid slot.
+    ///
+    /// Sample the *centre*, not `uv(SOLID_SLOT, 0.0, 0.0)`: the slot's top-left
+    /// corner sits exactly on a texel boundary, so linear filtering picks the
+    /// neighbouring slot per fragment and a tinted box dithers against whatever
+    /// is behind it.
+    pub fn solid_uv() -> [f32; 2] {
+        Self::uv(SOLID_SLOT, SKIN_SIZE as f32 * 0.5, SKIN_SIZE as f32 * 0.5)
+    }
+
     /// Atlas pixel rectangle `(x, y, size)` for a slot.
     pub fn slot_rect(slot: u32) -> (u32, u32, u32) {
         let (x, y) = slot_origin(slot);

@@ -168,6 +168,8 @@ pub enum Event {
         data: u8,
         block_id: i32,
     },
+    /// A server-triggered particle burst (`S2A`).
+    Particles(Vec<play::ParticleSpawn>),
     /// Our own entity appeared in the world (`S0C` for our id).
     Spawned,
     /// A remote player or mob appeared.
@@ -828,6 +830,10 @@ impl GameClient {
                     z: animation.z,
                     stage: animation.stage,
                 })
+            }
+            play::clientbound::PARTICLE => {
+                let particle = play::parse_particle(packet)?;
+                Ok(Event::Particles(vec![particle]))
             }
             play::clientbound::BLOCK_ACTION => {
                 let action = play::parse_block_action(packet)?;
@@ -1979,6 +1985,34 @@ mod tests {
                 block_id: 25,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn particle_packets_become_events() {
+        let (mut client, _peer) = test_game_client().await;
+        let mut burst = nephele_protocol::PacketWriter::new();
+        burst
+            .write_i32(11) // large smoke
+            .write_bool(false)
+            .write_f32(3.0)
+            .write_f32(65.5)
+            .write_f32(-1.0)
+            .write_f32(0.5)
+            .write_f32(0.5)
+            .write_f32(0.5)
+            .write_f32(0.02)
+            .write_i32(12);
+        let event = client
+            .handle(Packet::new(play::clientbound::PARTICLE, burst.into_bytes()))
+            .await
+            .unwrap();
+        let Event::Particles(particles) = event else {
+            panic!("expected a particle event, got {event:?}");
+        };
+        assert_eq!(particles.len(), 1);
+        assert_eq!(particles[0].particle_id, 11);
+        assert_eq!(particles[0].count, 12);
+        assert_eq!(particles[0].y, 65.5);
     }
 
     #[tokio::test]

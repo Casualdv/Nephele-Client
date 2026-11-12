@@ -38,7 +38,7 @@ use nephele_render::{
     break_overlay_texture, build_beams, build_break_overlay, build_entities, build_hand_item,
     build_hand_sprite, build_item_mesh, humanoid_hand, BeaconBeam, Camera, ColumnMeshJob,
     EntityDraw, Environment, HandDraw, HandItem, ItemDraw, ItemFrameDraw, LineMesh, MeshData,
-    Particles, Rect, Renderer, UiBatch,
+    ParticleKind, Particles, Rect, Renderer, UiBatch,
 };
 use nephele_world::save::{
     self, SavedItemStack, SavedPlayerState, WorldMetadata, WorldMode, WorldSave, WorldState,
@@ -106,6 +106,8 @@ enum NetMsg {
     Chat(String),
     /// The full entity table, replaced wholesale. Cheap enough at 20 Hz.
     Entities(Vec<EntitySnapshot>),
+    /// Server-triggered particle bursts (`S2A`).
+    Particles(Vec<play::ParticleSpawn>),
     /// Tab-list skin hashes (uuid, texture hash, slim model).
     Skins(Vec<([u8; 16], String, bool)>),
     /// One map's picture changed; the render thread owns the atlas slot.
@@ -221,6 +223,10 @@ struct Shared {
     player: PlayerState,
     yaw: f32,
     pitch: f32,
+    /// `NEPHELE_YAW`/`NEPHELE_PITCH`: force the camera look every frame, so a
+    /// screenshot pass can frame a landmark without driving the grabbed mouse.
+    /// `None` in a normal session; mouse look is unaffected otherwise.
+    look_override: Option<(f32, f32)>,
     input: Input,
     status: String,
     spawned: bool,
@@ -441,11 +447,29 @@ pub fn run(options: PlayOptions) -> Result<(), Box<dyn Error>> {
 
 impl Default for Shared {
     fn default() -> Self {
+        // Screenshot/debug hooks, the same shape as `NEPHELE_SCREEN`: they only
+        // force the camera look, so a capture pass can frame a landmark without
+        // driving the grabbed mouse.
+        let env_degrees = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .map(f32::to_radians)
+        };
+        let look_override = env_degrees("NEPHELE_YAW").map(|yaw| {
+            let pitch = env_degrees("NEPHELE_PITCH")
+                .map(|value| value.clamp(-1.55, 1.55))
+                .unwrap_or(0.0);
+            (yaw, pitch)
+        });
+        let yaw = look_override.map_or(0.0, |look| look.0);
+        let pitch = look_override.map_or(0.0, |look| look.1);
         Self {
             audio: None,
             player: PlayerState::default(),
-            yaw: 0.0,
-            pitch: 0.0,
+            yaw,
+            pitch,
+            look_override,
             input: Input::default(),
             status: String::new(),
             spawned: false,
@@ -1752,6 +1776,9 @@ async fn net_loop(
                             let _ = tx.send(NetMsg::Map(map_id, state));
                         }
                     }
+                    Ok(Event::Particles(particles)) => {
+                        let _ = tx.send(NetMsg::Particles(particles));
+                    }
                     Ok(Event::Malformed { id, message }) => {
                         eprintln!("skipping packet 0x{id:02X}: {message}");
                     }
@@ -2683,6 +2710,17 @@ impl LiveApp {
                 Ok(NetMsg::NoteBlock { x, y, z, pitch }) => {
                     self.particles.spawn_note(x, y, z, pitch);
                 }
+                Ok(NetMsg::Particles(particles)) => {
+                    for event in particles {
+                        self.particles.spawn_kind(
+                            particle_kind(&event),
+                            [event.x, event.y, event.z],
+                            [event.offset_x, event.offset_y, event.offset_z],
+                            event.speed,
+                            event.count,
+                        );
+                    }
+                }
                 Ok(NetMsg::Chat(text)) => {
                     println!("[chat] {}", chat::plain(&chat::parse(&text)));
                     self.push_chat(text);
@@ -2890,6 +2928,9 @@ impl LiveApp {
                 _ => MeshData::default(),
             };
             overlay.append(self.particles.build_debris(right, up, alpha));
+            if let Some(textures) = self.textures.as_ref() {
+                overlay.append(self.particles.build_sprites(textures, right, up));
+            }
             if let Some(renderer) = self.renderer.as_mut() {
                 renderer.set_overlay(&overlay);
             }
@@ -2950,8 +2991,8 @@ impl LiveApp {
                         (feet[1] + EYE_HEIGHT) as f32,
                         feet[2] as f32,
                     ),
-                    yaw: state.yaw,
-                    pitch: state.pitch,
+                    yaw: state.look_override.map_or(state.yaw, |look| look.0),
+                    pitch: state.look_override.map_or(state.pitch, |look| look.1),
                     fov_y: self.settings.fov.to_radians(),
                     ..Camera::default()
                 },
@@ -5572,6 +5613,29 @@ fn armor_tint(item: i16) -> Option<[f32; 4]> {
     Some(color)
 }
 
+/// Map an `S2A` particle id (and its trailing arguments) to the renderer's
+/// particle kind. The ids are the vanilla 1.8 `EnumParticleTypes` ids.
+fn particle_kind(event: &play::ParticleSpawn) -> ParticleKind {
+    match event.particle_id {
+        36 => {
+            let id = event.arguments.first().copied().unwrap_or(0) as i16;
+            let meta = event.arguments.get(1).copied().unwrap_or(0) as i16;
+            ParticleKind::ItemBreak { id, meta }
+        }
+        37 | 38 => {
+            let raw = event.arguments.first().copied().unwrap_or(1) as u16;
+            ParticleKind::BlockBreak(BlockState::from_raw(raw))
+        }
+        5 | 31 => ParticleKind::Splash,
+        9 | 10 => ParticleKind::Crit,
+        11 | 12 | 29 => ParticleKind::Smoke,
+        24 => ParticleKind::Portal,
+        26 | 27 => ParticleKind::Flame,
+        34 => ParticleKind::Heart,
+        _ => ParticleKind::Smoke,
+    }
+}
+
 /// In 1.8 a filled map's damage value is its map id.
 fn map_id_of(item: &ItemStack) -> Option<i32> {
     (item.id == play::ITEM_FILLED_MAP).then_some(item.damage as i32)
@@ -5691,6 +5755,7 @@ mod tests {
             player: PlayerState::default(),
             yaw: 0.0,
             pitch: 0.0,
+            look_override: None,
             input: Input::default(),
             status: String::new(),
             spawned: false,

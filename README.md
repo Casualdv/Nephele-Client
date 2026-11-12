@@ -37,6 +37,9 @@ talks protocol 47, and joins offline-mode servers.
 - Players: entity tracking, skins and skin loading, classic/slim humanoid
   rendering with the second layer, held items and armour, crouch and arm swing,
   team-coloured nametags with tab-list ping, and framed maps with real pictures
+- Particles: block debris, note blocks and the `S2A` sprite kinds (smoke,
+  flame, crit, portal, splash, heart, block/item cracks) drawn on the same
+  texture array
 - Items: server drops render as spinning entities; local survival adds mined
   block items to inventory
 - First person: a skin-textured arm holding the selected block, with a swing while mining

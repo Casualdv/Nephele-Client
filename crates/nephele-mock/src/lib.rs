@@ -630,12 +630,26 @@ async fn send_bot_equipment(connection: &mut Connection, bots: &[MockBot]) -> Re
     if let Some(iron) = bots.get(7) {
         send_bot_equipment_slot(connection, iron.entity_id, play::equipment_slot::HELD, 276)
             .await?;
-        for (slot, item) in [
-            (play::equipment_slot::HELMET, 306),
-            (play::equipment_slot::CHESTPLATE, 307),
-            (play::equipment_slot::LEGGINGS, 308),
-            (play::equipment_slot::BOOTS, 309),
+        // `NEPHELE_MOCK_ARMOUR=helmet,chest` narrows which pieces this bot
+        // wears, so a capture pass can tell an armour-layer fault from a skin
+        // or model one. Unset means full iron.
+        let wanted: Vec<String> = std::env::var("NEPHELE_MOCK_ARMOUR")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|name| name.trim().to_ascii_lowercase())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (slot, item, name) in [
+            (play::equipment_slot::HELMET, 306, "helmet"),
+            (play::equipment_slot::CHESTPLATE, 307, "chest"),
+            (play::equipment_slot::LEGGINGS, 308, "legs"),
+            (play::equipment_slot::BOOTS, 309, "boots"),
         ] {
+            if !wanted.is_empty() && !wanted.iter().any(|want| want == name) {
+                continue;
+            }
             send_bot_equipment_slot(connection, iron.entity_id, slot, item).await?;
         }
     }

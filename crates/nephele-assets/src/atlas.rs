@@ -240,6 +240,13 @@ impl TextureArray {
                 tiles.push((layer.to_string(), to_tile(&image.to_rgba8())));
             }
         }
+        // Particle sprites are generated, not shipped: 1.8's particle sheet is
+        // outside the block directory and the resource step does not extract
+        // it. Adding them here keeps the particle path on the same texture
+        // array as the block debris.
+        for (name, image) in crate::particle_textures::layers() {
+            tiles.push((name.to_string(), image));
+        }
         let mut array = Self::from_tiles_and_animations(tiles, animation_strips);
         let mut unresolved: Vec<&'static str> = Vec::new();
         for name in referenced_texture_names() {

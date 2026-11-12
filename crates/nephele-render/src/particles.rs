@@ -1,21 +1,96 @@
-//! Block debris and note-block particles.
+//! Block debris, note-block and server-triggered sprite particles.
 //!
-//! Both live on the renderer paths that already exist: debris is a
-//! block-textured [`MeshData`] uploaded into the break-overlay buffer (same
-//! shader, same atlas, no depth writes), and notes are camera-facing quads in
-//! the [`EntityMesh`] buffer, which already carries per-vertex colour and
-//! alpha. Neither needs a texture of its own.
+//! All of them live on renderer paths that already exist. Debris and sprite
+//! quads are textured [`MeshData`] uploaded into the break-overlay buffer
+//! (same shader, same texture array, no depth writes); notes are camera-facing
+//! quads in the [`EntityMesh`] buffer, which already carries per-vertex colour
+//! and alpha. Sprite layers come from [`nephele_assets::particle_textures`] -
+//! generated tiles appended to the same [`TextureArray`] as the block and item
+//! layers, so there is still one particle system and one texture array.
 //!
 //! Positions here are in blocks and velocities in blocks per second; the
 //! simulation runs at display rate rather than 20 Hz because it only feeds the
 //! next frame.
 
-use nephele_assets::{face_textures, is_transparent, TextureArray};
+use nephele_assets::{
+    face_textures, is_transparent, item_texture_name, particle_textures, TextureArray,
+    MISSING_TEXTURE,
+};
 use nephele_world::block::blocks_movement;
 use nephele_world::{BlockState, World};
 
+use glam::Vec3;
+
 use crate::entity::{EntityMesh, EntityVertex};
 use crate::mesh::{MeshData, Vertex, NO_ANIMATION};
+
+/// One kind of camera-facing particle sprite.
+///
+/// Block and item cracks sample the block/item texture; the rest use the
+/// generated `particle_textures` tiles. This is the same particle path as the
+/// block debris above — one `Particles` owner, one texture array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticleKind {
+    BlockBreak(BlockState),
+    ItemBreak { id: i16, meta: i16 },
+    Smoke,
+    Flame,
+    Crit,
+    Portal,
+    Splash,
+    Heart,
+}
+
+impl ParticleKind {
+    fn layer(self, textures: &TextureArray) -> u32 {
+        match self {
+            ParticleKind::BlockBreak(state) => face_textures(state)
+                .map(|faces| textures.slot_or_missing(faces.side))
+                .unwrap_or_else(|| textures.slot_or_missing("stone")),
+            ParticleKind::ItemBreak { id, meta } => item_texture_name(id, meta)
+                .map(|name| textures.slot_or_missing(name))
+                .unwrap_or_else(|| textures.slot_or_missing(MISSING_TEXTURE)),
+            ParticleKind::Smoke => textures.slot_or_missing(particle_textures::SMOKE),
+            ParticleKind::Flame => textures.slot_or_missing(particle_textures::FLAME),
+            ParticleKind::Crit => textures.slot_or_missing(particle_textures::CRIT),
+            ParticleKind::Portal => textures.slot_or_missing(particle_textures::PORTAL),
+            ParticleKind::Splash => textures.slot_or_missing(particle_textures::SPLASH),
+            ParticleKind::Heart => textures.slot_or_missing(particle_textures::HEART),
+        }
+    }
+
+    fn base_size(self) -> f32 {
+        match self {
+            ParticleKind::ItemBreak { .. } => 0.12,
+            ParticleKind::BlockBreak(_) => 0.16,
+            ParticleKind::Splash => 0.12,
+            ParticleKind::Crit => 0.18,
+            ParticleKind::Smoke => 0.18,
+            ParticleKind::Portal => 0.14,
+            ParticleKind::Flame => 0.16,
+            ParticleKind::Heart => 0.16,
+        }
+    }
+}
+
+/// One sprite ready for [`build_particle_mesh`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParticleDraw {
+    pub position: [f32; 3],
+    /// Edge length in blocks.
+    pub size: f32,
+    pub kind: ParticleKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Sprite {
+    position: [f32; 3],
+    velocity: [f32; 3],
+    age: f32,
+    life: f32,
+    size: f32,
+    kind: ParticleKind,
+}
 
 /// How long a broken block's shards live, in seconds (vanilla: 20..40 ticks).
 const DEBRIS_LIFETIME: f32 = 1.1;
@@ -52,11 +127,13 @@ struct Note {
     color: [f32; 3],
 }
 
-/// Everything transient the client spawns: break debris and note particles.
+/// Everything transient the client spawns: break debris, note particles and
+/// server-triggered sprite bursts.
 #[derive(Debug, Clone, Default)]
 pub struct Particles {
     debris: Vec<Debris>,
     notes: Vec<Note>,
+    sprites: Vec<Sprite>,
     /// Deterministic counter, so a spawn sequence is reproducible in tests.
     seed: u32,
 }
@@ -67,12 +144,13 @@ impl Particles {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.debris.is_empty() && self.notes.is_empty()
+        self.debris.is_empty() && self.notes.is_empty() && self.sprites.is_empty()
     }
 
     pub fn clear(&mut self) {
         self.debris.clear();
         self.notes.clear();
+        self.sprites.clear();
     }
 
     pub fn debris_count(&self) -> usize {
@@ -81,6 +159,47 @@ impl Particles {
 
     pub fn note_count(&self) -> usize {
         self.notes.len()
+    }
+
+    pub fn sprite_count(&self) -> usize {
+        self.sprites.len()
+    }
+
+    /// Spawn `count` camera-facing sprites of one kind inside `offset`.
+    pub fn spawn_kind(
+        &mut self,
+        kind: ParticleKind,
+        position: [f32; 3],
+        offset: [f32; 3],
+        speed: f32,
+        count: i32,
+    ) {
+        let count = count.clamp(0, 128);
+        let speed = speed.max(0.05);
+        for _ in 0..count {
+            let seed = self.next_seed();
+            let random = |salt: u32| rand01(seed ^ salt) * 2.0 - 1.0;
+            let particle = [
+                position[0] + random(0x9e37_79b9) * offset[0],
+                position[1] + random(0x85eb_ca6b) * offset[1],
+                position[2] + random(0xc2b2_ae35) * offset[2],
+            ];
+            let velocity = [
+                random(0x27d4_eb2f) * speed,
+                rand01(seed ^ 0x1656_67b1) * speed,
+                random(0x2545_f491) * speed,
+            ];
+            let life = 0.35 + rand01(seed ^ 0x7feb_352d) * 0.55;
+            let size = kind.base_size() * (0.7 + rand01(seed ^ 0x846c_a68b) * 0.6);
+            self.sprites.push(Sprite {
+                position: particle,
+                velocity,
+                age: 0.0,
+                life,
+                size,
+                kind,
+            });
+        }
     }
 
     /// Spawn `DEBRIS_COUNT` shards for a block that just broke or was placed.
@@ -206,6 +325,38 @@ impl Particles {
             note.position[2] += note.velocity[2] * dt;
             true
         });
+
+        self.sprites.retain_mut(|sprite| {
+            sprite.age += dt;
+            if sprite.age >= sprite.life {
+                return false;
+            }
+            sprite.velocity[1] -= 9.8 * dt;
+            sprite.position[0] += sprite.velocity[0] * dt;
+            sprite.position[1] += sprite.velocity[1] * dt;
+            sprite.position[2] += sprite.velocity[2] * dt;
+            sprite.position[1] > -64.0
+        });
+    }
+
+    /// Camera-facing quads for the sprite particles, on the same block texture
+    /// array as the debris.
+    pub fn build_sprites(
+        &self,
+        textures: &TextureArray,
+        right: [f32; 3],
+        up: [f32; 3],
+    ) -> MeshData {
+        let draws: Vec<ParticleDraw> = self
+            .sprites
+            .iter()
+            .map(|sprite| ParticleDraw {
+                position: sprite.position,
+                size: sprite.size * (1.0 - sprite.age / sprite.life * 0.35),
+                kind: sprite.kind,
+            })
+            .collect();
+        build_particle_mesh(&draws, textures, right, up)
     }
 
     /// Textured quads for the overlay pass. `alpha` is the fraction through the
@@ -308,6 +459,69 @@ impl Particles {
         self.seed = self.seed.wrapping_add(1).wrapping_mul(1_664_525);
         self.seed ^ 0x9e37_79b9
     }
+}
+
+/// Build camera-facing quads for every sprite particle.
+pub fn build_particle_mesh(
+    particles: &[ParticleDraw],
+    textures: &TextureArray,
+    right: [f32; 3],
+    up: [f32; 3],
+) -> MeshData {
+    let mut mesh = MeshData::default();
+    let right = Vec3::from(right);
+    let up = Vec3::from(up);
+    for particle in particles {
+        let layer = particle.kind.layer(textures);
+        let centre = Vec3::from(particle.position);
+        let half = particle.size * 0.5;
+        let corners = [
+            centre - right * half - up * half,
+            centre + right * half - up * half,
+            centre + right * half + up * half,
+            centre - right * half + up * half,
+        ];
+        let positions: [[f32; 3]; 4] = [
+            corners[0].to_array(),
+            corners[1].to_array(),
+            corners[2].to_array(),
+            corners[3].to_array(),
+        ];
+        let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        for reverse in [false, true] {
+            let base = mesh.vertices.len() as u32;
+            for index in 0..4 {
+                mesh.vertices.push(Vertex {
+                    position: positions[index],
+                    uv: uvs[index],
+                    shade: 1.0,
+                    layer,
+                    anim: NO_ANIMATION,
+                    light: 1.0,
+                });
+            }
+            if reverse {
+                mesh.indices.extend_from_slice(&[
+                    base,
+                    base + 2,
+                    base + 1,
+                    base,
+                    base + 3,
+                    base + 2,
+                ]);
+            } else {
+                mesh.indices.extend_from_slice(&[
+                    base,
+                    base + 1,
+                    base + 2,
+                    base,
+                    base + 2,
+                    base + 3,
+                ]);
+            }
+        }
+    }
+    mesh
 }
 
 fn append_quad(
@@ -459,5 +673,91 @@ mod tests {
             .vertices
             .iter()
             .all(|vertex| vertex.color[3] > 0.0 && vertex.color[3] <= 1.0));
+    }
+
+    fn sprite_atlas() -> TextureArray {
+        let tile = image::RgbaImage::from_pixel(TILE_SIZE, TILE_SIZE, Rgba([90, 140, 60, 255]));
+        let mut tiles: Vec<(String, image::RgbaImage)> = vec![("stone".into(), tile)];
+        for (name, image) in nephele_assets::particle_textures::layers() {
+            tiles.push((name.into(), image));
+        }
+        TextureArray::from_tiles(tiles)
+    }
+
+    #[test]
+    fn every_sprite_kind_samples_its_own_generated_layer() {
+        let textures = sprite_atlas();
+        let missing = textures.slot_or_missing(MISSING_TEXTURE);
+        let kinds = [
+            ParticleKind::Smoke,
+            ParticleKind::Flame,
+            ParticleKind::Crit,
+            ParticleKind::Portal,
+            ParticleKind::Splash,
+            ParticleKind::Heart,
+        ];
+        let mut seen = Vec::new();
+        for kind in kinds {
+            let layer = kind.layer(&textures);
+            assert_ne!(layer, missing, "{kind:?} fell back to the missing tile");
+            assert!(!seen.contains(&layer), "{kind:?} shares a layer");
+            seen.push(layer);
+        }
+    }
+
+    #[test]
+    fn cracks_reuse_the_block_and_item_layers() {
+        let textures = sprite_atlas();
+        assert_eq!(
+            ParticleKind::BlockBreak(BlockState::new(1, 0)).layer(&textures),
+            textures.slot("stone").expect("stone layer")
+        );
+        // No item layers in this array, so an item crack must degrade to the
+        // missing tile rather than panicking or sampling layer 0.
+        assert_eq!(
+            ParticleKind::ItemBreak { id: 265, meta: 0 }.layer(&textures),
+            textures.slot_or_missing(MISSING_TEXTURE)
+        );
+    }
+
+    #[test]
+    fn sprite_quads_are_double_sided() {
+        let textures = sprite_atlas();
+        let draw = ParticleDraw {
+            position: [0.0, 64.0, 0.0],
+            size: 0.2,
+            kind: ParticleKind::Heart,
+        };
+        let mesh = build_particle_mesh(&[draw], &textures, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        // Two triangles per side, two sides, so the quad shows from behind too.
+        assert_eq!(mesh.vertices.len(), 8);
+        assert_eq!(mesh.indices.len(), 12);
+        let layer = textures.slot_or_missing(nephele_assets::particle_textures::HEART);
+        assert!(mesh.vertices.iter().all(|vertex| vertex.layer == layer));
+    }
+
+    #[test]
+    fn sprites_fall_and_expire() {
+        let mut particles = Particles::new();
+        particles.spawn_kind(ParticleKind::Flame, [0.0, 64.0, 0.0], [0.0; 3], 0.0, 4);
+        assert_eq!(particles.sprite_count(), 4);
+        let start = particles.sprites[0].position[1];
+        let world = World::new(0);
+        particles.update(0.05, &world);
+        assert!(particles.sprites[0].position[1] < start);
+        for _ in 0..40 {
+            particles.update(0.05, &world);
+        }
+        assert_eq!(particles.sprite_count(), 0);
+        assert!(particles.is_empty(), "sprites should expire");
+    }
+
+    #[test]
+    fn a_particle_burst_is_capped_and_never_negative() {
+        let mut particles = Particles::new();
+        particles.spawn_kind(ParticleKind::Smoke, [0.0; 3], [1.0; 3], 1.0, 10_000);
+        assert_eq!(particles.sprite_count(), 128);
+        particles.spawn_kind(ParticleKind::Smoke, [0.0; 3], [1.0; 3], 1.0, -5);
+        assert_eq!(particles.sprite_count(), 128);
     }
 }

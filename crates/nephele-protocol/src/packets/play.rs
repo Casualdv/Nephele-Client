@@ -41,6 +41,8 @@ pub mod clientbound {
     pub const BLOCK_ACTION: i32 = 0x24;
     pub const BLOCK_BREAK_ANIMATION: i32 = 0x25;
     pub const MAP_CHUNK_BULK: i32 = 0x26;
+    /// `S2A`: a server-triggered particle burst.
+    pub const PARTICLE: i32 = 0x2A;
     pub const SET_SLOT: i32 = 0x2F;
     pub const OPEN_WINDOW: i32 = 0x2D;
     pub const CLOSE_WINDOW: i32 = 0x2E;
@@ -615,6 +617,64 @@ pub fn parse_block_break_animation(packet: &Packet) -> Result<BlockBreakAnimatio
         y,
         z,
         stage,
+    })
+}
+
+/// `S2A Particle`: one server-triggered particle burst.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParticleSpawn {
+    pub particle_id: i32,
+    pub long_distance: bool,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub offset_z: f32,
+    pub speed: f32,
+    pub count: i32,
+    /// Block/item arguments used by `iconcrack_` and `blockcrack_` particles.
+    pub arguments: Vec<i32>,
+}
+
+/// Parse `S2A Particle`. The number of trailing VarInt arguments is fixed by
+/// the particle type: item crack has two, block crack/dust have one.
+pub fn parse_particle(packet: &Packet) -> Result<ParticleSpawn> {
+    let mut r = packet.reader();
+    let particle_id = r.read_i32()?;
+    let long_distance = r.read_bool()?;
+    let x = r.read_f32()?;
+    let y = r.read_f32()?;
+    let z = r.read_f32()?;
+    let offset_x = r.read_f32()?;
+    let offset_y = r.read_f32()?;
+    let offset_z = r.read_f32()?;
+    let speed = r.read_f32()?;
+    let count = r.read_i32()?;
+    let argument_count = match particle_id {
+        36 => 2,
+        37 | 38 => 1,
+        _ => 0,
+    };
+    let mut arguments = Vec::with_capacity(argument_count);
+    for _ in 0..argument_count {
+        arguments.push(r.read_varint()?);
+    }
+    if !r.is_empty() {
+        return Err(Error::Protocol("trailing bytes in particle packet".into()));
+    }
+    Ok(ParticleSpawn {
+        particle_id,
+        long_distance,
+        x,
+        y,
+        z,
+        offset_x,
+        offset_y,
+        offset_z,
+        speed,
+        count,
+        arguments,
     })
 }
 
@@ -1978,6 +2038,85 @@ pub fn parse_use_entity(packet: &Packet) -> Result<(i32, i32, Option<[f32; 3]>)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_a_particle_burst() {
+        let mut w = PacketWriter::new();
+        w.write_i32(26) // flame
+            .write_bool(true)
+            .write_f32(1.5)
+            .write_f32(64.0)
+            .write_f32(-2.25)
+            .write_f32(0.1)
+            .write_f32(0.2)
+            .write_f32(0.3)
+            .write_f32(0.05)
+            .write_i32(6);
+        let particle = parse_particle(&Packet::new(clientbound::PARTICLE, w.into_bytes())).unwrap();
+        assert_eq!(particle.particle_id, 26);
+        assert!(particle.long_distance);
+        assert_eq!((particle.x, particle.y, particle.z), (1.5, 64.0, -2.25));
+        assert_eq!(
+            (particle.offset_x, particle.offset_y, particle.offset_z),
+            (0.1, 0.2, 0.3)
+        );
+        assert_eq!(particle.speed, 0.05);
+        assert_eq!(particle.count, 6);
+        assert!(particle.arguments.is_empty());
+    }
+
+    #[test]
+    fn particle_trailing_arguments_are_fixed_by_kind() {
+        // 36 iconcrack_: item id then metadata.
+        let mut w = PacketWriter::new();
+        w.write_i32(36)
+            .write_bool(false)
+            .write_f32(0.0)
+            .write_f32(64.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_i32(8)
+            .write_varint(265)
+            .write_varint(2);
+        let particle = parse_particle(&Packet::new(clientbound::PARTICLE, w.into_bytes())).unwrap();
+        assert_eq!(particle.arguments, vec![265, 2]);
+
+        // 37 blockcrack_: one block state.
+        let mut w = PacketWriter::new();
+        w.write_i32(37)
+            .write_bool(false)
+            .write_f32(0.0)
+            .write_f32(64.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_i32(4)
+            .write_varint(0x0100);
+        let particle = parse_particle(&Packet::new(clientbound::PARTICLE, w.into_bytes())).unwrap();
+        assert_eq!(particle.arguments, vec![0x0100]);
+    }
+
+    #[test]
+    fn a_particle_with_stray_bytes_is_rejected() {
+        let mut w = PacketWriter::new();
+        w.write_i32(34)
+            .write_bool(false)
+            .write_f32(0.0)
+            .write_f32(64.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_f32(0.0)
+            .write_i32(3)
+            .write_varint(7);
+        assert!(parse_particle(&Packet::new(clientbound::PARTICLE, w.into_bytes())).is_err());
+    }
 
     #[test]
     fn parses_a_note_block_action() {

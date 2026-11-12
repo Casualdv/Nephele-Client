@@ -30,5 +30,5 @@ pub use mesh::{
     build_hand_sprite, build_item_mesh, build_world_mesh, mesh_column, ColumnMeshJob, HandItem,
     ItemDraw, MeshData, Vertex,
 };
-pub use particles::{note_color, Particles};
+pub use particles::{build_particle_mesh, note_color, ParticleDraw, ParticleKind, Particles};
 pub use ui::{Rect, UiBatch, UiVertex};

@@ -994,6 +994,13 @@ fn part_pivot(draw: &EntityDraw, part_index: usize) -> [f32; 3] {
 
 /// Armour is drawn as a slightly inflated solid box tinted by material. The
 /// slot order is boots, leggings, chestplate, helmet.
+///
+/// The inflation is a full model pixel, not a fraction: the second skin layer
+/// sits 0.25 px out, and anything closer than ~0.75 px z-fights with it at
+/// lobby distance, which shows up as per-pixel dithering between the tint and
+/// the jacket/pants texture.
+const ARMOR_INFLATE: f32 = 1.0;
+
 fn append_armor(mesh: &mut EntityMesh, draw: &EntityDraw, parts: &[Part; 6]) {
     if !draw.armor.iter().any(Option::is_some) {
         return;
@@ -1002,21 +1009,21 @@ fn append_armor(mesh: &mut EntityMesh, draw: &EntityDraw, parts: &[Part; 6]) {
         let mut boot = parts[4];
         boot.origin[1] = 0.0;
         boot.size[1] = 4.0;
-        append_solid_part(mesh, draw, &boot, 4, 0.35, color);
+        append_solid_part(mesh, draw, &boot, 4, ARMOR_INFLATE, color);
         let mut boot = parts[5];
         boot.origin[1] = 0.0;
         boot.size[1] = 4.0;
-        append_solid_part(mesh, draw, &boot, 5, 0.35, color);
+        append_solid_part(mesh, draw, &boot, 5, ARMOR_INFLATE, color);
     }
     if let Some(color) = draw.armor[1] {
-        append_solid_part(mesh, draw, &parts[4], 4, 0.3, color);
-        append_solid_part(mesh, draw, &parts[5], 5, 0.3, color);
+        append_solid_part(mesh, draw, &parts[4], 4, ARMOR_INFLATE, color);
+        append_solid_part(mesh, draw, &parts[5], 5, ARMOR_INFLATE, color);
     }
     if let Some(color) = draw.armor[2] {
-        append_solid_part(mesh, draw, &parts[1], 1, 0.35, color);
+        append_solid_part(mesh, draw, &parts[1], 1, ARMOR_INFLATE, color);
     }
     if let Some(color) = draw.armor[3] {
-        append_solid_part(mesh, draw, &parts[0], 0, 0.4, color);
+        append_solid_part(mesh, draw, &parts[0], 0, ARMOR_INFLATE, color);
     }
 }
 
@@ -1032,7 +1039,7 @@ fn append_solid_part(
     let [w, h, d] = part.size;
     let [gx, gy, gz] = [ox - inflate, oy - inflate, oz - inflate];
     let [gw, gh, gd] = [w + inflate * 2.0, h + inflate * 2.0, d + inflate * 2.0];
-    let uv = SkinAtlas::uv(SkinAtlas::solid_slot(), 0.0, 0.0);
+    let uv = SkinAtlas::solid_uv();
     let alpha = if draw.invisible { 0.35 } else { color[3] };
     for (face_index, face) in FACES.iter().enumerate() {
         // A helmet is an open-faced shell: leave the +Z face out so the
@@ -1239,7 +1246,7 @@ pub fn append_item_frame(mesh: &mut EntityMesh, draw: &ItemFrameDraw) {
             SkinAtlas::uv(slot, 128.0, 128.0),
         ),
         None => {
-            let uv = SkinAtlas::uv(SkinAtlas::solid_slot(), 0.0, 0.0);
+            let uv = SkinAtlas::solid_uv();
             (uv, uv)
         }
     };
@@ -1531,10 +1538,75 @@ mod tests {
         let mesh = build_entities(&[draw]);
         assert!(mesh.vertices.len() > 6 * 6 * 4);
         // Armour uses the solid-white slot, so its tint survives the shader.
-        assert!(mesh
-            .vertices
-            .iter()
-            .any(|v| v.uv == SkinAtlas::uv(SkinAtlas::solid_slot(), 0.0, 0.0)));
+        assert!(mesh.vertices.iter().any(|v| v.uv == SkinAtlas::solid_uv()));
+    }
+
+    #[test]
+    fn every_armour_box_matches_the_part_it_covers() {
+        // A tint per slot, so each box's vertices can be isolated.
+        let tints = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+        ];
+        // Boots, leggings, chestplate, helmet: the box each one draws, in
+        // model pixels plus its inflation, converted to blocks. The boot and
+        // legging slots cover *both* legs, so their x span is two legs wide.
+        let expected = [
+            (8.0 + 2.0, 4.0 + 2.0, 4.0 + 2.0),
+            (8.0 + 2.0, 12.0 + 2.0, 4.0 + 2.0),
+            (8.0 + 2.0, 12.0 + 2.0, 4.0 + 2.0),
+            (8.0 + 2.0, 8.0 + 2.0, 8.0 + 2.0),
+        ];
+        for (slot, tint) in tints.iter().enumerate() {
+            let mut draw = bare_player([0.0; 3], 0.0, 0.0, 0.0, 0);
+            draw.armor[slot] = Some(*tint);
+            let mesh = build_entities(&[draw]);
+            let boxed: Vec<_> = mesh.vertices.iter().filter(|v| v.color == *tint).collect();
+            assert!(!boxed.is_empty(), "armour slot {slot} drew nothing");
+            let span = |axis: usize| {
+                let min = boxed
+                    .iter()
+                    .map(|v| v.position[axis])
+                    .fold(f32::MAX, f32::min);
+                let max = boxed
+                    .iter()
+                    .map(|v| v.position[axis])
+                    .fold(f32::MIN, f32::max);
+                max - min
+            };
+            let (pixels_x, pixels_y, pixels_z) = expected[slot];
+            let want = [pixels_x * PIXEL, pixels_y * PIXEL, pixels_z * PIXEL];
+            let solid_uv = SkinAtlas::solid_uv();
+            for vertex in &boxed {
+                assert_eq!(
+                    vertex.uv, solid_uv,
+                    "armour slot {slot} samples the skin instead of the solid texel"
+                );
+            }
+            for (axis, want) in want.iter().enumerate() {
+                let got = span(axis);
+                assert!(
+                    (got - want).abs() < 0.01,
+                    "armour slot {slot} axis {axis}: {got} blocks, expected {want}"
+                );
+            }
+            // Every triangle must stay inside one box: a tinted vertex mixed
+            // with a skin vertex is a mis-indexed quad, which reads as
+            // per-pixel noise over the player instead of a solid shell.
+            for triangle in mesh.indices.chunks_exact(3) {
+                let vertices: Vec<_> = triangle
+                    .iter()
+                    .map(|&i| mesh.vertices[i as usize])
+                    .collect();
+                let tinted = vertices.iter().filter(|v| v.color == *tint).count();
+                assert!(
+                    tinted == 0 || tinted == 3,
+                    "armour slot {slot} triangle mixes tint and skin: {vertices:?}"
+                );
+            }
+        }
     }
 
     #[test]
