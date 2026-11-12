@@ -240,6 +240,8 @@ struct Shared {
     window_open: bool,
     /// `S2D` inventory type of the open window, for the panel title.
     window_kind: Option<String>,
+    /// `S2D` title the server gave the open window, already flattened.
+    window_title: Option<String>,
     /// Our own tab-list latency, `None` until the server tells us.
     ping: Option<i32>,
     /// Entity under the crosshair, as picked by the network thread.
@@ -448,6 +450,7 @@ impl Default for Shared {
             window_slots: Vec::new(),
             window_open: false,
             window_kind: None,
+            window_title: None,
             ping: None,
             target: None,
             window_id: None,
@@ -1253,12 +1256,36 @@ async fn net_loop(
         Some(path) => {
             let stored = nephele_auth::StoredSession::load(path)
                 .map_err(|err| format!("no Microsoft session ({err}); run `nephele auth` first"))?;
-            if stored.is_expired() {
-                return Err(
-                    "your cached Microsoft session expired; run `nephele auth` to sign in again"
-                        .into(),
-                );
-            }
+            let stored = if stored.is_expired() {
+                // Refresh off the async runtime: the token exchange is blocking
+                // HTTP and the rest of the loop must stay responsive.
+                let path = path.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let renewed = stored.refresh()?;
+                    if let Err(err) = renewed.save(&path) {
+                        eprintln!("could not save the refreshed Microsoft session: {err}");
+                    }
+                    Ok::<_, nephele_auth::AuthError>(renewed)
+                })
+                .await
+                {
+                    Ok(Ok(stored)) => stored,
+                    Ok(Err(err)) => {
+                        return Err(format!(
+                            "your cached Microsoft session expired and could not be refreshed \
+                             ({err}); run `nephele auth` to sign in again"
+                        ));
+                    }
+                    Err(err) => {
+                        return Err(format!(
+                            "could not refresh your Microsoft session ({err}); \
+                             run `nephele auth` to sign in again"
+                        ));
+                    }
+                }
+            } else {
+                stored
+            };
             GameClient::join_online(&address, &stored.session())
                 .await
                 .map_err(|err| format!("{err}; if this persists, run `nephele auth`"))?
@@ -1282,6 +1309,9 @@ async fn net_loop(
 
     let mut miner = Miner::default();
     let mut attack_cooldown = Instant::now();
+    // Drives thunder flashes for multiplayer weather; singleplayer has its own
+    // deterministic stream in `local_loop`.
+    let mut weather_random = 0x9E37_79B9_7F4A_7C15u64;
     // `NEPHELE_SCOREBOARD=1` dumps the resolved sidebar once a second, so a
     // live lobby can be checked without a renderer.
     let dump_scoreboard = std::env::var("NEPHELE_SCOREBOARD").is_ok();
@@ -1582,6 +1612,12 @@ async fn net_loop(
                     state.xp_bar = client.xp_bar;
                     state.xp_level = client.xp_level;
                     state.time_of_day = (client.time_of_day.rem_euclid(24000) as f32).max(0.0);
+                    state.raining = client.raining;
+                    state.thundering = client.thundering;
+                    state.lightning = (state.lightning - 0.08).max(0.0);
+                    if state.thundering && weather_roll(&mut weather_random) % 700 == 0 {
+                        state.lightning = 1.0;
+                    }
                     state.chunks = client.world.loaded_chunks();
                     if state.inventory.len() != client.inventory.len() {
                         state.inventory = client.inventory.clone();
@@ -1596,6 +1632,10 @@ async fn net_loop(
                         .map(|open| open.slots.clone())
                         .unwrap_or_default();
                     state.window_kind = client.open_window.as_ref().map(|open| open.kind.clone());
+                    state.window_title = client.open_window.as_ref().and_then(|open| {
+                        let title = open.title.trim();
+                        (!title.is_empty()).then(|| title.to_owned())
+                    });
                     state.ping = own_ping(&client);
                     state.target = entity_hit.map(|hit| hit.id);
                 }
@@ -1650,6 +1690,17 @@ async fn net_loop(
                     Ok(Event::Velocity { vx, vy, vz }) => {
                         let mut state = shared.lock().unwrap();
                         state.player.set_velocity(vx, vy, vz);
+                    }
+                    Ok(Event::Weather {
+                        raining,
+                        thundering,
+                    }) => {
+                        let mut state = shared.lock().unwrap();
+                        state.raining = raining;
+                        state.thundering = thundering;
+                        if !raining || !thundering {
+                            state.lightning = 0.0;
+                        }
                     }
                     Ok(Event::Chat(text)) => {
                         let _ = tx.send(NetMsg::Chat(text));
@@ -1739,6 +1790,8 @@ struct FrameView {
     window_slots: Vec<Option<ItemStack>>,
     /// Inventory type of the open window, for the panel title.
     window_kind: Option<String>,
+    /// Title the server gave the open window.
+    window_title: Option<String>,
     /// Our own latency, from the tab list.
     ping: Option<i32>,
     health: f32,
@@ -2741,6 +2794,7 @@ impl LiveApp {
                 window_open: state.window_open,
                 window_slots: state.window_slots.clone(),
                 window_kind: state.window_kind.clone(),
+                window_title: state.window_title.clone(),
                 ping: state.ping,
                 health: state.health,
                 food: state.food,
@@ -3104,6 +3158,7 @@ impl LiveApp {
             lightning: view.lightning,
             clock: self.time,
             window_kind: view.window_kind.as_deref(),
+            window_title: view.window_title.as_deref(),
         };
 
         // The options tree has sliders, which the button list cannot express, so
@@ -5301,6 +5356,7 @@ mod tests {
             window_slots: Vec::new(),
             window_open: false,
             window_kind: None,
+            window_title: None,
             ping: None,
             target: None,
             window_id: None,

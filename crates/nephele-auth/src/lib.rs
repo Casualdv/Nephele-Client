@@ -55,6 +55,8 @@ pub enum AuthError {
     Io(String),
     #[error("no client id configured")]
     NoClientId,
+    #[error("the cached session has no refresh token; run `nephele auth` to sign in again")]
+    NoRefreshToken,
 }
 
 /// What the player has to do: go to this URL and type this code.
@@ -75,6 +77,16 @@ struct TokenResponse {
     access_token: String,
     #[serde(default)]
     refresh_token: Option<String>,
+}
+
+/// The Microsoft token pair from the device-code flow.
+///
+/// The refresh token has to be kept: without it an expired Minecraft token
+/// cannot be renewed, and the next join fails with an opaque 403.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenPair {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -168,11 +180,25 @@ impl StoredSession {
 
     /// Whether the cached Minecraft token has expired.
     ///
-    /// The device-code flow keeps no refresh token, so an expired session cannot
-    /// be renewed silently: the join call fails with Microsoft's opaque 403. The
-    /// caller checks this first so the player is told to sign in again instead.
+    /// An expired session is renewed with [`StoredSession::refresh`] when a
+    /// refresh token is stored. Older `auth.json` files have no refresh token,
+    /// so for those the caller has to tell the player to sign in again.
     pub fn is_expired(&self) -> bool {
         unix_now() + 60 >= self.expires_at
+    }
+
+    /// Renew an expired session with the cached refresh token.
+    ///
+    /// The returned session carries the rotated refresh token. The caller is
+    /// responsible for saving it, so a successful refresh survives the next
+    /// launch too.
+    pub fn refresh(&self) -> Result<Self, AuthError> {
+        let token = self
+            .refresh_token
+            .as_deref()
+            .ok_or(AuthError::NoRefreshToken)?;
+        let session = refresh(&self.client_id, token)?;
+        Ok(Self::from_session(&self.client_id, &session))
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), AuthError> {
@@ -226,8 +252,21 @@ pub fn wait_for_token_with(
     client_id: &str,
     code: &DeviceCode,
     legacy: bool,
-    mut on_wait: impl FnMut(Duration),
+    on_wait: impl FnMut(Duration),
 ) -> Result<String, AuthError> {
+    Ok(wait_for_token_pair_with(client_id, code, legacy, on_wait)?.access_token)
+}
+
+/// Like [`wait_for_token_with`], but keeps the refresh token as well.
+///
+/// The refresh token is what lets an expired session be renewed silently on a
+/// later launch, so the interactive sign-in path must not discard it.
+pub fn wait_for_token_pair_with(
+    client_id: &str,
+    code: &DeviceCode,
+    legacy: bool,
+    mut on_wait: impl FnMut(Duration),
+) -> Result<TokenPair, AuthError> {
     let (_, token_url, _) = endpoints(legacy);
     let deadline = Instant::now() + Duration::from_secs(code.expires_in);
     let interval = Duration::from_secs(code.interval.max(1));
@@ -246,7 +285,10 @@ pub fn wait_for_token_with(
             Ok(text) => {
                 let token: TokenResponse = serde_json::from_str(&text)
                     .map_err(|err| AuthError::Unexpected(format!("{err}: {text}")))?;
-                return Ok(token.access_token);
+                return Ok(TokenPair {
+                    access_token: token.access_token,
+                    refresh_token: token.refresh_token,
+                });
             }
             // `authorization_pending` comes back as a 400 while the player has
             // not finished; anything else is a real failure.
@@ -392,7 +434,12 @@ pub fn refresh(client_id: &str, refresh_token: &str) -> Result<Session, AuthErro
     let token: TokenResponse = serde_json::from_str(&text)
         .map_err(|err| AuthError::Unexpected(format!("{err}: {text}")))?;
     let mut session = to_minecraft(client_id, &token.access_token)?;
-    session.refresh_token = token.refresh_token;
+    // Microsoft may rotate the refresh token, but some responses omit it. Keep
+    // the token we used in that case: dropping it would make the next refresh
+    // need another interactive sign-in.
+    session.refresh_token = token
+        .refresh_token
+        .or_else(|| Some(refresh_token.to_owned()));
     Ok(session)
 }
 
@@ -400,9 +447,9 @@ pub fn refresh(client_id: &str, refresh_token: &str) -> Result<Session, AuthErro
 pub fn login(client_id: &str, mut show: impl FnMut(&DeviceCode)) -> Result<Session, AuthError> {
     let code = begin(client_id)?;
     show(&code);
-    let ms_token = wait_for_token(client_id, &code, |_| {})?;
-    let mut session = to_minecraft(client_id, &ms_token)?;
-    session.refresh_token = None;
+    let tokens = wait_for_token_pair_with(client_id, &code, false, |_| {})?;
+    let mut session = to_minecraft(client_id, &tokens.access_token)?;
+    session.refresh_token = tokens.refresh_token;
     Ok(session)
 }
 
@@ -551,6 +598,38 @@ mod tests {
         assert!(!stored.is_expired());
         stored.expires_at = unix_now() - 1;
         assert!(stored.is_expired());
+    }
+
+    #[test]
+    fn a_stored_session_keeps_its_refresh_token() {
+        let session = Session {
+            access_token: "mc-token".into(),
+            expires_at: unix_now() + 3600,
+            profile: Profile {
+                id: "uuid".into(),
+                name: "name".into(),
+            },
+            refresh_token: Some("ms-refresh".into()),
+        };
+        let stored = StoredSession::from_session("client", &session);
+        assert_eq!(stored.refresh_token.as_deref(), Some("ms-refresh"));
+        assert_eq!(
+            stored.session().refresh_token.as_deref(),
+            Some("ms-refresh")
+        );
+    }
+
+    #[test]
+    fn refreshing_without_a_refresh_token_does_not_hit_the_network() {
+        let stored = StoredSession {
+            client_id: "id".into(),
+            access_token: "token".into(),
+            expires_at: unix_now() - 1,
+            id: "uuid".into(),
+            name: "name".into(),
+            refresh_token: None,
+        };
+        assert!(matches!(stored.refresh(), Err(AuthError::NoRefreshToken)));
     }
 
     #[test]

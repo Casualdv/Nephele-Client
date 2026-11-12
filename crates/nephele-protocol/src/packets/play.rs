@@ -37,6 +37,8 @@ pub mod clientbound {
     pub const BLOCK_ACTION: i32 = 0x24;
     pub const BLOCK_BREAK_ANIMATION: i32 = 0x25;
     pub const MAP_CHUNK_BULK: i32 = 0x26;
+    /// `S2B`: rain/thunder state and a handful of one-shot game events.
+    pub const CHANGE_GAME_STATE: i32 = 0x2B;
     pub const SET_SLOT: i32 = 0x2F;
     pub const OPEN_WINDOW: i32 = 0x2D;
     pub const CLOSE_WINDOW: i32 = 0x2E;
@@ -802,6 +804,42 @@ pub fn parse_experience(packet: &Packet) -> Result<Experience> {
 pub struct TimeUpdate {
     pub world_age: i64,
     pub time_of_day: i64,
+}
+
+/// `S2B Change Game State`: a reason byte and a float whose meaning depends on
+/// that reason. Only the weather reasons are interesting to a client today.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChangeGameState {
+    pub reason: u8,
+    pub value: f32,
+}
+
+/// Reason values for `S2B` (`S2BPacketChangeGameState`).
+pub mod game_state {
+    pub const INVALID_BED: u8 = 0;
+    pub const BEGIN_RAINING: u8 = 1;
+    pub const END_RAINING: u8 = 2;
+    pub const CHANGE_GAME_MODE: u8 = 3;
+    pub const ENTER_CREDITS: u8 = 4;
+    pub const DEMO_MESSAGE: u8 = 5;
+    pub const ARROW_HIT_PLAYER: u8 = 6;
+    pub const RAIN_LEVEL_CHANGE: u8 = 7;
+    pub const THUNDER_LEVEL_CHANGE: u8 = 8;
+}
+
+pub fn parse_change_game_state(packet: &Packet) -> Result<ChangeGameState> {
+    let mut r = packet.reader();
+    Ok(ChangeGameState {
+        reason: r.read_u8()?,
+        value: r.read_f32()?,
+    })
+}
+
+/// `S2B` written from the server side, used by the mock and tests.
+pub fn change_game_state(reason: u8, value: f32) -> Packet {
+    let mut w = PacketWriter::new();
+    w.write_u8(reason).write_f32(value);
+    Packet::new(clientbound::CHANGE_GAME_STATE, w.into_bytes())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -2226,6 +2264,19 @@ mod tests {
                 kind: "minecraft:crafting_table".to_string(),
                 title: "{\"text\":\"Crafting\"}".to_string(),
                 slots: 46,
+            }
+        );
+    }
+
+    #[test]
+    fn change_game_state_round_trips() {
+        let packet = change_game_state(game_state::BEGIN_RAINING, 0.0);
+        assert_eq!(packet.id, clientbound::CHANGE_GAME_STATE);
+        assert_eq!(
+            parse_change_game_state(&packet).expect("game state"),
+            ChangeGameState {
+                reason: game_state::BEGIN_RAINING,
+                value: 0.0,
             }
         );
     }

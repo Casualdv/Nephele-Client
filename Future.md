@@ -227,7 +227,7 @@ positionally (attenuation to 16 blocks, stereo panning).
 | Item | Size | Notes |
 |---|---|---|
 | **Microsoft device-code OAuth → Xbox Live → Minecraft services** | **done** | `nephele-auth` + `nephele auth`; `play --online` uses the cached session. Still needs an Azure client id. |
-| Token storage + refresh | M | `azalea-auth` has a cache; encrypt at rest. |
+| Token storage + refresh | **done** | `auth.json` keeps the refresh token; an expired Minecraft token is refreshed and the rotated pair saved before joining. Encrypting the file at rest is still open. |
 | Online-mode encryption handshake | **done** | AES-CFB8, server id hash, RSA PKCS#1 and the session-server join all implemented. |
 | Server list screen (ping, MOTD, version, favourites, history) | **done** | Saved list with a live ping per row (MOTD, version, latency, 1s timeout, refreshed on open and by a Refresh button), favourites, select / double-click / Enter to join. No history list and no player counts yet. |
 | Dimension change, respawn packets, portals | L | |
@@ -244,7 +244,7 @@ positionally (attenuation to 16 blocks, stereo panning).
 | World list, rename, delete, backup | M | Rename/delete plus timestamped snapshot and restore from the world list. |
 | Autosave, save-on-quit, dirty chunk tracking | M | 15 s autosave, save on quit/disconnect, and save-before-unload for dirty columns. |
 | Chunk loading/unloading while walking | M | Radius + 2 unload (world and renderer); memory bound not yet measured over a ten-minute live walk. |
-| Time of day, weather, lightning | M | Persisted `Time`/`DayTime`/rain/thunder; day/night uses the renderer's `Environment` shader, with rain/lightning CLI overlays. |
+| Time of day, weather, lightning | M | Persisted `Time`/`DayTime`/rain/thunder; day/night uses the renderer's `Environment` shader, with rain/lightning CLI overlays. Multiplayer now takes rain/thunder from `S2B Change Game State` instead of a debug toggle. |
 
 ### 10. Distribution and product
 

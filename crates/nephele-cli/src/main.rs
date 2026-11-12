@@ -298,11 +298,11 @@ fn run_auth(client_id: Option<String>, out: Option<PathBuf>, legacy: bool) -> Ex
     print!("  waiting");
     let _ = std::io::stdout().flush();
 
-    let token = match nephele_auth::wait_for_token_with(&client_id, &code, legacy, |_| {
+    let tokens = match nephele_auth::wait_for_token_pair_with(&client_id, &code, legacy, |_| {
         print!(".");
         let _ = std::io::stdout().flush();
     }) {
-        Ok(token) => token,
+        Ok(tokens) => tokens,
         Err(err) => {
             println!();
             eprintln!("error: {err}");
@@ -311,13 +311,14 @@ fn run_auth(client_id: Option<String>, out: Option<PathBuf>, legacy: bool) -> Ex
     };
     println!(" done");
 
-    let session = match nephele_auth::to_minecraft(&client_id, &token) {
+    let mut session = match nephele_auth::to_minecraft(&client_id, &tokens.access_token) {
         Ok(session) => session,
         Err(err) => {
             eprintln!("error: {err}");
             return ExitCode::FAILURE;
         }
     };
+    session.refresh_token = tokens.refresh_token;
 
     println!(
         "  signed in as {} ({})",

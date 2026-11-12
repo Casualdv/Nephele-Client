@@ -168,9 +168,11 @@ yet, so SmartScreen warns on every fresh download. Build it yourself from source
 if you would rather not trust a binary.
 
 **Online mode says 403 (Invalid session).**
-Cached Microsoft tokens last about 24 hours, and the client does not yet refresh
-them automatically. Run `cargo run -p nephele -- auth` and join again. Automatic
-refresh is a known gap, not a permissions problem.
+Cached Microsoft tokens last about 24 hours. The client now refreshes them
+automatically from the refresh token stored in `auth.json`, so a normal expired
+session joins without running `auth` again. An `auth.json` written by an older
+build has no refresh token; run `cargo run -p nephele -- auth` once to replace
+it, then automatic refresh takes over.
 
 **Where are my settings, servers and worlds?**
 `%APPDATA%\Nephele` (or `$XDG_DATA_HOME/nephele`, or `~/.local/share/nephele`):

@@ -190,6 +190,8 @@ pub struct HudState<'a> {
     pub clock: f32,
     /// Inventory type of the open window (`minecraft:chest`, ...), for its title.
     pub window_kind: Option<&'a str>,
+    /// Title the server gave the open window; preferred over the type label.
+    pub window_title: Option<&'a str>,
 }
 
 /// Vanilla's automatic GUI scale: integers only so the pixel font stays crisp.
@@ -2266,13 +2268,11 @@ pub fn draw_inventory(
             let panel = inventory_panel(scale, width, height);
             bg.rect(panel, PANEL);
             bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
-            fg.text_centered(
-                "Crafting Table",
-                width / 2.0,
-                panel.y - s(13.0),
-                scale,
-                TEXT,
-            );
+            let title = hud
+                .window_title
+                .filter(|title| !title.is_empty())
+                .unwrap_or("Crafting Table");
+            fg.text_centered(title, width / 2.0, panel.y - s(13.0), scale, TEXT);
             fg.text(
                 "Crafting",
                 panel.x + s(30.0),
@@ -2297,10 +2297,13 @@ pub fn draw_inventory(
             let panel = container_panel(slots.len(), scale, width, height);
             bg.rect(panel, PANEL);
             bg.rect_outline(panel, scale.max(1.0), BUTTON_BORDER);
-            let title = hud
-                .window_kind
-                .map(window_kind_label)
-                .unwrap_or("Container");
+            let title = match hud.window_title.filter(|title| !title.is_empty()) {
+                Some(title) => title,
+                None => hud
+                    .window_kind
+                    .map(window_kind_label)
+                    .unwrap_or("Container"),
+            };
             fg.text_centered(title, width / 2.0, panel.y - s(13.0), scale, TEXT);
             fg.text(
                 "Inventory",
@@ -3525,6 +3528,7 @@ mod tests {
             lightning: 0.0,
             clock: 0.0,
             window_kind: None,
+            window_title: None,
         }
     }
 

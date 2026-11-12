@@ -434,6 +434,15 @@ otherwise complete and works; only the shippable app id is missing.
 location; `paths::migrate_legacy_file` copies it across once on launch, and
 nothing writes there any more.
 
+**Token refresh.** `auth.json` stores the refresh token and `expires_at` as well
+as the access token. The interactive flow (`nephele auth`) keeps the refresh
+token returned by `wait_for_token_pair_with`; on join, an expired session is
+renewed through `nephele_auth::refresh` (`StoredSession::refresh`) before the
+server join is attempted, and the rotated pair is written back immediately.
+Microsoft sometimes omits a rotated refresh token, so the old one is reused in
+that case. An older `auth.json` with no refresh token still needs one
+`nephele auth` run.
+
 ---
 
 ## 9. Protocol & online join
@@ -749,9 +758,19 @@ lane `client-ui`). Four new modules in `nephele-cli/src` carry it:
 - **Generic server windows.** A container window is now drawn for **any slot
   count**: `window_rows`/`container_panel_size`/`server_window_origin` lay the
   container slots nine to a row above the player's 36, so a hopper, a single chest,
-  a double chest or a furnace all render without a bespoke screen, titled from
-  `S2D`'s inventory type (`window_kind_label`). The 46-slot crafting table keeps
-  its vanilla 3x3-plus-output layout.
+  a double chest or a furnace all render without a bespoke screen. The panel
+  heading uses the title the server sent in `S2D` (flattened from chat JSON by
+  `window_title_text`); `window_kind_label` from the inventory type is only the
+  fallback. The 46-slot crafting table keeps its vanilla 3x3-plus-output layout
+  and also shows the server's title.
+- **Server weather.** `S2B Change Game State` is parsed (`CHANGE_GAME_STATE`
+  0x2B): begin/end rain and the rain/thunder level reasons update
+  `GameClient.raining`/`thundering` and emit `Event::Weather`, which the net loop
+  copies into `Shared` for the existing rain/lightning overlay. The net loop
+  decays `lightning` and rolls thunder flashes with the same rhythm as
+  singleplayer. Protocol 47 has no separate sky-colour field; the sky stays
+  derived from time and weather. Local singleplayer keeps its own
+  `advance_weather` simulation.
 - **Entity clicks are the `net` lane's.** `client.entities.raycast` picks the target,
   mining is gated on it, and `C02 ATTACK`/`INTERACT_AT` are sent directly from the net
   loop. A parallel `interact.rs` prototype (Candidate/pick + a `Shared::entity_actions`

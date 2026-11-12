@@ -37,6 +37,8 @@ pub use skins::{SkinInfo, Skins};
 pub struct OpenWindowState {
     pub id: u8,
     pub kind: String,
+    /// The title the server gave the window, already flattened from chat JSON.
+    pub title: String,
     /// Slot contents as sent by `S30`; empty until the first resync.
     pub slots: Vec<Option<ItemStack>>,
 }
@@ -127,6 +129,11 @@ pub enum Event {
         health: f32,
         food: i32,
     },
+    /// The server started or stopped rain/thunder (`S2B Change Game State`).
+    Weather {
+        raining: bool,
+        thundering: bool,
+    },
     Respawn {
         dimension: i8,
     },
@@ -147,6 +154,8 @@ pub enum Event {
     WindowOpened {
         window_id: u8,
         kind: String,
+        /// Display text from the packet's title component.
+        title: String,
     },
     /// A container window closed (`S2E`).
     WindowClosed,
@@ -241,6 +250,15 @@ fn pitch_to_mc(pitch_radians: f32) -> f32 {
     -pitch_radians.to_degrees()
 }
 
+/// `S2D`'s title is a chat component; flatten it for the panel heading. A plain
+/// string title (some servers send one) is kept as-is.
+fn window_title_text(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => nephele_protocol::packets::status::flatten_chat(&value),
+        Err(_) => raw.to_owned(),
+    }
+}
+
 /// Last fields actually transmitted by the 20 Hz movement loop.
 #[derive(Default)]
 struct MovementReport {
@@ -307,6 +325,10 @@ pub struct GameClient {
     pub xp_total: i32,
     pub world_age: i64,
     pub time_of_day: i64,
+    /// Whether the server has it raining right now (`S2B`).
+    pub raining: bool,
+    /// Whether the server has it thundering right now (`S2B`).
+    pub thundering: bool,
     pub spawn_position: Option<(i32, i32, i32)>,
     /// Player container contents (`S30` / `S2F`), 45 slots; 36..=44 is the hotbar.
     pub inventory: Vec<Option<ItemStack>>,
@@ -491,6 +513,8 @@ impl GameClient {
             xp_total: 0,
             world_age: 0,
             time_of_day: 0,
+            raining: false,
+            thundering: false,
             spawn_position: None,
             inventory: vec![None; play::PLAYER_CONTAINER_SLOTS],
             held_slot: 0,
@@ -737,6 +761,27 @@ impl GameClient {
                 self.time_of_day = time.time_of_day;
                 Ok(Event::Packet(packet.id))
             }
+            play::clientbound::CHANGE_GAME_STATE => {
+                let change = play::parse_change_game_state(packet)?;
+                // 1.8 `NetHandlerPlayClient.handleChangeGameState`: begin/end
+                // rain are absolute, the level reasons carry 0..1 strength.
+                match change.reason {
+                    play::game_state::BEGIN_RAINING => self.raining = true,
+                    play::game_state::END_RAINING => self.raining = false,
+                    play::game_state::RAIN_LEVEL_CHANGE => self.raining = change.value > 0.0,
+                    play::game_state::THUNDER_LEVEL_CHANGE => {
+                        self.thundering = change.value > 0.0;
+                    }
+                    _ => {}
+                }
+                if !self.raining {
+                    self.thundering = false;
+                }
+                Ok(Event::Weather {
+                    raining: self.raining,
+                    thundering: self.thundering,
+                })
+            }
             play::clientbound::SPAWN_POSITION => {
                 let pos = play::parse_spawn_position(packet)?;
                 self.spawn_position = Some(pos);
@@ -847,14 +892,17 @@ impl GameClient {
             }
             play::clientbound::OPEN_WINDOW => {
                 let window = play::parse_open_window(packet)?;
+                let title = window_title_text(&window.title);
                 self.open_window = Some(OpenWindowState {
                     id: window.window_id,
                     kind: window.kind.clone(),
+                    title: title.clone(),
                     slots: Vec::new(),
                 });
                 Ok(Event::WindowOpened {
                     window_id: window.window_id,
                     kind: window.kind,
+                    title,
                 })
             }
             play::clientbound::CLOSE_WINDOW => {
@@ -1601,6 +1649,8 @@ mod tests {
             xp_total: 0,
             world_age: 0,
             time_of_day: 0,
+            raining: false,
+            thundering: false,
             spawn_position: None,
             inventory: vec![None; play::PLAYER_CONTAINER_SLOTS],
             held_slot: 0,
@@ -2576,6 +2626,7 @@ mod tests {
         client.open_window = Some(OpenWindowState {
             id: 2,
             kind: "minecraft:chest".into(),
+            title: "Loot".into(),
             slots: Vec::new(),
         });
 
@@ -3047,5 +3098,81 @@ mod tests {
         assert_eq!(pinned, 0, "the server kept correcting us to the same spot");
         assert_eq!(client.payload_mismatches, 0);
         client.disconnect().await;
+    }
+
+    #[tokio::test]
+    async fn change_game_state_starts_and_stops_rain() {
+        let (mut client, _peer) = test_game_client().await;
+
+        let event = client
+            .handle(play::change_game_state(
+                play::game_state::BEGIN_RAINING,
+                0.0,
+            ))
+            .await
+            .expect("begin rain");
+        assert_eq!(
+            event,
+            Event::Weather {
+                raining: true,
+                thundering: false,
+            }
+        );
+        assert!(client.raining);
+
+        let event = client
+            .handle(play::change_game_state(
+                play::game_state::THUNDER_LEVEL_CHANGE,
+                1.0,
+            ))
+            .await
+            .expect("thunder level");
+        assert_eq!(
+            event,
+            Event::Weather {
+                raining: true,
+                thundering: true,
+            }
+        );
+        assert!(client.thundering);
+
+        let event = client
+            .handle(play::change_game_state(play::game_state::END_RAINING, 0.0))
+            .await
+            .expect("end rain");
+        assert_eq!(
+            event,
+            Event::Weather {
+                raining: false,
+                thundering: false,
+            }
+        );
+        assert!(!client.raining);
+        assert!(!client.thundering);
+    }
+
+    #[tokio::test]
+    async fn open_window_keeps_the_server_title() {
+        let (mut client, _peer) = test_game_client().await;
+        let event = client
+            .handle(play::open_window(
+                1,
+                "minecraft:chest",
+                "{\"text\":\"Loot\",\"color\":\"gold\"}",
+                27,
+            ))
+            .await
+            .expect("open window");
+        assert_eq!(
+            event,
+            Event::WindowOpened {
+                window_id: 1,
+                kind: "minecraft:chest".into(),
+                title: "Loot".into(),
+            }
+        );
+        let open = client.open_window.expect("window state");
+        assert_eq!(open.kind, "minecraft:chest");
+        assert_eq!(open.title, "Loot");
     }
 }
