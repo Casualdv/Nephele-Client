@@ -25,6 +25,13 @@ const WATER_LAKE_CHANCE: i32 = 4;
 const LAVA_LAKE_CHANCE: i32 = 80;
 const DUNGEON_CHANCE: i32 = 8;
 
+/// `BiomeDecorator`'s per-chunk patch counts. `sandPerChunk2` is the sand pass,
+/// `sandPerChunk` the gravel one — the names are vanilla's, and they are the
+/// wrong way round.
+const SAND_PATCHES: i32 = 3;
+const CLAY_PATCHES: i32 = 1;
+const GRAVEL_PATCHES: i32 = 1;
+
 /// `ChunkProviderGenerate.populate`: one owner chunk's population pass.
 pub fn decorate<W: GenWorld>(
     world: &mut W,
@@ -69,8 +76,9 @@ pub fn decorate<W: GenWorld>(
     biome_decorator(world, rand, origin_x, origin_z);
 }
 
-/// `BiomeDecorator.decorate` → `genDecorations`. This is the ore half; the
-/// surface features follow in later commits, in vanilla's order.
+/// `BiomeDecorator.decorate` → `genDecorations`, in vanilla's order. Ores and
+/// the underwater patches are ported; the surface features follow in later
+/// commits.
 fn biome_decorator<W: GenWorld>(
     world: &mut W,
     rand: &mut JavaRandom,
@@ -78,6 +86,100 @@ fn biome_decorator<W: GenWorld>(
     origin_z: i32,
 ) {
     crate::ores::generate_ores(world, rand, origin_x, origin_z);
+
+    // `sandPerChunk2` sand patches, `clayPerChunk` clay, then `sandPerChunk`
+    // gravel. Every iteration consumes the two position draws whether or not the
+    // patch is accepted, because the acceptance test happens inside `generate`.
+    for _ in 0..SAND_PATCHES {
+        let x = origin_x + rand.next_int_bound(16) + 8;
+        let z = origin_z + rand.next_int_bound(16) + 8;
+        let y = world.solid_top(x, z);
+        sand_patch(world, rand, x, y, z, block::ids::SAND, 7);
+    }
+    for _ in 0..CLAY_PATCHES {
+        let x = origin_x + rand.next_int_bound(16) + 8;
+        let z = origin_z + rand.next_int_bound(16) + 8;
+        let y = world.solid_top(x, z);
+        clay_patch(world, rand, x, y, z, 4);
+    }
+    for _ in 0..GRAVEL_PATCHES {
+        let x = origin_x + rand.next_int_bound(16) + 8;
+        let z = origin_z + rand.next_int_bound(16) + 8;
+        let y = world.solid_top(x, z);
+        sand_patch(world, rand, x, y, z, block::ids::GRAVEL, 6);
+    }
+}
+
+/// `WorldGenSand.generate`: a disc of sand (or gravel) two blocks deep, only
+/// where the column is under water, replacing dirt and grass.
+///
+/// The radius draw happens **after** the water test, so a dry column consumes
+/// no draw at all. That asymmetry is why the pass has to be ported rather than
+/// approximated: a rejected patch leaves the stream where it was.
+fn sand_patch<W: GenWorld>(
+    world: &mut W,
+    rand: &mut JavaRandom,
+    x: i32,
+    y: i32,
+    z: i32,
+    block: u16,
+    radius: i32,
+) -> bool {
+    if !world.is_water(x, y, z) {
+        return false;
+    }
+    let r = rand.next_int_bound(radius - 2) + 2;
+    let vertical = 2;
+
+    for px in (x - r)..=(x + r) {
+        for pz in (z - r)..=(z + r) {
+            let dx = px - x;
+            let dz = pz - z;
+            if dx * dx + dz * dz > r * r {
+                continue;
+            }
+            for py in (y - vertical)..=(y + vertical) {
+                let state = world.get_block(px, py, pz);
+                if matches!(state.id(), block::ids::DIRT | block::ids::GRASS) {
+                    world.set_block(px, py, pz, BlockState::new(block, 0));
+                }
+            }
+        }
+    }
+    true
+}
+
+/// `WorldGenClay.generate`: the same disc one block deep, replacing dirt **and
+/// clay** with clay. `number_of_blocks` is a radius in vanilla despite the name.
+fn clay_patch<W: GenWorld>(
+    world: &mut W,
+    rand: &mut JavaRandom,
+    x: i32,
+    y: i32,
+    z: i32,
+    number_of_blocks: i32,
+) -> bool {
+    if !world.is_water(x, y, z) {
+        return false;
+    }
+    let r = rand.next_int_bound(number_of_blocks - 2) + 2;
+
+    for px in (x - r)..=(x + r) {
+        for pz in (z - r)..=(z + r) {
+            let dx = px - x;
+            let dz = pz - z;
+            if dx * dx + dz * dz > r * r {
+                continue;
+            }
+            for py in (y - 1)..=(y + 1) {
+                let state = world.get_block(px, py, pz);
+                if matches!(state.id(), block::ids::DIRT | block::ids::CLAY) {
+                    world.set_block(px, py, pz, BlockState::new(block::ids::CLAY, 0));
+                }
+            }
+        }
+    }
+    true
 }
 
 /// The per-biome `decorate` overrides that run **before** `super.decorate`.

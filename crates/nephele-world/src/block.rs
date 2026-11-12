@@ -129,16 +129,48 @@ pub fn is_water(state: BlockState) -> bool {
     matches!(state.id(), 8 | 9)
 }
 
-/// An approximation of `Material.isSolid()`.
+/// `Material.isSolid()`, which in 1.8.9 is the same predicate as
+/// `Material.blocksMovement()`.
 ///
-/// Vanilla asks the block's material; this crate has no material table, so the
-/// predicate is "not air, not a liquid, not one of the blocks vanilla marks
-/// replaceable, and not fire". That matches every block worldgen can meet
-/// (stone, dirt, grass, sand, gravel, clay, ores, wood, netherrack, end stone)
-/// and is only wrong for exotic blocks generation never places. Used by the
-/// lake, dungeon and sand passes.
+/// Vanilla answers per *material*, not per block: `MaterialLiquid` (water,
+/// lava), `MaterialLogic` (plants, crops, snow cover, vines) and
+/// `MaterialTransparent` (air, fire) all return `false`, and every other
+/// material returns `true`. This crate has no material table, so the `false`
+/// set is spelled out — only the ids generation can actually produce. Anything
+/// not listed is solid, which is `Material`'s own default, so the predicate errs
+/// the way vanilla does.
+///
+/// Two vanilla quirks this preserves: leaves are **solid** (the
+/// `getTopSolidOrLiquidBlock` caller filters them out separately), and so are
+/// torches and rails (`Material.circuits`).
+///
+/// Not to be confused with [`blocks_movement`] below, which answers the
+/// renderer's ray-trace question and includes torches, rails and panes.
 pub fn is_solid(state: BlockState) -> bool {
-    !state.is_air() && !is_liquid(state) && !is_replaceable(state) && state.id() != ids::FIRE
+    !matches!(
+        state.id(),
+        0   // air                        MaterialTransparent
+        | 6   // sapling                    Material.plants
+        | 8 | 9 | 10 | 11 // water, lava  MaterialLiquid
+        | 31  // dead bush                  Material.plants
+        | 32  // tall grass                 Material.plants
+        | 37 | 38 // dandelion, poppy       Material.plants
+        | 39 | 40 // mushrooms              Material.plants
+        | 51  // fire                       MaterialTransparent
+        | 59  // wheat                      Material.plants
+        | 78  // snow cover                 Material.snow (MaterialLogic)
+        | 83  // sugar cane                 Material.plants
+        | 106 // vine                       MaterialLogic
+        | 111 // water lily                 Material.plants
+        | 115 // nether wart                Material.plants
+        | 141 | 142 // carrots, potatoes  Material.plants
+        | 175 // double plant               Material.plants
+    )
+}
+
+/// `Material.leaves`, which `getTopSolidOrLiquidBlock` skips over.
+pub fn is_leaves(state: BlockState) -> bool {
+    state.id() == ids::LEAVES
 }
 
 /// `Block.isReplaceable(world, pos)`.

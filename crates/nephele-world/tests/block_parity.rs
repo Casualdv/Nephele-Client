@@ -495,7 +495,9 @@ fn terrain_matches_the_reference_except_where_vanilla_populates() {
     let window_z = (centre_z - COMPARE_HALF)..=(centre_z + COMPARE_HALF);
 
     // Generate exactly what the fixture covers, so every population pass that
-    // could write into the window has its 2x2 square available.
+    // could write into the window has its 2x2 square available. The fixture is
+    // 25x25 and the window its inner 17x17, so the four-chunk margin is the
+    // neighbour support the edge of the window needs.
     let world = generate(SEED, min_x, max_x, min_z, max_z);
 
     let mut report = Report::default();

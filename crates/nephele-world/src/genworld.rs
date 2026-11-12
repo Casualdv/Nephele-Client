@@ -77,13 +77,18 @@ pub trait GenWorld {
         block::is_solid(self.get_block(x, y, z))
     }
 
-    /// `World.getTopSolidOrLiquidBlock(pos)`: one above the highest solid
-    /// block, ignoring liquids and leaves. Unlike [`Self::height`] this can land
-    /// inside water, which the underwater sand/clay pass expects.
+    /// `World.getTopSolidOrLiquidBlock(pos)`: one above the highest block whose
+    /// material blocks movement, skipping leaves.
+    ///
+    /// Liquids do **not** block movement in 1.8.9, which is the whole point: the
+    /// returned position is under water whenever the column is, and that is what
+    /// the underwater sand and clay passes test for. Unlike [`Self::height`]
+    /// this ignores plants and snow cover too.
     fn solid_top(&self, x: i32, z: i32) -> i32 {
         for y in (0..256).rev() {
-            if self.is_solid(x, y, z) {
-                return y + 1;
+            let state = self.get_block(x, y, z);
+            if block::is_solid(state) && !block::is_leaves(state) {
+                return (y + 1).min(255);
             }
         }
         0

@@ -149,12 +149,17 @@ pub fn minable<W: GenWorld>(
 ) {
     // `MathHelper.sin/cos`, not the libm ones: vanilla quantises angles through
     // the same table.
+    //
+    // The float grouping matters. Vanilla writes
+    // `MathHelper.sin(f) * (float)n / 8.0F`, which multiplies first and divides
+    // after; pre-dividing into a `spread` rounds differently and moves the
+    // ellipse enough to change which blocks a `floor` picks up.
     let angle = rand.next_float() * std::f32::consts::PI;
-    let spread = size as f32 / 8.0;
-    let start_x = (x + 8) as f32 + math::sin(angle) * spread;
-    let end_x = (x + 8) as f32 - math::sin(angle) * spread;
-    let start_z = (z + 8) as f32 + math::cos(angle) * spread;
-    let end_z = (z + 8) as f32 - math::cos(angle) * spread;
+    let size_f = size as f32;
+    let start_x = (x + 8) as f32 + math::sin(angle) * size_f / 8.0;
+    let end_x = (x + 8) as f32 - math::sin(angle) * size_f / 8.0;
+    let start_z = (z + 8) as f32 + math::cos(angle) * size_f / 8.0;
+    let end_z = (z + 8) as f32 - math::cos(angle) * size_f / 8.0;
     let start_y = (y + rand.next_int_bound(3) - 2) as f64;
     let end_y = (y + rand.next_int_bound(3) - 2) as f64;
 
