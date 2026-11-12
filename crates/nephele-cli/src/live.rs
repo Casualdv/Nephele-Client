@@ -242,6 +242,9 @@ struct Shared {
     window_kind: Option<String>,
     /// Our own tab-list latency, `None` until the server tells us.
     ping: Option<i32>,
+    /// The whole tab list, refreshed from `S38` by the network loop. The UI
+    /// sorts and caps it; the network side must not guess at presentation.
+    tab_list: Vec<ui::TabEntry>,
     /// Entity under the crosshair, as picked by the network thread.
     target: Option<i32>,
     /// Server window id, or 1 for the local crafting-table window.
@@ -449,6 +452,7 @@ impl Default for Shared {
             window_open: false,
             window_kind: None,
             ping: None,
+            tab_list: Vec::new(),
             target: None,
             window_id: None,
             local_container: LocalContainer::default(),
@@ -1597,6 +1601,15 @@ async fn net_loop(
                         .unwrap_or_default();
                     state.window_kind = client.open_window.as_ref().map(|open| open.kind.clone());
                     state.ping = own_ping(&client);
+                    state.tab_list = client
+                        .player_list
+                        .values()
+                        .map(|entry| ui::TabEntry {
+                            name: entry.name.clone(),
+                            gamemode: entry.gamemode,
+                            ping: entry.ping,
+                        })
+                        .collect();
                     state.target = entity_hit.map(|hit| hit.id);
                 }
 
@@ -1754,8 +1767,35 @@ struct FrameView {
     lightning: f32,
     /// Whether the player is standing on something, for view bobbing.
     on_ground: bool,
+    /// Whether the server has placed us; the join screen waits for this.
+    spawned: bool,
     /// Fraction of the way through the current 20 Hz tick.
     alpha: f64,
+}
+
+/// The join in progress. Kept on the UI side so the network thread does not
+/// have to know about screens; `expected` is the current view distance's column
+/// count, and the screen leaves when the player's own column is loaded.
+struct LoadingState {
+    world: String,
+    detail: String,
+    expected: usize,
+    started: Instant,
+    /// Where "back" goes if this join fails: the server list or the world list.
+    failure_screen: Screen,
+}
+
+impl LoadingState {
+    fn new(world: String, detail: String, view_distance: u8, failure_screen: Screen) -> Self {
+        let side = view_distance as usize * 2 + 1;
+        Self {
+            world,
+            detail,
+            expected: side * side,
+            started: Instant::now(),
+            failure_screen,
+        }
+    }
 }
 
 struct LiveApp {
@@ -1905,6 +1945,12 @@ struct LiveApp {
     last_feet: [f64; 3],
     /// Brightness the loaded meshes were built with, so a change can re-mesh.
     applied_brightness: Brightness,
+    /// A join in progress, or `None` once the player's column is on screen.
+    loading: Option<LoadingState>,
+    /// Why the last join failed, shown on `Screen::Disconnected`.
+    connect_error: Option<String>,
+    /// Where the failed-join screen's back button goes.
+    connect_return: Screen,
     error: Option<Box<dyn Error>>,
 }
 
@@ -2056,6 +2102,9 @@ impl LiveApp {
             bob_phase: 0.0,
             last_feet: [0.0, 0.0, 0.0],
             applied_brightness: settings_brightness,
+            loading: None,
+            connect_error: None,
+            connect_return: Screen::Servers,
             error: None,
         };
 
@@ -2477,14 +2526,22 @@ impl LiveApp {
                 }
                 Ok(NetMsg::Error(err)) => {
                     eprintln!("network error: {err}");
-                    self.screen = Screen::Game;
                     self.set_mouse_capture(false);
                     self.chat_open = false;
                     self.reset_for_dimension(0);
                     self.chat_log.clear();
                     self.skin_slots.clear();
                     self.shared.lock().unwrap().reset_session();
-                    self.disconnect_reason = Some(err.clone());
+                    if let Some(loading) = self.loading.take() {
+                        // The join never reached a world: give it a screen of
+                        // its own instead of a banner over an empty level.
+                        self.connect_return = loading.failure_screen;
+                        self.connect_error = Some(err.clone());
+                        self.screen = Screen::Disconnected;
+                    } else {
+                        self.screen = Screen::Game;
+                        self.disconnect_reason = Some(err.clone());
+                    }
                     let mut state = self.shared.lock().unwrap();
                     state.error = Some(err);
                 }
@@ -2752,10 +2809,34 @@ impl LiveApp {
                 thundering: state.thundering,
                 lightning: state.lightning,
                 on_ground: state.player.on_ground,
+                spawned: state.spawned,
                 feet,
                 alpha,
             }
         };
+
+        // The join screen leaves when the player's own column is loaded, which
+        // is the point vanilla's `GuiDownloadTerrain` closes. A server that
+        // streams fewer columns than the view distance asks for still opens;
+        // the 30 s fallback keeps a stalled stream from becoming a soft lock.
+        if self.screen == Screen::Loading {
+            let chunk = (
+                (view.feet[0].floor() as i32).div_euclid(16),
+                (view.feet[2].floor() as i32).div_euclid(16),
+            );
+            let landed = view.spawned
+                && view.chunks > 0
+                && self.world.get(ChunkCoord::new(chunk.0, chunk.1)).is_some();
+            let timed_out = view.spawned
+                && self
+                    .loading
+                    .as_ref()
+                    .is_some_and(|loading| loading.started.elapsed() >= Duration::from_secs(30));
+            if landed || timed_out {
+                self.loading = None;
+                self.enter_game();
+            }
+        }
 
         // View bobbing: vanilla sways the camera with the walk cycle. Amplitude
         // follows horizontal speed, so standing still does not bob at all.
@@ -3324,6 +3405,60 @@ impl LiveApp {
                 width,
                 height,
             ),
+            Screen::Loading => {
+                let loading = self.loading.as_ref();
+                let title = if view.chunks == 0 {
+                    "Joining world..."
+                } else {
+                    "Building terrain"
+                };
+                let world = loading.map(|state| state.world.as_str()).unwrap_or("");
+                let detail = loading.map(|state| state.detail.as_str()).unwrap_or("");
+                let label = if detail.is_empty() || detail == world {
+                    world.to_string()
+                } else {
+                    format!("{world}  -  {detail}")
+                };
+                ui::draw_loading(
+                    &mut self.ui_bg,
+                    &mut self.ui_fg,
+                    &ui::LoadingView {
+                        title,
+                        world: &label,
+                        loaded: view.chunks,
+                        expected: loading.map(|state| state.expected).unwrap_or(0),
+                    },
+                    scale,
+                    width,
+                    height,
+                );
+                Vec::new()
+            }
+            Screen::Disconnected => {
+                let reason = self.connect_error.as_deref().unwrap_or("unknown error");
+                let address = self
+                    .last_address
+                    .as_ref()
+                    .map(|address| address.to_string())
+                    .unwrap_or_default();
+                let back_label = if self.connect_return == Screen::Worlds {
+                    "Back to World List"
+                } else {
+                    "Back to Server List"
+                };
+                ui::draw_connect_failed(
+                    &mut self.ui_bg,
+                    &mut self.ui_fg,
+                    reason,
+                    &address,
+                    self.last_address.is_some(),
+                    back_label,
+                    self.pointer,
+                    scale,
+                    width,
+                    height,
+                )
+            }
             Screen::Pause => {
                 ui::draw_pause(&mut self.ui_bg, &mut self.ui_fg, &hud, scale, width, height)
             }
@@ -3428,7 +3563,8 @@ impl LiveApp {
                 width,
                 height,
             );
-            self.draw_scoreboard(scale, width, height);
+            let sidebar = self.draw_scoreboard(scale, width, height);
+            self.draw_player_list(sidebar, scale, width, height);
             self.draw_chat(scale, width, height);
         }
 
@@ -3470,9 +3606,16 @@ impl LiveApp {
 
     /// Spawn the network thread for `address` and switch to the game screen.
     fn start_network(&mut self, address: ServerAddress) {
-        self.screen = Screen::Game;
+        self.screen = Screen::Loading;
         self.set_mouse_capture(false);
         self.last_address = Some(address.clone());
+        self.connect_error = None;
+        self.loading = Some(LoadingState::new(
+            address.to_string(),
+            "Connecting to the server".to_string(),
+            self.settings.view_distance,
+            Screen::Servers,
+        ));
         let shared = Arc::clone(&self.shared);
         let username = self.options.username.clone();
         let session_path = if self.options.online {
@@ -3719,8 +3862,17 @@ impl LiveApp {
 
     fn start_local_save(&mut self, save: WorldSave) {
         let mode = save.metadata().mode;
-        self.screen = Screen::Game;
+        let name = save.metadata().name.clone();
+        self.screen = Screen::Loading;
         self.set_mouse_capture(false);
+        self.connect_error = None;
+        self.last_address = None;
+        self.loading = Some(LoadingState::new(
+            name,
+            "Building terrain".to_string(),
+            self.settings.view_distance,
+            Screen::Worlds,
+        ));
         {
             let mut state = self.shared.lock().unwrap();
             state.creative = mode.is_creative();
@@ -3973,13 +4125,16 @@ impl LiveApp {
     }
 
     /// The scoreboard sidebar, if the server has given us one.
-    fn draw_scoreboard(&mut self, scale: f32, width: f32, height: f32) {
+    fn draw_scoreboard(
+        &mut self,
+        scale: f32,
+        width: f32,
+        height: f32,
+    ) -> Option<crate::scoreboard::Layout> {
         if self.sidebar.is_empty() {
-            return;
+            return None;
         }
-        let Some(objective) = self.sidebar.sidebar.as_ref() else {
-            return;
-        };
+        let objective = self.sidebar.sidebar.as_ref()?;
         let rows = self.sidebar.sidebar_rows();
         let list = ui::ScoreboardRowList {
             title: Some(objective.title.as_slice()),
@@ -3991,6 +4146,34 @@ impl LiveApp {
             &list,
             scale,
             width,
+            height,
+        )
+    }
+
+    /// The hold-Tab player list, kept clear of the sidebar.
+    fn draw_player_list(
+        &mut self,
+        sidebar: Option<crate::scoreboard::Layout>,
+        scale: f32,
+        width: f32,
+        height: f32,
+    ) {
+        if self.screen != Screen::Game || self.chat_open || !self.keys.contains(&KeyCode::Tab) {
+            return;
+        }
+        let entries = self.shared.lock().unwrap().tab_list.clone();
+        if entries.is_empty() {
+            return;
+        }
+        let available_right = sidebar
+            .map(|layout| (layout.x * scale - 2.0 * scale).max(0.0))
+            .unwrap_or(width);
+        ui::draw_player_list(
+            &mut self.ui_bg,
+            &mut self.ui_fg,
+            &entries,
+            available_right,
+            scale,
             height,
         );
     }
@@ -4410,6 +4593,20 @@ impl LiveApp {
             Action::ConnectSubmit => self.connect_from_input(),
             Action::ConnectCancel => self.screen = Screen::Servers,
             Action::Resume => self.enter_game(),
+            Action::RetryConnect => {
+                self.connect_error = None;
+                self.disconnect_reason = None;
+                self.reconnect();
+            }
+            Action::BackToServers => {
+                self.connect_error = None;
+                self.disconnect_reason = None;
+                if self.connect_return == Screen::Worlds {
+                    self.open_worlds();
+                } else {
+                    self.open_servers();
+                }
+            }
             Action::OpenSettings => {
                 self.settings_return = Screen::Pause;
                 self.rebinding = None;
@@ -4779,6 +4976,14 @@ impl ApplicationHandler for LiveApp {
                     self.confirm_delete_selected_world();
                     return;
                 }
+                if self.screen == Screen::Disconnected
+                    && event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyR)
+                {
+                    self.connect_error = None;
+                    self.reconnect();
+                    return;
+                }
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyR)
                     && self.disconnect_reason.is_some()
@@ -4826,6 +5031,11 @@ impl ApplicationHandler for LiveApp {
                                 self.world_error = None;
                             }
                             Screen::Connect | Screen::Death => self.screen = Screen::Title,
+                            Screen::Loading => {}
+                            Screen::Disconnected => {
+                                self.connect_error = None;
+                                self.open_servers();
+                            }
                         },
                         (KeyCode::KeyF, ElementState::Pressed) if self.screen == Screen::Game => {
                             let mut state = self.shared.lock().unwrap();
@@ -5302,6 +5512,7 @@ mod tests {
             window_open: false,
             window_kind: None,
             ping: None,
+            tab_list: Vec::new(),
             target: None,
             window_id: None,
             local_container: LocalContainer::default(),

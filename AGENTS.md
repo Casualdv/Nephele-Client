@@ -443,6 +443,10 @@ nothing writes there any more.
 - Order matters: **Mojang join call happens before** the encryption response is sent.
 - `Connection::send_encryption_response` + `read_login_outcome`;
   `GameClient::join_online` runs the HTTP join on `spawn_blocking`.
+- **1.8.9 has no boss-bar packet.** Clientbound `0x0C` is `Spawn Player`; the boss
+  bar id (`0x0C`) belongs to 1.9+. Do not "add boss bar support" by reading `0x0C` —
+  it would decode every other player as a health bar. `S45 Title` (`0x45`) is real on
+  protocol 47 but is not parsed yet (see §11, PvP shell).
 
 ---
 
@@ -809,6 +813,42 @@ development shortcut (never the only route).
 - Difficulty is stored and shown; single-player has nothing that spawns yet and a
   server owns it in multiplayer, so it changes no behaviour.
 
+**PvP shell: tab list and join screens** (added 2026-11-12, lane `pvp-shell`,
+continuation of `client-ui`). Both are in `ui.rs` + `live.rs` and need no other lane.
+
+- **Tab player list (hold `TAB`).** `S38` already fed `GameClient::player_list`; the
+  network loop now copies it into `Shared.tab_list`, and `ui::draw_player_list` draws
+  it while Tab is held in `Screen::Game` (a held key, not a toggle, like vanilla).
+  Sorted case-insensitively by name and **capped at 80 rows**, 20 per column and up to
+  four columns; header `Players (N)`; one gamemode letter (`S`/`C`/`A`/`Sp`) and
+  vanilla's five-bar latency icon (`ping_bars`: 5/4/3/2/1 at 150/300/600/1000 ms, no
+  bars when the server reports no latency). The pane is clamped to the **left edge of
+  the scoreboard sidebar**, so a 15-row sidebar and an 80-player list cannot overlap;
+  names are truncated to the column with `..`.
+- **Join screen.** `Screen::Loading` covers the window (dark-brown, like
+  `GuiDownloadTerrain`) with the world name (singleplayer) or address (multiplayer),
+  "Joining world..." until the first column then "Building terrain", and a bar from
+  columns received over `(2 × view distance + 1)²`. It leaves when the player's own
+  column is loaded (`spawned && chunks > 0 && world.get(player chunk)`), with a 30 s
+  fallback so a stalled stream cannot soft-lock. A **failed** join now goes to
+  `Screen::Disconnected` (reason, address, Reconnect / Back to Server List) instead of
+  the old banner over an empty level; a mid-match disconnect still uses that banner.
+- **Boss bar and titles are blocked on `net`, not implemented.** 1.8.9 has **no
+  boss-bar packet** — clientbound `0x0C` is `Spawn Player`; the boss bar is a 1.9+
+  packet, and a 1.8 server emulates one with wither/dragon entities. `S45 Title`
+  (`0x45`) is absent from `nephele-protocol`'s clientbound table and from
+  `nephele-client`'s `Event` enum, so no title can reach the UI. Required from `net`:
+  `TITLE = 0x45` with the four fade packets, a title `Event` carrying
+  (title, subtitle, fade-in/stay/fade-out, actionbar), and a boss-bar decision
+  (entity-based, since the packet does not exist on 47).
+- **The four pending Video Settings rows are still pending.** `nephele-render` has no
+  hook for any of them: smooth lighting is unconditional inside `vertex_light` (no
+  flag on `ColumnMeshJob`), and there is no fancy-graphics, dynamic-light or
+  alternate-block code path in the crate. `OptionRow::takes_effect()` is deliberately
+  unchanged. The smallest unblock is a `ColumnMeshJob` options struct
+  (`smooth_lighting`, `fancy`, `alternate_blocks`) threaded from `live.rs`, plus a
+  `Renderer::set_dynamic_lights`.
+
 ---
 
 ## 12. Milestones
@@ -825,7 +865,8 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) |
 | `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
 | `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | **merged at `f0347c1`** - scoreboards, teams, `C02`, maps, frames, keep-alive, beacon/note/debris particles |
-| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, options tree with a live Video Settings page, `keybinds.rs` (26 actions, click-to-rebind, conflict handling); tab list, boss bar, titles and the loading screen still open |
+| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, options tree with a live Video Settings page, `keybinds.rs` (26 actions, click-to-rebind, conflict handling) |
+| `pvp-shell` | tab list, join screen, titles/boss bar | `pvp-shell` | continuation of `client-ui`: **tab player list and the join/failed-join screens landed 2026-11-12**; boss bar and titles blocked on `net` (`S45` unparsed, no 1.8 boss-bar packet); four video rows still blocked on `render` |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
 | `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
 | `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
@@ -1022,9 +1063,9 @@ re-serialize the chunk wholesale.
 - Reference-world checks live in `genlayer.rs` and `worldgen.rs`;
   `chunk_biomes_match_a_world_the_real_server_generated` passes and
   `debug_first_mismatch` / `debug_stage_trace` narrow any future regression.
-- **719 test cases across the workspace** (706 passed, 13 ignored). `nephele-world`
+- **727 test cases across the workspace** (714 passed, 13 ignored). `nephele-world`
   carries the parity suite, including `debug_stage_trace` and
-  `debug_first_mismatch`. The six real-socket tests in
+  `debug_first_mismatch`. `nephele-cli` has 152 passing tests. The six real-socket tests in
   `crates/nephele-client/tests/join_mock.rs` cover status,
   compression, chat, joining/loading the mock world, drop pickup, and crafting
   planks through `C0E`.

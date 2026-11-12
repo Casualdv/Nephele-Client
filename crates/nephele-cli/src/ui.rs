@@ -62,6 +62,12 @@ pub enum Screen {
     Servers,
     Connect,
     Game,
+    /// Joining a world: the dirt-coloured cover, drawn until the player's own
+    /// column arrives. Replaces the world view, so no HUD shows through.
+    Loading,
+    /// A join failed before a match started. Distinct from the in-game
+    /// "Disconnected" banner, which keeps the frozen world visible.
+    Disconnected,
     Pause,
     /// The options tree root.
     Options,
@@ -153,6 +159,10 @@ pub enum Action {
     ModuleToggle(ModuleId),
     /// Put every module back where it started.
     ModulesReset,
+    /// Retry the last address from the failed-join screen.
+    RetryConnect,
+    /// Leave the failed-join screen for the saved-server list.
+    BackToServers,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -663,6 +673,222 @@ pub struct ScoreboardRowList<'a> {
     pub rows: &'a [ScoreboardRow],
 }
 
+// --- tab player list -------------------------------------------------------
+
+/// One row of the hold-Tab player list, as `S38` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabEntry {
+    pub name: String,
+    /// 0 survival, 1 creative, 2 adventure, 3 spectator.
+    pub gamemode: i32,
+    /// Server-reported latency in ms; negative means "not measured yet".
+    pub ping: i32,
+}
+
+/// Cap the overlay, as vanilla does: a 300-player lobby must not cover the
+/// screen and sorting 300 names every frame is wasted work.
+pub const TAB_LIST_MAX_ROWS: usize = 80;
+/// Vanilla fills one column before starting the next.
+pub const TAB_LIST_ROWS_PER_COLUMN: usize = 20;
+const TAB_ROW_H: f32 = 9.0;
+const TAB_HEADER_H: f32 = 11.0;
+const TAB_PAD: f32 = 2.0;
+const TAB_GAP: f32 = 3.0;
+const TAB_GAMEMODE_W: f32 = 8.0;
+const TAB_PING_W: f32 = 9.0;
+
+/// Sorted, capped rows for the overlay. Vanilla sorts by display name, ignoring
+/// case; a stable sort keeps two identical names in uuid order, which is at
+/// least deterministic.
+pub fn tab_list_rows(entries: &[TabEntry]) -> Vec<&TabEntry> {
+    let mut rows: Vec<&TabEntry> = entries.iter().collect();
+    rows.sort_by_key(|entry| entry.name.to_lowercase());
+    rows.truncate(TAB_LIST_MAX_ROWS);
+    rows
+}
+
+/// Where the tab overlay goes, in GUI pixels (before `gui_scale`).
+///
+/// `available_right` is the left edge of the scoreboard sidebar in the same
+/// space, so the two never overlap. Vanilla has no such rule, but its sidebar
+/// and tab list are both on the right and do collide on a busy server.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabListLayout {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub columns: usize,
+    pub rows_per_column: usize,
+    pub column_width: f32,
+}
+
+pub fn tab_list_layout(
+    rows: &[&TabEntry],
+    available_right: f32,
+    screen_height: f32,
+) -> TabListLayout {
+    let count = rows.len().min(TAB_LIST_MAX_ROWS);
+    let columns = count
+        .div_ceil(TAB_LIST_ROWS_PER_COLUMN)
+        .clamp(1, TAB_LIST_MAX_ROWS / TAB_LIST_ROWS_PER_COLUMN);
+    let limit = (available_right - 2.0).max(24.0);
+    let widest_name = rows
+        .iter()
+        .take(count)
+        .map(|entry| UiBatch::text_width(&entry.name, 1.0))
+        .fold(0.0f32, f32::max);
+    let natural = widest_name + TAB_GAP + TAB_GAMEMODE_W + TAB_GAP + TAB_PING_W + TAB_PAD * 2.0;
+    let column_width = natural.min(limit / columns as f32).max(1.0);
+    let width = column_width * columns as f32;
+    // A short window loses rows rather than letting the pane run off-screen.
+    let max_rows = (((screen_height * 0.96 - TAB_HEADER_H - TAB_PAD * 2.0) / TAB_ROW_H).floor()
+        as usize)
+        .max(1);
+    let upper = TAB_LIST_ROWS_PER_COLUMN.min(max_rows).max(1);
+    let rows_per_column = count.div_ceil(columns).clamp(1, upper);
+    let height = TAB_HEADER_H + rows_per_column as f32 * TAB_ROW_H + TAB_PAD * 2.0;
+    let max_y = (screen_height - height - 2.0).max(2.0);
+    TabListLayout {
+        x: ((limit - width) / 2.0).max(2.0),
+        y: (screen_height * 0.04).clamp(2.0, max_y),
+        width,
+        height,
+        columns,
+        rows_per_column,
+        column_width,
+    }
+}
+
+/// Vanilla's five-bar latency icon: the number of lit bars.
+pub fn ping_bars(ping: i32) -> u8 {
+    match ping {
+        ..0 => 0,
+        0..150 => 5,
+        150..300 => 4,
+        300..600 => 3,
+        600..1000 => 2,
+        _ => 1,
+    }
+}
+
+fn ping_color(bars: u8) -> [f32; 4] {
+    match bars {
+        0..=2 => PING_BAD,
+        3 => PING_WARN,
+        _ => PING_GOOD,
+    }
+}
+
+/// `C`/`S`/`A`/`Sp`, or `?` for a gamemode a future server invents.
+fn gamemode_short(gamemode: i32) -> &'static str {
+    match gamemode {
+        0 => "S",
+        1 => "C",
+        2 => "A",
+        3 => "Sp",
+        _ => "?",
+    }
+}
+
+/// Truncate to `budget` GUI pixels, with a two-dot tail, so a long name can
+/// never run into the gamemode or ping column.
+fn fit_label(name: &str, budget: f32) -> String {
+    if budget < 6.0 {
+        return String::new();
+    }
+    if UiBatch::text_width(name, 1.0) <= budget {
+        return name.to_string();
+    }
+    let mut out = String::new();
+    for ch in name.chars() {
+        let mut candidate = out.clone();
+        candidate.push(ch);
+        candidate.push_str("..");
+        if UiBatch::text_width(&candidate, 1.0) > budget {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("..");
+    out
+}
+
+/// Draw the hold-Tab player list. `available_right` is in window pixels.
+pub fn draw_player_list(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    entries: &[TabEntry],
+    available_right: f32,
+    scale: f32,
+    height: f32,
+) {
+    let rows = tab_list_rows(entries);
+    if rows.is_empty() {
+        return;
+    }
+    let layout = tab_list_layout(&rows, available_right / scale, height / scale);
+    let panel = Rect::new(
+        layout.x * scale,
+        layout.y * scale,
+        layout.width * scale,
+        layout.height * scale,
+    );
+    bg.rect(panel, [0.0, 0.0, 0.0, 0.31]);
+    fg.text_centered(
+        &format!("Players ({})", entries.len()),
+        panel.x + panel.w / 2.0,
+        panel.y + TAB_PAD * scale,
+        scale,
+        TEXT,
+    );
+
+    let text_budget =
+        layout.column_width - (TAB_PAD * 2.0 + TAB_GAP + TAB_GAMEMODE_W + TAB_GAP + TAB_PING_W);
+    let visible = (layout.columns * layout.rows_per_column).min(rows.len());
+    for (index, entry) in rows.iter().take(visible).enumerate() {
+        let column = index / layout.rows_per_column;
+        let row = index % layout.rows_per_column;
+        let column_x = panel.x + column as f32 * layout.column_width * scale;
+        let y = panel.y + (TAB_HEADER_H + TAB_PAD + row as f32 * TAB_ROW_H) * scale;
+
+        fg.text(
+            &fit_label(&entry.name, text_budget),
+            column_x + TAB_PAD * scale,
+            y,
+            scale,
+            TEXT,
+        );
+        fg.text(
+            gamemode_short(entry.gamemode),
+            column_x
+                + (layout.column_width - TAB_PAD - TAB_PING_W - TAB_GAP - TAB_GAMEMODE_W) * scale,
+            y,
+            scale,
+            TEXT_DIM,
+        );
+
+        // Five 1-px bars, right-aligned, bottom-aligned to the text row.
+        let bars = ping_bars(entry.ping);
+        let bar_x = column_x + (layout.column_width - TAB_PAD - TAB_PING_W) * scale;
+        let bar_bottom = y + 8.0 * scale;
+        for bar in 0..5 {
+            let bar_height = (bar as f32 + 1.0) * scale;
+            let rect = Rect::new(
+                bar_x + bar as f32 * 2.0 * scale,
+                bar_bottom - bar_height,
+                scale,
+                bar_height,
+            );
+            if bar < bars as usize {
+                bg.rect(rect, ping_color(bars));
+            } else {
+                bg.rect(rect, [0.0, 0.0, 0.0, 0.45]);
+            }
+        }
+    }
+}
+
 const MODULE_LABEL: [f32; 4] = [0.72, 0.72, 0.72, 1.0];
 const MODULE_PANEL: [f32; 4] = [0.0, 0.0, 0.0, 0.6];
 const KEY_BG: [f32; 4] = [0.08, 0.08, 0.08, 0.55];
@@ -1064,6 +1290,128 @@ pub fn draw_status_banner(
     if !detail.is_empty() {
         fg.text_centered(detail, cx, height * 0.52, scale * 1.25, TEXT_DIM);
     }
+}
+
+// --- joining a world -------------------------------------------------------
+
+/// What the join screen shows. `expected` is the column count the current view
+/// distance asks for; servers may send fewer (a small world) or more, so the
+/// bar is a progress estimate, and the screen leaves on the player's own column
+/// rather than on 100%.
+pub struct LoadingView<'a> {
+    /// "Building terrain" once columns arrive, "Joining world..." before.
+    pub title: &'a str,
+    /// World name (singleplayer) or server address.
+    pub world: &'a str,
+    pub loaded: usize,
+    pub expected: usize,
+}
+
+pub fn loading_progress(loaded: usize, expected: usize) -> f32 {
+    if expected == 0 {
+        return 0.0;
+    }
+    (loaded as f32 / expected as f32).clamp(0.0, 1.0)
+}
+
+/// Vanilla's `GuiDownloadTerrain`: a full-window cover, the world name, and a
+/// progress bar. The 1.8 screen has no bar; the count is what this client
+/// actually knows, so it is shown rather than faked as a spinner.
+pub fn draw_loading(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    view: &LoadingView<'_>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) {
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.19, 0.15, 0.11, 1.0]);
+    let cx = width / 2.0;
+    fg.text_centered(view.title, cx, height * 0.34, scale * 2.0, TEXT);
+    fg.text_centered(
+        view.world,
+        cx,
+        height * 0.34 + scale * 22.0,
+        scale,
+        TEXT_DIM,
+    );
+
+    let bar_w = 200.0 * scale;
+    let bar_h = 8.0 * scale;
+    let bar = Rect::new(cx - bar_w / 2.0, height * 0.48, bar_w, bar_h);
+    bg.rect(bar, [0.08, 0.08, 0.08, 1.0]);
+    let progress = loading_progress(view.loaded, view.expected);
+    if progress > 0.0 {
+        bg.rect(
+            Rect::new(
+                bar.x + scale,
+                bar.y + scale,
+                (bar_w - 2.0 * scale) * progress,
+                bar_h - 2.0 * scale,
+            ),
+            [0.35, 0.75, 0.35, 1.0],
+        );
+    }
+    bg.rect_outline(bar, scale.max(1.0), BUTTON_BORDER);
+
+    let label = if view.loaded == 0 {
+        "Connecting...".to_string()
+    } else {
+        format!(
+            "{} / {} chunks ({}%)",
+            view.loaded,
+            view.expected,
+            (progress * 100.0).round() as i32
+        )
+    };
+    fg.text_centered(&label, cx, bar.y + bar_h + scale * 6.0, scale, TEXT_DIM);
+}
+
+/// Vanilla's `GuiDisconnected`: a join that never reached a world gets its own
+/// screen, not the in-game "Disconnected" banner over a frozen level.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_connect_failed(
+    bg: &mut UiBatch,
+    fg: &mut UiBatch,
+    reason: &str,
+    address: &str,
+    can_reconnect: bool,
+    back_label: &str,
+    pointer: Option<[f32; 2]>,
+    scale: f32,
+    width: f32,
+    height: f32,
+) -> Vec<Button> {
+    bg.rect(Rect::new(0.0, 0.0, width, height), [0.19, 0.15, 0.11, 1.0]);
+    let cx = width / 2.0;
+    fg.text_centered("Failed to connect", cx, height * 0.28, scale * 2.0, TEXT);
+    fg.text_centered(reason, cx, height * 0.36, scale, TEXT_DIM);
+    if !address.is_empty() {
+        fg.text_centered(address, cx, height * 0.40, scale, TEXT_DIM);
+    }
+
+    let mut buttons = Vec::new();
+    let mut y = height * 0.52;
+    let w = 200.0 * scale;
+    let h = 20.0 * scale;
+
+    if can_reconnect {
+        let retry = Rect::new(cx - w / 2.0, y, w, h);
+        draw_button(bg, fg, retry, "Reconnect", scale, hovered(pointer, &retry));
+        buttons.push(Button {
+            action: Action::RetryConnect,
+            rect: retry,
+        });
+        y += h + scale * 6.0;
+    }
+
+    let back = Rect::new(cx - w / 2.0, y, w, h);
+    draw_button(bg, fg, back, back_label, scale, hovered(pointer, &back));
+    buttons.push(Button {
+        action: Action::BackToServers,
+        rect: back,
+    });
+    buttons
 }
 
 /// The pause menu: title, "Back to Game", "Disconnect".
@@ -3308,6 +3656,73 @@ mod tests {
         assert_eq!(gui_scale(320.0, 240.0), 1.0);
         assert_eq!(gui_scale(3840.0, 2160.0), 4.0);
         assert_eq!(gui_scale(100.0, 100.0), 1.0);
+    }
+
+    fn tab_entry(name: &str, gamemode: i32, ping: i32) -> TabEntry {
+        TabEntry {
+            name: name.to_string(),
+            gamemode,
+            ping,
+        }
+    }
+
+    #[test]
+    fn tab_list_sorts_by_name_and_caps_at_eighty_rows() {
+        let mut entries: Vec<TabEntry> = (0..90)
+            .map(|index| tab_entry(&format!("player{index:02}"), 0, 20))
+            .collect();
+        entries.push(tab_entry("Zed", 1, 50));
+        let rows = tab_list_rows(&entries);
+        assert_eq!(rows.len(), TAB_LIST_MAX_ROWS);
+        assert_eq!(rows[0].name, "player00");
+        let mut expected: Vec<&str> = rows.iter().map(|entry| entry.name.as_str()).collect();
+        expected.sort_by_key(|name| name.to_lowercase());
+        let actual: Vec<&str> = rows.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn tab_list_never_overlaps_the_sidebar() {
+        let entries: Vec<TabEntry> = (0..TAB_LIST_MAX_ROWS)
+            .map(|index| tab_entry(&format!("a_rather_long_name_{index}"), 1, 90))
+            .collect();
+        let rows = tab_list_rows(&entries);
+        for available_right in [320.0f32, 480.0, 640.0, 960.0] {
+            let layout = tab_list_layout(&rows, available_right, 240.0);
+            assert!(
+                layout.x + layout.width <= available_right + 0.01,
+                "tab list {layout:?} spills past {available_right}"
+            );
+            assert!(layout.columns <= 4);
+            assert!(layout.rows_per_column <= TAB_LIST_ROWS_PER_COLUMN);
+        }
+    }
+
+    #[test]
+    fn ping_bars_follow_vanilla_thresholds() {
+        assert_eq!(ping_bars(-1), 0, "unknown latency draws no bars");
+        assert_eq!(ping_bars(20), 5);
+        assert_eq!(ping_bars(149), 5);
+        assert_eq!(ping_bars(150), 4);
+        assert_eq!(ping_bars(599), 3);
+        assert_eq!(ping_bars(999), 2);
+        assert_eq!(ping_bars(1000), 1);
+    }
+
+    #[test]
+    fn loading_progress_is_bounded() {
+        assert_eq!(loading_progress(0, 0), 0.0);
+        assert_eq!(loading_progress(50, 100), 0.5);
+        assert_eq!(loading_progress(200, 100), 1.0);
+    }
+
+    #[test]
+    fn long_tab_names_are_truncated_to_their_budget() {
+        let budget = UiBatch::text_width("WWWWWWWW", 1.0);
+        let fitted = fit_label("WWWWWWWWWWWWWWWW", budget);
+        assert!(UiBatch::text_width(&fitted, 1.0) <= budget);
+        assert!(fitted.ends_with(".."));
+        assert_eq!(fit_label("short", budget), "short");
     }
 
     #[test]

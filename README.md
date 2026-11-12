@@ -31,6 +31,8 @@ talks protocol 47, and joins offline-mode servers.
 - Client HUD: toggleable, draggable modules (FPS, ping, CPS, keystrokes,
   coordinates, speed), a scoreboard sidebar and coloured chat, with settings
   saved to `settings.json`
+- PvP shell: a hold-Tab player list (name, gamemode, latency), a join screen with
+  chunk progress, and a real failed-join screen with reconnect
 - Options tree: Video Settings, rebindable controls with conflict handling,
   volumes, chat settings, language and resource packs — all persisted and applied
   without a restart (where the renderer has a hook)

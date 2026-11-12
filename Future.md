@@ -198,7 +198,7 @@ This is what separates a PvP client from a compatible one.
 | Hunger / XP / armour / air HUD | M | |
 | Hotbar selection highlight, item counts, durability | S | |
 | Chat overlay + input + command suggestions | M | **Overlay + input done** (fade, `T`/`/`, Enter/Esc). Client-side `/help /gamemode /tp /setblock /give /seed`; unknown commands go to the server. **Colours done 2026-11-06**: `chat.rs` parses both the legacy `§` dialect and JSON chat components (colour inheritance, `#rrggbb`, team-prefix-ready spans). No tab-completion. `azalea-brigadier` and `azalea-chat` are MIT references. |
-| Scoreboard sidebar, tab player list, boss bar, titles | M | **Sidebar renderer + model done 2026-11-06** (`scoreboard.rs`: objectives, scores, teams, 15-row cap, right-aligned pane, `NEPHELE_SCOREBOARD_DEMO=1` shows a hand-built model). `S3B`-`S3E` parsing landed with the net merge, so the sidebar is fed by the server. No tab list, boss bar or titles yet. |
+| Scoreboard sidebar, tab player list, boss bar, titles | M | **Sidebar renderer + model done 2026-11-06** (`scoreboard.rs`: objectives, scores, teams, 15-row cap, right-aligned pane, `NEPHELE_SCOREBOARD_DEMO=1` shows a hand-built model). `S3B`-`S3E` parsing landed with the net merge, so the sidebar is fed by the server. **Tab player list done 2026-11-12** (hold Tab: sorted, 80-row cap, gamemode + latency, kept left of the sidebar). **Boss bar and titles blocked on `net`:** 1.8.9 has no boss-bar packet (`0x0C` is Spawn Player) and `S45` is unparsed. |
 | **Client modules:** FPS, CPS, keystrokes, coordinates, ping, armour status, potion timers, reach display | M | **Six done 2026-11-06**: FPS, ping, LMB/RMB CPS, keystrokes with pressed states, coordinates, speed. Each toggleable and draggable in the HUD editor (Pause → Options → HUD Modules), positions stored as window fractions in `settings.json`. Ping needs `S38` rows, so it shows `--` until a server sends them. Armour status, potion timers and reach are still open. |
 | **Toggle sprint, toggle sneak** | S | **Done 2026-11-08:** two latched actions in `keybinds.rs`, unbound by default, ORed into the movement input. Not persisted across sessions. |
 | **Zoom** (OptiFine-style smooth zoom) | S | |
@@ -284,7 +284,7 @@ and worktree for each.
 | `worldgen` | 15% | `provide_chunk`/`populate` split landed; caves, ores, flora, structures |
 | `survival` | 90% | eating, potions, enchantments, XP orbs |
 | `net` | 95% | resource packs, reconnect polish |
-| `client-ui` | 20% | scoreboard rendering, chat colours, HUD modules, keybinds |
+| `client-ui` | 45% | scoreboard rendering, chat colours, HUD modules, keybinds, options tree, tab player list, join/failed-join screens; boss bar and titles wait on `net` |
 | `entities` | 60% | skins and second layer, equipment, frame rendering, particles |
 | `audio` | 35% | music, volume settings, positional falloff tuning |
 | `saves` | 90% | live memory walk; tile entities dropped on imported chunks |
