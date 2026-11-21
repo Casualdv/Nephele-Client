@@ -133,7 +133,10 @@ mod tests {
         // is honest here: the loader is untested, not broken, and the gap is in
         // the preparation step rather than in this crate.
         let Ok(splashes) = SplashTexts::load(&texts) else {
-            eprintln!("skipping: no prepared splash texts under {}", texts.display());
+            eprintln!(
+                "skipping: no prepared splash texts under {}",
+                texts.display()
+            );
             return;
         };
         assert!(splashes.len() > 100, "{} splashes", splashes.len());
