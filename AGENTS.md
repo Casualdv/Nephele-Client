@@ -939,6 +939,19 @@ re-serialize the chunk wholesale.
   `ground_speeds_and_sprint_jump_match_the_model`; do not "fix" it by tuning the
   constants, which are descriptions of what the simulation produces.
 
+**Protocol and prepared assets**
+
+- **`S0E` velocity is not reliably flagged by `data`.** Vanilla appends the
+  three velocity shorts when `data > 0`, but a rotated item frame puts its
+  rotation in `data` and sends no velocity. Trusting the flag made the client
+  demand six absent bytes once per frame on a map wall, which printed
+  "skipping packet 0x0E: unexpected end of packet" (and dropped every frame).
+  Velocity is the last field, so read it only when at least 6 bytes remain.
+- **`nephele-prepare` extracts no `texts/` directory**, so a prepared tree has
+  no splash text or language files even though rendering works. The assets
+  splash test skips instead of panicking; the real fix belongs to the product
+  lane (extract `assets/minecraft/texts`).
+
 **Worldgen**
 
 - `getBiomesForGeneration` reads `initializeAllBiomeGenerators()[0]` — the coarse

@@ -1440,9 +1440,14 @@ pub fn parse_spawn_object(packet: &Packet) -> Result<SpawnObject> {
     let pitch = angle_from_byte(r.read_u8()?);
     let yaw = angle_from_byte(r.read_u8()?);
     let data = r.read_i32()?;
-    // Vanilla only appends a velocity when `data > 0`. Arrows and some other
-    // objects send `data = 0` with no velocity at all.
-    let velocity = if data > 0 {
+    // Vanilla appends a velocity only when `data > 0`, but `data` is not a
+    // velocity flag for every type: a rotated item frame puts its rotation
+    // there and sends no velocity at all. Trusting the flag alone made the
+    // client demand six bytes that were not in the packet, which surfaced as
+    // "skipping packet 0x0E: unexpected end of packet" once per frame on a map
+    // wall. Velocity is the last field, so the remaining length is the honest
+    // test.
+    let velocity = if data > 0 && r.remaining() >= 6 {
         [
             r.read_i16()? as f64 * VELOCITY_SCALE,
             r.read_i16()? as f64 * VELOCITY_SCALE,
@@ -2794,6 +2799,53 @@ mod entity_tests {
         assert!((object.yaw - 90.0).abs() < 1.5);
         assert_eq!(item_from_object_data(object.data), (17, 2));
         assert!((object.velocity[1] - 0.1).abs() < 1e-3);
+    }
+
+    /// A rotated item frame sends its rotation in `data` and **no** velocity.
+    /// Reading velocity whenever `data > 0` demanded six bytes that were not
+    /// there, once per frame on a map wall - the "skipping packet 0x0E" spam.
+    #[test]
+    fn a_rotated_item_frame_without_velocity_parses() {
+        let mut w = PacketWriter::new();
+        w.write_varint(41)
+            .write_u8(OBJECT_TYPE_ITEM_FRAME)
+            .write_i32((12.5 * 32.0) as i32)
+            .write_i32((70.0 * 32.0) as i32)
+            .write_i32((-8.5 * 32.0) as i32)
+            .write_u8(0)
+            .write_u8(0)
+            .write_i32(3); // rotation, not a velocity flag
+        let packet = Packet::new(clientbound::SPAWN_OBJECT, w.into_bytes());
+
+        let object = parse_spawn_object(&packet).expect("a frame with no velocity");
+        assert_eq!(object.kind, OBJECT_TYPE_ITEM_FRAME);
+        assert_eq!(object.data, 3);
+        assert_eq!(object.velocity, [0.0; 3]);
+        assert_eq!(object.x, 12.5);
+        assert_eq!(object.z, -8.5);
+    }
+
+    /// A velocity tail that stops early is treated as absent rather than
+    /// failing the whole packet: the position and the frame are worth more than
+    /// the missing third component.
+    #[test]
+    fn a_truncated_velocity_tail_is_tolerated() {
+        let mut w = PacketWriter::new();
+        w.write_varint(9)
+            .write_u8(OBJECT_TYPE_ITEM)
+            .write_i32(32)
+            .write_i32(32)
+            .write_i32(32)
+            .write_u8(0)
+            .write_u8(0)
+            .write_i32(1)
+            .write_i16(10)
+            .write_i16(20);
+        let packet = Packet::new(clientbound::SPAWN_OBJECT, w.into_bytes());
+
+        let object = parse_spawn_object(&packet).expect("short velocity tail");
+        assert_eq!(object.entity_id, 9);
+        assert_eq!(object.velocity, [0.0; 3]);
     }
 
     #[test]
