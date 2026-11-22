@@ -81,6 +81,19 @@ pub fn record_mesh_build_time(started_at: Instant, duration: Duration) {
     recorder.record_stage_span("initial_mesh_build", started_at, started_at + duration);
 }
 
+/// Record the three CPU phases the frame loop already times for its profiler
+/// overlay: UI building, mesh/upload submission, and the renderer's draw call.
+pub fn record_frame_phases(ui: Duration, mesh: Duration, draw: Duration) {
+    if !enabled() {
+        return;
+    }
+
+    let mut recorder = lock_recorder();
+    recorder.phase_ui.record(ui);
+    recorder.phase_mesh.record(mesh);
+    recorder.phase_draw.record(draw);
+}
+
 /// Record a synchronous chunk upload and its duration.
 pub fn record_chunk_upload(started_at: Instant, duration: Duration) {
     if !enabled() {
@@ -148,6 +161,9 @@ struct Recorder {
     window: u64,
     frame_intervals: Histogram,
     mesh_builds: Histogram,
+    phase_ui: Histogram,
+    phase_mesh: Histogram,
+    phase_draw: Histogram,
     frame_over_budget: u64,
     chunk_uploads: u64,
     chunk_upload_total: Duration,
@@ -163,6 +179,9 @@ impl Recorder {
             window: 0,
             frame_intervals: Histogram::new(),
             mesh_builds: Histogram::new(),
+            phase_ui: Histogram::new(),
+            phase_mesh: Histogram::new(),
+            phase_draw: Histogram::new(),
             frame_over_budget: 0,
             chunk_uploads: 0,
             chunk_upload_total: Duration::ZERO,
@@ -195,6 +214,9 @@ impl Recorder {
         let report = self.snapshot(now);
         self.frame_intervals.clear();
         self.mesh_builds.clear();
+        self.phase_ui.clear();
+        self.phase_mesh.clear();
+        self.phase_draw.clear();
         self.frame_over_budget = 0;
         self.chunk_uploads = 0;
         self.chunk_upload_total = Duration::ZERO;
@@ -239,6 +261,13 @@ impl Recorder {
             mesh_build_over_100ms: self.mesh_builds.over_max_count(),
             chunk_uploads: self.chunk_uploads,
             chunk_upload_total_ms: self.chunk_upload_total.as_secs_f64() * 1000.0,
+            phase_samples: self.phase_ui.samples,
+            ui_p50_ms: duration_ms(self.phase_ui.percentile_upper_ns(50)),
+            ui_p99_ms: duration_ms(self.phase_ui.percentile_upper_ns(99)),
+            mesh_p50_ms: duration_ms(self.phase_mesh.percentile_upper_ns(50)),
+            mesh_p99_ms: duration_ms(self.phase_mesh.percentile_upper_ns(99)),
+            draw_p50_ms: duration_ms(self.phase_draw.percentile_upper_ns(50)),
+            draw_p99_ms: duration_ms(self.phase_draw.percentile_upper_ns(99)),
             startup: (self.window == 0).then(|| self.startup_summary()),
         }
     }
@@ -400,6 +429,14 @@ struct WindowReport {
     mesh_build_over_100ms: u64,
     chunk_uploads: u64,
     chunk_upload_total_ms: f64,
+    /// Frames that reported a UI/mesh/draw phase split.
+    phase_samples: u64,
+    ui_p50_ms: Option<f64>,
+    ui_p99_ms: Option<f64>,
+    mesh_p50_ms: Option<f64>,
+    mesh_p99_ms: Option<f64>,
+    draw_p50_ms: Option<f64>,
+    draw_p99_ms: Option<f64>,
     startup: Option<StartupSummary>,
 }
 
@@ -440,7 +477,9 @@ impl WindowReport {
              frame_ms_p99={} budget_60fps_ms={:.3} frame_over_budget={} \
              frame_over_100ms={} p99_budget={} mesh_build_samples={} \
              mesh_build_ms_p50={} mesh_build_ms_p99={} chunk_uploads={} \
-             chunk_upload_total_ms={:.3} histogram_bucket_us=10",
+             chunk_upload_total_ms={:.3} phase_samples={} ui_ms_p50={} ui_ms_p99={} \
+             mesh_ms_p50={} mesh_ms_p99={} draw_ms_p50={} draw_ms_p99={} \
+             histogram_bucket_us=10",
             self.window,
             self.elapsed_s,
             self.frame_samples,
@@ -455,6 +494,13 @@ impl WindowReport {
             format_ms(self.mesh_build_p99_ms),
             self.chunk_uploads,
             self.chunk_upload_total_ms,
+            self.phase_samples,
+            format_ms(self.ui_p50_ms),
+            format_ms(self.ui_p99_ms),
+            format_ms(self.mesh_p50_ms),
+            format_ms(self.mesh_p99_ms),
+            format_ms(self.draw_p50_ms),
+            format_ms(self.draw_p99_ms),
         );
 
         if json_enabled() {

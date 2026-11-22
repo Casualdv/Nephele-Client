@@ -75,7 +75,13 @@ $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $jsonRequested = $Json -or ($RemainingArguments -contains '--json')
 
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-. 'C:\Users\dariu\AppData\Local\Temp\opencode\cargo-env.ps1'
+# Optional machine-local cargo environment (MSVC/vcvars shims, extra PATH). It
+# used to be dot-sourced unconditionally, which made this script fail on any
+# machine that did not happen to have that temp file.
+$cargoEnv = Join-Path $env:TEMP 'opencode\cargo-env.ps1'
+if (Test-Path -LiteralPath $cargoEnv -PathType Leaf) {
+    . $cargoEnv
+}
 
 if (-not $SkipBuild) {
     $buildArgs = @(
@@ -259,6 +265,10 @@ public static class NephelePerfWindow {
     if ($chunkUploads -eq 0) {
         throw "The measurement reports no chunk uploads in any window."
     }
+    $phaseSamples = ($windows | Measure-Object -Property phase_samples -Sum).Sum
+    if ($phaseSamples -eq 0) {
+        throw "The measurement reports no per-frame UI/mesh/draw phase samples."
+    }
 
     function Format-Ms($value) {
         if ($null -eq $value) { return 'n/a' }
@@ -292,6 +302,22 @@ public static class NephelePerfWindow {
             $window.chunk_uploads,
             [double]$window.chunk_upload_total_ms,
             (Format-Budget $window.p99_within_budget))
+    }
+
+    Write-Host ''
+    Write-Host 'Per-frame CPU phases (ms, upper bucket bound):'
+    Write-Host ('{0,6} {1,9} {2,9} {3,9} {4,9} {5,9} {6,9} {7,9}' -f
+        'window', 'ui_p50', 'ui_p99', 'mesh_p50', 'mesh_p99', 'draw_p50', 'draw_p99', 'samples')
+    foreach ($window in $windows) {
+        Write-Host ('{0,6} {1,9} {2,9} {3,9} {4,9} {5,9} {6,9} {7,9}' -f
+            $window.window,
+            (Format-Ms $window.ui_p50_ms),
+            (Format-Ms $window.ui_p99_ms),
+            (Format-Ms $window.mesh_p50_ms),
+            (Format-Ms $window.mesh_p99_ms),
+            (Format-Ms $window.draw_p50_ms),
+            (Format-Ms $window.draw_p99_ms),
+            $window.phase_samples)
     }
 
     Write-Host ''

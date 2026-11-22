@@ -547,8 +547,13 @@ or protocol changes**.
   ~0.55 s whenever health drops.
 - **Measured.** `scripts/measure_perf.ps1` on the integrated AMD Radeon
   (Ryzen 5 7535HS), 1280×720, view distance 8, vsync off:
-  frame p50 `6.960 ms`, p99 `7.410 ms`, 0 frames over the 16.667 ms budget,
-  ~143 fps. A separate real-asset 30 s local-world run measured p99 `12.880 ms`.
+  frame p50 `1.96 ms`, p99 `3.64 ms` (~510 fps), 0 frames over the 16.667 ms
+  budget. **The earlier "p50 6.960 / p99 7.410 ms, ~143 fps" figure was the
+  144 Hz panel, not the renderer**: `apply_settings()` was never called at
+  startup, so `set_vsync` never ran and the surface stayed `Fifo` even with
+  `NEPHELE_VSYNC=0`. View distance 2 and 8 both reported 6.96 ms, which is what
+  exposed it. The committed baseline is now a view-distance-8 run (289 columns)
+  with the per-phase split.
   The normal-world screenshot checked during this pass is
   `C:\Users\dariu\AppData\Local\Temp\opencode\p1-final-world.png`.
 
@@ -828,7 +833,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, options tree with a live Video Settings page, `keybinds.rs` (26 actions, click-to-rebind, conflict handling); tab list, boss bar, titles and the loading screen still open |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
 | `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
-| `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
+| `perf` | startup, view distance, baseline gate | `perf` | 100%, baseline re-measured 2026-11-22 (was vsync-locked); needs merge |
 | `audio` | everything sound | `audio` | **merged** - `nephele-audio` (symphonia + kira), break/place/step/hurt wired; music, mob sounds and the fifth volume bus still open |
 | `product` | launcher v2, updater, installer, legal | `saves-landing` (WIP commit) | 25%, blocked on code signing |
 
@@ -1059,8 +1064,19 @@ are opt-in behind `NEPHELE_PERF=1`, with a reproducible run via
 **Pillar 1 renderer polish landed 2026-11-03** (branch `p1-render`): animated
 `.mcmeta` textures, mipmapped block filtering, procedural sky (sun/moon/stars/
 clouds), per-biome fog, conservative height-field occlusion culling, the
-per-frame chunk upload budget and the damage vignette. Measured p99 on the
-integrated Radeon is 7.41 ms at 1280×720 / view distance 8 with vsync off.
+per-frame chunk upload budget and the damage vignette.
+
+**Performance gate re-measured 2026-11-22** (branch `perf-remeasure`). The old
+"p99 7.41 ms at view distance 8 with vsync off" was the 144 Hz panel: the
+surface stayed `Fifo` because `apply_settings()` (the only caller of
+`set_vsync`) never ran at startup, and the run was identical at view distance 2
+and 8. With that fixed, view distance 8 is **p50 1.96 ms / p99 3.64 ms**, and
+the per-frame split is **draw 1.80 / ui 0.05 / mesh 0.01 ms** - the renderer is
+draw-bound, as expected. The sky pass is now drawn *last* at the far plane with
+`LessEqual`, so terrain depth rejects its pixels instead of shading the whole
+frame first (draw p50 2.22 -> 1.80 ms). `scripts/measure_perf.ps1` prints and
+validates the three phases, and `scripts/perf-baseline.json` is a view-distance-8
+run with them.
 
 **Open:**
 

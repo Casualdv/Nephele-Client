@@ -24,7 +24,10 @@ fn vs_sky(@builtin(vertex_index) index: u32) -> SkyOut {
     );
     var out: SkyOut;
     out.ndc = positions[index];
-    out.clip_position = vec4<f32>(positions[index], 0.0, 1.0);
+    // Depth 1.0 (the far plane) so the sky can be drawn *after* the world with
+    // `LessEqual`: it then only shades pixels no geometry has written, instead
+    // of every pixel of the frame.
+    out.clip_position = vec4<f32>(positions[index], 1.0, 1.0);
     return out;
 }
 

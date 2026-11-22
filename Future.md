@@ -93,9 +93,9 @@ tinting, frustum + height-field occlusion culling, a per-frame upload budget,
 damage vignette, **scoreboards + teams + chat**, **maps, item frames and entity
 metadata**, players with head yaw and armour-stand holograms, **audio** (symphonia
 decode, kira mixing, break/place/step/hurt), launcher, CI, verified-resource
-preparation. Performance: 143 fps / p99 7.4 ms on integrated AMD at 1280×720,
-view distance 8, vsync off, with a committed baseline that fails the build on
-regression.
+preparation. Performance: **p50 1.96 ms / p99 3.64 ms (≈510 fps)** on integrated
+AMD at 1280×720, view distance 8, vsync off (draw 1.80 / ui 0.05 / mesh 0.01 ms),
+with a committed baseline that fails the build on regression.
 
 Measured parity against a world the real 1.8.9 server generated: **100%** of
 biome cells (0 / 160,000, seed 12345, 625 chunks — every GenLayer stage diff 0),

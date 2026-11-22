@@ -2183,6 +2183,12 @@ impl LiveApp {
         renderer.set_skins(&self.skin_atlas);
         perf::record_stage_span("texture_atlas_upload", skin_upload_start, Instant::now());
         self.renderer = Some(renderer);
+        // Push the loaded settings into the renderer once: `set_vsync` is what
+        // switches the surface out of `Fifo`, and nothing else calls
+        // `apply_settings` until the player touches the options screen. Without
+        // this a saved "vsync off" (or `NEPHELE_VSYNC=0`) was ignored and the
+        // client stayed locked to the display refresh.
+        self.apply_settings();
     }
 
     fn set_mouse_capture(&mut self, captured: bool) {
@@ -2899,7 +2905,8 @@ impl LiveApp {
                 }
             }
         }
-        self.prof_mesh += mesh_start.elapsed().as_secs_f32() * 1000.0;
+        let mesh_elapsed = mesh_start.elapsed();
+        self.prof_mesh += mesh_elapsed.as_secs_f32() * 1000.0;
 
         self.update_skins();
         self.draw_entities(&view);
@@ -2914,7 +2921,8 @@ impl LiveApp {
             view.alpha as f32,
         );
         self.draw_ui(&view);
-        self.prof_ui += ui_start.elapsed().as_secs_f32() * 1000.0;
+        let ui_elapsed = ui_start.elapsed();
+        self.prof_ui += ui_elapsed.as_secs_f32() * 1000.0;
 
         // The title screen orbits a camera inside the panorama cube.
         let mut camera = view.camera.clone();
@@ -2979,8 +2987,9 @@ impl LiveApp {
         if first_frame {
             perf::record_stage_span("first_frame_pipeline_creation", draw_start, Instant::now());
         }
-        self.prof_draw += draw_start.elapsed().as_secs_f32() * 1000.0;
-
+        let draw_elapsed = draw_start.elapsed();
+        self.prof_draw += draw_elapsed.as_secs_f32() * 1000.0;
+        perf::record_frame_phases(ui_elapsed, mesh_elapsed, draw_elapsed);
         if presented {
             self.frames += 1;
         }

@@ -313,7 +313,16 @@ impl Renderer {
 
         let block_textures =
             create_block_texture_array(&device, &queue, textures, startup_origin, &mut startup);
-        let texture_view = block_textures.create_view(&wgpu::TextureViewDescriptor::default());
+        // `default()` picks the view dimension from the layer count, so a
+        // texture set that packs into a single layer (a small resource pack, or
+        // the perf harness's one-texture world) would produce a `D2` view that
+        // the `D2Array` bind-group layout rejects. Ask for the array
+        // explicitly: the shader always samples a layer index.
+        let texture_view = block_textures.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("block texture array view"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         let (animation_texture, animation_view) =
             create_animation_texture(&device, &queue, textures);
         // Vanilla uses nearest magnification and linear mip transitions.
@@ -518,7 +527,8 @@ impl Renderer {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
+                // Drawn last, at the far plane: only untouched pixels pass.
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -1519,13 +1529,8 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            // The sky is a cheap full-screen ray shader. It writes no depth,
-            // so terrain drawn afterwards still works normally.
-            if !self.show_panorama {
-                pass.set_pipeline(&self.sky_pipeline);
-                pass.set_bind_group(0, &self.sky_bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
+            // The sky is drawn after the opaque world (see below, after the
+            // entity pass) so terrain depth rejects most of its pixels.
 
             // Title screen: a six-faced panorama cube instead of the world.
             if self.show_panorama {
@@ -1617,6 +1622,16 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.entity_vertices.slice(..));
                 pass.set_index_buffer(self.entity_indices.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.entity_index_count, 0, 0..1);
+            }
+
+            // Sky last, at the far plane with `LessEqual`: every pixel the
+            // world already covers fails the depth test, so only the visible
+            // sky is shaded. Must come before the blended passes (beams,
+            // overlay, lines, UI) that expect the sky behind them.
+            if !self.show_panorama {
+                pass.set_pipeline(&self.sky_pipeline);
+                pass.set_bind_group(0, &self.sky_bind_group, &[]);
+                pass.draw(0..3, 0..1);
             }
 
             // Beams add light on top of whatever is behind them, depth-tested
