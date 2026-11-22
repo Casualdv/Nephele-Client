@@ -71,6 +71,14 @@ pub mod sheets {
     pub const FURNACE: SpriteRect = SpriteRect::new(512, 512, 256, 256);
     /// `textures/gui/container/generic_54.png` - the chest panel.
     pub const CHEST: SpriteRect = SpriteRect::new(768, 512, 256, 256);
+    /// `textures/gui/container/hopper.png` - five slots and a player block.
+    pub const HOPPER: SpriteRect = SpriteRect::new(0, 768, 256, 256);
+    /// `textures/gui/container/dispenser.png` - the 3x3 dispenser panel.
+    pub const DISPENSER: SpriteRect = SpriteRect::new(256, 768, 256, 256);
+    /// `textures/gui/container/beacon.png` - the 230x219 beacon panel.
+    pub const BEACON: SpriteRect = SpriteRect::new(512, 768, 256, 256);
+    /// `textures/gui/container/anvil.png` - the repair panel.
+    pub const ANVIL: SpriteRect = SpriteRect::new(768, 768, 256, 256);
 }
 
 /// Individual sprites, in the coordinates vanilla's GUI classes use.
@@ -117,6 +125,24 @@ pub mod sprites {
     /// Empty/full versions of the arrow and flame, so progress can be clipped.
     pub const FURNACE_ARROW_BACKGROUND: SpriteRect = sheets::FURNACE.sub(176, 30, 24, 16);
     pub const FURNACE_FLAME_BACKGROUND: SpriteRect = sheets::FURNACE.sub(176, 46, 14, 14);
+
+    /// The 18x18 slot frame: dark top/left, `8B8B8B` fill, white right/bottom.
+    ///
+    /// Measured at `(7, 83)` in **`inventory.png`**, which is where the first
+    /// slot of the player storage block sits. `widgets.png` has no slot sprite
+    /// in 1.8.9 — its `(7, 83)` lands inside the hovered-button art — so the
+    /// frame is taken from the container sheet and drawn under every slot.
+    pub const SLOT: SpriteRect = sheets::INVENTORY.sub(7, 83, 18, 18);
+
+    /// The drawn part of the hopper, dispenser, beacon and anvil panels.
+    ///
+    /// `hopper.png` is 176x133 (`GuiHopper`), `beacon.png` is 230x219
+    /// (`GuiBeacon`), and dispenser/anvil are the usual 176x166. The rest of
+    /// each 256x256 sheet is unused or holds other art.
+    pub const HOPPER_PANEL: SpriteRect = sheets::HOPPER.sub(0, 0, 176, 133);
+    pub const DISPENSER_PANEL: SpriteRect = sheets::DISPENSER.sub(0, 0, 176, 166);
+    pub const BEACON_PANEL: SpriteRect = sheets::BEACON.sub(0, 0, 230, 219);
+    pub const ANVIL_PANEL: SpriteRect = sheets::ANVIL.sub(0, 0, 176, 166);
 }
 
 /// Bitmap font metrics for `ascii.png`.
@@ -217,6 +243,10 @@ impl UiAtlas {
             (sheets::CRAFTING_TABLE, "gui/container/crafting_table.png"),
             (sheets::FURNACE, "gui/container/furnace.png"),
             (sheets::CHEST, "gui/container/generic_54.png"),
+            (sheets::HOPPER, "gui/container/hopper.png"),
+            (sheets::DISPENSER, "gui/container/dispenser.png"),
+            (sheets::BEACON, "gui/container/beacon.png"),
+            (sheets::ANVIL, "gui/container/anvil.png"),
         ] {
             let full = textures_dir.join(path);
             if !full.is_file() {
@@ -271,7 +301,10 @@ impl UiAtlas {
 }
 
 /// The 1x1 white texel, tucked into unused atlas space.
-const WHITE: SpriteRect = SpriteRect::new(1020, 1020, 1, 1);
+///
+/// It must sit outside every sheet rectangle; `(0, 511)` is the gap between the
+/// icons/widgets band and the container row, and nothing else claims it.
+const WHITE: SpriteRect = SpriteRect::new(0, 511, 1, 1);
 
 fn blit(dest: &mut RgbaImage, src: &RgbaImage, x: u32, y: u32) {
     for sy in 0..src.height() {
@@ -330,6 +363,107 @@ mod tests {
         // The hunger row must not read the heart row: they are 27 pixels apart.
         assert_eq!(sprites::HEART_FULL.y + 27, sprites::FOOD_FULL.y);
         assert_ne!(sprites::HEART_FULL, sprites::FOOD_FULL);
+    }
+
+    #[test]
+    fn every_sheet_fits_and_no_two_overlap() {
+        // A sheet blitted on top of another silently corrupts both, so the
+        // layout is pinned rather than eyeballed.
+        let sheets = [
+            sheets::FONT,
+            sheets::ICONS,
+            sheets::WIDGETS,
+            sheets::LOGO,
+            sheets::OPTIONS_BACKGROUND,
+            sheets::INVENTORY,
+            sheets::CRAFTING_TABLE,
+            sheets::FURNACE,
+            sheets::CHEST,
+            sheets::HOPPER,
+            sheets::DISPENSER,
+            sheets::BEACON,
+            sheets::ANVIL,
+        ];
+        for sheet in sheets {
+            assert!(
+                sheet.x + sheet.w <= ATLAS_SIZE,
+                "{sheet:?} runs off the atlas"
+            );
+            assert!(
+                sheet.y + sheet.h <= ATLAS_SIZE,
+                "{sheet:?} runs off the atlas"
+            );
+        }
+        for (i, a) in sheets.iter().enumerate() {
+            for b in &sheets[i + 1..] {
+                let overlaps =
+                    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+                assert!(!overlaps, "{a:?} overlaps {b:?}");
+            }
+        }
+        // The white texel is written after every blit, so it must also sit in a
+        // hole rather than inside a sheet.
+        let contains = |sheet: SpriteRect, x: u32, y: u32| -> bool {
+            (x as i64) >= (sheet.x as i64)
+                && (x as i64) < (sheet.x as i64 + sheet.w as i64)
+                && (y as i64) >= (sheet.y as i64)
+                && (y as i64) < (sheet.y as i64 + sheet.h as i64)
+        };
+        for sheet in sheets {
+            assert!(
+                !contains(sheet, WHITE.x, WHITE.y),
+                "the white texel sits inside {sheet:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_slot_frame_is_the_measured_inventory_rectangle() {
+        // Measured in `inventory.png`: the first storage slot's frame starts at
+        // (7, 83) and its item cell at (8, 84), which is exactly what
+        // `ui::inventory_slot_origin(9)` returns.
+        assert_eq!(sprites::SLOT, SpriteRect::new(7, 512 + 83, 18, 18));
+        assert_eq!(sprites::SLOT.w, 18);
+        assert_eq!(sprites::SLOT.h, 18);
+    }
+
+    #[test]
+    fn container_panels_use_the_vanilla_window_sizes() {
+        assert_eq!(
+            (sprites::INVENTORY_PANEL.w, sprites::INVENTORY_PANEL.h),
+            (176, 166)
+        );
+        assert_eq!(
+            (
+                sprites::CRAFTING_TABLE_PANEL.w,
+                sprites::CRAFTING_TABLE_PANEL.h
+            ),
+            (176, 166)
+        );
+        assert_eq!(
+            (sprites::FURNACE_PANEL.w, sprites::FURNACE_PANEL.h),
+            (176, 166)
+        );
+        assert_eq!(
+            (sprites::DISPENSER_PANEL.w, sprites::DISPENSER_PANEL.h),
+            (176, 166)
+        );
+        assert_eq!((sprites::ANVIL_PANEL.w, sprites::ANVIL_PANEL.h), (176, 166));
+        // `GuiHopper` and `GuiBeacon` are their own sizes.
+        assert_eq!(
+            (sprites::HOPPER_PANEL.w, sprites::HOPPER_PANEL.h),
+            (176, 133)
+        );
+        assert_eq!(
+            (sprites::BEACON_PANEL.w, sprites::BEACON_PANEL.h),
+            (230, 219)
+        );
+        // The chest sheet holds six rows plus the shared player section.
+        assert_eq!((sprites::CHEST_TOP.w, sprites::CHEST_TOP.h), (176, 125));
+        assert_eq!(
+            (sprites::CHEST_BOTTOM.w, sprites::CHEST_BOTTOM.h),
+            (176, 96)
+        );
     }
 
     #[test]

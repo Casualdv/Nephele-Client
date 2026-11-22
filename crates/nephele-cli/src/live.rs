@@ -361,16 +361,21 @@ fn open_local_chest(state: &mut Shared, pos: (i32, i32, i32)) {
 /// six-row Game Menu, and sizes them `1 + rows*9 + 36`.
 fn window_kind_for(open: &OpenWindowState) -> ContainerKind {
     let name = open.kind.rsplit(':').next().unwrap_or(&open.kind);
-    match name {
-        "furnace" => ContainerKind::Furnace,
-        "crafting_table" => ContainerKind::CraftingTable,
-        _ => {
-            let layout = open.container_layout();
-            ContainerKind::Chest {
-                rows: layout.rows,
-                header: layout.header,
-            }
+    if let Some(kind) = ContainerKind::from_window_type(name) {
+        // Only trust a fixed-grid panel when the announced count fits it: a
+        // server can send any slot count under any type string, and drawing
+        // slots where no click reports them breaks the click mapping.
+        if kind
+            .expected_slots()
+            .is_none_or(|slots| slots == open.slot_count as usize)
+        {
+            return kind;
         }
+    }
+    let layout = open.container_layout();
+    ContainerKind::Chest {
+        rows: layout.rows,
+        header: layout.header,
     }
 }
 
@@ -399,6 +404,12 @@ fn simple_window_slot(index: usize, kind: ContainerKind) -> Option<SlotStore> {
             }
         }
         ContainerKind::CraftingTable => None,
+        // Server-only panels: there is no local block entity for them, so a
+        // click goes through `C0E` and never through this path.
+        ContainerKind::Hopper
+        | ContainerKind::Dispenser
+        | ContainerKind::Anvil
+        | ContainerKind::Beacon => None,
     }
 }
 
@@ -5657,6 +5668,37 @@ mod tests {
             ContainerKind::Chest {
                 rows: 3,
                 header: true
+            }
+        );
+
+        // A fixed-grid panel is used only when the announced count is the size
+        // its art lays out; otherwise the click mapping would not match.
+        assert_eq!(
+            window_kind_for(&window("minecraft:hopper", 41)),
+            ContainerKind::Hopper
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:dispenser", 45)),
+            ContainerKind::Dispenser
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:dropper", 45)),
+            ContainerKind::Dispenser
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:anvil", 39)),
+            ContainerKind::Anvil
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:beacon", 37)),
+            ContainerKind::Beacon
+        );
+        // Same type, wrong size: fall back to the generic chest panel.
+        assert_eq!(
+            window_kind_for(&window("minecraft:hopper", 63)),
+            ContainerKind::Chest {
+                rows: 3,
+                header: false
             }
         );
     }

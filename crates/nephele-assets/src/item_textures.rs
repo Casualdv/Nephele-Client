@@ -319,6 +319,63 @@ mod tests {
     }
 
     #[test]
+    fn every_item_id_resolves_and_reports_the_fallbacks() {
+        // The item table is the equivalent of a card list: every id the game
+        // can put in a slot must resolve to a sprite. Ids below 256 are block
+        // items and draw through the block face table, so the item map only has
+        // to cover 256..=425 and the records.
+        let mut fallbacks = Vec::new();
+        let mut total = 0usize;
+        for id in FIRST_ITEM_ID..=LAST_ITEM_ID {
+            total += 1;
+            let met_any = (0i16..=15).any(|meta| item_texture_name(id, meta).is_some());
+            if !met_any {
+                fallbacks.push(id);
+            }
+        }
+        for id in FIRST_RECORD_ID..=LAST_RECORD_ID {
+            total += 1;
+            if item_texture_name(id, 0).is_none() {
+                fallbacks.push(id);
+            }
+        }
+
+        // Exactly one id has no sprite anywhere in the jar. Anything else is a
+        // regression.
+        assert_eq!(fallbacks, vec![397], "unexpected icon fallbacks");
+        eprintln!(
+            "item icons: {}/{} ids resolve, {} falls back ({:?})",
+            total - fallbacks.len(),
+            total,
+            fallbacks.len(),
+            fallbacks
+        );
+    }
+
+    #[test]
+    fn every_mapped_item_sprite_exists_in_the_prepared_jar() {
+        let Some(minecraft) = crate::test_support::minecraft() else {
+            return;
+        };
+        let items = minecraft.join("textures/items");
+        let mut missing = Vec::new();
+        let mut checked = 0usize;
+        for (key, file) in all_item_texture_layers() {
+            checked += 1;
+            if !items.join(format!("{file}.png")).is_file() {
+                missing.push(key);
+            }
+        }
+        assert!(checked > 150, "the table should map most of the item set");
+        assert!(
+            missing.is_empty(),
+            "{} mapped item sprites are absent from the jar: {:?}",
+            missing.len(),
+            missing
+        );
+    }
+
+    #[test]
     fn every_crafting_recipe_output_has_a_sprite() {
         use crate::block_textures::face_textures;
         use nephele_world::BlockState;

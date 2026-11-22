@@ -14,6 +14,15 @@ const MAX_STACK: i16 = 64;
 pub enum ContainerKind {
     CraftingTable,
     Furnace,
+    /// A hopper: five slots in one row, then the player's 36.
+    Hopper,
+    /// A dispenser/dropper: nine slots in a 3x3 block, then the player's 36.
+    Dispenser,
+    /// An anvil: two inputs plus the output, then the player's 36.
+    Anvil,
+    /// A beacon: one payment slot, then a 9-wide player grid at a 230-wide
+    /// panel. Only reachable from a server window.
+    Beacon,
     /// A generic server-driven container, drawn with `generic_54`: `rows` rows
     /// of nine grid slots above the player's 36. When `header` is set, slot 0
     /// is a leading slot drawn in the title band and the grid starts at slot 1
@@ -23,6 +32,41 @@ pub enum ContainerKind {
         rows: u8,
         header: bool,
     },
+}
+
+impl ContainerKind {
+    /// A server window type, without the namespaced prefix.
+    ///
+    /// Hypixel sends `minecraft:chest` for every menu and sizes it with the
+    /// slot count, so only the types whose *panel art* differs are listed here;
+    /// everything else falls through to [`ContainerKind::Chest`].
+    pub fn from_window_type(name: &str) -> Option<Self> {
+        Some(match name {
+            "furnace" => Self::Furnace,
+            "crafting_table" => Self::CraftingTable,
+            "hopper" => Self::Hopper,
+            "dispenser" | "dropper" => Self::Dispenser,
+            "anvil" => Self::Anvil,
+            "beacon" => Self::Beacon,
+            _ => return None,
+        })
+    }
+
+    /// Slot count (container + the player's 36) the panel art lays out, for the
+    /// panels whose grid is fixed.
+    ///
+    /// A server may send any slot count under any type string, so the art is
+    /// only safe to use when the count matches it; otherwise the slots would
+    /// be drawn somewhere no click reports them.
+    pub fn expected_slots(self) -> Option<usize> {
+        Some(match self {
+            Self::Hopper => 5 + 36,
+            Self::Dispenser => 9 + 36,
+            Self::Anvil => 3 + 36,
+            Self::Beacon => 1 + 36,
+            _ => return None,
+        })
+    }
 }
 
 /// How a generic server window is laid out, derived from `S2D`'s slot count.

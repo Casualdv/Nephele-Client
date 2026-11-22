@@ -32,7 +32,7 @@ const SHADOW_PANEL: [f32; 4] = [0.0, 0.0, 0.0, 0.55];
 const BUTTON_BORDER: [f32; 4] = [0.05, 0.05, 0.05, 1.0];
 const PANEL: [f32; 4] = [0.16, 0.16, 0.16, 0.96];
 const SLOT_BG: [f32; 4] = [0.35, 0.35, 0.35, 1.0];
-const SLOT_HOVER: [f32; 4] = [0.55, 0.55, 0.55, 1.0];
+const SLOT_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 0.5];
 const ROW: [f32; 4] = [0.18, 0.18, 0.18, 1.0];
 const ROW_ALT: [f32; 4] = [0.15, 0.15, 0.15, 1.0];
 const ROW_HOVER: [f32; 4] = [0.30, 0.30, 0.30, 1.0];
@@ -2011,24 +2011,26 @@ fn inventory_panel(scale: f32, width: f32, height: f32) -> Rect {
     )
 }
 
-/// Height of a container panel in GUI pixels.
+/// Width and height of a container panel in GUI pixels, per window kind.
 ///
-/// Vanilla's `GuiChest` sizes itself `114 + rows * 18`, so a six-row chest is
-/// 222 tall while the player inventory and the furnace panels stay at 166.
-pub fn container_panel_height(kind: Option<ContainerKind>) -> f32 {
+/// Vanilla sizes each GUI separately: `GuiChest` is `114 + rows * 18`,
+/// `GuiHopper` is 176x133, `GuiBeacon` is 230x219, and the rest are 176x166.
+pub fn container_panel_size(kind: Option<ContainerKind>) -> [f32; 2] {
     match kind {
-        Some(ContainerKind::Chest { rows, .. }) => 114.0 + rows as f32 * 18.0,
-        _ => INVENTORY_PANEL_H,
+        Some(ContainerKind::Chest { rows, .. }) => [INVENTORY_PANEL_W, 114.0 + rows as f32 * 18.0],
+        Some(ContainerKind::Hopper) => [176.0, 133.0],
+        Some(ContainerKind::Beacon) => [230.0, 219.0],
+        _ => [INVENTORY_PANEL_W, INVENTORY_PANEL_H],
     }
 }
 
 /// The panel rect for whatever window is open, centred on the screen.
 fn container_panel(kind: Option<ContainerKind>, scale: f32, width: f32, height: f32) -> Rect {
-    let panel_h = container_panel_height(kind);
+    let [panel_w, panel_h] = container_panel_size(kind);
     Rect::new(
-        width / 2.0 - INVENTORY_PANEL_W * scale / 2.0,
+        width / 2.0 - panel_w * scale / 2.0,
         height / 2.0 - panel_h * scale / 2.0,
-        INVENTORY_PANEL_W * scale,
+        panel_w * scale,
         panel_h * scale,
     )
 }
@@ -2212,6 +2214,32 @@ pub fn window_slot_origin(slot: usize, kind: Option<ContainerKind>) -> Option<[f
             3..=38 => player_slot_origin(slot - 3)?,
             _ => return None,
         }),
+        Some(ContainerKind::Hopper) => Some(match slot {
+            0..=4 => [44.0 + slot as f32 * 18.0, 20.0],
+            5..=40 => player_slot_origin_at(slot - 5, 8.0, 51.0, 109.0)?,
+            _ => return None,
+        }),
+        Some(ContainerKind::Dispenser) => Some(match slot {
+            0..=8 => [
+                62.0 + (slot % 3) as f32 * 18.0,
+                17.0 + (slot / 3) as f32 * 18.0,
+            ],
+            9..=44 => player_slot_origin(slot - 9)?,
+            _ => return None,
+        }),
+        Some(ContainerKind::Anvil) => Some(match slot {
+            0 => [27.0, 47.0],
+            1 => [76.0, 47.0],
+            2 => [134.0, 47.0],
+            3..=38 => player_slot_origin(slot - 3)?,
+            _ => return None,
+        }),
+        Some(ContainerKind::Beacon) => Some(match slot {
+            0 => [136.0, 110.0],
+            // `GuiBeacon`'s player block is inset to x=36 and starts at y=137.
+            1..=37 => player_slot_origin_at(slot - 1, 36.0, 137.0, 195.0)?,
+            _ => return None,
+        }),
         Some(ContainerKind::Chest { rows, header }) => {
             let header = usize::from(header);
             let grid = rows as usize * 9;
@@ -2262,12 +2290,17 @@ fn chest_player_slot_origin(slot: usize, rows: u8) -> Option<[f32; 2]> {
 
 /// Top-left of one of the 36 player slots: three storage rows then the hotbar.
 fn player_slot_origin(slot: usize) -> Option<[f32; 2]> {
+    player_slot_origin_at(slot, 8.0, 84.0, 142.0)
+}
+
+/// The same 36-slot block, for the panels that inset or offset it.
+///
+/// `x0`/`y0` are the first storage slot's item cell and `hotbar_y` its hotbar
+/// row, all in GUI pixels and all measured from the sheet.
+fn player_slot_origin_at(slot: usize, x0: f32, y0: f32, hotbar_y: f32) -> Option<[f32; 2]> {
     Some(match slot {
-        0..=26 => [
-            8.0 + (slot % 9) as f32 * 18.0,
-            84.0 + (slot / 9) as f32 * 18.0,
-        ],
-        27..=35 => [8.0 + (slot - 27) as f32 * 18.0, 142.0],
+        0..=26 => [x0 + (slot % 9) as f32 * 18.0, y0 + (slot / 9) as f32 * 18.0],
+        27..=35 => [x0 + (slot - 27) as f32 * 18.0, hotbar_y],
         _ => return None,
     })
 }
@@ -2287,6 +2320,17 @@ pub fn window_slot_rect(
         SLOT_SIZE * scale,
         SLOT_SIZE * scale,
     ))
+}
+
+/// Whether a slot's frame is missing from the panel art and must be drawn.
+///
+/// Every sheet in `textures/gui/container` bakes the 18x18 frame in at the slot
+/// positions, so the UI blits the panel and puts only the item on top. The
+/// exception is the leading slot of a server window sized `1 + rows*9 + 36`
+/// (Hypixel's Game Menu, Ticket Market): it sits at `(8, 0)`, inside the
+/// panel's 17-pixel title band, where no sheet has a frame.
+fn slot_sits_outside_the_panel_art(slot: usize, kind: Option<ContainerKind>) -> bool {
+    matches!(kind, Some(ContainerKind::Chest { header: true, .. }) if slot == 0)
 }
 
 /// The furnace's flame and progress arrow, clipped to the smelting progress.
@@ -2354,11 +2398,19 @@ pub fn draw_inventory(
             window_slot_rect as fn(usize, Option<ContainerKind>, f32, f32, f32) -> Option<Rect>,
             match hud.window_kind {
                 Some(ContainerKind::Furnace) => "Furnace",
+                Some(ContainerKind::Hopper) => "Hopper",
+                Some(ContainerKind::Dispenser) => "Dispenser",
+                Some(ContainerKind::Anvil) => "Repair",
+                Some(ContainerKind::Beacon) => "Beacon",
                 Some(ContainerKind::Chest { .. }) => "Chest",
                 _ => "Crafting Table",
             },
             match hud.window_kind {
                 Some(ContainerKind::Furnace) => "Smelting",
+                Some(ContainerKind::Hopper) => "Transfer",
+                Some(ContainerKind::Dispenser) => "Container",
+                Some(ContainerKind::Anvil) => "Item repair",
+                Some(ContainerKind::Beacon) => "Power",
                 Some(ContainerKind::Chest { .. }) => "Storage",
                 _ => "Crafting",
             },
@@ -2372,11 +2424,25 @@ pub fn draw_inventory(
         ),
     };
 
-    // The jar's own panel art replaces the flat rectangle and its slot
-    // backgrounds; only the hover highlight and the items are drawn on top.
+    // Each window draws its own sheet's panel. The chest is the one cropped
+    // sheet: `generic_54` holds six rows plus one shared player section, so the
+    // top is clipped to `rows * 18 + 17` and the bottom is always `(0, 126,
+    // 176, 96)` — every chest shares the same player half.
     match hud.window_kind {
         Some(ContainerKind::Furnace) => {
             bg.sprite(sprites::FURNACE_PANEL, panel, TEXT);
+        }
+        Some(ContainerKind::Hopper) => {
+            bg.sprite(sprites::HOPPER_PANEL, panel, TEXT);
+        }
+        Some(ContainerKind::Dispenser) => {
+            bg.sprite(sprites::DISPENSER_PANEL, panel, TEXT);
+        }
+        Some(ContainerKind::Anvil) => {
+            bg.sprite(sprites::ANVIL_PANEL, panel, TEXT);
+        }
+        Some(ContainerKind::Beacon) => {
+            bg.sprite(sprites::BEACON_PANEL, panel, TEXT);
         }
         Some(ContainerKind::Chest { rows, .. }) => {
             // `GuiChest` blits the top at `(0, 0, 176, rows*18 + 17)` and the
@@ -2416,8 +2482,26 @@ pub fn draw_inventory(
         let Some(rect) = rect_of(slot, hud.window_kind, scale, width, height) else {
             continue;
         };
+        // Every panel sheet bakes its own slot frames in, so drawing the frame
+        // again would be pixel-identical at best and would corrupt a composite
+        // slot at worst (the crafting-table and anvil outputs are 26x26 art,
+        // not an 18x18 frame). The one slot no sheet covers is the title-band
+        // slot of a `1 + rows*9 + 36` server window, which sits in the panel's
+        // border — that one gets the jar's frame so it is clickable-looking.
+        if slot_sits_outside_the_panel_art(slot, hud.window_kind) {
+            bg.sprite(
+                sprites::SLOT,
+                Rect::new(rect.x - s(1.0), rect.y - s(1.0), s(18.0), s(18.0)),
+                TEXT,
+            );
+        }
         if hovered(hud.pointer, &rect) {
-            bg.rect(rect, SLOT_HOVER);
+            // `GuiContainer` washes the hovered slot with a 19x19 50% white
+            // rectangle, one pixel wider than the frame on each side.
+            bg.rect(
+                Rect::new(rect.x - s(1.0), rect.y - s(1.0), s(19.0), s(19.0)),
+                SLOT_HOVER,
+            );
         }
         if let Some(item) = slots.get(slot).copied().flatten() {
             let inner = Rect::new(rect.x + s(1.0), rect.y + s(1.0), s(16.0), s(16.0));
@@ -3960,9 +4044,9 @@ mod tests {
         assert_eq!(window_slot_origin(64, ticket), None);
 
         // The panel grows with the rows: `114 + rows * 18`.
-        assert_eq!(container_panel_height(six), 222.0);
-        assert_eq!(container_panel_height(three), 168.0);
-        assert_eq!(container_panel_height(ticket), 168.0);
+        assert_eq!(container_panel_size(six), [176.0, 222.0]);
+        assert_eq!(container_panel_size(three), [176.0, 168.0]);
+        assert_eq!(container_panel_size(ticket), [176.0, 168.0]);
 
         let (width, height, scale) = (1280.0, 720.0, 3.0);
         for (kind, slots) in [(six, 90), (ticket, 64)] {
@@ -3983,6 +4067,181 @@ mod tests {
                 rects.push(rect);
             }
         }
+    }
+
+    #[test]
+    fn hopper_dispenser_anvil_and_beacon_slots_match_their_sheets() {
+        // Every coordinate below was read off the prepared sheet by finding the
+        // 18x18 frame (dark top/left, white right/bottom, 8B8B8B fill), not
+        // copied from memory. The item cell is the frame plus one pixel.
+
+        // `GuiHopper`: five slots in a row at y=20, player block at 51/109.
+        let hopper = Some(ContainerKind::Hopper);
+        assert_eq!(window_slot_origin(0, hopper), Some([44.0, 20.0]));
+        assert_eq!(window_slot_origin(4, hopper), Some([116.0, 20.0]));
+        assert_eq!(window_slot_origin(5, hopper), Some([8.0, 51.0]));
+        assert_eq!(window_slot_origin(31, hopper), Some([152.0, 87.0]));
+        assert_eq!(window_slot_origin(32, hopper), Some([8.0, 109.0]));
+        assert_eq!(window_slot_origin(40, hopper), Some([152.0, 109.0]));
+        assert_eq!(window_slot_origin(41, hopper), None);
+        assert_eq!(container_panel_size(hopper), [176.0, 133.0]);
+
+        // `ContainerDispenser`: 3x3 at x=62, y=17, player at 84/142.
+        let dispenser = Some(ContainerKind::Dispenser);
+        assert_eq!(window_slot_origin(0, dispenser), Some([62.0, 17.0]));
+        assert_eq!(window_slot_origin(2, dispenser), Some([98.0, 17.0]));
+        assert_eq!(window_slot_origin(3, dispenser), Some([62.0, 35.0]));
+        assert_eq!(window_slot_origin(8, dispenser), Some([98.0, 53.0]));
+        assert_eq!(window_slot_origin(9, dispenser), Some([8.0, 84.0]));
+        assert_eq!(window_slot_origin(44, dispenser), Some([152.0, 142.0]));
+        assert_eq!(window_slot_origin(45, dispenser), None);
+        assert_eq!(container_panel_size(dispenser), [176.0, 166.0]);
+
+        // `GuiRepair`: input 27,47, second 76,47, output 134,47.
+        let anvil = Some(ContainerKind::Anvil);
+        assert_eq!(window_slot_origin(0, anvil), Some([27.0, 47.0]));
+        assert_eq!(window_slot_origin(1, anvil), Some([76.0, 47.0]));
+        assert_eq!(window_slot_origin(2, anvil), Some([134.0, 47.0]));
+        assert_eq!(window_slot_origin(3, anvil), Some([8.0, 84.0]));
+        assert_eq!(window_slot_origin(38, anvil), Some([152.0, 142.0]));
+        assert_eq!(window_slot_origin(39, anvil), None);
+        assert_eq!(container_panel_size(anvil), [176.0, 166.0]);
+
+        // `GuiBeacon`: one payment slot at 136,110, then a 9-wide player block
+        // inset to x=36 at y=137/155/173 with the hotbar at 195.
+        let beacon = Some(ContainerKind::Beacon);
+        assert_eq!(window_slot_origin(0, beacon), Some([136.0, 110.0]));
+        assert_eq!(window_slot_origin(1, beacon), Some([36.0, 137.0]));
+        assert_eq!(window_slot_origin(27, beacon), Some([180.0, 173.0]));
+        assert_eq!(window_slot_origin(28, beacon), Some([36.0, 195.0]));
+        assert_eq!(window_slot_origin(36, beacon), Some([180.0, 195.0]));
+        assert_eq!(window_slot_origin(37, beacon), None);
+        assert_eq!(container_panel_size(beacon), [230.0, 219.0]);
+    }
+
+    #[test]
+    fn every_window_kind_keeps_its_slots_inside_its_panel() {
+        let (width, height, scale) = (1280.0, 720.0, 3.0);
+        let kinds = [
+            (Some(ContainerKind::Hopper), 41),
+            (Some(ContainerKind::Dispenser), 45),
+            (Some(ContainerKind::Anvil), 39),
+            (Some(ContainerKind::Beacon), 37),
+        ];
+        for (kind, slots) in kinds {
+            let panel = container_panel(kind, scale, width, height);
+            let mut rects: Vec<Rect> = Vec::new();
+            for slot in 0..slots {
+                let rect = window_slot_rect(slot, kind, scale, width, height).expect("slot exists");
+                assert!(rect.x >= panel.x, "{kind:?} slot {slot} escapes left");
+                assert!(rect.y >= panel.y, "{kind:?} slot {slot} escapes up");
+                assert!(
+                    rect.x + rect.w <= panel.x + panel.w,
+                    "{kind:?} slot {slot} escapes right"
+                );
+                assert!(
+                    rect.y + rect.h <= panel.y + panel.h,
+                    "{kind:?} slot {slot} escapes down"
+                );
+                for other in &rects {
+                    let overlap = rect.x < other.x + other.w
+                        && other.x < rect.x + rect.w
+                        && rect.y < other.y + other.h
+                        && other.y < rect.y + rect.h;
+                    assert!(!overlap, "{kind:?} slots overlap");
+                }
+                rects.push(rect);
+            }
+            assert_eq!(rects.len(), slots, "{kind:?} reports every slot");
+        }
+    }
+
+    #[test]
+    fn each_window_draws_its_own_sheet_and_the_slot_sprite_fills_the_gap() {
+        let inventory = vec![None; 45];
+        let textures = TextureArray::from_tiles(vec![(
+            "missing".to_string(),
+            image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 255, 255])),
+        )]);
+        let quads_with = |batch: &UiBatch, uv: [f32; 4]| -> Vec<Rect> {
+            batch
+                .vertices
+                .chunks(4)
+                .filter(|quad| quad[0].uv == [uv[0], uv[1]] && quad[2].uv == [uv[2], uv[3]])
+                .map(|quad| {
+                    let x0 = quad[0].position[0].min(quad[2].position[0]);
+                    let y0 = quad[0].position[1].min(quad[2].position[1]);
+                    let x1 = quad[0].position[0].max(quad[2].position[0]);
+                    let y1 = quad[0].position[1].max(quad[2].position[1]);
+                    Rect::new(x0, y0, x1 - x0, y1 - y0)
+                })
+                .collect()
+        };
+
+        let cases = [
+            (Some(ContainerKind::Hopper), sprites::HOPPER_PANEL, 41),
+            (Some(ContainerKind::Dispenser), sprites::DISPENSER_PANEL, 45),
+            (Some(ContainerKind::Anvil), sprites::ANVIL_PANEL, 39),
+            (Some(ContainerKind::Beacon), sprites::BEACON_PANEL, 37),
+            (Some(ContainerKind::Furnace), sprites::FURNACE_PANEL, 39),
+            (
+                Some(ContainerKind::CraftingTable),
+                sprites::CRAFTING_TABLE_PANEL,
+                46,
+            ),
+            (None, sprites::INVENTORY_PANEL, 45),
+        ];
+        for (kind, panel_sprite, slots) in cases {
+            let slots_vec = vec![None; slots];
+            let hud = HudState {
+                window_slots: Some(&slots_vec),
+                window_kind: kind,
+                ..hud_state(&inventory)
+            };
+            let (mut bg, mut fg, mut icons) =
+                (UiBatch::default(), UiBatch::default(), UiBatch::default());
+            draw_inventory(
+                &mut bg, &mut fg, &mut icons, &hud, None, &textures, 2.0, 1280.0, 720.0,
+            );
+            assert_eq!(
+                quads_with(&bg, panel_sprite.uv()).len(),
+                1,
+                "{kind:?} must draw exactly one {panel_sprite:?} panel"
+            );
+        }
+
+        // A `1 + rows*9 + 36` window: the title-band slot has no frame in the
+        // sheet, so it is the one slot that gets the explicit slot sprite.
+        let slots_vec = vec![None; 64];
+        let hud = HudState {
+            window_slots: Some(&slots_vec),
+            window_kind: Some(ContainerKind::Chest {
+                rows: 3,
+                header: true,
+            }),
+            ..hud_state(&inventory)
+        };
+        let (mut bg, mut fg, mut icons) =
+            (UiBatch::default(), UiBatch::default(), UiBatch::default());
+        draw_inventory(
+            &mut bg, &mut fg, &mut icons, &hud, None, &textures, 2.0, 1280.0, 720.0,
+        );
+        let frames = quads_with(&bg, sprites::SLOT.uv());
+        assert_eq!(frames.len(), 1, "only the unframed header slot needs art");
+        let header = window_slot_rect(0, hud.window_kind, 2.0, 1280.0, 720.0).expect("header slot");
+        assert_eq!(
+            frames[0].x,
+            header.x - 2.0,
+            "frame starts one GUI pixel left"
+        );
+        assert_eq!(frames[0].y, header.y - 2.0, "frame starts one GUI pixel up");
+        assert_eq!(frames[0].w, 36.0, "18 GUI pixels at scale 2");
+        assert_eq!(frames[0].h, 36.0);
+
+        // And the chest still draws the cropped top plus the shared bottom.
+        assert_eq!(quads_with(&bg, sprites::CHEST_BOTTOM.uv()).len(), 1);
+        let top = sprites::CHEST_TOP.sub(0, 0, 176, 3 * 18 + 17);
+        assert_eq!(quads_with(&bg, top.uv()).len(), 1, "3-row crop");
     }
 
     #[test]
