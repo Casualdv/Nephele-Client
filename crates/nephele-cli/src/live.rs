@@ -1853,6 +1853,15 @@ async fn net_loop(
                 }
 
                 if client.spawned {
+                    // `NEPHELE_TRACE_MOVE=1` prints what we send; pair it with
+                    // the S08 trace below to see whether the server is rejecting
+                    // our position or we are drifting from it.
+                    if std::env::var_os("NEPHELE_TRACE_MOVE").is_some() {
+                        eprintln!(
+                            "[move] sent {:.3} {:.3} {:.3} ground={on_ground} yaw={:.1} pitch={:.1}",
+                            position.x, position.y, position.z, yaw, pitch
+                        );
+                    }
                     client.send_movement_tick(position, yaw, pitch, on_ground)
                         .await.map_err(|err| err.to_string())?;
                 }
@@ -1946,6 +1955,18 @@ async fn net_loop(
                         // for the next tick leaves the camera up to 50 ms
                         // behind and smears a teleport across the map.
                         let mut state = shared.lock().unwrap();
+                        if std::env::var_os("NEPHELE_TRACE_MOVE").is_some() {
+                            eprintln!(
+                                "[move] S08 {:.3} {:.3} {:.3} flags={} us {:.3} {:.3} {:.3}",
+                                position.x,
+                                position.y,
+                                position.z,
+                                relative_flags,
+                                state.player.x,
+                                state.player.y,
+                                state.player.z
+                            );
+                        }
                         state.player.correct_position(position, relative_flags);
                         state.prev_position = [position.x, position.y, position.z];
                         state.yaw = yaw;
@@ -5165,17 +5186,10 @@ impl ApplicationHandler for LiveApp {
                             Screen::Connect | Screen::Death => self.screen = Screen::Title,
                         },
                         (KeyCode::KeyF, ElementState::Pressed) if self.screen == Screen::Game => {
-                            let mut state = self.shared.lock().unwrap();
-                            // Flying is a singleplayer/creative toy. On a server
-                            // it is a kick or a ban: the server owns position,
-                            // sees a player hovering, and rubberbands every tick.
-                            if state.local || state.creative {
-                                state.player.flying = !state.player.flying;
-                                state.player.vy = 0.0;
-                                println!("flying: {}", state.player.flying);
-                            } else {
-                                println!("flight is disabled on servers");
-                            }
+                            // Flight is not bound to a key: 1.8 uses a double
+                            // tap of space in creative, and flying on a server is
+                            // a kick or a ban. `--fly` still exists for demos and
+                            // singleplayer.
                         }
                         (_, ElementState::Pressed)
                             if self.screen == Screen::Inventory

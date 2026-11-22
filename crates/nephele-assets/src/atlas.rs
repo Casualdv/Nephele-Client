@@ -213,9 +213,25 @@ impl TextureArray {
 
             // 1.8 stores grass and foliage as grayscale and tints them at
             // runtime with the biome colour. Bake the plains colour in.
+            //
+            // Plants are the same trick and were missing from this list, which
+            // is why tall grass and ferns rendered as white spikes: their
+            // textures are greyscale, so an untinted tile is a grey blob.
+            // Vanilla's rules: tall grass and ferns take the grass colour, vines
+            // take the foliage colour, a lily pad is a fixed dark green, and
+            // flowers are untinted.
             match name {
                 "grass_top" => tint(&mut tile, GRASS_TINT),
                 "leaves_oak" | "leaves_acacia" => tint(&mut tile, FOLIAGE_TINT),
+                "tallgrass"
+                | "fern"
+                | "double_plant_grass_bottom"
+                | "double_plant_grass_top"
+                | "double_plant_fern_bottom"
+                | "double_plant_fern_top" => tint(&mut tile, GRASS_TINT),
+                "vine" => tint(&mut tile, FOLIAGE_TINT),
+                // `BlockLilyPad` 0x208030 in 1.8.
+                "waterlily" => tint(&mut tile, [0.125, 0.502, 0.188]),
                 "grass_side" => {
                     if let Ok(overlay) = image::open(blocks_dir.join("grass_side_overlay.png")) {
                         let mut overlay = to_tile(&overlay.to_rgba8());
@@ -559,6 +575,75 @@ fn missing_texture() -> RgbaImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Diagnostic, not a gate: load a prepared `textures/blocks` directory and
+    /// print every name the block table asks for that the directory does not
+    /// contain, plus what each cross-plant id actually resolves to.
+    ///
+    /// Run it when a texture looks wrong in-game:
+    ///   $env:NEPHELE_BLOCKS_DIR="...\assets\minecraft\textures\blocks"
+    ///   cargo test -p nephele-assets dump_unresolved -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_unresolved_textures() {
+        use crate::block_textures::face_textures;
+
+        let Ok(dir) = std::env::var("NEPHELE_BLOCKS_DIR") else {
+            eprintln!("set NEPHELE_BLOCKS_DIR to a prepared textures/blocks directory");
+            return;
+        };
+        let array = TextureArray::load_from_dir(std::path::Path::new(&dir)).expect("atlas");
+        println!(
+            "blocks dir: {dir}\ntiles: {}  layers: {}  missing slot: {}",
+            array.layer_count() * TILES_PER_LAYER,
+            array.layer_count(),
+            array.missing
+        );
+        let unresolved = array.unresolved_names();
+        println!("unresolved names ({}): {:?}", unresolved.len(), unresolved);
+
+        for id in [31u16, 175, 37, 38, 106, 111, 6, 2, 3] {
+            let state = nephele_world::BlockState::from_raw(id << 4);
+            match face_textures(state) {
+                Some(faces) => {
+                    let slot = array.slot_or_missing(faces.side);
+                    // Mean colour of the packed tile, so "white spikes" can be
+                    // told apart from "right texture, wrong quad".
+                    let size = array.layer_size() as usize;
+                    let layer = slot as usize / TILES_PER_LAYER as usize;
+                    let local = slot as usize % TILES_PER_LAYER as usize;
+                    let tile_x = (local % TILES_PER_ROW as usize) * 16;
+                    let tile_y = (local / TILES_PER_ROW as usize) * 16;
+                    let pixels = array.pixels();
+                    let (mut r, mut g, mut b, mut a, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+                    for py in 0..16 {
+                        for px in 0..16 {
+                            let row = layer * size + tile_y + py;
+                            let col = tile_x + px;
+                            let at = (row * size + col) * 4;
+                            r += u32::from(pixels[at]);
+                            g += u32::from(pixels[at + 1]);
+                            b += u32::from(pixels[at + 2]);
+                            a += u32::from(pixels[at + 3]);
+                            n += 1;
+                        }
+                    }
+                    println!(
+                        "id {id:>3} meta 0 -> side {:<26} slot {:>3} {:?} mean rgb ({:>3},{:>3},{:>3}) a {:>3}{}",
+                        faces.side,
+                        slot,
+                        array.name_of(slot),
+                        r / n,
+                        g / n,
+                        b / n,
+                        a / n,
+                        if slot == array.missing { "  <-- MISSING" } else { "" }
+                    );
+                }
+                None => println!("id {id:>3} -> no texture at all"),
+            }
+        }
+    }
 
     #[test]
     fn mip_levels_above_the_clamp_would_blend_neighbouring_tiles() {
