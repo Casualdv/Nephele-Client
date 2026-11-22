@@ -178,14 +178,14 @@ per render frame — it no longer does. Keep new simulation work inside
 | Item | Size | Notes |
 |---|---|---|
 | Survival inventory screen (2×2 crafting, armour slots) | L | Done: vanilla layout, cursor stack, left/right/shift clicks via `C0E`. |
-| Crafting table, furnace, chest, hopper, dispenser, brewing, enchanting, anvil, beacon | XL | **Crafting table done** (server window protocol plus a local 3×3 window); furnace/chest and the rest unstarted. |
+| Crafting table, furnace, chest, hopper, dispenser, brewing, enchanting, anvil, beacon | XL | **Crafting table, furnace and chest done**: the crafting table keeps its vanilla 46-slot layout; a local furnace/chest has its own panel and state, and the mock now opens real furnace (smelts at 20 Hz) and chest block entities with click support; any server window sized `1 + rows*9 + 36` (Hypixel's Game Menu, shop chests, Ticket Machine) is drawn from `generic_54` with a title-band header slot and the player half aligned. Hoppers and the remaining bespoke containers still fall back to the generic grid; only the `1 + rows*9 + 36` shape is pixel-aligned. |
 | Shift-click, drag-split, item dragging, hotbar swap keys | M | |
 | Item tooltips: name, rarity colour, enchantments | M | |
-| Durability bar, stack counts, item icons | M | Partial: prepared icons now render for mapped tools, armour, materials and common food; unmapped ids still use the missing tile. |
+| Durability bar, stack counts, item icons | M | **Durability bar and stack counts done** (vanilla 13×2 bar, green→red, 1 px minimum). Prepared icons render for mapped tools, armour, materials and common food; unmapped ids still use the missing tile. |
 | Crafting recipe matching | L | Partial: a shared recipe book drives local 2×2/3×3 grids and the mock's 3×3 recipes, including the tree-to-pickaxe chain. The mock's 2×2 recipes remain separate; most vanilla recipes and container recipes are absent. |
-| Eating, potions, status effects | L | |
+| Eating, potions, status effects | L | **Eating done 2026-11-12**: 1.8 food table, 32-tick use time, hunger/saturation applied in singleplayer and the mock. Potions and status effects still open. |
 | Enchantments | L | |
-| Health, hunger, saturation, XP, air supply | M | Server-driven; we render and predict. |
+| Health, hunger, saturation, XP, air supply | M | Server-driven; eating applies hunger/saturation locally and through the mock. No hunger drain over time yet. |
 | Death screen, respawn, keep-inventory | M | |
 | Armour bar + armour slots | S | |
 
@@ -196,7 +196,7 @@ This is what separates a PvP client from a compatible one.
 | Item | Size | Notes |
 |---|---|---|
 | Hunger / XP / armour / air HUD | M | |
-| Hotbar selection highlight, item counts, durability | S | |
+| Hotbar selection highlight, item counts, durability | S | **Done**: selection frame, stack counts and durability bars come from `draw_stack`; lobby hotbar items arrive through `Set Slot` / `Window Items` window 0 (36..44). |
 | Chat overlay + input + command suggestions | M | **Overlay + input done** (fade, `T`/`/`, Enter/Esc). Client-side `/help /gamemode /tp /setblock /give /seed`; unknown commands go to the server. **Colours done 2026-11-06**: `chat.rs` parses both the legacy `§` dialect and JSON chat components (colour inheritance, `#rrggbb`, team-prefix-ready spans). No tab-completion. `azalea-brigadier` and `azalea-chat` are MIT references. |
 | Scoreboard sidebar, tab player list, boss bar, titles | M | **Sidebar renderer + model done 2026-11-06** (`scoreboard.rs`: objectives, scores, teams, 15-row cap, right-aligned pane, `NEPHELE_SCOREBOARD_DEMO=1` shows a hand-built model). `S3B`-`S3E` parsing landed with the net merge, so the sidebar is fed by the server. No tab list, boss bar or titles yet. |
 | **Client modules:** FPS, CPS, keystrokes, coordinates, ping, armour status, potion timers, reach display | M | **Six done 2026-11-06**: FPS, ping, LMB/RMB CPS, keystrokes with pressed states, coordinates, speed. Each toggleable and draggable in the HUD editor (Pause → Options → HUD Modules), positions stored as window fractions in `settings.json`. Ping needs `S38` rows, so it shows `--` until a server sends them. Armour status, potion timers and reach are still open. |
@@ -282,7 +282,7 @@ and worktree for each.
 | `biomes` | 100% | nothing — every GenLayer stage diffs 0 against the oracle |
 | `biome-vis` | 100% | singleplayer streams the vanilla pipeline and columns carry `Level.Biomes`; visible grass tint waits on `render` |
 | `worldgen` | 15% | `provide_chunk`/`populate` split landed; caves, ores, flora, structures |
-| `survival` | 90% | eating, potions, enchantments, XP orbs |
+| `survival` | 95% | potions, enchantments, XP orbs, hunger drain |
 | `net` | 95% | resource packs, reconnect polish |
 | `client-ui` | 20% | scoreboard rendering, chat colours, HUD modules, keybinds |
 | `entities` | 60% | skins and second layer, equipment, frame rendering, particles |

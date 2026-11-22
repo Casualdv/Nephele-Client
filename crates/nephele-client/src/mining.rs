@@ -58,6 +58,12 @@ pub struct Miner {
     current: Option<Aim>,
     progress: f32,
     hit_delay: u8,
+    /// The block the hit delay belongs to. Vanilla keeps `blockHitDelay` as a
+    /// global timer, which throttles a whole row of blocks to one break per
+    /// five ticks while the crosshair sweeps along it. Keying the delay on the
+    /// block instead means it only throttles repeats of *that* block, so
+    /// dragging the crosshair across a row breaks each block at its own speed.
+    hit_delay_target: Option<(i32, i32, i32)>,
     /// A block we just destroyed that the server has not confirmed yet.
     pending: Option<(i32, i32, i32)>,
     pending_ticks: u8,
@@ -110,10 +116,21 @@ impl Miner {
         }
 
         // Vanilla only honours the hit delay in creative, but it also keeps
-        // rapid clicks from starting a second block immediately.
+        // rapid clicks from starting a second block immediately. The delay is
+        // scoped to the block it was set on: sweeping onto a different block
+        // clears it so the row breaks at normal speed.
         if self.hit_delay > 0 {
-            self.hit_delay -= 1;
-            return events;
+            let same_block = self.hit_delay_target.is_some()
+                && aim.map(|aim| aim.pos()) == self.hit_delay_target;
+            if same_block {
+                self.hit_delay -= 1;
+                if self.hit_delay == 0 {
+                    self.hit_delay_target = None;
+                }
+                return events;
+            }
+            self.hit_delay = 0;
+            self.hit_delay_target = None;
         }
 
         let Some(aim) = aim else {
@@ -141,8 +158,10 @@ impl Miner {
             self.progress = 0.0;
             // Vanilla's `blockHitDelay`: without it a single click that spans
             // two ticks clears two blocks, and holding the button would mine
-            // twenty blocks a second.
+            // twenty blocks a second. Keyed on this block so it cannot throttle
+            // the next one in a row.
             self.hit_delay = HIT_DELAY_TICKS;
+            self.hit_delay_target = Some(aim.pos());
             if creative {
                 self.pending = Some(aim.pos());
                 self.pending_ticks = PENDING_TICKS;
@@ -312,18 +331,13 @@ mod tests {
     }
 
     #[test]
-    fn creative_chains_onto_the_next_block_after_the_hit_delay() {
+    fn creative_sweeps_onto_the_next_block_at_normal_speed() {
         let world = two_blocks(BlockState::STONE);
         let mut miner = Miner::default();
         assert_eq!(miner.tick(&world, Some(aim()), true, true).len(), 2);
 
-        // Vanilla's `blockHitDelay` keeps the next block from being hit on the
-        // same click; it lasts HIT_DELAY_TICKS ticks.
-        for _ in 0..HIT_DELAY_TICKS {
-            assert!(miner
-                .tick(&world, Some(next_to_aim()), true, true)
-                .is_empty());
-        }
+        // Dragging the crosshair onto the next block must not inherit the
+        // previous block's cooldown: the row breaks at one block per tick.
         assert_eq!(
             miner.tick(&world, Some(next_to_aim()), true, true),
             vec![
@@ -331,6 +345,47 @@ mod tests {
                 MiningEvent::Stop(next_to_aim())
             ]
         );
+    }
+
+    #[test]
+    fn creative_breaks_a_five_block_row_at_one_per_tick() {
+        let mut column = ChunkColumn::empty(0, 0);
+        for x in 1..=5 {
+            column.set_block(x, 10, 1, BlockState::STONE);
+        }
+        let mut world = World::new(0);
+        world.insert(column);
+
+        let mut miner = Miner::default();
+        let mut broken = 0;
+        for x in 1..=5 {
+            let aim = Aim {
+                x,
+                y: 10,
+                z: 1,
+                face: 1,
+                cursor: [0.5, 1.0, 0.5],
+            };
+            broken += miner
+                .tick(&world, Some(aim), true, true)
+                .iter()
+                .filter(|event| matches!(event, MiningEvent::Stop(_)))
+                .count();
+        }
+        assert_eq!(broken, 5, "a swept row must not wait out a shared cooldown");
+    }
+
+    #[test]
+    fn creative_still_throttles_the_block_it_just_broke() {
+        let world = world_with(BlockState::STONE);
+        let mut miner = Miner::default();
+        assert_eq!(miner.tick(&world, Some(aim()), true, true).len(), 2);
+
+        // The same block (still there because the server has not confirmed it)
+        // is never asked for twice in a row.
+        for _ in 0..(HIT_DELAY_TICKS - 1) {
+            assert!(miner.tick(&world, Some(aim()), true, true).is_empty());
+        }
     }
 
     #[test]

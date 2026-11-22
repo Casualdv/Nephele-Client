@@ -526,7 +526,9 @@ or protocol changes**.
 - **Mipmaps.** The block array has the full 16 → 1 chain. Mips are generated in
   `nephele-assets` with an alpha-weighted box filter, so cutout edges do not
   darken. Sampling is nearest magnification with linear minification/mip
-  transitions, matching vanilla's look.
+  transitions, matching vanilla's look. The sampler is capped at mip 2
+  (`BLOCK_LOD_MAX`): sixteen tiles share a layer and the chain is generated
+  from the whole packed layer, so higher levels would blend neighbouring tiles.
 - **Sky.** `sky.wgsl` is one full-screen ray pass: day/night gradient, square
   sun and moon, stable hashed stars, and two-octave procedural clouds at y=192.
   Time comes from the server's `TIME_UPDATE` in multiplayer and advances one
@@ -665,12 +667,56 @@ per-axis, inset footprint. `resting_on_the_floor_does_not_drift_upward` guards d
   matched after trimming empty rows/columns, so a shape can sit anywhere in the
   grid; stack sizes in the grid do not matter. Local singleplayer uses the same
   recipe matcher; a real multiplayer server still computes its own output.
+- **Generic container windows are `1 + rows*9 + 36` (2026-11-06).**
+  `OpenWindowState.slot_count` keeps `S2D`'s own count and
+  `ContainerLayout::from_slot_count` derives the layout: the player's 36 slots
+  are last, and if the remainder after removing them is `1 mod 9` the first
+  slot is a **header slot** (Hypixel's Game Menu, shop chests and Ticket
+  Machine). `ContainerKind::Chest { rows, header }` then draws `generic_54`
+  cropped to `rows*18 + 17` plus the 96-pixel player section, with the header
+  slot at `(8,0)` in the title band, grid slots `1..=rows*9` at
+  `(8 + i%9*18, 18 + i/9*18)`, and the player half at `rows*18 + 31` /
+  `rows*18 + 89`. Slot indices are the server's: a click on the header reports
+  0, the first grid cell 1, the first player slot `1 + rows*9` — the raw index
+  goes straight back in `C0E`, so left/right/shift all land on the slot the
+  server numbered. A plain chest (`rows*9 + 36`) has `header = false`; local
+  chests stay three rows with no header.
+- **The lobby hotbar needs three things to land (2026-11-06).** Hypixel fills
+  slots 36..44 with individual `S2F Set Slot` packets, which may arrive before
+  any `S30 Window Items`; `SET_SLOT` grows `inventory` to
+  `PLAYER_CONTAINER_SLOTS` (45) first, so they are not dropped. A full 45-entry
+  `Window Items` snapshot maps the hotbar to 36..44; a **shorter** snapshot
+  (some lobbies send only the 36 main-inventory slots) no longer clears
+  36..44, which used to wipe a hotbar that had already arrived. `draw_stack`
+  renders stack counts and a vanilla 13x2 durability bar (green→red via
+  `Color.HSBtoRGB(fraction/3, 1, 1)`, 1 px minimum) for any item with a
+  `max_damage` entry and `damage > 0`.
+- **HUD sprites are pinned to `icons.png`/`widgets.png` (2026-11-05).** Hearts
+  sample x=52/61 (not 54/63, which drew a background plus a two-pixel-shifted
+  overlay), food comes from y=27, the armour row from y=9 with vanilla item
+  values from slots 5..=8, and the hotbar items use the same `draw_stack` path
+  as the inventory so tools and food get real sprites. Tests pin every sprite to
+  its absolute atlas coordinate.
 - **Item icons (added 2026-11-02).** `TextureArray::load_from_dir` appends
   namespaced layers from the prepared sibling `textures/items` directory, so
   item names cannot collide with block layers. Inventory slots render mapped
   tools, armour, materials and common food as flat icons; dropped-item cubes use
   the same item texture on each face. Unmapped item ids still use
   `MISSING_TEXTURE`, and held first-person rendering remains block-only.
+- **Eating, armour absorption and block entities (added 2026-11-12).**
+  `nephele_world::food` carries the 1.8 food table (steak is 8 hunger / 12.8
+  saturation) and `EAT_TICKS = 32`; the local loop and the mock both start a
+  32-tick bite on `C08` with food, consume one item, and apply
+  `FoodStats.addStats` (hunger capped at 20, saturation at the resulting
+  hunger). `nephele_world::armour` has vanilla's 4%-per-point absorption
+  (capped at 20 points / 80%) and `fall_damage` starts after three blocks;
+  singleplayer applies it on landing. The mock now opens
+  `minecraft:furnace` (39 slots) and `minecraft:chest` (63 slots) on right-click,
+  ticks the furnace at 20 Hz with `smelting::{smelt, fuel_ticks, COOK_TICKS}`,
+  and resolves clicks in both halves; `LocalFurnace` and the mock share the fuel
+  table. **The furnace progress bar is still local-only:** the mock sends the
+  three slots via `S2F` but no progress packet, so an online furnace shows its
+  panel and items without a live flame/arrow.
 
 **Chat and client-side commands** (added 2026-11-01):
 
@@ -823,9 +869,9 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 | `biomes` | GenLayer parity | `biomes` | **100% biome cells, every stage diff 0 — lane complete** |
 | `biome-vis` | singleplayer generator + biome data path | `biome-vis` | done: `local_loop` streams `VanillaGenerator`, columns carry `Level.Biomes`; needs merge |
 | `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) |
-| `survival` | inventory, containers, HUD art | `survival` | 90%: server windows sized from the packet, HUD sprites + armour row |
+| `survival` | inventory, containers, HUD art | `survival` | 95%: rebuilt on main; `ContainerKind` generic windows (header slot, furnace, local chest), durability bars, 203 item sprites, HUD/armour sprites, eating, armour absorption, furnace/chest block entities |
 | `net` | protocol, real servers, maps, frames, metadata, scoreboards | `net` | **merged at `f0347c1`** - scoreboards, teams, `C02`, maps, frames, keep-alive, beacon/note/debris particles |
-| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, options tree with a live Video Settings page, `keybinds.rs` (26 actions, click-to-rebind, conflict handling); tab list, boss bar, titles and the loading screen still open |
+| `client-ui` | chat colours, settings, loading screen, modules | `client-ui` | **merged** - chat colours, six HUD modules with a draggable editor, scoreboard sidebar renderer, options tree with a live Video Settings page, `keybinds.rs` (26 actions, click-to-rebind, conflict handling); its generic-window layout (`window_rows`/`server_window_origin`) was **replaced by `survival`'s `ContainerKind` model**; tab list, boss bar, titles and the loading screen still open |
 | `saves` | `level.dat`, player data, region writing | `saves` | 90% and **landed on main** |
 | `entities` | players, skins, nametags, frames, maps on screen | `entities` | 60%: head yaw, holograms, picking, lobby population |
 | `perf` | startup, view distance, baseline gate | `perf` | 100%, committed baseline; needs merge |
@@ -850,9 +896,10 @@ mock 2x2/3x3 crafting, and the death screen and respawn are implemented. Local
 singleplayer now evaluates the shared recipe book in both the 2x2 inventory grid
 and a usable 3x3 crafting-table window, awards basic block items when mining, and
 consumes block stacks when placing in survival. The tree-to-pickaxe chain still
-needs an interactive hand check. **Still missing:** eating, armour equip and
-damage reduction, hunger effects, XP orbs, furnace/chest block entities, and
-item icons for unmapped item ids.
+needs an interactive hand check. **Done 2026-11-12:** eating (32-tick use,
+hunger/saturation), armour absorption on local fall damage, and furnace/chest
+block entities with mock support. **Still missing:** hunger drain over time,
+XP orbs, and item icons for unmapped item ids.
 
 **M5 singleplayer saves (2026-11-04).** World storage is vanilla-shaped now:
 `nephele.dat` remains as a compatibility mirror, but `level.dat` is the source

@@ -29,7 +29,9 @@ use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas};
 use nephele_audio::{AudioEngine, Listener};
 use nephele_client::mining::{Aim, Miner, MiningEvent};
 use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
-use nephele_client::{Event, GameClient, LocalContainer, Vec3};
+use nephele_client::{
+    ContainerKind, Event, GameClient, LocalContainer, LocalFurnace, OpenWindowState, Vec3,
+};
 use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
@@ -238,8 +240,6 @@ struct Shared {
     /// Slots of the server's open container (crafting table), and whether one is.
     window_slots: Vec<Option<ItemStack>>,
     window_open: bool,
-    /// `S2D` inventory type of the open window, for the panel title.
-    window_kind: Option<String>,
     /// Our own tab-list latency, `None` until the server tells us.
     ping: Option<i32>,
     /// Entity under the crosshair, as picked by the network thread.
@@ -248,6 +248,14 @@ struct Shared {
     window_id: Option<u8>,
     /// Offline crafting-table grid and cursor; the player's inventory stays above.
     local_container: LocalContainer,
+    /// Which container panel the open window uses.
+    window_kind: Option<ContainerKind>,
+    /// Block position of the open local container, for furnaces and chests.
+    window_pos: Option<(i32, i32, i32)>,
+    /// Local furnaces by block position; they keep smelting while closed.
+    furnaces: std::collections::HashMap<(i32, i32, i32), LocalFurnace>,
+    /// Local chest contents by block position, 27 slots each.
+    chests: std::collections::HashMap<(i32, i32, i32), Vec<Option<ItemStack>>>,
     /// Ask the game thread to send `C0D` for the open container.
     close_window: bool,
     /// Single-player has no server to apply clicks, so the UI applies them.
@@ -281,7 +289,10 @@ fn refresh_local_crafting_preview(state: &mut Shared) {
 }
 
 fn sync_local_table_inventory(state: &mut Shared) {
-    if state.window_id != Some(1) || state.window_slots.len() < 46 {
+    if state.window_id != Some(1)
+        || state.window_kind != Some(ContainerKind::CraftingTable)
+        || state.window_slots.len() < 46
+    {
         return;
     }
     state.window_slots[1..10].copy_from_slice(state.local_container.grid());
@@ -293,8 +304,190 @@ fn open_local_crafting_table(state: &mut Shared) {
     state.local_container = LocalContainer::default();
     state.window_slots = vec![None; 46];
     state.window_id = Some(1);
+    state.window_kind = Some(ContainerKind::CraftingTable);
+    state.window_pos = None;
     state.window_open = true;
     sync_local_table_inventory(state);
+}
+
+/// Furnace window slots: input, fuel, output, then the 36 player slots.
+fn sync_local_furnace(state: &mut Shared) {
+    let Some(furnace) = state.window_pos.and_then(|pos| state.furnaces.get(&pos)) else {
+        return;
+    };
+    state.window_slots[0] = furnace.input;
+    state.window_slots[1] = furnace.fuel;
+    state.window_slots[2] = furnace.output;
+    state.window_slots[3..39].copy_from_slice(&state.inventory[9..45]);
+}
+
+fn open_local_furnace(state: &mut Shared, pos: (i32, i32, i32)) {
+    state.furnaces.entry(pos).or_default();
+    state.window_slots = vec![None; 39];
+    state.window_id = Some(1);
+    state.window_kind = Some(ContainerKind::Furnace);
+    state.window_pos = Some(pos);
+    state.window_open = true;
+    sync_local_furnace(state);
+}
+
+/// Chest window slots: 27 chest cells, then the 36 player slots.
+fn sync_local_chest(state: &mut Shared) {
+    let Some(chest) = state.window_pos.and_then(|pos| state.chests.get(&pos)) else {
+        return;
+    };
+    state.window_slots[0..27].copy_from_slice(chest);
+    state.window_slots[27..63].copy_from_slice(&state.inventory[9..45]);
+}
+
+fn open_local_chest(state: &mut Shared, pos: (i32, i32, i32)) {
+    state.chests.entry(pos).or_insert_with(|| vec![None; 27]);
+    state.window_slots = vec![None; 63];
+    state.window_id = Some(1);
+    state.window_kind = Some(ContainerKind::Chest {
+        rows: 3,
+        header: false,
+    });
+    state.window_pos = Some(pos);
+    state.window_open = true;
+    sync_local_chest(state);
+}
+
+/// Map a server window's inventory type onto the panel the UI draws.
+///
+/// The row count and leading slot come from `OpenWindowState::container_layout`,
+/// which reads `S2D`'s own slot count rather than the type string: Hypixel
+/// sends `minecraft:chest` for every menu, from a one-row reward summary to the
+/// six-row Game Menu, and sizes them `1 + rows*9 + 36`.
+fn window_kind_for(open: &OpenWindowState) -> ContainerKind {
+    let name = open.kind.rsplit(':').next().unwrap_or(&open.kind);
+    match name {
+        "furnace" => ContainerKind::Furnace,
+        "crafting_table" => ContainerKind::CraftingTable,
+        _ => {
+            let layout = open.container_layout();
+            ContainerKind::Chest {
+                rows: layout.rows,
+                header: layout.header,
+            }
+        }
+    }
+}
+
+/// Where a furnace/chest window slot actually lives.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlotStore {
+    Container(usize),
+    Player(usize),
+}
+
+fn simple_window_slot(index: usize, kind: ContainerKind) -> Option<SlotStore> {
+    match kind {
+        ContainerKind::Furnace => match index {
+            0..=2 => Some(SlotStore::Container(index)),
+            3..=38 => Some(SlotStore::Player(index - 3)),
+            _ => None,
+        },
+        ContainerKind::Chest { rows, header } => {
+            let container = usize::from(header) + rows as usize * 9;
+            if index < container {
+                Some(SlotStore::Container(index))
+            } else if index < container + 36 {
+                Some(SlotStore::Player(index - container))
+            } else {
+                None
+            }
+        }
+        ContainerKind::CraftingTable => None,
+    }
+}
+
+/// One click inside a furnace or chest window.
+fn click_local_simple_container(state: &mut Shared, index: usize, button: i8, shift: bool) {
+    let Some(kind) = state.window_kind else {
+        return;
+    };
+    let Some(pos) = state.window_pos else {
+        return;
+    };
+    let Some(store) = simple_window_slot(index, kind) else {
+        return;
+    };
+    let container_len = match kind {
+        ContainerKind::Chest { rows, header } => usize::from(header) + rows as usize * 9,
+        _ => 3,
+    };
+
+    // Read both sides out, so the click works the same on either.
+    let mut container: Vec<Option<ItemStack>> = match kind {
+        ContainerKind::Chest { .. } => state
+            .chests
+            .get(&pos)
+            .cloned()
+            .unwrap_or_else(|| vec![None; container_len]),
+        _ => {
+            let furnace = state.furnaces.entry(pos).or_default();
+            vec![furnace.input, furnace.fuel, furnace.output]
+        }
+    };
+
+    let mut cursor = state.local_container.cursor();
+    let mut player = state.inventory.clone();
+
+    match store {
+        SlotStore::Container(slot) => {
+            if shift {
+                if let Some(item) = container.get(slot).copied().flatten() {
+                    let mut slots = player.clone();
+                    if insert_player_stack(&mut slots, item).is_none() {
+                        container[slot] = None;
+                        player = slots;
+                    }
+                }
+            } else {
+                let (next_cursor, next_slot) = inventory::click(cursor, container[slot], button);
+                cursor = next_cursor;
+                container[slot] = next_slot;
+            }
+        }
+        SlotStore::Player(slot) => {
+            let inventory_slot = slot + 9;
+            if shift {
+                if let Some(item) = player.get(inventory_slot).copied().flatten() {
+                    if let Some(rest) = inventory::insert_stack(&mut container, item) {
+                        player[inventory_slot] = Some(rest);
+                    } else {
+                        player[inventory_slot] = None;
+                    }
+                }
+            } else {
+                let (next_cursor, next_slot) =
+                    inventory::click(cursor, player[inventory_slot], button);
+                cursor = next_cursor;
+                player[inventory_slot] = next_slot;
+            }
+        }
+    }
+    debug_assert_eq!(container.len(), container_len);
+
+    match kind {
+        ContainerKind::Chest { .. } => {
+            state.chests.insert(pos, container);
+        }
+        _ => {
+            let furnace = state.furnaces.entry(pos).or_default();
+            furnace.input = container[0];
+            furnace.fuel = container[1];
+            furnace.output = container[2];
+        }
+    }
+    state.local_container.set_cursor(cursor);
+    state.inventory = player;
+
+    match kind {
+        ContainerKind::Chest { .. } => sync_local_chest(state),
+        _ => sync_local_furnace(state),
+    }
 }
 
 fn insert_player_stack(slots: &mut [Option<ItemStack>], item: ItemStack) -> Option<ItemStack> {
@@ -448,6 +641,9 @@ impl Default for Shared {
             window_slots: Vec::new(),
             window_open: false,
             window_kind: None,
+            window_pos: None,
+            furnaces: std::collections::HashMap::new(),
+            chests: std::collections::HashMap::new(),
             ping: None,
             target: None,
             window_id: None,
@@ -623,6 +819,13 @@ fn ground_block(world: &World, feet: [f64; 3]) -> Option<BlockState> {
 /// increasing whole-number threshold, so a step lands about every 1.67 blocks
 /// walked.
 #[derive(Debug)]
+/// An in-progress food bite: which hotbar slot is being eaten and for how many
+/// ticks. Vanilla's `ItemFood` use duration is 32 ticks.
+struct Eating {
+    slot: usize,
+    ticks: u32,
+}
+
 struct StepTrigger {
     last: Option<[f64; 3]>,
     walked: f32,
@@ -843,6 +1046,16 @@ fn local_loop(
     let mut last_saved_player = saved_player;
     let mut autosave_deadline = Instant::now() + PLAYER_STATE_SAVE_INTERVAL;
     let mut weather_random = seed ^ 0x9E37_79B9_7F4A_7C15;
+    // A food item is consumed after 32 ticks of use (`ItemFood`). The slot is
+    // kept so switching hotbar slots cancels the bite, like vanilla.
+    let mut eating: Option<Eating> = None;
+    // Fall damage tracking: vanilla starts at three blocks and armour absorbs it.
+    let mut fall_distance = 0.0f64;
+    let mut was_on_ground = true;
+    let mut last_position = {
+        let state = shared.lock().unwrap();
+        (state.player.x, state.player.y, state.player.z)
+    };
 
     loop {
         if std::mem::take(&mut shared.lock().unwrap().pending_respawn) {
@@ -855,8 +1068,28 @@ fn local_loop(
             state.food = 20;
             state.food_saturation = 5.0;
             state.food_exhaustion = 0.0;
+            eating = None;
         }
         let (position, yaw, pitch, on_ground) = step_player(&shared, &world);
+        {
+            let mut state = shared.lock().unwrap();
+            if !state.creative {
+                if on_ground {
+                    if !was_on_ground && fall_distance > 3.0 {
+                        let armour = crate::ui::armour_points(&state.inventory);
+                        let damage = nephele_world::armour::fall_damage(fall_distance, armour);
+                        if damage > 0.0 {
+                            state.health = (state.health - damage).max(0.0);
+                        }
+                    }
+                    fall_distance = 0.0;
+                } else if position.y < last_position.1 {
+                    fall_distance += last_position.1 - position.y;
+                }
+            }
+        }
+        was_on_ground = on_ground;
+        last_position = (position.x, position.y, position.z);
         let listener = ear(position);
         radius = local_stream_radius(&shared.lock().unwrap());
 
@@ -1012,7 +1245,52 @@ fn local_loop(
                 play_block_break(&shared, broken, target.pos(), listener, yaw);
             }
         }
+        if let Some(mut bite) = eating.take() {
+            let mut state = shared.lock().unwrap();
+            let held_slot = HOTBAR_FIRST_SLOT + (state.held_slot.clamp(0, 8) as usize);
+            let held = state.inventory.get(bite.slot).copied().flatten();
+            let food = held.and_then(|item| nephele_world::food::food(item.id, item.damage));
+            if bite.slot == held_slot {
+                if let Some(food) = food {
+                    bite.ticks += 1;
+                    if bite.ticks >= nephele_world::food::EAT_TICKS {
+                        let (hunger, saturation) =
+                            nephele_world::food::apply(state.food, state.food_saturation, food);
+                        state.food = hunger;
+                        state.food_saturation = saturation;
+                        if let Some(stack) = state.inventory[bite.slot].as_mut() {
+                            stack.count -= 1;
+                            if stack.count <= 0 {
+                                state.inventory[bite.slot] = None;
+                            }
+                        }
+                    } else {
+                        eating = Some(bite);
+                    }
+                }
+            }
+        }
         if use_pressed {
+            // Food starts a 32-tick use unless the click is on a block that
+            // consumes it (door, crafting table, furnace or chest).
+            let interactive = aim
+                .map(|aim| {
+                    let id = world.get_block(aim.x, aim.y, aim.z).id();
+                    nephele_world::shapes::is_door(id) || matches!(id, 54 | 58 | 61)
+                })
+                .unwrap_or(false);
+            if !interactive {
+                let state = shared.lock().unwrap();
+                let slot = HOTBAR_FIRST_SLOT + (state.held_slot.clamp(0, 8) as usize);
+                let held = state.inventory.get(slot).copied().flatten();
+                if let Some(item) = held {
+                    if nephele_world::food::food(item.id, item.damage).is_some()
+                        && state.food < nephele_world::food::MAX_HUNGER
+                    {
+                        eating = Some(Eating { slot, ticks: 0 });
+                    }
+                }
+            }
             if let Some(aim) = aim {
                 let targeted = world.get_block(aim.x, aim.y, aim.z);
                 if nephele_world::shapes::is_door(targeted.id()) {
@@ -1023,6 +1301,16 @@ fn local_loop(
                     let mut state = shared.lock().unwrap();
                     if state.window_id.is_none() {
                         open_local_crafting_table(&mut state);
+                    }
+                } else if targeted.id() == 61 {
+                    let mut state = shared.lock().unwrap();
+                    if state.window_id.is_none() {
+                        open_local_furnace(&mut state, (aim.x, aim.y, aim.z));
+                    }
+                } else if targeted.id() == 54 {
+                    let mut state = shared.lock().unwrap();
+                    if state.window_id.is_none() {
+                        open_local_chest(&mut state, (aim.x, aim.y, aim.z));
                     }
                 } else {
                     let (held_slot, held) = {
@@ -1105,6 +1393,16 @@ fn local_loop(
             // the same 20-minute day the protocol would produce.
             state.time_of_day = (state.time_of_day + 1.0) % 24000.0;
             world_state.day_time = state.time_of_day as i64;
+            // Furnaces smelt on the game tick whether or not their window is
+            // open, exactly like the server-side tile entities.
+            if !state.furnaces.is_empty() {
+                for furnace in state.furnaces.values_mut() {
+                    furnace.tick();
+                }
+                if state.window_open && state.window_kind == Some(ContainerKind::Furnace) {
+                    sync_local_furnace(&mut state);
+                }
+            }
         }
 
         std::thread::sleep(TICK);
@@ -1579,6 +1877,7 @@ async fn net_loop(
                     state.held_slot = client.held_slot;
                     state.health = client.health;
                     state.food = client.food;
+                    state.food_saturation = client.saturation;
                     state.xp_bar = client.xp_bar;
                     state.xp_level = client.xp_level;
                     state.time_of_day = (client.time_of_day.rem_euclid(24000) as f32).max(0.0);
@@ -1588,14 +1887,20 @@ async fn net_loop(
                     } else {
                         state.inventory.copy_from_slice(&client.inventory);
                     }
-                    state.window_id = client.open_window.as_ref().map(|open| open.id);
+                    let window = client.open_window.as_ref();
+                    state.window_id = window.map(|open| open.id);
                     state.window_open = state.window_id.is_some();
-                    state.window_slots = client
-                        .open_window
-                        .as_ref()
+                    state.window_slots = window
                         .map(|open| open.slots.clone())
                         .unwrap_or_default();
-                    state.window_kind = client.open_window.as_ref().map(|open| open.kind.clone());
+                    // The panel layout comes from the server's announced slot
+                    // count, not the type string: Hypixel sends the same
+                    // `minecraft:chest` for a one-row summary and the six-row
+                    // Game Menu.
+                    state.window_kind = window.map(window_kind_for);
+                    if window.is_none() {
+                        state.window_pos = None;
+                    }
                     state.ping = own_ping(&client);
                     state.target = entity_hit.map(|hit| hit.id);
                 }
@@ -1737,8 +2042,8 @@ struct FrameView {
     inventory: Vec<Option<ItemStack>>,
     window_open: bool,
     window_slots: Vec<Option<ItemStack>>,
-    /// Inventory type of the open window, for the panel title.
-    window_kind: Option<String>,
+    window_kind: Option<ContainerKind>,
+    furnace_progress: Option<(f32, f32)>,
     /// Our own latency, from the tab list.
     ping: Option<i32>,
     health: f32,
@@ -2111,6 +2416,15 @@ impl LiveApp {
             tracing::warn!(texture = name, "unresolved block texture");
         }
         perf::record_stage_span("texture_atlas_decode", texture_decode_start, Instant::now());
+        let unmapped_items = nephele_assets::unmapped_item_ids();
+        tracing::info!(
+            mapped = nephele_assets::all_item_texture_layers().len(),
+            unmapped = unmapped_items.len(),
+            "item icons resolved"
+        );
+        for id in &unmapped_items {
+            tracing::warn!(item = id, "item id has no sprite");
+        }
         // The UI sheets live one level up: `textures/font`, `textures/gui`.
         let ui_root = self
             .options
@@ -2740,7 +3054,11 @@ impl LiveApp {
                 inventory: state.inventory.clone(),
                 window_open: state.window_open,
                 window_slots: state.window_slots.clone(),
-                window_kind: state.window_kind.clone(),
+                window_kind: state.window_kind,
+                furnace_progress: state
+                    .window_pos
+                    .and_then(|pos| state.furnaces.get(&pos))
+                    .map(|furnace| (furnace.flame(), furnace.progress())),
                 ping: state.ping,
                 health: state.health,
                 food: state.food,
@@ -3103,7 +3421,8 @@ impl LiveApp {
             thundering: view.thundering,
             lightning: view.lightning,
             clock: self.time,
-            window_kind: view.window_kind.as_deref(),
+            window_kind: view.window_kind,
+            furnace_progress: view.furnace_progress,
         };
 
         // The options tree has sliders, which the button list cannot express, so
@@ -4166,6 +4485,8 @@ impl LiveApp {
                 state.window_slots.clear();
                 state.window_open = false;
                 state.window_id = None;
+                state.window_kind = None;
+                state.window_pos = None;
                 state.close_window = false;
                 self.inventory_cursor = None;
                 refresh_local_crafting_preview(&mut state);
@@ -4240,6 +4561,13 @@ impl LiveApp {
         };
 
         if state.local {
+            if matches!(
+                state.window_kind,
+                Some(ContainerKind::Furnace) | Some(ContainerKind::Chest { .. })
+            ) {
+                click_local_simple_container(&mut state, index, button, shift);
+                return;
+            }
             if local_table {
                 if shift {
                     if index == 0 {
@@ -5258,6 +5586,74 @@ fn brighten_job(job: &mut ColumnMeshJob, brightness: Brightness) {
 mod tests {
     use super::*;
 
+    fn window(kind: &str, slot_count: u8) -> OpenWindowState {
+        OpenWindowState {
+            id: 1,
+            kind: kind.to_string(),
+            slot_count,
+            slots: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn server_window_layout_comes_from_the_announced_slot_count() {
+        // Hypixel's menus are `1 + rows*9 + 36`: six rows is 91, three is 64.
+        // The leading slot is what keeps the player half at 1+rows*9.
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 91)),
+            ContainerKind::Chest {
+                rows: 6,
+                header: true
+            }
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 64)),
+            ContainerKind::Chest {
+                rows: 3,
+                header: true
+            }
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 46)),
+            ContainerKind::Chest {
+                rows: 1,
+                header: true
+            }
+        );
+        // A plain chest has no leading slot.
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 90)),
+            ContainerKind::Chest {
+                rows: 6,
+                header: false
+            }
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:chest", 63)),
+            ContainerKind::Chest {
+                rows: 3,
+                header: false
+            }
+        );
+        // The special panels keep their own layout.
+        assert_eq!(
+            window_kind_for(&window("minecraft:crafting_table", 46)),
+            ContainerKind::CraftingTable
+        );
+        assert_eq!(
+            window_kind_for(&window("minecraft:furnace", 39)),
+            ContainerKind::Furnace
+        );
+        // A type we do not know still draws as a chest of the right shape.
+        assert_eq!(
+            window_kind_for(&window("minecraft:dispenser", 64)),
+            ContainerKind::Chest {
+                rows: 3,
+                header: true
+            }
+        );
+    }
+
     fn local_state_for_test() -> Shared {
         Shared {
             player: PlayerState::default(),
@@ -5305,6 +5701,9 @@ mod tests {
             target: None,
             window_id: None,
             local_container: LocalContainer::default(),
+            window_pos: None,
+            furnaces: std::collections::HashMap::new(),
+            chests: std::collections::HashMap::new(),
             close_window: false,
             local: true,
             local_shutdown: false,
@@ -5448,6 +5847,76 @@ mod tests {
 
         assert!((whole.yaw - split.yaw).abs() < 1e-5);
         assert!((whole.pitch - split.pitch).abs() < 1e-5);
+    }
+
+    #[test]
+    fn local_chest_keeps_its_contents_when_the_window_closes() {
+        let mut state = local_state_for_test();
+        state.inventory[9] = Some(ItemStack::new(4, 5, 0));
+        open_local_chest(&mut state, (1, 64, 1));
+        assert_eq!(state.window_slots.len(), 63);
+
+        // Window slot 27 is the first player slot; shift-click moves it over.
+        click_local_simple_container(&mut state, 27, 0, true);
+        assert_eq!(
+            state.chests.get(&(1, 64, 1)).unwrap()[0],
+            Some(ItemStack::new(4, 5, 0))
+        );
+        assert_eq!(state.inventory[9], None);
+
+        // Reopening the same block shows the stored stack again.
+        state.window_open = false;
+        state.window_kind = None;
+        open_local_chest(&mut state, (1, 64, 1));
+        assert_eq!(state.window_slots[0], Some(ItemStack::new(4, 5, 0)));
+    }
+
+    #[test]
+    fn local_furnace_window_projects_input_fuel_and_output() {
+        let mut state = local_state_for_test();
+        open_local_furnace(&mut state, (2, 64, 2));
+        assert_eq!(state.window_slots.len(), 39);
+
+        state.inventory[9] = Some(ItemStack::new(15, 1, 0));
+        click_local_simple_container(&mut state, 3, 0, true);
+        state.inventory[10] = Some(ItemStack::new(263, 1, 0));
+        click_local_simple_container(&mut state, 4, 0, true);
+
+        let furnace = state.furnaces.get(&(2, 64, 2)).unwrap();
+        assert_eq!(furnace.input, Some(ItemStack::new(15, 1, 0)));
+        assert_eq!(furnace.fuel, Some(ItemStack::new(263, 1, 0)));
+        assert_eq!(state.window_slots[0], furnace.input);
+        assert_eq!(state.window_slots[1], furnace.fuel);
+    }
+
+    #[test]
+    fn local_furnace_smelts_through_window_clicks() {
+        let mut state = local_state_for_test();
+        open_local_furnace(&mut state, (3, 64, 3));
+
+        // Window slot 3 is the first player slot: shift-click ore into the
+        // input, then planks into the fuel slot.
+        state.inventory[9] = Some(ItemStack::new(15, 1, 0));
+        click_local_simple_container(&mut state, 3, 0, true);
+        state.inventory[10] = Some(ItemStack::new(5, 1, 0));
+        click_local_simple_container(&mut state, 4, 0, true);
+
+        assert_eq!(state.window_slots[0], Some(ItemStack::new(15, 1, 0)));
+        assert_eq!(state.window_slots[1], Some(ItemStack::new(5, 1, 0)));
+
+        for _ in 0..200 {
+            if let Some(furnace) = state.furnaces.get_mut(&(3, 64, 3)) {
+                furnace.tick();
+            }
+        }
+        sync_local_furnace(&mut state);
+
+        assert_eq!(
+            state.window_slots[2],
+            Some(ItemStack::new(265, 1, 0)),
+            "the output slot shows the smelted ingot"
+        );
+        assert_eq!(state.window_slots[0], None);
     }
 
     #[test]

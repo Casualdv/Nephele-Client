@@ -161,6 +161,11 @@ const RECIPES: &[(u16, u16, u8, Shape)] = &[
     ),
 ];
 
+/// Every recipe result as `(id, damage)`, for icon-coverage checks.
+pub fn recipe_outputs() -> impl Iterator<Item = (u16, u16)> {
+    RECIPES.iter().map(|(id, damage, _, _)| (*id, *damage))
+}
+
 /// Match a 3x3 grid of `(id, damage)` cells, `None` being empty.
 pub fn craft(grid: &[Option<(u16, u16)>; 9]) -> Option<Recipe> {
     let filled: Vec<(u16, u16)> = grid.iter().flatten().copied().collect();

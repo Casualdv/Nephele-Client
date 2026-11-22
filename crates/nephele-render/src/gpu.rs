@@ -327,6 +327,7 @@ impl Renderer {
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            lod_max_clamp: nephele_assets::BLOCK_LOD_MAX,
             ..Default::default()
         });
 
