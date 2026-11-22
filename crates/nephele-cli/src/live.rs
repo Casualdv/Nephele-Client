@@ -36,7 +36,7 @@ use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
 use nephele_render::{
-    append_hand, beams_in_column, biome_fog_color, block_outline, break_overlay_texture,
+    append_hand, beams_in_column, biome_fog_color, block_shape_outline, break_overlay_texture,
     build_beams, build_break_overlay, build_entities, build_hand_item, build_item_mesh, BeaconBeam,
     Camera, ColumnMeshJob, EntityDraw, Environment, HandDraw, HandItem, ItemDraw, LineMesh,
     MeshData, Particles, Renderer, UiBatch,
@@ -2475,7 +2475,9 @@ impl LiveApp {
 
         {
             let mut state = self.shared.lock().unwrap();
-            state.player.flying = self.options.fly;
+            // `--fly` exists for singleplayer and demos only. Starting a server
+            // session airborne is the fastest way to be kicked for flying.
+            state.player.flying = self.options.fly && self.options.address.is_none();
         }
         println!("Textures: {} layers.", textures.layer_count(),);
 
@@ -2953,7 +2955,14 @@ impl LiveApp {
         let aim_moved = aim != self.drawn_aim;
         if aim_moved {
             let lines = match aim {
-                Some(aim) => block_outline(aim.x, aim.y, aim.z, OUTLINE_COLOR),
+                Some(aim) => {
+                    // Match the selection frame to the block's real shape: a
+                    // single box around a slab or staircase reads as "the game
+                    // thinks this is a full block".
+                    let block = self.world.get_block(aim.x, aim.y, aim.z);
+                    let shape = nephele_world::shapes::block_shape(block.id(), block.meta());
+                    block_shape_outline(aim.x, aim.y, aim.z, shape, OUTLINE_COLOR)
+                }
                 None => LineMesh::default(),
             };
             if let Some(renderer) = self.renderer.as_mut() {
@@ -5157,9 +5166,16 @@ impl ApplicationHandler for LiveApp {
                         },
                         (KeyCode::KeyF, ElementState::Pressed) if self.screen == Screen::Game => {
                             let mut state = self.shared.lock().unwrap();
-                            state.player.flying = !state.player.flying;
-                            state.player.vy = 0.0;
-                            println!("flying: {}", state.player.flying);
+                            // Flying is a singleplayer/creative toy. On a server
+                            // it is a kick or a ban: the server owns position,
+                            // sees a player hovering, and rubberbands every tick.
+                            if state.local || state.creative {
+                                state.player.flying = !state.player.flying;
+                                state.player.vy = 0.0;
+                                println!("flying: {}", state.player.flying);
+                            } else {
+                                println!("flight is disabled on servers");
+                            }
                         }
                         (_, ElementState::Pressed)
                             if self.screen == Screen::Inventory
