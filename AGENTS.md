@@ -515,6 +515,12 @@ pane or other small shape. Cross-plants stay on their separate crossed-quad path
   chorus plant/flower 199/200. Double slabs (43/125/181/204) and the beacon (138)
   intentionally stay cubes because their visible bulk is a full block.
 
+**One shape implementation, not two.** `render-audit` carried a parallel pass at
+the same shapes (zero-thickness iron-bar planes, no plant culling, no tint). It
+was **not** merged on top: `render-shapes` supersedes it, and the audit branch
+only added roadmap prose describing the older state. If that branch is revived,
+diff it against this file first — its `bars_shape`/`block_shape` are older.
+
 
 ### Dropped items — done
 
