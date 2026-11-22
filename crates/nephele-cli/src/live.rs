@@ -3100,6 +3100,13 @@ impl LiveApp {
         // The framerate cap sleeps out whatever is left of the frame's budget
         // at the end of `frame()`, once the picture is presented.
 
+        if self.screen == Screen::Game && !self.startup_cmds.is_empty() && view.chunks > 200 {
+            let commands = std::mem::take(&mut self.startup_cmds);
+            for command in commands {
+                self.run_command(command.trim_start_matches('/'));
+            }
+        }
+
         if let Some(err) = &view.error {
             eprintln!("disconnected: {err}");
         }

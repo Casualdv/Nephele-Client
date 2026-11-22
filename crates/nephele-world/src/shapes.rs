@@ -48,8 +48,96 @@ const STAIRS: [[ShapeBox; 2]; 4] = [
     ],
 ];
 
-/// A fence post; the rails get added once connected-texture state exists.
+/// A fence post; the rails are added by `fence_shape` when it connects.
 const FENCE: &[ShapeBox] = &[b([6.0, 0.0, 6.0], [10.0, 16.0, 10.0])];
+
+/// An isolated iron bar: the vanilla two-pixel post.
+const BARS_POST: ShapeBox = b([7.0, 0.0, 7.0], [9.0, 16.0, 9.0]);
+
+/// Iron bars, as one two-pixel-thick half-slab per connected side.
+///
+/// Vanilla's `bars_*` models are zero-thickness planes plus separate two-pixel
+/// rim boxes. A thin slab has the same silhouette from every angle and needs no
+/// rim geometry, which matters here because the mesher has no per-face UV
+/// sub-ranges to map those rims correctly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BarsShape {
+    boxes: [ShapeBox; 4],
+    len: usize,
+}
+
+impl BarsShape {
+    pub fn as_slice(&self) -> &[ShapeBox] {
+        &self.boxes[..self.len]
+    }
+}
+
+pub fn bars_shape(connections: PaneConnections) -> BarsShape {
+    let mut boxes = [BARS_POST; 4];
+    let mut len = 0;
+    if connections.west {
+        boxes[len] = b([0.0, 0.0, 7.0], [8.0, 16.0, 9.0]);
+        len += 1;
+    }
+    if connections.east {
+        boxes[len] = b([8.0, 0.0, 7.0], [16.0, 16.0, 9.0]);
+        len += 1;
+    }
+    if connections.north {
+        boxes[len] = b([7.0, 0.0, 0.0], [9.0, 16.0, 8.0]);
+        len += 1;
+    }
+    if connections.south {
+        boxes[len] = b([7.0, 0.0, 8.0], [9.0, 16.0, 16.0]);
+        len += 1;
+    }
+    if len == 0 {
+        boxes[0] = BARS_POST;
+        len = 1;
+    }
+    BarsShape { boxes, len }
+}
+
+/// Fence post plus the two rails on each connected side. The rails are the
+/// vanilla heights (6..9 and 12..15), so a fence line reads as rails rather
+/// than a solid wall of planks.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FenceShape {
+    boxes: [ShapeBox; 9],
+    len: usize,
+}
+
+impl FenceShape {
+    pub fn as_slice(&self) -> &[ShapeBox] {
+        &self.boxes[..self.len]
+    }
+}
+
+pub fn fence_shape(connections: PaneConnections) -> FenceShape {
+    let mut boxes = [b([6.0, 0.0, 6.0], [10.0, 16.0, 10.0]); 9];
+    let mut len = 1;
+    let mut rail = |min: [f32; 3], max: [f32; 3]| {
+        boxes[len] = b(min, max);
+        len += 1;
+    };
+    if connections.west {
+        rail([0.0, 6.0, 6.0], [6.0, 9.0, 10.0]);
+        rail([0.0, 12.0, 6.0], [6.0, 15.0, 10.0]);
+    }
+    if connections.east {
+        rail([10.0, 6.0, 6.0], [16.0, 9.0, 10.0]);
+        rail([10.0, 12.0, 6.0], [16.0, 15.0, 10.0]);
+    }
+    if connections.north {
+        rail([6.0, 6.0, 0.0], [10.0, 9.0, 6.0]);
+        rail([6.0, 12.0, 0.0], [10.0, 15.0, 6.0]);
+    }
+    if connections.south {
+        rail([6.0, 6.0, 10.0], [10.0, 9.0, 16.0]);
+        rail([6.0, 12.0, 10.0], [10.0, 15.0, 16.0]);
+    }
+    FenceShape { boxes, len }
+}
 
 /// The centre post of an unconnected pane.
 const PANE_POST: ShapeBox = b([7.0, 0.0, 7.0], [9.0, 16.0, 9.0]);
@@ -68,6 +156,26 @@ const TORCH: &[ShapeBox] = &[b([7.0, 0.0, 7.0], [9.0, 10.0, 9.0])];
 const PLATE: &[ShapeBox] = &[b([1.0, 0.0, 1.0], [15.0, 1.0, 15.0])];
 /// The same plate while pressed, at half its thickness.
 const PLATE_PRESSED: &[ShapeBox] = &[b([1.0, 0.0, 1.0], [15.0, 0.5, 15.0])];
+
+/// Cross-quad plants. They have no collision and must not be treated as a
+/// full cube by neighbour culling or ambient occlusion: a flower that claims
+/// to be solid culls the grass top underneath it and leaves a hole.
+const CROSS_PLANTS: [u16; 14] = [6, 31, 32, 37, 38, 39, 40, 59, 83, 104, 105, 115, 141, 142];
+
+/// Flat ground cover: lily pads and carpet occupy one pixel.
+const FLAT_LAYER: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 1.0, 16.0])];
+
+/// Snow layers: two pixels per level, one to eight levels.
+const SNOW_LAYERS: [&[ShapeBox]; 8] = [
+    &[b([0.0, 0.0, 0.0], [16.0, 2.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 4.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 6.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 8.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 10.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 12.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 14.0, 16.0])],
+    &[b([0.0, 0.0, 0.0], [16.0, 16.0, 16.0])],
+];
 
 /// Horizontal pane connections around one block.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -119,6 +227,11 @@ pub fn pane_shape(connections: PaneConnections) -> PaneShape {
 
 pub const fn is_pane(id: u16) -> bool {
     matches!(id, 101 | 102 | 160)
+}
+
+/// Wooden and nether-brick fences share the post-and-rails geometry.
+pub const fn is_fence(id: u16) -> bool {
+    matches!(id, 85 | 113 | 139)
 }
 
 pub const fn is_door(id: u16) -> bool {
@@ -217,7 +330,7 @@ pub fn toggle_door_open(world: &mut World, x: i32, y: i32, z: i32) -> bool {
 /// The boxes making up `id`/`meta`. Unknown blocks are a single full cube.
 pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
     match id {
-        44 | 126 | 182 => {
+        44 | 126 | 182 | 205 => {
             if meta & 8 != 0 {
                 SLAB_TOP
             } else {
@@ -226,10 +339,10 @@ pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
         }
         // Stairs: wood, cobble, brick, stone brick, nether brick, quartz,
         // sandstone, red sandstone, purpur.
-        53 | 67 | 108 | 109 | 114 | 128 | 134 | 135 | 136 | 156 | 163 | 164 | 180 => {
+        53 | 67 | 108 | 109 | 114 | 128 | 134 | 135 | 136 | 156 | 163 | 164 | 180 | 203 => {
             &STAIRS[(meta & 3) as usize]
         }
-        85 | 113 => FENCE,
+        85 | 113 | 139 => FENCE,
         101 | 102 | 160 => PANE,
         id if is_door(id) => {
             if meta & 8 != 0 {
@@ -238,7 +351,16 @@ pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
                 door_shape(meta, 0)
             }
         }
-        50 => TORCH,
+        50 | 75 | 76 => TORCH,
+        // Cross-quad plants and crops occupy no solid volume. The mesher draws
+        // their geometry; this entry is what keeps culling and AO honest.
+        id if CROSS_PLANTS.contains(&id) => EMPTY,
+        175 => EMPTY,
+        78 => SNOW_LAYERS[(meta & 7) as usize],
+        111 | 171 => FLAT_LAYER,
+        // Fire is drawn as crossed, animated quads by the mesher; it must not
+        // masquerade as a full cube to its neighbours.
+        51 => EMPTY,
         // Stone, wooden, weighted iron and weighted gold plates. Metadata is
         // the pressed flag for the first two and the redstone strength for the
         // weighted ones; either way a non-zero value means pressed.
@@ -281,6 +403,21 @@ mod tests {
     }
 
     #[test]
+    fn plants_cover_and_fire_are_never_full_cubes() {
+        for id in [
+            6u16, 31, 32, 37, 38, 39, 40, 51, 59, 78, 83, 104, 105, 111, 115, 141, 142, 171, 175,
+        ] {
+            assert!(
+                !is_full_cube(block_shape(id, 0)),
+                "{id} must not report a full cube"
+            );
+        }
+        assert_eq!(block_shape(37, 0), EMPTY);
+        assert_eq!(block_shape(78, 7)[0].max[1], 16.0);
+        assert_eq!(block_shape(111, 0)[0].max[1], 1.0);
+    }
+
+    #[test]
     fn stairs_are_a_slab_plus_a_step_in_four_directions() {
         for facing in 0..4 {
             let shape = block_shape(53, facing);
@@ -311,6 +448,60 @@ mod tests {
                 .iter()
                 .all(|b| b.min.iter().zip(b.max.iter()).all(|(a, b)| a <= b)));
         }
+    }
+
+    #[test]
+    fn fences_get_rails_only_where_they_connect() {
+        let isolated = fence_shape(PaneConnections::default());
+        assert_eq!(
+            isolated.as_slice(),
+            &[b([6.0, 0.0, 6.0], [10.0, 16.0, 10.0])]
+        );
+
+        let east = fence_shape(PaneConnections {
+            east: true,
+            ..PaneConnections::default()
+        });
+        assert_eq!(east.as_slice().len(), 3);
+        assert!(east
+            .as_slice()
+            .iter()
+            .any(|part| part.min == [10.0, 6.0, 6.0] && part.max == [16.0, 9.0, 10.0]));
+        assert!(east
+            .as_slice()
+            .iter()
+            .any(|part| part.min == [10.0, 12.0, 6.0] && part.max == [16.0, 15.0, 10.0]));
+
+        let all = fence_shape(PaneConnections {
+            west: true,
+            east: true,
+            north: true,
+            south: true,
+        });
+        assert_eq!(all.as_slice().len(), 9);
+    }
+
+    #[test]
+    fn bars_are_two_pixel_slabs_not_paper_thin_cards() {
+        // An isolated bar is the vanilla two-pixel post.
+        let isolated = bars_shape(PaneConnections::default());
+        assert_eq!(isolated.as_slice(), &[BARS_POST]);
+
+        // A north-south line is one slab per half block, two pixels thick in x
+        // and continuous along z: a plane would vanish edge-on, which is the
+        // "cross-plant" look this shape exists to avoid.
+        let line = bars_shape(PaneConnections {
+            north: true,
+            south: true,
+            ..PaneConnections::default()
+        });
+        assert_eq!(line.as_slice().len(), 2);
+        let north = line.as_slice()[0];
+        assert_eq!(north.min, [7.0, 0.0, 0.0]);
+        assert_eq!(north.max, [9.0, 16.0, 8.0]);
+        let south = line.as_slice()[1];
+        assert_eq!(south.min, [7.0, 0.0, 8.0]);
+        assert_eq!(south.max, [9.0, 16.0, 16.0]);
     }
 
     #[test]

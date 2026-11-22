@@ -122,6 +122,9 @@ cargo run -p nephele-launcher                    # the launcher UI
 # development shortcuts (never the only way to reach a screen):
 $env:NEPHELE_SCREEN="servers"   # title|servers|connect|settings|creative|pause|local
 $env:NEPHELE_DATA_DIR="..."     # override the user data directory
+$env:NEPHELE_DEMO="shapes"       # `view` only: wall + bars + fences + fire test scene
+$env:NEPHELE_CMDS="/setblock ~3 ~ ~0 fire;/setblock ~7 ~ ~0 stone"
+                                  # one-shot client-side commands once chunks load
 ```
 
 CI runs fmt, clippy with `-D warnings`, tests, and the publish gate. **A commit that
@@ -459,7 +462,7 @@ nothing writes there any more.
   6, 31, 32, 37, 38, 39, 40, 59, 83, 141, 142, 175, emitting two diagonals each drawn
   twice with opposite winding. Pinned by `plants_are_crossed_quads_not_cubes`.
 
-### Shape-aware meshing — first pass done (2026-11-02)
+### Shape-aware meshing - bars, fences and fire (2026-11-05)
 
 `mesh_column` now consumes `nephele_world::shapes::block_shape(id, meta)`. Full
 cubes keep the direct unit-cube path; each non-full `ShapeBox` emits its six faces
@@ -468,9 +471,50 @@ culling runs only when both states are full cubes, preserving the existing
 `is_transparent` rules without dropping the partially covered face beside a stair,
 pane or other small shape. Cross-plants stay on their separate crossed-quad path.
 
-The current table now renders slabs, stairs, fence posts, panes, door slabs and
-standing torches. Fence rails and pane connections are not modelled yet; shaped
-blocks currently emit their box faces without neighbour culling.
+- **Iron bars (101)** are two-pixel-thick slabs, one per connected side
+  (`bars_shape`), with the matching slice of `iron_bars` sampled on their thin
+  faces so the texture never squashes into stripes. Vanilla's `bars_*` models
+  are zero-thickness planes plus separate rim boxes; a slab gives the same
+  silhouette from every angle. A zero-thickness centre plane was the first
+  attempt and vanished edge-on, so a run of bars read as a row of perpendicular
+  cards. An isolated bar is the vanilla two-pixel post.
+- **Fences (85, 113) and cobblestone walls (139)** get a 4px post plus two rails
+  (y=6..9 and 12..15) on every connected side via `fence_shape`.
+  **Glass/stained panes (102, 160)** keep the 2px arm boxes. All three resolve
+  connections through the column's border planes, so a line crossing a chunk edge
+  joins up (`pane_shape_for_block`, `fence_shape_for_block`).
+- **Fire (51)** is two crossed planes, full block height, alternating
+  `fire_layer_0`/`fire_layer_1` between their four sides, full-bright, and drawn
+  from both windings. Its geometry lives in `MeshData::transparent_*` and the
+  renderer draws that range after the solid chunk pass with the same alpha-blended
+  block pipeline. `block_shape(51)` is `EMPTY`, so fire no longer culls the faces
+  of the block it sits on. It is also in `is_transparent`.
+- **Plants, crops and ground cover are not cubes.** `block_shape` used to fall
+  back to `FULL` for every id it did not know, so a flower reported a full cube
+  and the grass top beneath it was culled or AO-darkened: black holes under
+  flower beds. Cross-quads and crops (6, 31, 32, 37-40, 59, 83, 104, 105, 115,
+  141, 142, 175), torches and redstone torches (50, 75, 76), lily pads and
+  carpet (111, 171) now report `EMPTY` or a 1-pixel layer, and snow layers (78)
+  report their real height. They are also in `is_transparent`. The mesher still
+  draws the crossed quads; the shape table is what stops culling/AO.
+- **Biome grass/foliage tint** is per block position and blended 3x3 at biome
+  edges (`tint_for_block` + `BiomeColorizer`). There is no extra vertex
+  attribute: `Vertex.anim` packs `animation index + 1` in bits 0..6, a tint-mask
+  bit 7 and 0xRRGGBB in bits 8..31, so `NO_ANIMATION` is `0xFFFFFF00`. Grass
+  sides store the overlay coverage in their alpha channel and set the mask bit,
+  which lets the shader tint the grass pixels without tinting the dirt below.
+  The shader decodes the word and multiplies before fog.
+- **Still on the cube path** (audited 2026-11-05; vanilla renders these as
+  non-cubes but the table has no model for them yet): bed 26; rails 27/28/66;
+  cobweb 30; piston head 34; redstone wire 55; signs 63/68; ladder 65; levers
+  69; pressure plates 70/72/147/148; buttons 77/143; nether portal 90; cake 92;
+  repeaters 93/94; trapdoors 96/167; vines 106; fence gates 107; enchanting
+  table 116; brewing stand 117; cauldron 118; end portal 119 and its frame 120;
+  cocoa 127; tripwire 132; flower pot 140; skull 144; anvil 145; comparators
+  149/150; daylight detector 151; hopper 154; banners 176/177; end rod 198;
+  chorus plant/flower 199/200. Double slabs (43/125/181/204) and the beacon (138)
+  intentionally stay cubes because their visible bulk is a full block.
+
 
 ### Dropped items — done
 
@@ -865,7 +909,7 @@ places (`Future.md`'s milestones, the old session names, and the roadmap), and
 
 | Lane | Owns | Branch | State |
 |---|---|---|---|
-| `render` | shapes, tinting, sky, fog | `render` | 95%: bars, fire, plant culling and biome tint landed; audit leftovers |
+| `render` | shapes, tinting, sky, fog | `render` + `render-shapes` | **merged**: bars/fences/fire shapes, plant culling, biome tint (mask texture), colormap extraction; `render-audit` left over |
 | `biomes` | GenLayer parity | `biomes` | **100% biome cells, every stage diff 0 — lane complete** |
 | `biome-vis` | singleplayer generator + biome data path | `biome-vis` | done: `local_loop` streams `VanillaGenerator`, columns carry `Level.Biomes`; needs merge |
 | `worldgen` | two-stage generation, caves, ores, flora, structures (W1–W5) | `w-worldgen` | split done; population generators next (80% of block diffs) |

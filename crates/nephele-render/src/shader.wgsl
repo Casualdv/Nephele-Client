@@ -51,7 +51,11 @@ fn vs_main(in: VertexIn) -> VertexOut {
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    // `in.layer` is a packed tile slot: 16 tiles per 64×64 layer, 4×4 inside.
+    // `in.anim` is the animation row, or 0xFFFFFFFF for a static texture.
+    // `in.tint` is the packed 0xRRGGBB biome tint; white is the no-op.
+    let anim = in.anim;
+
+    // `in.layer` is a packed tile slot: 16 tiles per 64x64 layer, 4x4 inside.
     let local = in.layer % 16u;
     let offset = vec2<f32>(f32(local % 4u), f32(local / 4u));
     let uv = (in.uv + offset) * 0.25;
@@ -68,9 +72,10 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 
     // `.mcmeta` animations live in a 2D strip atlas. The vertex carries the
     // animation row, while the current frame comes from the tick clock.
-    if (in.anim != 0xFFFFFFFFu) {
-        let frame_info = uniforms.animations[in.anim * 2u];
-        let timing = uniforms.animations[in.anim * 2u + 1u];
+    if (anim != 0xFFFFFFFFu) {
+        let index = anim;
+        let frame_info = uniforms.animations[index * 2u];
+        let timing = uniforms.animations[index * 2u + 1u];
         let count = max(u32(timing.y), 1u);
         let frame = u32(floor(uniforms.animation.x / max(timing.z, 1.0))) % count;
         let anim_uv = vec2<f32>(
@@ -79,6 +84,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         );
         texel = textureSampleLevel(animation_atlas, block_sampler, anim_uv, 0.0);
     }
+
     // Leaves, glass and other cutout textures use alpha testing.
     if (texel.a < 0.5) {
         discard;

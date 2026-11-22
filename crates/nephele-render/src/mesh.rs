@@ -3,7 +3,8 @@ use nephele_assets::{
 };
 use nephele_world::block::ids;
 use nephele_world::shapes::{
-    block_shape, door_shape, is_door, is_full_cube, is_pane, pane_shape, PaneConnections, PaneShape,
+    bars_shape, block_shape, door_shape, fence_shape, is_door, is_fence, is_full_cube, is_pane,
+    pane_shape, FenceShape, PaneConnections, PaneShape,
 };
 use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World};
 
@@ -15,7 +16,7 @@ pub struct Vertex {
     pub shade: f32,
     /// Packed texture slot: `layer = slot / 16`, tile = `slot % 16`.
     pub layer: u32,
-    /// Optional index into the renderer's `.mcmeta` animation table.
+    /// Animation index + 1, or `NO_ANIMATION` for a static layer.
     pub anim: u32,
     /// Packed 0xRRGGBB biome tint; white means "leave the texture untouched".
     pub tint: u32,
@@ -52,11 +53,15 @@ impl Vertex {
 pub struct MeshData {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
+    /// Blended geometry (fire), drawn after the opaque pass with no depth
+    /// writes. Keeping it separate is what lets it use a second pipeline.
+    pub transparent_vertices: Vec<Vertex>,
+    pub transparent_indices: Vec<u32>,
 }
 
 impl MeshData {
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.indices.is_empty() && self.transparent_indices.is_empty()
     }
 
     pub fn append(&mut self, other: MeshData) {
@@ -64,6 +69,11 @@ impl MeshData {
         self.vertices.extend(other.vertices);
         self.indices
             .extend(other.indices.into_iter().map(|i| i + base));
+
+        let base = self.transparent_vertices.len() as u32;
+        self.transparent_vertices.extend(other.transparent_vertices);
+        self.transparent_indices
+            .extend(other.transparent_indices.into_iter().map(|i| i + base));
     }
 }
 
@@ -228,7 +238,9 @@ pub struct ColumnMeshJob {
     pub key: (i32, i32),
     /// One entry per 16-block section; `None` when the section is all air.
     pub sections: Vec<Option<Vec<u16>>>,
-    /// 18x18 biome ids including a one-block border, indexed `(z + 1) * 18 + x + 1`.
+    /// 18x18 biome ids including a one-block border, indexed
+    /// `(z + 1) * 18 + x + 1`. The mesher averages the 3x3 neighbourhood for
+    /// grass and foliage, the same way vanilla's `BiomeColorHelper` does.
     pub biomes: Vec<u8>,
     /// Blocks of the neighbour at local x = 15, indexed `y * 16 + z`.
     pub west: Vec<u16>,
@@ -267,9 +279,8 @@ impl ColumnMeshJob {
         let mut biomes = vec![1u8; 18 * 18];
         for z in -1..=16 {
             for x in -1..=16 {
-                let world_x = key.0 * 16 + x;
-                let world_z = key.1 * 16 + z;
-                biomes[((z + 1) * 18 + x + 1) as usize] = world_biome(world, world_x, world_z);
+                biomes[((z + 1) * 18 + x + 1) as usize] =
+                    world_biome(world, key.0 * 16 + x, key.1 * 16 + z);
             }
         }
         Self {
@@ -644,6 +655,37 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             let local_y = ((index >> 8) & 15) as i32;
             let y = section_y + local_y;
             let id = raw >> 4;
+            let meta = (raw & 0x0f) as u8;
+            let block_tint = tint_for_block(atlas, job, id, meta, local_x, local_z);
+
+            // Iron bars are two-pixel slabs (see `append_bars`), not a
+            // zero-thickness centre plane: a plane collapses to nothing
+            // edge-on and a line of them reads as a row of crossed cards.
+            if id == 101 {
+                let bx = (base_x + local_x) as f32;
+                let by = y as f32;
+                let bz = (base_z + local_z) as f32;
+                append_bars(
+                    &mut mesh,
+                    layers[2],
+                    anims[2],
+                    job.light(local_x, y + 1, local_z) as f32 / 15.0,
+                    [bx, by, bz],
+                    connections_at(job, local_x, y, local_z),
+                );
+                continue;
+            }
+
+            // Fire is two crossed, animated quads (fire_layer_0 and
+            // fire_layer_1) that must blend rather than cut out, so it goes
+            // into the transparent mesh.
+            if id == 51 {
+                let bx = (base_x + local_x) as f32;
+                let by = y as f32;
+                let bz = (base_z + local_z) as f32;
+                append_fire(&mut mesh, atlas, [bx, by, bz], local_x, y, local_z, job);
+                continue;
+            }
 
             // Plants are two crossed quads, not a cube. Rendering them as
             // cubes is what makes flowers and grass look like solid boxes.
@@ -704,11 +746,12 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                 }
                 continue;
             }
-            let meta = (raw & 0x0f) as u8;
-            let block_tint = tint_for_block(atlas, job, id, meta, local_x, local_z);
             let pane_boxes = is_pane(id).then(|| pane_shape_for_block(job, local_x, y, local_z));
+            let fence_boxes = is_fence(id).then(|| fence_shape_for_block(job, local_x, y, local_z));
             let shape = if let Some(pane) = pane_boxes.as_ref() {
                 pane.as_slice()
+            } else if let Some(fence) = fence_boxes.as_ref() {
+                fence.as_slice()
             } else if is_door(id) {
                 door_shape_for_block(job, id, meta, local_x, y, local_z)
             } else {
@@ -784,17 +827,25 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
 }
 
 fn pane_shape_for_block(job: &ColumnMeshJob, x: i32, y: i32, z: i32) -> PaneShape {
-    pane_shape(PaneConnections {
+    pane_shape(connections_at(job, x, y, z))
+}
+
+fn fence_shape_for_block(job: &ColumnMeshJob, x: i32, y: i32, z: i32) -> FenceShape {
+    fence_shape(connections_at(job, x, y, z))
+}
+
+fn connections_at(job: &ColumnMeshJob, x: i32, y: i32, z: i32) -> PaneConnections {
+    PaneConnections {
         west: pane_connects(job.block(x - 1, y, z)),
         east: pane_connects(job.block(x + 1, y, z)),
         north: pane_connects(job.block(x, y, z - 1)),
         south: pane_connects(job.block(x, y, z + 1)),
-    })
+    }
 }
 
 fn pane_connects(raw: u16) -> bool {
     let id = raw >> 4;
-    is_pane(id) || is_full_cube(block_shape(id, (raw & 0x0f) as u8))
+    is_pane(id) || is_fence(id) || is_full_cube(block_shape(id, (raw & 0x0f) as u8))
 }
 
 fn door_shape_for_block(
@@ -942,6 +993,7 @@ fn should_cull_full_cube_face(
     neighbour == raw && is_transparent(id)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_quad(
     mesh: &mut MeshData,
     face: &FaceDef,
@@ -971,16 +1023,155 @@ fn append_quad(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-/// Blocks drawn as two crossed quads rather than a cube.
+/// Iron bars: two-pixel-thick slabs (`bars_shape`) with vanilla's UV slices on
+/// the thin faces.
 ///
+/// A zero-thickness centre plane looks right head-on but vanishes edge-on, so a
+/// run of bars reads as a row of crossed cards. A plain two-pixel box fixes the
+/// silhouette but squashes the whole 16-pixel bar texture into its thin faces,
+/// which reads as stripes of noise. Sampling the matching slice of the texture
+/// on each face gives both: a wall that is solid from every angle and a bar
+/// pattern that keeps its scale.
+fn append_bars(
+    mesh: &mut MeshData,
+    layer: u32,
+    anim: u32,
+    light: f32,
+    origin: [f32; 3],
+    connections: PaneConnections,
+) {
+    const THIN_LO: f32 = 7.0 / 16.0;
+    const THIN_HI: f32 = 9.0 / 16.0;
+    const THIN: (f32, f32) = (THIN_LO, THIN_HI);
+    let [bx, by, bz] = origin;
+
+    for bar in bars_shape(connections).as_slice() {
+        let min = [
+            bx + bar.min[0] / 16.0,
+            by + bar.min[1] / 16.0,
+            bz + bar.min[2] / 16.0,
+        ];
+        let max = [
+            bx + bar.max[0] / 16.0,
+            by + bar.max[1] / 16.0,
+            bz + bar.max[2] / 16.0,
+        ];
+        // The arm runs along whichever horizontal axis is more than half a
+        // block long; that length is what the big faces should sample.
+        let span_x = bar.max[0] - bar.min[0] >= 8.0;
+        let span_z = bar.max[2] - bar.min[2] >= 8.0;
+        let arm_x = (bar.min[0] / 16.0, bar.max[0] / 16.0);
+        let arm_z = (bar.min[2] / 16.0, bar.max[2] / 16.0);
+
+        for face in &FACES {
+            // `face.uvs` maps u/v onto the unit face; scale that into the
+            // texture slice this particular face covers.
+            let (u, v) = if face.normal[1] != 0 {
+                (
+                    if span_x { arm_x } else { THIN },
+                    if span_z { arm_z } else { THIN },
+                )
+            } else if face.normal[0] != 0 {
+                (if span_z { arm_z } else { THIN }, (0.0, 1.0))
+            } else {
+                (if span_x { arm_x } else { THIN }, (0.0, 1.0))
+            };
+            let base = mesh.vertices.len() as u32;
+            for (corner, uv) in face.corners.iter().zip(face.uvs.iter()) {
+                mesh.vertices.push(Vertex {
+                    position: [
+                        if corner[0] == 0.0 { min[0] } else { max[0] },
+                        if corner[1] == 0.0 { min[1] } else { max[1] },
+                        if corner[2] == 0.0 { min[2] } else { max[2] },
+                    ],
+                    uv: [u.0 + uv[0] * (u.1 - u.0), v.0 + uv[1] * (v.1 - v.0)],
+                    shade: face.shade,
+                    layer,
+                    anim,
+                    tint: NO_TINT,
+                    light,
+                });
+            }
+            mesh.indices
+                .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+    }
+}
+
+/// Fire: two crossed planes, each drawn from both sides, alternating the two
+/// `.mcmeta` layers so the flames keep moving even in a static frame.
+fn append_fire(
+    mesh: &mut MeshData,
+    atlas: &TextureArray,
+    origin: [f32; 3],
+    local_x: i32,
+    y: i32,
+    local_z: i32,
+    job: &ColumnMeshJob,
+) {
+    let layers = [
+        atlas.slot_or_missing("fire_layer_0"),
+        atlas.slot_or_missing("fire_layer_1"),
+    ];
+    let anims = [
+        atlas.animation("fire_layer_0").unwrap_or(NO_ANIMATION),
+        atlas.animation("fire_layer_1").unwrap_or(NO_ANIMATION),
+    ];
+    let light = (job.light(local_x, y + 1, local_z) as f32 / 15.0).max(0.85);
+    let [bx, by, bz] = origin;
+    let quads = [
+        [
+            [bx, by, bz],
+            [bx + 1.0, by, bz + 1.0],
+            [bx + 1.0, by + 1.0, bz + 1.0],
+            [bx, by + 1.0, bz],
+        ],
+        [
+            [bx + 1.0, by, bz],
+            [bx, by, bz + 1.0],
+            [bx, by + 1.0, bz + 1.0],
+            [bx + 1.0, by + 1.0, bz],
+        ],
+    ];
+    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+
+    for (plane, quad) in quads.into_iter().enumerate() {
+        for (side, order) in [[0usize, 1, 2, 3], [3, 2, 1, 0]].into_iter().enumerate() {
+            let layer = layers[(plane + side) % 2];
+            let anim = anims[(plane + side) % 2];
+            let base = mesh.transparent_vertices.len() as u32;
+            for index in order {
+                mesh.transparent_vertices.push(Vertex {
+                    position: quad[index],
+                    uv: uvs[index],
+                    shade: 1.0,
+                    layer,
+                    anim,
+                    tint: NO_TINT,
+                    light,
+                });
+            }
+            mesh.transparent_indices.extend_from_slice(&[
+                base,
+                base + 1,
+                base + 2,
+                base,
+                base + 2,
+                base + 3,
+            ]);
+        }
+    }
+}
+
 /// Saplings, grass, flowers, mushrooms, crops, sugar cane and the double
 /// plants. Everything else keeps the cube path.
 fn is_cross_plant(id: u16) -> bool {
     matches!(
         id,
-        6 | 31 | 32 | 37 | 38 | 39 | 40 | 59 | 83 | 141 | 142 | 175
+        6 | 31 | 32 | 37 | 38 | 39 | 40 | 59 | 83 | 104 | 105 | 115 | 141 | 142 | 175
     )
 }
+
 /// Mesh one chunk column straight from the world.
 pub fn build_column_mesh(column: &ChunkColumn, world: &World, atlas: &TextureArray) -> MeshData {
     let job = ColumnMeshJob::from_column(column, world);
@@ -1250,7 +1441,7 @@ mod tests {
 
     #[test]
     fn isolated_pane_mesh_uses_the_centre_post() {
-        let mesh = single_block_mesh(BlockState::new(101, 0));
+        let mesh = single_block_mesh(BlockState::new(102, 0));
         assert_eq!(mesh.vertices.len(), 24);
         assert_eq!(
             bounds(&mesh.vertices),
@@ -1596,12 +1787,181 @@ mod tests {
                 .iter()
                 .map(|index| mesh.vertices[*index as usize].position)
                 .collect();
-            if positions.iter().all(|p| p[1] >= 65.0) {
+            if positions.iter().all(|p| p[1] >= 65.0) && positions.iter().any(|p| p[1] > 65.0) {
                 quads += 1;
             }
         }
         assert_eq!(quads, 4, "expected two crossed quads drawn both ways");
     }
+
+    #[test]
+    fn flowers_do_not_cull_the_grass_below_them() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::new(2, 0));
+        column.set_block(3, 65, 3, BlockState::new(38, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+        let top_face = mesh.indices.chunks(6).any(|window| {
+            window.iter().all(|index| {
+                let position = mesh.vertices[*index as usize].position;
+                (position[1] - 65.0).abs() < 1.0e-6
+                    && (3.0..=4.0).contains(&position[0])
+                    && (3.0..=4.0).contains(&position[2])
+            })
+        });
+        assert!(top_face, "the grass top under a flower must not be culled");
+    }
+
+    #[test]
+    fn grass_carries_its_biome_tint_and_masks_the_side_overlay() {
+        let mut column = ChunkColumn::empty(0, 0);
+        let mut biomes = [1u8; 256];
+        biomes.fill(21); // jungle
+        column.set_biomes(&biomes);
+        column.set_block(3, 64, 3, BlockState::new(2, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+
+        let tinted: Vec<u32> = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.tint)
+            .filter(|tint| *tint != NO_TINT)
+            .collect();
+        assert!(!tinted.is_empty(), "grass must carry a biome tint");
+    }
+
+    #[test]
+    fn fire_is_two_crossed_quads_with_both_animated_layers() {
+        let atlas = nephele_assets::TextureArray::from_tiles(vec![
+            (
+                "fire_layer_0".to_string(),
+                RgbaImage::from_pixel(16, 16, image::Rgba([250, 120, 30, 255])),
+            ),
+            (
+                "fire_layer_1".to_string(),
+                RgbaImage::from_pixel(16, 16, image::Rgba([255, 200, 60, 255])),
+            ),
+        ]);
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::new(51, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas);
+
+        assert!(
+            mesh.vertices.is_empty(),
+            "fire must not enter the cube path"
+        );
+        assert_eq!(mesh.transparent_vertices.len(), 16);
+        assert_eq!(mesh.transparent_indices.len(), 24);
+        let mut slots: Vec<u32> = mesh
+            .transparent_vertices
+            .iter()
+            .map(|vertex| vertex.layer)
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), 2, "both fire layers must be used");
+        assert_eq!(
+            bounds(&mesh.transparent_vertices),
+            ([3.0, 64.0, 3.0], [4.0, 65.0, 4.0])
+        );
+    }
+
+    #[test]
+    fn fire_does_not_hide_the_face_of_its_neighbour() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::STONE);
+        column.set_block(3, 65, 3, BlockState::new(51, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+        // The fire sits above the stone; the stone's top face must survive.
+        let mut top_faces = 0;
+        for window in mesh.indices.chunks(6) {
+            let positions: Vec<[f32; 3]> = window
+                .iter()
+                .map(|index| mesh.vertices[*index as usize].position)
+                .collect();
+            if positions.iter().all(|p| p[1] == 65.0) {
+                top_faces += 1;
+            }
+        }
+        assert!(top_faces >= 1, "the fire must not cull the block below it");
+    }
+
+    #[test]
+    fn fences_and_bars_build_arms_only_where_they_connect() {
+        // An isolated iron bar is the vanilla two-pixel post, with real
+        // thickness in both horizontal axes.
+        let mesh = single_block_mesh(BlockState::new(101, 0));
+        let (min, max) = bounds(&mesh.vertices);
+        assert!((min[0] - 7.0 / 16.0).abs() < 1.0e-5);
+        assert!((max[0] - 9.0 / 16.0).abs() < 1.0e-5);
+        assert!((min[2] - 7.0 / 16.0).abs() < 1.0e-5);
+        assert!((max[2] - 9.0 / 16.0).abs() < 1.0e-5);
+
+        // A north-south line of bars must be one continuous wall that is two
+        // pixels thick in x. A zero-thickness plane collapses to nothing
+        // edge-on, which is the "cross-plant" look this shape avoids.
+        let mut column = ChunkColumn::empty(0, 0);
+        for z in 8..=10 {
+            column.set_block(8, 40, z, BlockState::new(101, 0));
+        }
+        let world = world_with(column.clone());
+        let atlas = atlas();
+        let mesh = build_column_mesh(&column, &world, &atlas);
+        let bar_layer = atlas.slot_or_missing("iron_bars");
+        let bars: Vec<Vertex> = mesh
+            .vertices
+            .iter()
+            .copied()
+            .filter(|vertex| vertex.layer == bar_layer)
+            .collect();
+        assert!(!bars.is_empty());
+        assert!(
+            bars.iter().all(|vertex| {
+                vertex.position[0] >= 8.0 + 7.0 / 16.0 - 1.0e-5
+                    && vertex.position[0] <= 8.0 + 9.0 / 16.0 + 1.0e-5
+            }),
+            "a north-south bar line must stay inside one two-pixel slab"
+        );
+        let (min, max) = bounds(&bars);
+        assert!((min[2] - 8.5).abs() < 1.0e-6);
+        assert!((max[2] - 10.5).abs() < 1.0e-6);
+
+        // A bar against a wall grows a slab that reaches the wall, running
+        // along the connection (east), so it stays two pixels thick in z.
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(8, 40, 8, BlockState::new(101, 0));
+        column.set_block(9, 40, 8, BlockState::STONE);
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas);
+        let bars: Vec<Vertex> = mesh
+            .vertices
+            .iter()
+            .copied()
+            .filter(|vertex| vertex.layer == bar_layer)
+            .collect();
+        let (min, max) = bounds(&bars);
+        assert!((min[0] - 8.5).abs() < 1.0e-6);
+        assert!((max[0] - 9.0).abs() < 1.0e-6);
+        assert!((min[2] - (8.0 + 7.0 / 16.0)).abs() < 1.0e-5);
+        assert!((max[2] - (8.0 + 9.0 / 16.0)).abs() < 1.0e-5);
+
+        // A nether-brick fence against the same wall has rails.
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(8, 40, 8, BlockState::new(113, 0));
+        column.set_block(9, 40, 8, BlockState::STONE);
+        let world = world_with(column.clone());
+        let job = ColumnMeshJob::from_column(&column, &world);
+        let shape = fence_shape_for_block(&job, 8, 40, 8);
+        assert_eq!(shape.as_slice().len(), 3, "post plus two east rails");
+        assert!(shape
+            .as_slice()
+            .iter()
+            .any(|part| part.min == [10.0, 6.0, 6.0] && part.max == [16.0, 9.0, 10.0]));
+    }
+
     #[test]
     fn mesh_job_snapshot_matches_live_world() {
         let mut column = ChunkColumn::empty(0, 0);

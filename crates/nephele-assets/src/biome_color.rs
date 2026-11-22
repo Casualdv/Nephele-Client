@@ -1,9 +1,9 @@
 //! Vanilla biome colourizer tables for grass, foliage and water.
 //!
 //! 1.8.9 stores grass and foliage colours in two 256x256 PNGs and looks them up
-//! by `(temperature, rainfall)`. Those files are extracted from the player's own
-//! client jar by `nephele-prepare`; the fallback below keeps a fresh tree usable
-//! before resources are prepared.
+//! by `(temperature, rainfall)`. Those files are extracted from the player's
+//! own client jar by `nephele-prepare`; the fallback below keeps a fresh tree
+//! usable before resources are prepared.
 
 use std::path::Path;
 
@@ -41,8 +41,8 @@ impl BiomeColorizer {
 
     /// Vanilla `BiomeColorHelper` colour for one biome.
     pub fn tint(&self, kind: TintKind, biome_id: i32) -> [f32; 3] {
-        let biome = biome::any(biome_id)
-            .unwrap_or_else(|| biome::any(1).expect("plains is a registered biome"));
+        let biome =
+            biome::any(biome_id).unwrap_or_else(|| biome::any(1).expect("plains is registered"));
         let temperature = biome.base.temperature.clamp(0.0, 1.0) as f64;
         let rainfall = biome.base.rainfall.clamp(0.0, 1.0) as f64;
         match kind {
@@ -65,10 +65,6 @@ impl BiomeColorizer {
                 }
             }
         }
-    }
-
-    pub fn water_color(biome_id: i32) -> [f32; 3] {
-        Self::fallback().tint(TintKind::Water, biome_id)
     }
 }
 
@@ -137,11 +133,12 @@ mod tests {
 
     #[test]
     fn swamp_water_is_green_and_others_are_white() {
+        let colors = BiomeColorizer::fallback();
         assert_eq!(
-            BiomeColorizer::water_color(6),
+            colors.tint(TintKind::Water, 6),
             [224.0 / 255.0, 1.0, 174.0 / 255.0]
         );
-        assert_eq!(BiomeColorizer::water_color(1), [1.0, 1.0, 1.0]);
+        assert_eq!(colors.tint(TintKind::Water, 1), [1.0, 1.0, 1.0]);
     }
 
     #[test]
