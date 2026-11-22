@@ -25,7 +25,9 @@ use crate::servers::{Ping, PingBoard, ServerEntry, ServerList, Status};
 use crate::settings::{Brightness, OptionRow, Settings};
 use crate::skins::SkinLoader;
 use crate::ui::{self, Action, HudState, Screen};
-use nephele_assets::{Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas, MISSING_TEXTURE};
+use nephele_assets::{
+    EntityAtlas, Panorama, SkinAtlas, SplashTexts, TextureArray, UiAtlas, MISSING_TEXTURE,
+};
 use nephele_audio::{AudioEngine, Listener};
 use nephele_client::mining::{Aim, Miner, MiningEvent};
 use nephele_client::physics::{Input, PlayerState, EYE_HEIGHT};
@@ -2154,6 +2156,20 @@ impl LiveApp {
         }
 
         let size = window.inner_size();
+        // Entity textures for block-entity models. A missing file leaves its
+        // slot magenta and is named here, like the block atlas.
+        let entity_atlas = EntityAtlas::load(
+            self.options
+                .assets_dir
+                .parent()
+                .unwrap_or(&self.options.assets_dir),
+        );
+        if !entity_atlas.missing().is_empty() {
+            tracing::warn!(
+                missing = ?entity_atlas.missing(),
+                "entity atlas is incomplete; those models will draw magenta"
+            );
+        }
         let renderer_start = Instant::now();
         let mut renderer = match Renderer::new(
             window.clone(),
@@ -2162,6 +2178,7 @@ impl LiveApp {
             &textures,
             &ui_atlas,
             panorama.as_ref(),
+            &entity_atlas,
         ) {
             Ok(renderer) => renderer,
             Err(err) => return self.fail(event_loop, err),

@@ -49,6 +49,14 @@ impl EntityMesh {
     pub fn is_empty(&self) -> bool {
         self.indices.is_empty()
     }
+
+    /// Append another mesh, rebasing its indices.
+    pub fn append(&mut self, other: EntityMesh) {
+        let base = self.vertices.len() as u32;
+        self.vertices.extend(other.vertices);
+        self.indices
+            .extend(other.indices.into_iter().map(|index| index + base));
+    }
 }
 
 /// One entity to draw this frame.

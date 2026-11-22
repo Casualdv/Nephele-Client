@@ -5,6 +5,7 @@
 //! surface, pipelines and draw calls.
 
 pub mod beacon;
+pub mod block_entities;
 pub mod camera;
 pub mod entity;
 pub mod environment;

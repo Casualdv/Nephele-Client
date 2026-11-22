@@ -128,6 +128,12 @@ impl Viewer {
         );
 
         let size = window.inner_size();
+        let entity_atlas = nephele_assets::EntityAtlas::load(
+            self.options
+                .assets_dir
+                .parent()
+                .unwrap_or(&self.options.assets_dir),
+        );
         let mut renderer = match Renderer::new(
             window.clone(),
             size.width,
@@ -135,6 +141,7 @@ impl Viewer {
             &textures,
             &UiAtlas::blank(),
             None,
+            &entity_atlas,
         ) {
             Ok(renderer) => renderer,
             Err(err) => return self.fail(event_loop, err),

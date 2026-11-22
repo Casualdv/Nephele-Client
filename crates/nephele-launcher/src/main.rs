@@ -162,6 +162,7 @@ impl Launcher {
             &blocks,
             &ui_atlas,
             None,
+            &nephele_assets::EntityAtlas::empty(),
         ) {
             Ok(renderer) => renderer,
             Err(err) => return self.fail(event_loop, err),

@@ -1,11 +1,14 @@
 use nephele_assets::{
     face_textures, is_transparent, item_texture_name, TextureArray, TintKind, MISSING_TEXTURE,
 };
+use nephele_world::block_entity::{render_kind, RenderKind};
 use nephele_world::shapes::{
     bars_shape, block_shape, door_shape, fence_shape, is_door, is_fence, is_full_cube, is_pane,
     pane_shape, FenceShape, PaneConnections, PaneShape,
 };
 use nephele_world::{BlockState, ChunkColumn, ChunkCoord, World};
+
+use crate::block_entities;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -71,11 +74,17 @@ pub struct MeshData {
     /// writes. Keeping it separate is what lets it use a second pipeline.
     pub transparent_vertices: Vec<Vertex>,
     pub transparent_indices: Vec<u32>,
+    /// Block-entity models (chests, signs, banners) in the entity vertex
+    /// format, because their textures live in the entity atlas rather than the
+    /// block tile array. Drawn with the entity pipeline and its own bind group.
+    pub block_entities: crate::entity::EntityMesh,
 }
 
 impl MeshData {
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty() && self.transparent_indices.is_empty()
+        self.indices.is_empty()
+            && self.transparent_indices.is_empty()
+            && self.block_entities.is_empty()
     }
 
     pub fn append(&mut self, other: MeshData) {
@@ -88,6 +97,8 @@ impl MeshData {
         self.transparent_vertices.extend(other.transparent_vertices);
         self.transparent_indices
             .extend(other.transparent_indices.into_iter().map(|i| i + base));
+
+        self.block_entities.append(other.block_entities);
     }
 }
 
@@ -582,7 +593,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
     let mut mesh = MeshData::default();
     // Block states repeat heavily, so resolve the texture layers once per
     // distinct state instead of three hash lookups per block.
-    type ResolvedTextures = ([u32; 3], [Option<u32>; 3]);
+    type ResolvedTextures = ([u32; 3], [Option<u32>; 3], Option<(u32, Option<u32>, u8)>);
     let mut resolved: std::collections::HashMap<u16, Option<ResolvedTextures>> =
         std::collections::HashMap::with_capacity(64);
 
@@ -599,6 +610,64 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             if raw == 0 {
                 continue;
             }
+            let local_x = (index & 15) as i32;
+            let local_z = ((index >> 4) & 15) as i32;
+            let local_y = ((index >> 8) & 15) as i32;
+            let y = section_y + local_y;
+            let id = raw >> 4;
+            let meta = (raw & 0x0f) as u8;
+            let kind = render_kind(id, meta);
+
+            // Block entities have their own models and do not sample the block
+            // tile array, so they are dispatched before the texture lookup.
+            if let RenderKind::BlockEntity(_) = kind {
+                if let block_entities::ModelPlan::Draw(entity) =
+                    block_entities::model_for(id, meta, job, local_x, y, local_z)
+                {
+                    let origin = [
+                        (base_x + local_x) as f32,
+                        y as f32,
+                        (base_z + local_z) as f32,
+                    ];
+                    let light = job.light(local_x, y, local_z) as f32 / 15.0;
+                    match entity {
+                        nephele_world::block_entity::BlockEntityKind::Chest { size } => {
+                            block_entities::append_chest(
+                                &mut mesh.block_entities,
+                                id,
+                                size == nephele_world::block_entity::ChestSize::Double,
+                                meta,
+                                origin,
+                                light,
+                            );
+                        }
+                        nephele_world::block_entity::BlockEntityKind::Sign { kind } => {
+                            block_entities::append_sign(
+                                &mut mesh.block_entities,
+                                kind,
+                                meta,
+                                origin,
+                                light,
+                            );
+                        }
+                        nephele_world::block_entity::BlockEntityKind::Bed { head } => {
+                            block_entities::append_bed(&mut mesh, atlas, head, meta, origin, light);
+                        }
+                        nephele_world::block_entity::BlockEntityKind::Banner { wall } => {
+                            block_entities::append_banner(
+                                &mut mesh.block_entities,
+                                wall,
+                                meta,
+                                origin,
+                                light,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+
             let layers = match resolved.entry(raw) {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -610,105 +679,104 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                         ];
                         let anims = [textures.top, textures.bottom, textures.side]
                             .map(|name| atlas.animation(name));
-                        (layers, anims)
+                        let front = textures.front.map(|(name, facing)| {
+                            (atlas.slot_or_missing(name), atlas.animation(name), facing)
+                        });
+                        (layers, anims, front)
                     });
                     *entry.insert(textures)
                 }
             };
-            let Some((layers, anims)) = layers else {
+            let Some((layers, anims, front)) = layers else {
                 continue;
             };
 
-            let local_x = (index & 15) as i32;
-            let local_z = ((index >> 4) & 15) as i32;
-            let local_y = ((index >> 8) & 15) as i32;
-            let y = section_y + local_y;
-            let id = raw >> 4;
             let block_tint = tint_for_block(atlas, job, raw, local_x, local_z);
 
-            // Iron bars are two-pixel slabs (see `append_bars`), not a
-            // zero-thickness centre plane: a plane collapses to nothing
-            // edge-on and a line of them reads as a row of crossed cards.
-            if id == 101 {
-                let bx = (base_x + local_x) as f32;
-                let by = y as f32;
-                let bz = (base_z + local_z) as f32;
-                append_bars(
-                    &mut mesh,
-                    layers[2],
-                    anims[2],
-                    job.light(local_x, y + 1, local_z) as f32 / 15.0,
-                    [bx, by, bz],
-                    connections_at(job, local_x, y, local_z),
-                );
-                continue;
-            }
-
-            // Fire is two crossed, animated quads (fire_layer_0 and
-            // fire_layer_1) that must blend rather than cut out, so it goes
-            // into the transparent mesh.
-            if id == 51 {
-                let bx = (base_x + local_x) as f32;
-                let by = y as f32;
-                let bz = (base_z + local_z) as f32;
-                append_fire(&mut mesh, atlas, [bx, by, bz], local_x, y, local_z, job);
-                continue;
-            }
-
-            // Plants are two crossed quads, not a cube. Rendering them as
-            // cubes is what makes flowers and grass look like solid boxes.
-            if is_cross_plant(id) {
-                let layer = layers[2];
-                let anim = tinted_anim(anims[2], block_tint, false);
-                let bx = (base_x + local_x) as f32;
-                let by = y as f32;
-                let bz = (base_z + local_z) as f32;
-                let (lo, hi) = (0.1f32, 0.9f32);
-                let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
-                let light = job.light(local_x, y + 1, local_z) as f32 / 15.0;
-
-                let quads = [
-                    [
-                        [bx + lo, by, bz + lo],
-                        [bx + hi, by, bz + hi],
-                        [bx + hi, by + 1.0, bz + hi],
-                        [bx + lo, by + 1.0, bz + lo],
-                    ],
-                    [
-                        [bx + lo, by, bz + hi],
-                        [bx + hi, by, bz + lo],
-                        [bx + hi, by + 1.0, bz + lo],
-                        [bx + lo, by + 1.0, bz + hi],
-                    ],
-                ];
-
-                for quad in quads {
-                    // Both windings, so the plant is visible from either side.
-                    for order in [[0usize, 1, 2, 3], [3, 2, 1, 0]] {
-                        let base = mesh.vertices.len() as u32;
-                        for index in order {
-                            mesh.vertices.push(Vertex {
-                                position: quad[index],
-                                uv: uvs[index],
-                                shade: 1.0,
-                                layer,
-                                anim,
-                                light,
-                            });
-                        }
-                        mesh.indices.extend_from_slice(&[
-                            base,
-                            base + 1,
-                            base + 2,
-                            base,
-                            base + 2,
-                            base + 3,
-                        ]);
-                    }
+            match kind {
+                // Iron bars are two-pixel slabs (see `append_bars`), not a
+                // zero-thickness centre plane: a plane collapses to nothing
+                // edge-on and a line of them reads as a row of crossed cards.
+                RenderKind::Bars => {
+                    let bx = (base_x + local_x) as f32;
+                    let by = y as f32;
+                    let bz = (base_z + local_z) as f32;
+                    append_bars(
+                        &mut mesh,
+                        layers[2],
+                        anims[2],
+                        job.light(local_x, y + 1, local_z) as f32 / 15.0,
+                        [bx, by, bz],
+                        connections_at(job, local_x, y, local_z),
+                    );
+                    continue;
                 }
-                continue;
+                // Fire is two crossed, animated quads (fire_layer_0 and
+                // fire_layer_1) that must blend rather than cut out, so it goes
+                // into the transparent mesh.
+                RenderKind::Fire => {
+                    let bx = (base_x + local_x) as f32;
+                    let by = y as f32;
+                    let bz = (base_z + local_z) as f32;
+                    append_fire(&mut mesh, atlas, [bx, by, bz], local_x, y, local_z, job);
+                    continue;
+                }
+                // Plants are two crossed quads, not a cube. Rendering them as
+                // cubes is what makes flowers and grass look like solid boxes.
+                RenderKind::CrossPlant => {
+                    let layer = layers[2];
+                    let anim = tinted_anim(anims[2], block_tint, false);
+                    let bx = (base_x + local_x) as f32;
+                    let by = y as f32;
+                    let bz = (base_z + local_z) as f32;
+                    let (lo, hi) = (0.1f32, 0.9f32);
+                    let uvs = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+                    let light = job.light(local_x, y + 1, local_z) as f32 / 15.0;
+
+                    let quads = [
+                        [
+                            [bx + lo, by, bz + lo],
+                            [bx + hi, by, bz + hi],
+                            [bx + hi, by + 1.0, bz + hi],
+                            [bx + lo, by + 1.0, bz + lo],
+                        ],
+                        [
+                            [bx + lo, by, bz + hi],
+                            [bx + hi, by, bz + lo],
+                            [bx + hi, by + 1.0, bz + lo],
+                            [bx + lo, by + 1.0, bz + hi],
+                        ],
+                    ];
+
+                    for quad in quads {
+                        // Both windings, so the plant is visible from either
+                        // side.
+                        for order in [[0usize, 1, 2, 3], [3, 2, 1, 0]] {
+                            let base = mesh.vertices.len() as u32;
+                            for index in order {
+                                mesh.vertices.push(Vertex {
+                                    position: quad[index],
+                                    uv: uvs[index],
+                                    shade: 1.0,
+                                    layer,
+                                    anim,
+                                    light,
+                                });
+                            }
+                            mesh.indices.extend_from_slice(&[
+                                base,
+                                base + 1,
+                                base + 2,
+                                base,
+                                base + 2,
+                                base + 3,
+                            ]);
+                        }
+                    }
+                    continue;
+                }
+                _ => {}
             }
-            let meta = (raw & 0x0f) as u8;
             let pane_boxes = is_pane(id).then(|| pane_shape_for_block(job, local_x, y, local_z));
             let fence_boxes = is_fence(id).then(|| fence_shape_for_block(job, local_x, y, local_z));
             let shape = if let Some(pane) = pane_boxes.as_ref() {
@@ -729,7 +797,7 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             if is_full_cube(shape) {
                 // Keep the common cube path on unit-cube coordinates. A whole
                 // face can be culled only when its neighbour also fills a cube.
-                for face in &FACES {
+                for (face_index, face) in FACES.iter().enumerate() {
                     if should_cull_full_cube_face(job, raw, id, local_x, y, local_z, face) {
                         continue;
                     }
@@ -743,11 +811,20 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
                         ]
                     });
                     let lights = face_vertex_lights(job, local_x, y, local_z, face);
+                    // Furnaces, dispensers and droppers have one distinct face.
+                    let (layer, anim) = match front {
+                        Some((front_layer, front_anim, facing))
+                            if face_facing(face_index) == facing =>
+                        {
+                            (front_layer, front_anim)
+                        }
+                        _ => (layers[face.slot], anims[face.slot]),
+                    };
                     append_quad(
                         &mut mesh,
                         face,
-                        layers[face.slot],
-                        anims[face.slot],
+                        layer,
+                        anim,
                         // Grass is the one block whose faces disagree: the top
                         // is the colormap colour, the sides only tint the
                         // overlay pixels (mask), and the bottom is dirt.
@@ -928,6 +1005,20 @@ fn vertex_light(job: &ColumnMeshJob, block: [i32; 3], face: &FaceDef, corner_ind
     };
 
     (face_light * ao).clamp(0.0, 1.0)
+}
+
+/// `FACES` order is +Y, -Y, -Z, +Z, +X, -X; block metadata facing is 0 down,
+/// 1 up, 2 north, 3 south, 4 west, 5 east.
+fn face_facing(face_index: usize) -> u8 {
+    match face_index {
+        0 => 1,
+        1 => 0,
+        2 => 2,
+        3 => 3,
+        4 => 5,
+        5 => 4,
+        _ => 0,
+    }
 }
 
 fn is_ao_occluder(raw: u16) -> bool {
@@ -1136,14 +1227,8 @@ fn append_fire(
 }
 
 /// Saplings, grass, flowers, mushrooms, crops, sugar cane and the double
-/// plants. Everything else keeps the cube path.
-fn is_cross_plant(id: u16) -> bool {
-    matches!(
-        id,
-        6 | 31 | 32 | 37 | 38 | 39 | 40 | 59 | 83 | 104 | 105 | 115 | 141 | 142 | 175
-    )
-}
-
+/// plants all share the crossed-quad path; the render-kind table in
+/// `nephele_world` owns that classification.
 const FOLIAGE_PINE: u32 = 0x619961;
 const FOLIAGE_BIRCH: u32 = 0x80A755;
 /// `BlockLilyPad.colorMultiplier` is a constant, not a biome resolver.
@@ -2146,5 +2231,83 @@ mod tests {
         assert_eq!(job.block(0, 256, 0), 0);
         assert_eq!(job.light(0, -1, 0), 0);
         assert_eq!(job.light(0, 256, 0), 15);
+    }
+}
+
+#[cfg(test)]
+mod block_entity_mesh_tests {
+    use super::*;
+    use crate::entity::EntityMesh;
+    use image::RgbaImage;
+
+    fn atlas() -> TextureArray {
+        TextureArray::from_tiles(vec![(
+            "stone".to_string(),
+            RgbaImage::from_pixel(16, 16, image::Rgba([128, 128, 128, 255])),
+        )])
+    }
+
+    fn world_with(column: ChunkColumn) -> World {
+        let mut world = World::new(0);
+        world.insert(column);
+        world
+    }
+
+    #[test]
+    fn two_adjacent_chests_render_one_double_model() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::new(54, 3));
+        column.set_block(4, 64, 3, BlockState::new(54, 3));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+        // One double chest: body, lid and knob, six quads each, four vertices.
+        assert_eq!(mesh.block_entities.vertices.len(), 3 * 6 * 4);
+        assert_eq!(mesh.block_entities.indices.len(), 3 * 6 * 6);
+    }
+
+    #[test]
+    fn a_lone_chest_is_a_single_model_and_keeps_its_block() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::new(54, 3));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+        assert_eq!(mesh.block_entities.vertices.len(), 3 * 6 * 4);
+        // The chest is a block entity, not a cube: no block-pipeline vertices.
+        assert!(mesh.vertices.is_empty());
+    }
+
+    #[test]
+    fn a_wall_sign_has_no_post_and_a_bed_stays_on_the_block_pipeline() {
+        let mut column = ChunkColumn::empty(0, 0);
+        column.set_block(3, 64, 3, BlockState::new(68, 3));
+        column.set_block(5, 64, 5, BlockState::new(26, 0));
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+        // Wall sign: one box.
+        assert_eq!(mesh.block_entities.vertices.len(), 6 * 4);
+        // Bed: five block-pipeline quads.
+        assert_eq!(mesh.vertices.len(), 5 * 4);
+    }
+
+    #[test]
+    fn the_model_meshes_are_empty_by_default() {
+        let mesh = EntityMesh::default();
+        assert!(mesh.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod facing_tests {
+    use super::face_facing;
+
+    #[test]
+    fn the_face_index_maps_to_block_metadata_facing() {
+        // FACES: 0 +Y, 1 -Y, 2 -Z, 3 +Z, 4 +X, 5 -X.
+        assert_eq!(face_facing(0), 1, "up");
+        assert_eq!(face_facing(1), 0, "down");
+        assert_eq!(face_facing(2), 2, "north");
+        assert_eq!(face_facing(3), 3, "south");
+        assert_eq!(face_facing(4), 5, "east");
+        assert_eq!(face_facing(5), 4, "west");
     }
 }

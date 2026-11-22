@@ -197,6 +197,20 @@ const LADDER_EAST: &[ShapeBox] = &[b([15.0, 0.0, 0.0], [16.0, 16.0, 16.0])];
 /// A bed is 9/16 tall in vanilla; the model's corner posts are cosmetic.
 const BED: &[ShapeBox] = &[b([0.0, 0.0, 0.0], [16.0, 9.0, 16.0])];
 
+/// Block entities are drawn by `nephele-render`'s model builders, not by the
+/// shape path. These boxes exist only so culling and ambient occlusion treat
+/// them as the non-cubes they are: a chest or sign must not hide the face of
+/// the block behind it.
+const CHEST: &[ShapeBox] = &[b([1.0, 0.0, 1.0], [15.0, 15.0, 15.0])];
+const SIGN: &[ShapeBox] = &[
+    b([7.0, 0.0, 7.0], [9.0, 10.0, 9.0]),
+    b([0.0, 10.0, 7.0], [16.0, 16.0, 9.0]),
+];
+const BANNER: &[ShapeBox] = &[
+    b([7.0, 0.0, 7.0], [9.0, 16.0, 9.0]),
+    b([3.0, 8.0, 7.0], [13.0, 16.0, 9.0]),
+];
+
 /// Button: 6x6 pixels on a wall, 2 pixels proud of it. Meta 0 is the floor,
 /// 5 the ceiling, 1..4 the four walls (`BlockButton.getFacing`).
 const BUTTON_DOWN: &[ShapeBox] = &[b([5.0, 0.0, 5.0], [11.0, 2.0, 11.0])];
@@ -458,6 +472,9 @@ pub fn block_shape(id: u16, meta: u8) -> &'static [ShapeBox] {
             _ => LADDER_EAST,
         },
         26 => BED,
+        54 | 130 | 146 => CHEST,
+        63 | 68 => SIGN,
+        176 | 177 => BANNER,
         143 | 77 => match meta & 7 {
             0 => BUTTON_DOWN,
             1 => BUTTON_EAST,

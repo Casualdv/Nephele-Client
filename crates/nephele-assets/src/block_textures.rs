@@ -8,6 +8,10 @@ pub struct FaceTextures {
     pub top: &'static str,
     pub bottom: &'static str,
     pub side: &'static str,
+    /// A distinct front face (furnace, dispenser, dropper): the texture and the
+    /// block-metadata facing it belongs to (0 down, 1 up, 2 north, 3 south,
+    /// 4 west, 5 east). The mesher substitutes it for that one face.
+    pub front: Option<(&'static str, u8)>,
 }
 
 const fn same(name: &'static str) -> FaceTextures {
@@ -15,12 +19,24 @@ const fn same(name: &'static str) -> FaceTextures {
         top: name,
         bottom: name,
         side: name,
+        front: None,
     }
 }
 
 /// One texture per face, with distinct top/bottom/side.
 const fn split(top: &'static str, bottom: &'static str, side: &'static str) -> FaceTextures {
-    FaceTextures { top, bottom, side }
+    FaceTextures {
+        top,
+        bottom,
+        side,
+        front: None,
+    }
+}
+
+/// The same textures with a facing-dependent front face.
+const fn with_front(mut textures: FaceTextures, name: &'static str, facing: u8) -> FaceTextures {
+    textures.front = Some((name, facing));
+    textures
 }
 
 /// 1.8 dye order; `silver` is the light-grey texture name.
@@ -92,7 +108,11 @@ pub fn face_textures(state: BlockState) -> Option<FaceTextures> {
         56 => same("diamond_ore"),
         57 => same("diamond_block"),
         58 => split("crafting_table_top", "planks_oak", "crafting_table_side"),
-        61 => split("furnace_top", "furnace_top", "furnace_side"),
+        61 => with_front(
+            split("furnace_top", "furnace_top", "furnace_side"),
+            "furnace_front_off",
+            meta & 7,
+        ),
         73 => same("redstone_ore"),
         79 => same("ice"),
         80 => same("snow"),
@@ -155,7 +175,15 @@ pub fn face_textures(state: BlockState) -> Option<FaceTextures> {
         19 => same(if meta == 1 { "sponge_wet" } else { "sponge" }),
         21 => same("lapis_ore"),
         22 => same("lapis_block"),
-        23 => split("furnace_top", "furnace_top", "dispenser_front_horizontal"),
+        23 => with_front(
+            split("furnace_top", "furnace_top", "furnace_side"),
+            if meta & 7 <= 1 {
+                "dispenser_front_vertical"
+            } else {
+                "dispenser_front_horizontal"
+            },
+            meta & 7,
+        ),
         25 => same("noteblock"),
         26 => bed(meta),
         27 => same("rail_golden_powered"),
@@ -189,7 +217,11 @@ pub fn face_textures(state: BlockState) -> Option<FaceTextures> {
             };
             split(farmland, "dirt", farmland)
         }
-        62 => split("furnace_top", "furnace_top", "furnace_front_on"),
+        62 => with_front(
+            split("furnace_top", "furnace_top", "furnace_side"),
+            "furnace_front_on",
+            meta & 7,
+        ),
         63 => same("planks_oak"),
         64 => door("door_wood_upper", "door_wood_lower"),
         65 => same("ladder"),
@@ -276,7 +308,15 @@ pub fn face_textures(state: BlockState) -> Option<FaceTextures> {
             "quartz_block_side",
         ),
         157 => same("rail_activator"),
-        158 => split("furnace_top", "furnace_top", "dropper_front_horizontal"),
+        158 => with_front(
+            split("furnace_top", "furnace_top", "furnace_side"),
+            if meta & 7 <= 1 {
+                "dropper_front_vertical"
+            } else {
+                "dropper_front_horizontal"
+            },
+            meta & 7,
+        ),
         160 => pane(meta),
         161 => same(if meta & 3 == 1 {
             "leaves_big_oak"
@@ -798,5 +838,36 @@ mod tests {
         assert!(is_transparent(ids::GLASS));
         assert!(is_transparent(95));
         assert!(!is_transparent(ids::STONE));
+    }
+}
+
+#[cfg(test)]
+mod front_face_tests {
+    use super::*;
+
+    #[test]
+    fn furnaces_and_dispensers_put_their_front_on_the_facing_face() {
+        let furnace = face_textures(BlockState::new(61, 3)).expect("furnace");
+        assert_eq!(furnace.side, "furnace_side");
+        assert_eq!(furnace.front, Some(("furnace_front_off", 3)));
+
+        let lit = face_textures(BlockState::new(62, 4)).expect("lit furnace");
+        assert_eq!(lit.front, Some(("furnace_front_on", 4)));
+
+        let dispenser = face_textures(BlockState::new(23, 5)).expect("dispenser");
+        assert_eq!(dispenser.side, "furnace_side");
+        assert_eq!(dispenser.front, Some(("dispenser_front_horizontal", 5)));
+
+        let up = face_textures(BlockState::new(23, 1)).expect("up dispenser");
+        assert_eq!(up.front, Some(("dispenser_front_vertical", 1)));
+
+        let dropper = face_textures(BlockState::new(158, 2)).expect("dropper");
+        assert_eq!(dropper.front, Some(("dropper_front_horizontal", 2)));
+    }
+
+    #[test]
+    fn ordinary_blocks_have_no_front() {
+        assert_eq!(face_textures(BlockState::STONE).expect("stone").front, None);
+        assert_eq!(face_textures(BlockState::GRASS).expect("grass").front, None);
     }
 }

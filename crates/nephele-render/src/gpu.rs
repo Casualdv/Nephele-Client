@@ -145,6 +145,8 @@ pub struct Renderer {
     ui_front: UiVertexBuffers,
     entity_pipeline: wgpu::RenderPipeline,
     entity_bind_group: wgpu::BindGroup,
+    /// Chest/sign/banner geometry: same pipeline, entity texture atlas.
+    block_entity_bind_group: wgpu::BindGroup,
     skin_texture: wgpu::Texture,
     /// Atlas version already uploaded, so skins only re-upload when they change.
     skin_version: u64,
@@ -187,6 +189,7 @@ impl Renderer {
         textures: &TextureArray,
         ui_atlas: &UiAtlas,
         panorama: Option<&Panorama>,
+        entity_atlas: &nephele_assets::EntityAtlas,
     ) -> Result<Self, RendererError> {
         let startup_origin = Instant::now();
         let device_init_start = Instant::now();
@@ -813,6 +816,62 @@ impl Renderer {
             ],
         });
 
+        // Block entities (chests, signs, banners) reuse the entity pipeline but
+        // sample the entity texture atlas instead of a skin.
+        let entity_atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("block entity atlas"),
+            size: wgpu::Extent3d {
+                width: entity_atlas.width(),
+                height: entity_atlas.height(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &entity_atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            entity_atlas.pixels(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * entity_atlas.width()),
+                rows_per_image: Some(entity_atlas.height()),
+            },
+            wgpu::Extent3d {
+                width: entity_atlas.width(),
+                height: entity_atlas.height(),
+                depth_or_array_layers: 1,
+            },
+        );
+        let block_entity_view =
+            entity_atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let block_entity_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("block entity bind group"),
+            layout: &entity_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&block_entity_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&entity_sampler),
+                },
+            ],
+        });
+
         let entity_shader = timed_shader(
             &device,
             wgpu::ShaderModuleDescriptor {
@@ -1025,6 +1084,7 @@ impl Renderer {
             ui_front,
             entity_pipeline,
             entity_bind_group,
+            block_entity_bind_group,
             skin_texture,
             skin_version: 0,
             entity_vertices,
@@ -1163,6 +1223,43 @@ impl Renderer {
             );
         }
 
+        chunk.block_entity_index_count = mesh.block_entities.indices.len() as u32;
+        if !mesh.block_entities.vertices.is_empty() {
+            let vertex_bytes = std::mem::size_of_val(mesh.block_entities.vertices.as_slice())
+                as wgpu::BufferAddress;
+            if vertex_bytes > chunk.block_entity_vertex_capacity {
+                chunk.block_entity_vertex_capacity = allocate_size(vertex_bytes);
+                chunk.block_entity_vertices = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("chunk block entity vertices"),
+                    size: chunk.block_entity_vertex_capacity,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(
+                &chunk.block_entity_vertices,
+                0,
+                bytemuck::cast_slice(&mesh.block_entities.vertices),
+            );
+
+            let index_bytes = std::mem::size_of_val(mesh.block_entities.indices.as_slice())
+                as wgpu::BufferAddress;
+            if index_bytes > chunk.block_entity_index_capacity {
+                chunk.block_entity_index_capacity = allocate_size(index_bytes);
+                chunk.block_entity_indices = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("chunk block entity indices"),
+                    size: chunk.block_entity_index_capacity,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+            }
+            queue.write_buffer(
+                &chunk.block_entity_indices,
+                0,
+                bytemuck::cast_slice(&mesh.block_entities.indices),
+            );
+        }
+
         let mut cull_min = [f32::INFINITY; 3];
         let mut cull_max = [f32::NEG_INFINITY; 3];
         let mut block_heights = [0.0f32; 256];
@@ -1176,7 +1273,20 @@ impl Renderer {
             let cell = z * 16 + x;
             block_heights[cell] = block_heights[cell].max(vertex.position[1]);
         }
-        if mesh.vertices.is_empty() && mesh.transparent_vertices.is_empty() {
+        for vertex in &mesh.block_entities.vertices {
+            for axis in 0..3 {
+                cull_min[axis] = cull_min[axis].min(vertex.position[axis]);
+                cull_max[axis] = cull_max[axis].max(vertex.position[axis]);
+            }
+            let x = (vertex.position[0] - min[0]).floor().clamp(0.0, 15.0) as usize;
+            let z = (vertex.position[2] - min[2]).floor().clamp(0.0, 15.0) as usize;
+            let cell = z * 16 + x;
+            block_heights[cell] = block_heights[cell].max(vertex.position[1]);
+        }
+        if mesh.vertices.is_empty()
+            && mesh.transparent_vertices.is_empty()
+            && mesh.block_entities.vertices.is_empty()
+        {
             cull_min = min;
             cull_max = max;
         }
@@ -1603,7 +1713,9 @@ impl Renderer {
                     .chunks
                     .iter()
                     .filter(|(&key, chunk)| {
-                        if (chunk.index_count == 0 && chunk.transparent_index_count == 0)
+                        if (chunk.index_count == 0
+                            && chunk.transparent_index_count == 0
+                            && chunk.block_entity_index_count == 0)
                             || !frustum.intersects(chunk.min, chunk.max)
                         {
                             return false;
@@ -1654,6 +1766,26 @@ impl Renderer {
                         wgpu::IndexFormat::Uint32,
                     );
                     pass.draw_indexed(0..chunk.transparent_index_count, 0, 0..1);
+                }
+
+                // Block entities (chests, signs, banners) use the entity
+                // pipeline over the entity atlas, so they are a separate draw
+                // per chunk but still depth-tested against the terrain.
+                for (key, _) in &visible {
+                    let Some(chunk) = self.chunks.get(key) else {
+                        continue;
+                    };
+                    if chunk.block_entity_index_count == 0 {
+                        continue;
+                    }
+                    pass.set_pipeline(&self.entity_pipeline);
+                    pass.set_bind_group(0, &self.block_entity_bind_group, &[]);
+                    pass.set_vertex_buffer(0, chunk.block_entity_vertices.slice(..));
+                    pass.set_index_buffer(
+                        chunk.block_entity_indices.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    pass.draw_indexed(0..chunk.block_entity_index_count, 0, 0..1);
                 }
             }
 
@@ -2285,6 +2417,12 @@ struct ChunkBuffers {
     transparent_vertex_capacity: wgpu::BufferAddress,
     transparent_index_capacity: wgpu::BufferAddress,
     transparent_index_count: u32,
+    /// Chest/sign/banner models: entity vertex layout, entity atlas.
+    block_entity_vertices: wgpu::Buffer,
+    block_entity_indices: wgpu::Buffer,
+    block_entity_vertex_capacity: wgpu::BufferAddress,
+    block_entity_index_capacity: wgpu::BufferAddress,
+    block_entity_index_count: u32,
     min: [f32; 3],
     max: [f32; 3],
     /// Maximum solid height in each 4×4 block cell of the column.
@@ -2324,6 +2462,21 @@ impl ChunkBuffers {
             transparent_vertex_capacity: 4096,
             transparent_index_capacity: 4096,
             transparent_index_count: 0,
+            block_entity_vertices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk block entity vertices"),
+                size: 4096,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            block_entity_indices: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("chunk block entity indices"),
+                size: 4096,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            block_entity_vertex_capacity: 4096,
+            block_entity_index_capacity: 4096,
+            block_entity_index_count: 0,
             min: [0.0; 3],
             max: [0.0; 3],
             occluder: [0.0; 16],

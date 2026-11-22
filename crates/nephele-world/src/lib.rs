@@ -16,6 +16,7 @@
 
 pub mod biome;
 pub mod block;
+pub mod block_entity;
 pub mod blocks;
 pub mod caves;
 pub mod chunk;

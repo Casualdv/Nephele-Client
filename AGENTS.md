@@ -539,11 +539,76 @@ pane or other small shape. Cross-plants stay on their separate crossed-quad path
   through the existing non-full-cube path and inherits its culling rules.
   Slopes and multi-part models are still approximations (rails are flat).
 - **Still on the cube path** (audited 2026-11-12): cobweb 30 (a cube in
-  vanilla too), signs 63/68, nether portal 90, repeaters 93/94, vines 106, fence
+  vanilla too), nether portal 90, repeaters 93/94, vines 106, fence
   gates 107, brewing stand 117, end portal 119 and its frame 120, cocoa 127,
-  comparators 149/150, hopper 154, banners 176/177, end rod 198 and chorus
+  comparators 149/150, hopper 154, end rod 198 and chorus
   plant/flower 199/200. Double slabs (43/125/181/204) and the beacon (138)
   intentionally stay cubes because their visible bulk is a full block.
+
+### Block entities (2026-11-22)
+
+Chests, signs, beds and banners have block *models* in vanilla (`ModelChest`,
+`ModelSign`, `ModelBanner`, `bed_foot`/`bed_head`), not block-model JSON, which is
+why they used to fall through to the cube path. `nephele_world::block_entity`
+now owns the classification and a **render-kind table**:
+
+- `BlockEntityKind::{Chest{size}, Sign{kind}, Bed{head}, Banner{wall},
+  EnchantingTable, Beacon}` — `BlockEntityKind::of(id, meta)` answers from the
+  state alone; `render_kind(id, meta)` returns
+  `RenderKind::{Cube, Shape, CrossPlant, Bars, Fire, BlockEntity}`. The mesher
+  dispatches on that table instead of ad-hoc id checks.
+- `nephele-render::block_entities` builds the models:
+  - **Chest** (54/146/130): `ModelChest` body 14×10×14, lid 14×5×14, knob
+    2×4×1. Two chests of the same kind and facing join along the axis
+    perpendicular to their facing; the lower-coordinate half renders
+    `ModelLargeChest` (30 wide, knob centred at x=16) and the other half renders
+    nothing. Ender chests never join, and 1.8.9 ships no `ender_double.png`.
+  - **Sign** (63 post, 68 wall): board 24×12×2 at 2/3 scale, plus the 2×14×2
+    stick for posts. Sign *text* is not rendered.
+  - **Banner** (176/177): `ModelBanner` — slate 20×40×1, top bar, and the stand
+    for standing banners. Only `entity/banner/base.png` is used: colour and
+    pattern layers come from tile-entity NBT and are not decoded.
+  - **Bed** (26): the `bed_foot`/`bed_head` model (9/16 body, end face, sides,
+    3/16 underside plane) on the **block** pipeline, because its textures are
+    the block textures `bed_feet_*`/`bed_head_*`.
+- **Two rotation conventions, and they are opposite.** `ModelRenderer`/entity
+  models are rotated by `GlStateManager.rotate` (+90 takes +Z to -X); block
+  models (`"y": 90`) rotate the other way (+90 takes -Z to +X). `block_entities`
+  has `rotate_gl` and `rotate_y` for exactly that reason. Chest metadata 2/3/4/5
+  maps to 180/0/90/-90 degrees, standing signs and banners to
+  `-meta*22.5`, wall signs/banners to the same table as chests.
+- **Entity textures** live under `textures/entity`, not the block tile array:
+  `nephele-assets::entity_atlas` packs `chest/{normal,trapped,ender,christmas}`
+  (+ the doubles, 128×64), `sign.png` (64×32) and `banner/base.png` into one
+  256×256 RGBA atlas with fixed slots, and `nephele-prepare` copies
+  `minecraft/textures/entity/` (`OUTPUT_VERSION` 4). Missing files leave their
+  slot magenta and are logged at boot.
+- The renderer uploads a per-chunk `EntityMesh` (`MeshData::block_entities`),
+  draws it with the **entity pipeline** but the new `block_entity_bind_group`
+  (entity atlas), after the opaque and fire passes. Light is baked into each
+  vertex's colour from `job.light`, so a chest in a dark room is dark.
+- **Furnace, dispenser, dropper, verified and fixed.** `FaceTextures` gained
+  `front: Option<(&str, u8)>`, and the mesher substitutes it on the one face
+  whose normal matches the metadata facing. The furnace previously used
+  `furnace_side` on *all* faces (no front at all), and the dispenser/dropper used
+  their front texture on all four sides. Crafting tables were already correct.
+  The hopper is still a cube; its top is `hopper_top` (the funnel opening), which
+  reads as a dark square from above.
+- **ModelBox corner order matters.** Vanilla's `positiontexturevertexN`
+  variables are one off from a 0..7 corner array; using the raw numbers produced
+  inside-out boxes (visible only as a hollow shell, because the near faces were
+  culled). Two unit tests now pin it: `every_box_triangle_faces_away_from_the_box_centre`
+  and `every_bed_quad_faces_outward`.
+
+**Verified 2026-11-22** (single-player, seed 12345, camera at eye level):
+`be-chests.png` (single chest, one double chest with the centred knob, a
+west-facing chest, an ender chest), `be-signs3.png` (post sign, wall sign on a
+stone wall, bed with the head board toward the camera), `be-furnace.png`
+(furnace front, dispenser front, a west-facing furnace, chest) and
+`be-signs3.png`/`be-machines.png` for the rest. This is **shape and facing
+only**: it was compared against vanilla's models by construction (the same pixel
+origins, texture rects and transforms), not against a running vanilla client.
+
 
 **Verified 2026-11-12** (single-player, seed 12345, and the mock server). Grass
 tops were measured as mean channel ratios over a clean patch and compared with
