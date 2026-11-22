@@ -115,7 +115,7 @@ try {
     $env:NEPHELE_GPU = 'integrated'
     $env:NEPHELE_SCREEN = 'local'
     $env:NEPHELE_VSYNC = '0'
-    $env:NEPHELE_OCCLUSION = '1'
+    $env:NEPHELE_OCCLUSION = '0'
     Remove-Item Env:NEPHELE_VIEW_DISTANCE -ErrorAction SilentlyContinue
     $env:NEPHELE_DATA_DIR = $dataDir
     Remove-Item Env:NEPHELE_PROFILE -ErrorAction SilentlyContinue

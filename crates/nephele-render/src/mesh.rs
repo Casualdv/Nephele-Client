@@ -553,6 +553,18 @@ fn blocks_direct_sky(state: BlockState) -> bool {
 
 const FOLIAGE_PINE: u32 = 0x619961;
 const FOLIAGE_BIRCH: u32 = 0x80A755;
+const GRASS_PLAINS: u32 = 0x79C05A;
+const FOLIAGE_PLAINS: u32 = 0x59AE30;
+
+/// `NEPHELE_TINT=0` disables biome tinting, for before/after capture.
+fn biome_tint_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NEPHELE_TINT")
+            .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
+            .unwrap_or(true)
+    })
+}
 
 fn tint_for_block(
     atlas: &TextureArray,
@@ -562,6 +574,16 @@ fn tint_for_block(
     x: i32,
     z: i32,
 ) -> u32 {
+    if !biome_tint_enabled() {
+        // Reproduce the old fixed-plains colours, so `NEPHELE_TINT=0` is a
+        // fair before/after for the per-biome colourisation.
+        return match id {
+            2 | 31 => GRASS_PLAINS,
+            8 | 9 => NO_TINT,
+            ids::LEAVES => FOLIAGE_PLAINS,
+            _ => NO_TINT,
+        };
+    }
     let kind = match id {
         2 | 31 => TintKind::Grass,
         8 | 9 => TintKind::Water,

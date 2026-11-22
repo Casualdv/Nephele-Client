@@ -28,7 +28,7 @@ use nephele_protocol::ServerAddress;
 use nephele_render::{
     append_hand, biome_fog_color, block_outline, break_overlay_texture, build_break_overlay,
     build_entities, build_hand_item, build_item_mesh, Camera, ColumnMeshJob, EntityDraw,
-    Environment, HandDraw, HandItem, ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
+    EntityMesh, Environment, HandDraw, HandItem, ItemDraw, LineMesh, MeshData, Renderer, UiBatch,
 };
 use nephele_world::save::{self, WorldMetadata, WorldMode, WorldSave};
 use nephele_world::{raycast, BlockState, ChunkColumn, ChunkCoord, World};
@@ -1002,6 +1002,7 @@ struct LiveApp {
     last_frame: Instant,
     title_timer: f32,
     frames: u32,
+    first_frame_marked: bool,
     drawn_aim: Option<Aim>,
     drawn_stage: Option<u8>,
     ui_bg: UiBatch,
@@ -1050,6 +1051,13 @@ struct LiveApp {
     /// Shift held down, for inventory quick-move clicks.
     shift: bool,
     last_fps: f32,
+    /// Scripted camera path from `NEPHELE_CAM_PATH`, used to validate culling.
+    cam_path: Vec<crate::viewer::PathSpec>,
+    cam_path_time: f32,
+    cam_path_seconds: f32,
+    cam_path_yaw: f32,
+    cam_path_pitch: f32,
+    cam_path_frames: u32,
     /// Previous health value, so a drop can flash the damage vignette.
     last_health: f32,
     hurt_flash: f32,
@@ -1114,6 +1122,7 @@ impl LiveApp {
             last_frame: Instant::now(),
             title_timer: 0.0,
             frames: 0,
+            first_frame_marked: false,
             drawn_aim: None,
             drawn_stage: None,
             ui_bg: UiBatch::default(),
@@ -1156,6 +1165,24 @@ impl LiveApp {
             inventory_cursor: None,
             shift: false,
             last_fps: 0.0,
+            cam_path: std::env::var("NEPHELE_CAM_PATH")
+                .map(|value| crate::viewer::parse_path(&value))
+                .unwrap_or_default(),
+            cam_path_time: 0.0,
+            cam_path_seconds: std::env::var("NEPHELE_CAM_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|seconds| *seconds > 0.0)
+                .unwrap_or(12.0),
+            cam_path_yaw: std::env::var("NEPHELE_CAM_YAW")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(0.0),
+            cam_path_pitch: std::env::var("NEPHELE_CAM_PITCH")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .unwrap_or(0.0),
+            cam_path_frames: 0,
             last_health: 20.0,
             hurt_flash: 0.0,
             error: None,
@@ -1186,6 +1213,7 @@ impl LiveApp {
     }
 
     fn init(&mut self, event_loop: &ActiveEventLoop) {
+        perf::mark("init-begin");
         let attributes = Window::default_attributes()
             .with_title("Nephele")
             .with_inner_size(LogicalSize::new(1280.0, 720.0));
@@ -1193,11 +1221,13 @@ impl LiveApp {
             Ok(window) => Arc::new(window),
             Err(err) => return self.fail(event_loop, err),
         };
+        perf::mark("window-created");
 
         let textures = match TextureArray::load_from_dir(&self.options.assets_dir) {
             Ok(textures) => textures,
             Err(err) => return self.fail(event_loop, err),
         };
+        perf::mark("block-textures-loaded");
         // The UI sheets live one level up: `textures/font`, `textures/gui`.
         let ui_root = self
             .options
@@ -1211,6 +1241,7 @@ impl LiveApp {
                 return self.fail(event_loop, format!("could not build the UI atlas: {err}"));
             }
         };
+        perf::mark("ui-atlas-loaded");
 
         // Title screen art: the panorama cube and the splash line.
         let panorama = Panorama::load(&ui_root).ok();
@@ -1236,6 +1267,7 @@ impl LiveApp {
             Ok(renderer) => renderer,
             Err(err) => return self.fail(event_loop, err),
         };
+        perf::mark("renderer-ready");
 
         {
             let mut state = self.shared.lock().unwrap();
@@ -1388,11 +1420,13 @@ impl LiveApp {
             }
             draws.push(draw);
         }
-        let mut entity_mesh = build_entities(&draws);
-        let mut item_mesh = build_item_mesh(&items, textures, self.time);
+        let entity_mesh = build_entities(&draws);
+        let item_mesh = build_item_mesh(&items, textures, self.time);
+        let mut hand_mesh = EntityMesh::default();
+        let mut hand_item_mesh = MeshData::default();
         if self.screen == Screen::Game {
-            // The first-person arm is built in camera space and placed in the
-            // world, so it lands in the same depth-tested pass as everything else.
+            // The arm and the held block are drawn in a second pass with a
+            // cleared depth buffer, so they never clip into nearby geometry.
             let camera = &view.camera;
             let swing = if view.attacking {
                 (self.time * 11.0).sin() * 0.5 + 0.5
@@ -1400,7 +1434,7 @@ impl LiveApp {
                 0.0
             };
             let pose = append_hand(
-                &mut entity_mesh,
+                &mut hand_mesh,
                 &HandDraw {
                     eye: camera.position.to_array(),
                     right: camera.right().to_array(),
@@ -1418,7 +1452,7 @@ impl LiveApp {
                 .flatten();
             if let Some(state) = held.and_then(|item| item.block_state()) {
                 let state = nephele_world::BlockState::from_raw(state);
-                item_mesh.append(build_hand_item(
+                hand_item_mesh.append(build_hand_item(
                     &HandItem {
                         item: state.id() as i16,
                         meta: state.meta() as i16,
@@ -1434,6 +1468,8 @@ impl LiveApp {
         }
         renderer.set_entities(&entity_mesh);
         renderer.set_items(&item_mesh);
+        renderer.set_hand(&hand_mesh);
+        renderer.set_hand_item(&hand_item_mesh);
     }
 
     fn drain_network(&mut self) {
@@ -1549,13 +1585,15 @@ impl LiveApp {
         let frame_interval = now.saturating_duration_since(self.last_frame);
         self.last_frame = now;
         perf::record_frame_interval(frame_interval);
+        let mut probe = perf::Probe::start();
         let delta = frame_interval.as_secs_f32().min(0.1);
 
         self.drain_network();
         self.drain_pings();
         self.push_input();
+        probe.mark("network");
 
-        let view = {
+        let mut view = {
             let mut state = self.shared.lock().unwrap();
             // Physics runs at 20 Hz; render between ticks so motion is smooth
             // instead of stepping, like vanilla's `lastTickPos` interpolation.
@@ -1606,10 +1644,54 @@ impl LiveApp {
             }
         };
 
+        // A scripted camera path makes the culling validation reproducible.
+        if !self.cam_path.is_empty() && self.cam_path_seconds > 0.0 {
+            self.cam_path_time = (self.cam_path_time + delta).min(self.cam_path_seconds);
+            let count = self.cam_path.len();
+            let t = if count == 1 {
+                0.0
+            } else {
+                self.cam_path_time / self.cam_path_seconds * (count - 1) as f32
+            };
+            let index = (t.floor() as usize).min(count - 1);
+            let fraction = (t - index as f32).clamp(0.0, 1.0);
+            let resolve = |spec: &crate::viewer::PathSpec| match spec {
+                crate::viewer::PathSpec::Ground { x, z } => glam::Vec3::new(
+                    *x,
+                    crate::viewer::ground_height(&self.world, *x, *z) + 10.0,
+                    *z,
+                ),
+                crate::viewer::PathSpec::Point { position, .. } => *position,
+            };
+            let start = resolve(&self.cam_path[index]);
+            let end = resolve(&self.cam_path[(index + 1).min(count - 1)]);
+            view.camera.position = start.lerp(end, fraction);
+            view.camera.yaw = self.cam_path_yaw.to_radians();
+            view.camera.pitch = self.cam_path_pitch.to_radians();
+            self.cam_path_frames += 1;
+            if self.cam_path_time >= self.cam_path_seconds {
+                if let Some(renderer) = self.renderer.as_ref() {
+                    let (culled, occlusion_frames) = renderer.occlusion_stats();
+                    eprintln!(
+                        "[occlusion] path_complete frames={} false_culls={} culled={} \
+                         tested={} occlusion_frames={} pos={:.1},{:.1},{:.1}",
+                        self.cam_path_frames,
+                        renderer.occlusion_false_culls(),
+                        culled,
+                        renderer.occlusion_tested(),
+                        occlusion_frames,
+                        view.camera.position.x,
+                        view.camera.position.y,
+                        view.camera.position.z
+                    );
+                }
+                std::process::exit(0);
+            }
+        }
+
         if let Some(err) = &view.error {
             eprintln!("disconnected: {err}");
-        }
-        if view.health + 0.01 < self.last_health {
+        }        if view.health + 0.01 < self.last_health {
             self.hurt_flash = 0.55;
         }
         self.last_health = view.health;
@@ -1721,15 +1803,18 @@ impl LiveApp {
             }
         }
         self.prof_mesh += mesh_start.elapsed().as_secs_f32() * 1000.0;
+        probe.mark("mesh");
 
         self.update_skins();
         self.draw_entities(&view);
+        probe.mark("entities");
 
         self.time += delta;
         let ui_start = Instant::now();
         self.update_highlights(view.aim, view.stage);
         self.draw_ui(&view);
         self.prof_ui += ui_start.elapsed().as_secs_f32() * 1000.0;
+        probe.mark("ui");
 
         // The title screen orbits a camera inside the panorama cube.
         let mut camera = view.camera.clone();
@@ -1791,8 +1876,13 @@ impl LiveApp {
             }
         }
         self.prof_draw += draw_start.elapsed().as_secs_f32() * 1000.0;
+        probe.mark("draw");
 
         if presented {
+            if !self.first_frame_marked {
+                self.first_frame_marked = true;
+                perf::mark("first-frame-presented");
+            }
             self.frames += 1;
         }
         self.prof_frames += 1;
@@ -1860,6 +1950,7 @@ impl LiveApp {
             self.title_timer = 0.0;
             self.frames = 0;
         }
+        probe.finish(frame_interval);
     }
 
     /// Build and upload this frame's HUD / menu geometry.

@@ -57,7 +57,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         block_textures,
         block_sampler,
         in.uv,
-        i32(in.layer),
+        0,
         ddx,
         ddy,
     );
@@ -87,7 +87,7 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         tint_masks,
         block_sampler,
         in.uv,
-        i32(in.layer),
+        0,
         0.0,
     ).a;
     let tint = vec3<f32>(
@@ -97,7 +97,8 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     ) / 255.0;
     let tinted = texel.rgb * mix(vec3<f32>(1.0), tint, mask);
 
-    let lit = tinted * in.shade * in.light;
+    let lit = texel.rgb;
+    if (in.layer != 0u) { return vec4<f32>(0.0, 1.0, 0.0, 1.0); }
     let dist = length(in.world_pos - uniforms.camera.xyz);
     let fog = clamp(
         (dist - uniforms.environment.y)

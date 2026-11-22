@@ -127,6 +127,17 @@ pub struct Renderer {
     drawn_chunks: usize,
     occluded_chunks: usize,
     occlusion: OcclusionBuffer,
+    /// One-block reference buffer, allocated only with `NEPHELE_OCCLUSION_CHECK=1`.
+    occlusion_reference: Option<OcclusionBuffer>,
+    /// Chunks the coarse pass dropped that the reference says are visible.
+    occlusion_false_culls: u64,
+    /// Consecutive frames each column has been behind the height field.
+    occlusion_hits: std::collections::HashMap<(i32, i32), u8>,
+    /// Cumulative chunks actually dropped and frames the pass ran on.
+    occlusion_culled_total: u64,
+    occlusion_frames: u64,
+    /// Chunks the pass actually evaluated (in frustum, not the camera column).
+    occlusion_tested_total: u64,
     occlusion_enabled: bool,
 }
 
@@ -847,6 +858,7 @@ impl Renderer {
                 &uniform_buffer,
                 &sampler,
                 &animation_view,
+                &tint_mask_view,
                 &shader,
                 &pipeline_layout,
                 format,
@@ -913,15 +925,44 @@ impl Renderer {
             drawn_chunks: 0,
             occluded_chunks: 0,
             occlusion: OcclusionBuffer::new(),
+            occlusion_reference: std::env::var("NEPHELE_OCCLUSION_CHECK")
+                .map(|value| !matches!(value.trim(), "" | "0" | "false" | "off"))
+                .unwrap_or(false)
+                .then(OcclusionBuffer::new),
+            occlusion_false_culls: 0,
+            occlusion_hits: std::collections::HashMap::new(),
+            occlusion_culled_total: 0,
+            occlusion_frames: 0,
+            occlusion_tested_total: 0,
+            // Opt-in. The 4x4 height field is only trustworthy within
+            // `OCCLUSION_RADIUS`, where measurement showed it never actually
+            // culls a whole column; at the range where it does cull, the
+            // one-block reference check caught it dropping visible terrain.
+            // Frustum culling carries the load until a finer occluder exists.
             occlusion_enabled: std::env::var("NEPHELE_OCCLUSION")
-                .map(|value| !matches!(value.trim(), "0" | "false" | "off"))
-                .unwrap_or(true),
+                .map(|value| !matches!(value.trim(), "0" | "false" | "off" | ""))
+                .unwrap_or(false),
         })
     }
 
     /// Chunks submitted in the last frame, and how many are loaded at all.
     pub fn draw_stats(&self) -> (usize, usize) {
         (self.drawn_chunks, self.chunks.len())
+    }
+
+    /// Cumulative false culls reported by `NEPHELE_OCCLUSION_CHECK=1`.
+    pub fn occlusion_false_culls(&self) -> u64 {
+        self.occlusion_false_culls
+    }
+
+    /// Cumulative chunk drops by the occlusion pass and the frames it ran on.
+    pub fn occlusion_stats(&self) -> (u64, u64) {
+        (self.occlusion_culled_total, self.occlusion_frames)
+    }
+
+    /// Cumulative chunks evaluated by the occlusion pass.
+    pub fn occlusion_tested(&self) -> u64 {
+        self.occlusion_tested_total
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -1034,6 +1075,7 @@ impl Renderer {
         chunk.min = cull_min;
         chunk.max = cull_max;
         chunk.occluder = occluder;
+        chunk.heights = block_heights;
     }
 
     pub fn remove_chunk(&mut self, key: (i32, i32)) {
@@ -1116,6 +1158,81 @@ impl Renderer {
 
     pub fn entity_index_count(&self) -> u32 {
         self.entity_index_count
+    }
+
+    /// Replace the first-person arm geometry. Drawn in its own pass with a
+    /// cleared depth buffer, so standing against a wall cannot clip it.
+    pub fn set_hand(&mut self, mesh: &EntityMesh) {
+        self.hand_index_count = mesh.indices.len() as u32;
+        if mesh.vertices.is_empty() {
+            return;
+        }
+
+        let vertex_bytes = std::mem::size_of_val(mesh.vertices.as_slice()) as wgpu::BufferAddress;
+        if vertex_bytes > self.hand_vertex_capacity {
+            self.hand_vertex_capacity = allocate_size(vertex_bytes);
+            self.hand_vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hand vertices"),
+                size: self.hand_vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue
+            .write_buffer(&self.hand_vertices, 0, bytemuck::cast_slice(&mesh.vertices));
+
+        let index_bytes = std::mem::size_of_val(mesh.indices.as_slice()) as wgpu::BufferAddress;
+        if index_bytes > self.hand_index_capacity {
+            self.hand_index_capacity = allocate_size(index_bytes);
+            self.hand_indices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hand indices"),
+                size: self.hand_index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue
+            .write_buffer(&self.hand_indices, 0, bytemuck::cast_slice(&mesh.indices));
+    }
+
+    /// Replace the held block, drawn in the same cleared-depth pass as the arm.
+    pub fn set_hand_item(&mut self, mesh: &MeshData) {
+        self.hand_item_index_count = mesh.indices.len() as u32;
+        if mesh.vertices.is_empty() {
+            return;
+        }
+
+        let vertex_bytes = std::mem::size_of_val(mesh.vertices.as_slice()) as wgpu::BufferAddress;
+        if vertex_bytes > self.hand_item_vertex_capacity {
+            self.hand_item_vertex_capacity = allocate_size(vertex_bytes);
+            self.hand_item_vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hand item vertices"),
+                size: self.hand_item_vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue.write_buffer(
+            &self.hand_item_vertices,
+            0,
+            bytemuck::cast_slice(&mesh.vertices),
+        );
+
+        let index_bytes = std::mem::size_of_val(mesh.indices.as_slice()) as wgpu::BufferAddress;
+        if index_bytes > self.hand_item_index_capacity {
+            self.hand_item_index_capacity = allocate_size(index_bytes);
+            self.hand_item_indices = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("hand item indices"),
+                size: self.hand_item_index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue.write_buffer(
+            &self.hand_item_indices,
+            0,
+            bytemuck::cast_slice(&mesh.indices),
+        );
     }
 
     /// Replace every dropped item's geometry. Like entities, the whole buffer
@@ -1373,6 +1490,9 @@ impl Renderer {
                 if use_occlusion {
                     self.occlusion
                         .rasterize(&self.chunks, &view_proj, camera.position);
+                    if let Some(reference) = self.occlusion_reference.as_mut() {
+                        reference.rasterize_reference(&self.chunks, &view_proj, camera.position);
+                    }
                 }
                 let camera_key = (
                     camera.position.x.floor() as i32 >> 4,
@@ -1382,30 +1502,59 @@ impl Renderer {
                 // terrain early instead of shading it and discarding it.
                 let eye = camera.position;
                 let mut occluded = 0;
-                let mut visible: Vec<((i32, i32), f32)> = self
-                    .chunks
-                    .iter()
-                    .filter(|(&key, chunk)| {
-                        if chunk.index_count == 0 || !frustum.intersects(chunk.min, chunk.max) {
-                            return false;
+                let mut false_culls = 0u64;
+                let mut tested = 0u64;
+                let mut visible: Vec<((i32, i32), f32)> = Vec::with_capacity(self.chunks.len());
+                for (&key, chunk) in &self.chunks {
+                    if chunk.index_count == 0 || !frustum.intersects(chunk.min, chunk.max) {
+                        continue;
+                    }
+                    let mut hidden = false;
+                    if use_occlusion && key != camera_key {
+                        tested += 1;
+                        if self.occlusion.occludes(chunk, &view_proj) {
+                            // Hysteresis: a column has to stay behind the
+                            // height field for two frames before it disappears.
+                            // A single-frame flip at a silhouette edge is what
+                            // reads as popping.
+                            let hits = self.occlusion_hits.entry(key).or_insert(0);
+                            *hits = hits.saturating_add(1);
+                            if *hits >= OCCLUSION_HYSTERESIS {
+                                hidden = true;
+                            }
+                            if let Some(reference) = self.occlusion_reference.as_ref() {
+                                if !reference.occludes(chunk, &view_proj) {
+                                    false_culls += 1;
+                                    if false_culls <= 5 {
+                                        tracing::warn!(
+                                            key = ?key,
+                                            eye = ?camera.position,
+                                            "occlusion culled a column the one-block reference keeps"
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            self.occlusion_hits.remove(&key);
                         }
-                        if use_occlusion
-                            && key != camera_key
-                            && self.occlusion.occludes(chunk, &view_proj)
-                        {
-                            occluded += 1;
-                            return false;
-                        }
-                        true
-                    })
-                    .map(|(&key, chunk)| {
-                        let cx = (chunk.min[0] + chunk.max[0]) * 0.5 - eye.x;
-                        let cy = (chunk.min[1] + chunk.max[1]) * 0.5 - eye.y;
-                        let cz = (chunk.min[2] + chunk.max[2]) * 0.5 - eye.z;
-                        (key, cx * cx + cy * cy + cz * cz)
-                    })
-                    .collect();
+                    }
+                    if hidden {
+                        occluded += 1;
+                        continue;
+                    }
+                    let cx = (chunk.min[0] + chunk.max[0]) * 0.5 - eye.x;
+                    let cy = (chunk.min[1] + chunk.max[1]) * 0.5 - eye.y;
+                    let cz = (chunk.min[2] + chunk.max[2]) * 0.5 - eye.z;
+                    visible.push((key, cx * cx + cy * cy + cz * cz));
+                }
+                self.occlusion_hits.retain(|key, _| self.chunks.contains_key(key));
                 self.occluded_chunks = occluded;
+                self.occlusion_false_culls += false_culls;
+                if use_occlusion {
+                    self.occlusion_culled_total += occluded as u64;
+                    self.occlusion_frames += 1;
+                    self.occlusion_tested_total += tested;
+                }
                 visible.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
 
                 for (key, _) in &visible {
@@ -1459,10 +1608,82 @@ impl Renderer {
                 pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
                 pass.draw(0..self.line_vertex_count, 0..1);
             }
+        }
 
-            // The HUD/menus sit on top of everything, with no depth test.
-            if self.ui_back.index_count > 0 {
-                pass.set_pipeline(&self.ui_sprite_pipeline);
+        // First-person hand pass. Vanilla clears the depth buffer here so the
+        // arm and held block are never swallowed by a wall the player is
+        // standing against. The colour buffer is kept.
+        if self.hand_index_count > 0 || self.hand_item_index_count > 0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hand pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            if self.hand_item_index_count > 0 {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.set_vertex_buffer(0, self.hand_item_vertices.slice(..));
+                pass.set_index_buffer(self.hand_item_indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.hand_item_index_count, 0, 0..1);
+            }
+            if self.hand_index_count > 0 {
+                pass.set_pipeline(&self.entity_pipeline);
+                pass.set_bind_group(0, &self.entity_bind_group, &[]);
+                pass.set_vertex_buffer(0, self.hand_vertices.slice(..));
+                pass.set_index_buffer(self.hand_indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.hand_index_count, 0, 0..1);
+            }
+        }
+
+        // The HUD/menus sit on top of everything, with no depth test.
+        if self.ui_back.index_count > 0
+            || self.ui_blocks.index_count > 0
+            || self.ui_front.index_count > 0
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            if self.ui_back.index_count > 0 {                pass.set_pipeline(&self.ui_sprite_pipeline);
                 pass.set_bind_group(0, &self.ui_bind_group, &[]);
                 pass.set_vertex_buffer(0, self.ui_back.vertices.slice(..));
                 pass.set_index_buffer(self.ui_back.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -1859,6 +2080,7 @@ fn create_panorama(
     uniform_buffer: &wgpu::Buffer,
     sampler: &wgpu::Sampler,
     animation_view: &wgpu::TextureView,
+    tint_mask_view: &wgpu::TextureView,
     shader: &wgpu::ShaderModule,
     pipeline_layout: &wgpu::PipelineLayout,
     format: wgpu::TextureFormat,
@@ -1919,6 +2141,10 @@ fn create_panorama(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::TextureView(animation_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(tint_mask_view),
             },
         ],
     });
@@ -2030,6 +2256,8 @@ struct ChunkBuffers {
     max: [f32; 3],
     /// Maximum solid height in each 4×4 block cell of the column.
     occluder: [f32; 16],
+    /// Per-block top height, used only by the occlusion self-check.
+    heights: [f32; 256],
 }
 
 impl ChunkBuffers {
@@ -2053,6 +2281,7 @@ impl ChunkBuffers {
             min: [0.0; 3],
             max: [0.0; 3],
             occluder: [0.0; 16],
+            heights: [0.0; 256],
         }
     }
 }
@@ -2100,7 +2329,16 @@ impl Frustum {
 
 const OCCLUSION_WIDTH: usize = 80;
 const OCCLUSION_HEIGHT: usize = 45;
-const OCCLUSION_BIAS: f32 = 0.0025;
+/// Depth is stored as `1/w`, so occlusion compares linear view distance. The
+/// bias is in blocks; the old 0.0025 was in non-linear NDC z and, at typical
+/// view distances, was larger than the whole terrain depth range, which made
+/// the pass cull nothing.
+const OCCLUSION_BIAS: f32 = 0.5;
+/// Columns farther than this are not used as occluders. A shorter radius keeps
+/// the coarse height field honest in steep terrain.
+const OCCLUSION_RADIUS: f32 = 32.0;
+/// Frames a column must stay hidden before it is dropped.
+const OCCLUSION_HYSTERESIS: u8 = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct Projected {
@@ -2123,7 +2361,7 @@ struct OcclusionBuffer {
 impl OcclusionBuffer {
     fn new() -> Self {
         Self {
-            depth: vec![1.0; OCCLUSION_WIDTH * OCCLUSION_HEIGHT],
+            depth: vec![0.0; OCCLUSION_WIDTH * OCCLUSION_HEIGHT],
         }
     }
 
@@ -2133,7 +2371,30 @@ impl OcclusionBuffer {
         view_proj: &glam::Mat4,
         eye: glam::Vec3,
     ) {
-        self.depth.fill(1.0);
+        self.rasterize_cells(chunks, view_proj, eye, 4);
+    }
+
+    /// The same pass at one-block resolution, used as the reference for the
+    /// self-check. It is 16× the rasterization work, so it is opt-in.
+    fn rasterize_reference(
+        &mut self,
+        chunks: &std::collections::HashMap<(i32, i32), ChunkBuffers>,
+        view_proj: &glam::Mat4,
+        eye: glam::Vec3,
+    ) {
+        self.rasterize_cells(chunks, view_proj, eye, 1);
+    }
+
+    fn rasterize_cells(
+        &mut self,
+        chunks: &std::collections::HashMap<(i32, i32), ChunkBuffers>,
+        view_proj: &glam::Mat4,
+        eye: glam::Vec3,
+        cell_size: usize,
+    ) {
+        self.depth.fill(0.0);
+        let cells_per_side = 16 / cell_size;
+        let cell_size = cell_size as f32;
         for (&key, chunk) in chunks {
             if chunk.index_count == 0 || key.0 == i32::MIN {
                 continue;
@@ -2142,46 +2403,55 @@ impl OcclusionBuffer {
             // whole view distance is pure CPU work and was a p99 spike.
             let cx = key.0 as f32 * 16.0 + 8.0 - eye.x;
             let cz = key.1 as f32 * 16.0 + 8.0 - eye.z;
-            if cx * cx + cz * cz > 72.0 * 72.0 {
+            if cx * cx + cz * cz > OCCLUSION_RADIUS * OCCLUSION_RADIUS {
                 continue;
             }
-            for cell in 0..16 {
-                let height = chunk.occluder[cell];
+            for cell in 0..cells_per_side * cells_per_side {
+                let height = if cell_size == 4.0 {
+                    chunk.occluder[cell]
+                } else {
+                    chunk.heights[cell]
+                };
                 if height <= 0.0 {
                     continue;
                 }
-                let x0 = key.0 as f32 * 16.0 + (cell % 4) as f32 * 4.0;
-                let z0 = key.1 as f32 * 16.0 + (cell / 4) as f32 * 4.0;
-                let y = height + 0.08;
-                let corners = [
-                    [x0, y, z0],
-                    [x0 + 4.0, y, z0],
-                    [x0 + 4.0, y, z0 + 4.0],
-                    [x0, y, z0 + 4.0],
-                ];
-                let mut projected = [Projected {
-                    x: 0.0,
-                    y: 0.0,
-                    z: 1.0,
-                    inv_w: 0.0,
-                }; 4];
-                let mut valid = true;
-                for (index, corner) in corners.iter().enumerate() {
-                    match project_point(view_proj, *corner) {
-                        Some(point) => projected[index] = point,
-                        None => {
-                            valid = false;
-                            break;
-                        }
-                    }
-                }
-                if !valid {
-                    continue;
-                }
-                self.raster_triangle(projected[0], projected[1], projected[2]);
-                self.raster_triangle(projected[0], projected[2], projected[3]);
+                let x0 = key.0 as f32 * 16.0 + (cell % cells_per_side) as f32 * cell_size;
+                let z0 = key.1 as f32 * 16.0 + (cell / cells_per_side) as f32 * cell_size;
+                self.push_cell(x0, z0, cell_size, height, view_proj);
             }
         }
+    }
+
+    /// Rasterize one horizontal cell of the height field.
+    fn push_cell(
+        &mut self,
+        x0: f32,
+        z0: f32,
+        cell_size: f32,
+        height: f32,
+        view_proj: &glam::Mat4,
+    ) {
+        let y = height + 0.08;
+        let corners = [
+            [x0, y, z0],
+            [x0 + cell_size, y, z0],
+            [x0 + cell_size, y, z0 + cell_size],
+            [x0, y, z0 + cell_size],
+        ];
+        let mut projected = [Projected {
+            x: 0.0,
+            y: 0.0,
+            z: 1.0,
+            inv_w: 0.0,
+        }; 4];
+        for (index, corner) in corners.iter().enumerate() {
+            match project_point(view_proj, *corner) {
+                Some(point) => projected[index] = point,
+                None => return,
+            }
+        }
+        self.raster_triangle(projected[0], projected[1], projected[2]);
+        self.raster_triangle(projected[0], projected[2], projected[3]);
     }
 
     fn raster_triangle(&mut self, a: Projected, b: Projected, c: Projected) {
@@ -2238,16 +2508,18 @@ impl OcclusionBuffer {
                     continue;
                 }
                 let index = y * OCCLUSION_WIDTH + x;
-                if z < self.depth[index] {
-                    self.depth[index] = z;
+                if inv_w > self.depth[index] {
+                    self.depth[index] = inv_w;
                 }
             }
         }
     }
 
     fn occludes(&self, chunk: &ChunkBuffers, view_proj: &glam::Mat4) -> bool {
-        let min = chunk.min;
-        let max = chunk.max;
+        self.occludes_box(chunk.min, chunk.max, view_proj)
+    }
+
+    fn occludes_box(&self, min: [f32; 3], max: [f32; 3], view_proj: &glam::Mat4) -> bool {
         let centre = [
             (min[0] + max[0]) * 0.5,
             (min[1] + max[1]) * 0.5,
@@ -2276,7 +2548,13 @@ impl OcclusionBuffer {
                 return false;
             }
             let index = point.y as usize * OCCLUSION_WIDTH + point.x as usize;
-            if point.z <= self.depth[index] + OCCLUSION_BIAS {
+            let surface = self.depth[index];
+            if surface <= 0.0 {
+                return false;
+            }
+            // `surface` is 1/w of the nearest height-field surface at this
+            // pixel; the sample is hidden only when it is clearly farther.
+            if 1.0 / point.inv_w <= 1.0 / surface + OCCLUSION_BIAS {
                 return false;
             }
         }
@@ -2304,4 +2582,59 @@ fn project_point(view_proj: &glam::Mat4, point: [f32; 3]) -> Option<Projected> {
         z: ndc.z,
         inv_w,
     })
+}
+
+#[cfg(test)]
+mod occlusion_tests {
+    use super::*;
+
+    fn looking_down() -> glam::Mat4 {
+        Camera {
+            position: glam::Vec3::new(0.0, 100.0, 0.0),
+            yaw: 0.0,
+            pitch: -40f32.to_radians(),
+            fov_y: 70f32.to_radians(),
+            aspect: 16.0 / 9.0,
+            ..Camera::default()
+        }
+        .view_projection()
+    }
+
+    fn ridge(buffer: &mut OcclusionBuffer, view_proj: &glam::Mat4) {
+        for x in (-80..80).step_by(4) {
+            for z in (-60..20).step_by(4) {
+                buffer.push_cell(x as f32, z as f32, 4.0, 80.0, view_proj);
+            }
+        }
+    }
+
+    #[test]
+    fn a_ridge_hides_a_chunk_below_and_behind_it() {
+        let view_proj = looking_down();
+        let mut buffer = OcclusionBuffer::new();
+        ridge(&mut buffer, &view_proj);
+
+        assert!(
+            buffer.occludes_box([-8.0, 30.0, -80.0], [8.0, 40.0, -64.0], &view_proj),
+            "a column behind and below a ridge should be culled"
+        );
+    }
+
+    #[test]
+    fn a_chunk_above_the_ridge_is_not_hidden() {
+        let view_proj = looking_down();
+        let mut buffer = OcclusionBuffer::new();
+        ridge(&mut buffer, &view_proj);
+        assert!(
+            !buffer.occludes_box([-8.0, 90.0, -80.0], [8.0, 96.0, -64.0], &view_proj),
+            "a column above the ridge is visible and must not be culled"
+        );
+    }
+
+    #[test]
+    fn an_open_view_never_culls() {
+        let view_proj = looking_down();
+        let buffer = OcclusionBuffer::new();
+        assert!(!buffer.occludes_box([-8.0, 0.0, -80.0], [8.0, 20.0, -64.0], &view_proj));
+    }
 }

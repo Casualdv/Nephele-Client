@@ -49,7 +49,51 @@ struct Viewer {
     last_frame: Instant,
     title_timer: f32,
     frames: u32,
+    /// Scripted fly-through from `NEPHELE_CAM_PATH`, used to validate culling.
+    path: Vec<(glam::Vec3, Option<f32>)>,
+    path_time: f32,
+    path_seconds: f32,
+    total_frames: u32,
     error: Option<Box<dyn Error>>,
+}
+
+pub enum PathSpec {
+    Ground { x: f32, z: f32 },
+    Point { position: glam::Vec3, yaw: Option<f32> },
+}
+
+pub fn parse_path(value: &str) -> Vec<PathSpec> {
+    let mut path = Vec::new();
+    for entry in value.split(';') {
+        let numbers: Vec<f32> = entry
+            .split(',')
+            .filter_map(|part| part.trim().parse::<f32>().ok())
+            .collect();
+        match numbers.as_slice() {
+            [x, z] => path.push(PathSpec::Ground { x: *x, z: *z }),
+            [x, y, z] => path.push(PathSpec::Point {
+                position: glam::Vec3::new(*x, *y, *z),
+                yaw: None,
+            }),
+            [x, y, z, yaw] => path.push(PathSpec::Point {
+                position: glam::Vec3::new(*x, *y, *z),
+                yaw: Some(*yaw),
+            }),
+            _ => {}
+        }
+    }
+    path
+}
+
+pub fn ground_height(world: &World, x: f32, z: f32) -> f32 {
+    let bx = x.floor() as i32;
+    let bz = z.floor() as i32;
+    for y in (0..256).rev() {
+        if world.get_block(bx, y, bz).id() != 0 {
+            return y as f32 + 3.0;
+        }
+    }
+    64.0
 }
 
 impl Viewer {
@@ -71,6 +115,10 @@ impl Viewer {
             last_frame: Instant::now(),
             title_timer: 0.0,
             frames: 0,
+            path: Vec::new(),
+            path_time: 0.0,
+            path_seconds: 0.0,
+            total_frames: 0,
             error: None,
         }
     }
@@ -101,7 +149,22 @@ impl Viewer {
             textures.tile_size(),
             textures.tile_size()
         );
-
+        eprintln!(
+            "[debug] grass_top={:?} stone={:?} water={:?} dirt={:?} leaves={:?}",
+            textures.layer("grass_top"),
+            textures.layer("stone"),
+            textures.layer("water_still"),
+            textures.layer("dirt"),
+            textures.layer("leaves_oak")
+        );
+        for layer in [0u32, 7, 17, 18, 33] {
+            let index = (layer as usize * 16 * 16 + 8 * 16 + 8) * 4;
+            eprintln!(
+                "[debug] layer {layer} name={:?} center={:?}",
+                textures.name_of(layer),
+                &textures.mip_pixels(0)[index..index + 4]
+            );
+        }
         let size = window.inner_size();
         let mut renderer = match Renderer::new(
             window.clone(),
@@ -148,11 +211,41 @@ impl Viewer {
             mesh.vertices.len(),
             mesh.indices.len() / 3
         );
+        for vertex in mesh.vertices.iter().take(4) {
+            eprintln!(
+                "[debug] vertex layer={} anim={} tint={:#08x} light={} uv={:?}",
+                vertex.layer, vertex.anim, vertex.tint, vertex.light, vertex.uv
+            );
+        }
         renderer.set_mesh(&mesh);
 
         let spawn_height = generator.height_at(8, 8) as f32;
         self.spawn = glam::Vec3::new(8.5, spawn_height + 9.0, 8.5);
         self.camera.position = glam::Vec3::new(8.5, spawn_height + 9.0, 8.5);
+
+        // Scripted path for culling validation. Two numbers mean "x,z at two
+        // blocks above the terrain", three or four are an absolute camera
+        // position (plus optional yaw in degrees).
+        if let Ok(value) = std::env::var("NEPHELE_CAM_PATH") {
+            self.path = parse_path(&value)
+                .into_iter()
+                .map(|spec| match spec {
+                    PathSpec::Ground { x, z } => (
+                        glam::Vec3::new(x, ground_height(&self.world, x, z), z),
+                        None,
+                    ),
+                    PathSpec::Point { position, yaw } => (position, yaw),
+                })
+                .collect();
+            self.path_seconds = std::env::var("NEPHELE_CAM_SECONDS")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .filter(|seconds| *seconds > 0.0)
+                .unwrap_or(15.0);
+            if let Some((start, _)) = self.path.first() {
+                self.camera.position = *start;
+            }
+        }
         self.camera.set_aspect(size.width, size.height);
 
         self.renderer = Some(renderer);
@@ -214,9 +307,44 @@ impl Viewer {
             self.camera.fly(forward, strafe, up, delta);
         }
 
+        // A scripted path overrides keyboard movement while it runs, so a
+        // valley walk is reproducible frame for frame.
+        if !self.path.is_empty() && self.path_seconds > 0.0 {
+            self.path_time = (self.path_time + delta).min(self.path_seconds);
+            let count = self.path.len();
+            let t = if count == 1 {
+                0.0
+            } else {
+                self.path_time / self.path_seconds * (count - 1) as f32
+            };
+            let index = (t.floor() as usize).min(count - 1);
+            let fraction = (t - index as f32).clamp(0.0, 1.0);
+            let (start, yaw) = self.path[index];
+            let (end, _) = self.path[(index + 1).min(count - 1)];
+            self.camera.position = start.lerp(end, fraction);
+            if let Some(yaw) = yaw {
+                self.camera.yaw = yaw.to_radians();
+            }
+
+            if self.path_time >= self.path_seconds {
+                eprintln!(
+                    "[occlusion] path_complete frames={} false_culls={} culled={} occlusion_frames={} pos={:.1},{:.1},{:.1}",
+                    self.total_frames,
+                    renderer.occlusion_false_culls(),
+                    renderer.occlusion_stats().0,
+                    renderer.occlusion_stats().1,
+                    self.camera.position.x,
+                    self.camera.position.y,
+                    self.camera.position.z
+                );
+                std::process::exit(0);
+            }
+        }
+
         renderer.draw(&self.camera);
 
         self.frames += 1;
+        self.total_frames += 1;
         self.title_timer += delta;
         if self.title_timer >= TITLE_UPDATE {
             let fps = self.frames as f32 / self.title_timer;

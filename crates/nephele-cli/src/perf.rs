@@ -73,6 +73,67 @@ pub fn record_chunk_upload() {
     recorder.chunk_uploads = recorder.chunk_uploads.saturating_add(1);
 }
 
+/// Log a startup milestone with seconds since the perf clock started.
+pub fn mark(label: &str) {
+    if !enabled() {
+        return;
+    }
+    let started = *STARTED.get_or_init(Instant::now);
+    eprintln!(
+        "[perf] mark t={:.3}s {}",
+        started.elapsed().as_secs_f64(),
+        label
+    );
+}
+
+/// Time the stages of one frame so a slow frame can name the phase that
+/// caused it instead of only reporting the interval.
+pub struct Probe {
+    last: Instant,
+    stages: Vec<(&'static str, Duration)>,
+}
+
+impl Probe {
+    pub fn start() -> Self {
+        Self {
+            last: Instant::now(),
+            stages: Vec::new(),
+        }
+    }
+
+    pub fn mark(&mut self, name: &'static str) {
+        if !enabled() {
+            return;
+        }
+        let now = Instant::now();
+        self.stages.push((name, now.saturating_duration_since(self.last)));
+        self.last = now;
+    }
+
+    /// Print the stage breakdown when the whole frame ran long.
+    pub fn finish(mut self, interval: Duration) {
+        if !enabled() || interval <= Duration::from_nanos(FRAME_BUDGET_NS) {
+            return;
+        }
+        self.mark("tail");
+        let detail = self
+            .stages
+            .iter()
+            .map(|(name, duration)| format!("{name}={:.2}", duration.as_secs_f64() * 1000.0))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let started = *STARTED.get_or_init(Instant::now);
+        eprintln!(
+            "[perf] slow_frame t={:.3}s interval_ms={:.2} {}",
+            started.elapsed().as_secs_f64(),
+            interval.as_secs_f64() * 1000.0,
+            detail
+        );
+    }
+}
+
+static STARTED: OnceLock<Instant> = OnceLock::new();
+
 fn lock_recorder() -> std::sync::MutexGuard<'static, Recorder> {
     RECORDER
         .get_or_init(|| Mutex::new(Recorder::new()))
