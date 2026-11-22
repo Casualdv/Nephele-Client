@@ -842,12 +842,43 @@ lane `client-ui`). Four new modules in `nephele-cli/src` carry it:
   Missing/corrupt/partial files fall back to defaults field by field, unknown keys
   are ignored, and hand-edited values are clamped on load. Saved on every change
   (adjust, toggle, drag-release, Done).
-- **Generic server windows.** A container window is now drawn for **any slot
-  count**: `window_rows`/`container_panel_size`/`server_window_origin` lay the
-  container slots nine to a row above the player's 36, so a hopper, a single chest,
-  a double chest or a furnace all render without a bespoke screen, titled from
-  `S2D`'s inventory type (`window_kind_label`). The 46-slot crafting table keeps
-  its vanilla 3x3-plus-output layout.
+- **Generic server windows.** A container window is drawn for **any slot
+  count**, sized from `S2D`'s own count rather than its type string. `survival`'s
+  `ContainerKind` replaced `client-ui`'s `window_rows`/`server_window_origin`/
+  `window_kind_label` (deleted; do not bring them back). `ContainerLayout::
+  from_slot_count` derives rows and the leading slot: `1 + rows*9 + 36` is
+  Hypixel's Game Menu / Ticket Machine shape, a multiple of nine is a plain chest.
+- **Every container window draws its own sheet.** `ui_atlas` packs all eight
+  (`inventory`, `generic_54`, `crafting_table`, `furnace`, `hopper`, `dispenser`,
+  `beacon`, `anvil`); panels are 176x166 except a chest (`176 x (114 + rows*18)`,
+  drawn as the top cropped to `rows*18 + 17` plus the **same** 176x96
+  `CHEST_BOTTOM` player half for every row count), hopper (176x133) and beacon
+  (230x219). A fixed-grid panel (`Hopper`/`Dispenser`/`Anvil`/`Beacon`) is only
+  used when the announced count is the one its art lays out (41/45/39/37);
+  otherwise the window falls back to the chest panel, because drawing slots
+  where no click reports them breaks the click mapping.
+- **Slot frames are the sheet's, not rectangles.** Every panel bakes the 18x18
+  frame in at its slot positions and the UI blits the panel then the item. The
+  one slot no sheet covers is the title-band slot at `(8, 0)`, which gets
+  `sprites::SLOT` — the frame measured at `(7, 83)` of **`inventory.png`**.
+  (1.8.9's `widgets.png` has no slot sprite; its `(7, 83)` is inside the hovered
+  button gradient.) Do not paint `SLOT` over every slot: the crafting-table and
+  anvil outputs are 26x26 composites. Hover is vanilla's 19x19 50% white wash.
+- **Slot coordinates are measured, not remembered.** Hopper: 5 cells at
+  (44..116, 20), player 51/69/87, hotbar 109. Dispenser: 3x3 at (62..98,
+  17..53), player 84/142. Anvil: (27,47) (76,47) (134,47), player 84/142.
+  Beacon: (136,110), player x=36 at 137/155/173, hotbar 195. Each is pinned by a
+  test that also asserts every slot stays inside its panel and none overlap.
+- **Panel rendering is pixel-checked against the source sheet.** A test
+  rasterises the real `UiBatch` through the real atlas at GUI scale 1 and
+  asserts the drawn panel equals the sheet's own pixels (transparent texels are
+  skipped: the scrim shows through the rounded corners). It also writes
+  `%TEMP%\opencode\window-*.png` for a visual look. That is the side-by-side
+  comparison; there is no Hypixel account on this machine to open the real menu.
+- **Item icons.** `item_textures` maps 196 distinct sprites; a test walks every
+  id in 256..=425 plus the records: **181 of 182 resolve**, and the single
+  fallback is 397 (the mob skull, which has no sprite in the jar). A second test
+  asserts every mapped file exists in the prepared `textures/items`.
 - **Entity clicks are the `net` lane's.** `client.entities.raycast` picks the target,
   mining is gated on it, and `C02 ATTACK`/`INTERACT_AT` are sent directly from the net
   loop. A parallel `interact.rs` prototype (Candidate/pick + a `Shared::entity_actions`

@@ -4244,6 +4244,381 @@ mod tests {
         assert_eq!(quads_with(&bg, top.uv()).len(), 1, "3-row crop");
     }
 
+    /// The prepared `textures` directory, or `None` when this checkout has no
+    /// Minecraft assets (the repository ships none).
+    fn prepared_textures() -> Option<std::path::PathBuf> {
+        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let textures = manifest.join("../../.local/prepared/1.8.9/assets/minecraft/textures");
+        textures.is_dir().then_some(textures)
+    }
+
+    fn dummy_textures() -> TextureArray {
+        TextureArray::from_tiles(vec![(
+            "missing".to_string(),
+            image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 0, 255, 255])),
+        )])
+    }
+
+    /// Software raster of a UI batch over the real atlas.
+    ///
+    /// The renderer samples the UI atlas with a nearest-magnification sampler,
+    /// and every quad here is axis-aligned, so at GUI scale 1 this reproduces
+    /// the frame exactly. Block/item icons (`layer != 0`) are skipped: they
+    /// sample the block array, not the UI atlas.
+    fn rasterize_ui(
+        bg: &UiBatch,
+        fg: &UiBatch,
+        icons: &UiBatch,
+        atlas: &UiAtlas,
+        textures: &TextureArray,
+        w: usize,
+        h: usize,
+    ) -> Vec<[u8; 4]> {
+        let size = UiAtlas::SIZE as usize;
+        let src = atlas.pixels();
+        let mut out = vec![[0u8, 0, 0, 0]; w * h];
+        for batch in [bg, fg, icons] {
+            for quad in batch.vertices.chunks(4) {
+                let (x0, y0) = (quad[0].position[0], quad[0].position[1]);
+                let (x1, y1) = (quad[2].position[0], quad[2].position[1]);
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+                let (u0, v0) = (quad[0].uv[0], quad[0].uv[1]);
+                let (u1, v1) = (quad[2].uv[0], quad[2].uv[1]);
+                let tint = quad[0].color;
+                let layer = quad[0].layer;
+                for py in (y0.floor() as i64).max(0)..(y1.ceil() as i64).min(h as i64) {
+                    for px in (x0.floor() as i64).max(0)..(x1.ceil() as i64).min(w as i64) {
+                        let fx = (px as f32 + 0.5 - x0) / (x1 - x0);
+                        let fy = (py as f32 + 0.5 - y0) / (y1 - y0);
+                        if !(0.0..1.0).contains(&fx) || !(0.0..1.0).contains(&fy) {
+                            continue;
+                        }
+                        let u = u0 + fx * (u1 - u0);
+                        let v = v0 + fy * (v1 - v0);
+                        let texel = if layer == 0 {
+                            let tx = ((u * size as f32) as usize).min(size - 1);
+                            let ty = ((v * size as f32) as usize).min(size - 1);
+                            let at = (ty * size + tx) * 4;
+                            [src[at], src[at + 1], src[at + 2], src[at + 3]]
+                        } else {
+                            // `fs_block`: the vertex layer is a packed slot, the
+                            // uv is packed into the 4x4 grid inside it.
+                            let packed = layer;
+                            let local = packed % 16;
+                            let (ox, oy) = ((local % 4) as f32, (local / 4) as f32);
+                            let side = textures.layer_size() as f32;
+                            let bu = ((u + ox) * 0.25 * side) as usize;
+                            let bv = ((v + oy) * 0.25 * side) as usize;
+                            let layer_index = packed / 16;
+                            let stride = textures.bytes_per_layer();
+                            let pixels = textures.pixels();
+                            let row = textures.layer_size() as usize;
+                            let at = layer_index as usize * stride
+                                + (bv.min(row - 1) * row + bu.min(row - 1)) * 4;
+                            if at + 3 < pixels.len() {
+                                [pixels[at], pixels[at + 1], pixels[at + 2], pixels[at + 3]]
+                            } else {
+                                [0, 0, 0, 0]
+                            }
+                        };
+                        let alpha = (texel[3] as f32 / 255.0) * tint[3];
+                        if alpha <= 0.0 {
+                            continue;
+                        }
+                        let dst = &mut out[py as usize * w + px as usize];
+                        for channel in 0..3 {
+                            let src_c = texel[channel] as f32 / 255.0 * tint[channel];
+                            dst[channel] = ((src_c * alpha
+                                + dst[channel] as f32 / 255.0 * (1.0 - alpha))
+                                * 255.0)
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                        }
+                        dst[3] = ((alpha + dst[3] as f32 / 255.0 * (1.0 - alpha)) * 255.0)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The panel as the atlas stores it: one sprite, or the chest's cropped top
+    /// plus its shared player half.
+    fn expected_panel(
+        atlas: &UiAtlas,
+        kind: Option<ContainerKind>,
+        rows: u8,
+    ) -> (usize, usize, Vec<[u8; 4]>) {
+        let size = UiAtlas::SIZE as usize;
+        let src = atlas.pixels();
+        let pixel = |x: u32, y: u32| -> [u8; 4] {
+            let at = (y as usize * size + x as usize) * 4;
+            [src[at], src[at + 1], src[at + 2], src[at + 3]]
+        };
+        match kind {
+            Some(ContainerKind::Chest { .. }) => {
+                let top_h = rows as usize * 18 + 17;
+                let (w, h) = (176usize, top_h + 96);
+                let mut out = Vec::with_capacity(w * h);
+                for y in 0..h {
+                    for x in 0..w {
+                        let (sx, sy) = if y < top_h {
+                            (
+                                sprites::CHEST_TOP.x + x as u32,
+                                sprites::CHEST_TOP.y + y as u32,
+                            )
+                        } else {
+                            (
+                                sprites::CHEST_BOTTOM.x + x as u32,
+                                sprites::CHEST_BOTTOM.y + (y - top_h) as u32,
+                            )
+                        };
+                        out.push(pixel(sx, sy));
+                    }
+                }
+                (w, h, out)
+            }
+            _ => {
+                let sprite = match kind {
+                    Some(ContainerKind::Hopper) => sprites::HOPPER_PANEL,
+                    Some(ContainerKind::Dispenser) => sprites::DISPENSER_PANEL,
+                    Some(ContainerKind::Beacon) => sprites::BEACON_PANEL,
+                    Some(ContainerKind::Anvil) => sprites::ANVIL_PANEL,
+                    Some(ContainerKind::Furnace) => sprites::FURNACE_PANEL,
+                    Some(ContainerKind::CraftingTable) => sprites::CRAFTING_TABLE_PANEL,
+                    _ => sprites::INVENTORY_PANEL,
+                };
+                let (w, h) = (sprite.w as usize, sprite.h as usize);
+                let mut out = Vec::with_capacity(w * h);
+                for y in 0..h {
+                    for x in 0..w {
+                        out.push(pixel(sprite.x + x as u32, sprite.y + y as u32));
+                    }
+                }
+                (w, h, out)
+            }
+        }
+    }
+
+    /// At GUI scale 1 the drawn panel must equal the sheet's own pixels. That is
+    /// the side-by-side comparison: same sheet, same crop, same offset, and the
+    /// slot frames are the ones baked into that sheet.
+    #[test]
+    fn each_panel_is_pixel_identical_to_its_own_sheet() {
+        let Some(minecraft) = prepared_textures() else {
+            return;
+        };
+        let atlas = UiAtlas::load(&minecraft).expect("ui atlas");
+        let textures = TextureArray::load_from_dir(&minecraft.join("blocks"))
+            .unwrap_or_else(|_| dummy_textures());
+        let inventory = vec![None; 45];
+        let (width, height, scale) = (1280.0f32, 720.0f32, 1.0f32);
+
+        let cases: [(Option<ContainerKind>, u8, usize); 7] = [
+            (
+                Some(ContainerKind::Chest {
+                    rows: 3,
+                    header: false,
+                }),
+                3,
+                63,
+            ),
+            (
+                Some(ContainerKind::Chest {
+                    rows: 6,
+                    header: true,
+                }),
+                6,
+                91,
+            ),
+            (
+                Some(ContainerKind::Chest {
+                    rows: 1,
+                    header: true,
+                }),
+                1,
+                46,
+            ),
+            (Some(ContainerKind::Hopper), 0, 41),
+            (Some(ContainerKind::Dispenser), 0, 45),
+            (Some(ContainerKind::Anvil), 0, 39),
+            (Some(ContainerKind::Beacon), 0, 37),
+        ];
+
+        for (kind, rows, slots) in cases {
+            // Empty for the comparison, filled for the saved picture.
+            let empty_slots = vec![None; slots];
+            let mut filled_slots = vec![None; slots];
+            for (index, item) in [
+                (1usize, ItemStack::new(267, 1, 40)), // iron sword
+                (2, ItemStack::new(264, 12, 0)),      // diamonds
+                (3, ItemStack::new(260, 5, 0)),       // apples
+                (4, ItemStack::new(1, 64, 0)),        // stone
+                (10, ItemStack::new(5, 32, 1)),       // spruce planks
+            ] {
+                if index < slots {
+                    filled_slots[index] = Some(item);
+                }
+            }
+
+            let render = |slots: &[Option<ItemStack>]| {
+                let hud = HudState {
+                    window_slots: Some(slots),
+                    window_kind: kind,
+                    ..hud_state(&inventory)
+                };
+                let (mut bg, mut fg, mut icons) =
+                    (UiBatch::default(), UiBatch::default(), UiBatch::default());
+                draw_inventory(
+                    &mut bg, &mut fg, &mut icons, &hud, None, &textures, scale, width, height,
+                );
+                (bg, fg, icons)
+            };
+
+            let (bg, _, _) = render(&empty_slots);
+            let empty = (UiBatch::default(), UiBatch::default(), UiBatch::default());
+            let drawn = rasterize_ui(
+                &bg,
+                &empty.1,
+                &empty.2,
+                &atlas,
+                &textures,
+                width as usize,
+                height as usize,
+            );
+            let panel = container_panel(kind, scale, width, height);
+            let (pw, ph, expected) = expected_panel(&atlas, kind, rows);
+            let mut mismatched = 0usize;
+            let mut examples = Vec::new();
+            for y in 0..ph {
+                for x in 0..pw {
+                    let px = panel.x as usize + x;
+                    let py = panel.y as usize + y;
+                    let got = drawn[py * width as usize + px];
+                    let want = expected[y * pw + x];
+                    // A transparent texel means the sheet paints nothing there,
+                    // so whatever is behind it (the scrim, or the world) is
+                    // correct. Only compare pixels the sheet actually paints.
+                    if want[3] == 0 {
+                        continue;
+                    }
+                    // The title-band slot is the one place the UI adds art the
+                    // sheet does not have, and the panel label is text on `fg`.
+                    let header_slot =
+                        matches!(kind, Some(ContainerKind::Chest { header: true, .. }))
+                            && (7..27).contains(&x)
+                            && (0..18).contains(&y);
+                    if !header_slot && got != want {
+                        mismatched += 1;
+                        if examples.len() < 6 {
+                            examples.push((x, y, got, want));
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                mismatched, 0,
+                "{kind:?} panel differs from its sheet in {mismatched} pixels: {examples:?}"
+            );
+
+            // Keep the render for a visual check: panels, text and item icons.
+            let (bg_full, fg_full, icons_full) = render(&filled_slots);
+            let full = rasterize_ui(
+                &bg_full,
+                &fg_full,
+                &icons_full,
+                &atlas,
+                &textures,
+                width as usize,
+                height as usize,
+            );
+            let out = std::env::temp_dir().join(format!(
+                "opencode/window-{}.png",
+                match kind {
+                    Some(ContainerKind::Chest { rows, header }) =>
+                        format!("chest{rows}{}", if header { "h" } else { "" }),
+                    Some(ContainerKind::Hopper) => "hopper".to_string(),
+                    Some(ContainerKind::Dispenser) => "dispenser".to_string(),
+                    Some(ContainerKind::Anvil) => "anvil".to_string(),
+                    Some(ContainerKind::Beacon) => "beacon".to_string(),
+                    _ => "other".to_string(),
+                }
+            ));
+            let _ = std::fs::create_dir_all(out.parent().unwrap());
+            let image = image::RgbaImage::from_fn(width as u32, height as u32, |x, y| {
+                let p = full[y as usize * width as usize + x as usize];
+                image::Rgba(p)
+            });
+            let _ = image.save(&out);
+        }
+    }
+
+    #[test]
+    fn hover_wash_and_cursor_stack_draw_over_the_slots() {
+        let slots = vec![None; 63];
+        let inventory = vec![None; 45];
+        let textures = dummy_textures();
+        let scale = 2.0;
+        let (width, height) = (1280.0, 720.0);
+        let kind = Some(ContainerKind::Chest {
+            rows: 3,
+            header: false,
+        });
+        let slot = window_slot_rect(9, kind, scale, width, height).expect("slot");
+        let pointer = [slot.x + slot.w / 2.0, slot.y + slot.h / 2.0];
+        let hud = HudState {
+            window_slots: Some(&slots),
+            window_kind: kind,
+            pointer: Some(pointer),
+            ..hud_state(&inventory)
+        };
+        let (mut bg, mut fg, mut icons) =
+            (UiBatch::default(), UiBatch::default(), UiBatch::default());
+        draw_inventory(
+            &mut bg,
+            &mut fg,
+            &mut icons,
+            &hud,
+            Some(ItemStack::new(264, 7, 0)),
+            &textures,
+            scale,
+            width,
+            height,
+        );
+
+        // Vanilla's hover wash: 19x19 GUI pixels at 50% white, starting one
+        // pixel up-left of the item cell.
+        let wash = bg
+            .vertices
+            .chunks(4)
+            .find(|quad| quad[0].color == SLOT_HOVER)
+            .expect("a hovered slot gets the wash");
+        assert_eq!(wash[0].position, [slot.x - scale, slot.y - scale]);
+        assert_eq!(
+            wash[2].position,
+            [slot.x - scale + 19.0 * scale, slot.y - scale + 19.0 * scale]
+        );
+
+        // The held stack is drawn last, centred on the pointer, with its count.
+        let cursor = icons
+            .vertices
+            .chunks(4)
+            .find(|quad| {
+                (quad[2].position[0] - quad[0].position[0] - 16.0 * scale).abs() < 0.01
+                    && (quad[0].position[0] - (pointer[0] - 8.0 * scale)).abs() < 0.01
+            })
+            .expect("the cursor stack is drawn at the pointer");
+        assert!((cursor[0].position[1] - (pointer[1] - 8.0 * scale)).abs() < 0.01);
+        assert!(
+            fg.vertices.chunks(4).any(|quad| quad.len() == 4),
+            "the count is drawn on the text layer"
+        );
+    }
+
     #[test]
     fn durability_bars_only_show_for_worn_damageable_items() {
         assert_eq!(max_damage(267), Some(250)); // iron sword
