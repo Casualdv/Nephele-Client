@@ -51,6 +51,7 @@ pub const ASSET_PREFIXES: &[&str] = &[
     "minecraft/textures/gui/",
     "minecraft/textures/font/",
     "minecraft/textures/misc/",
+    "minecraft/textures/colormap/",
     "minecraft/font/",
     "minecraft/lang/en_US.lang",
 ];
@@ -531,6 +532,7 @@ mod tests {
     fn asset_filter_takes_only_what_the_client_reads() {
         assert!(is_wanted("minecraft/textures/blocks/stone.png"));
         assert!(is_wanted("minecraft/textures/gui/widgets.png"));
+        assert!(is_wanted("minecraft/textures/colormap/grass.png"));
         assert!(is_wanted("minecraft/lang/en_US.lang"));
         // Sounds are not in the jar at all - they come from the asset index -
         // so the jar filter must not pretend to want them.

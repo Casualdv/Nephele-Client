@@ -256,6 +256,7 @@ impl Particles {
                     layer: debris.layer,
                     anim: NO_ANIMATION,
                     light: debris.light,
+                    tint: crate::mesh::NO_TINT,
                 });
             }
             mesh.indices

@@ -39,6 +39,15 @@ foreach ($path in $worktrees) {
             Measure-Object Length -Sum).Sum / 1GB
     }
 
+    # The primary checkout holds .git as a directory, every linked worktree
+    # holds a .git file. Never remove the primary one: it is the integrator's
+    # checkout, and its branch is trivially "merged into main".
+    if (Test-Path (Join-Path $dir ".git") -PathType Container) {
+        $kept += $size
+        Write-Host ("keep    {0,-24} {1,6:N2} GB (primary checkout)" -f (Split-Path $dir -Leaf), $size)
+        continue
+    }
+
     $branch = (& git -C $dir rev-parse --abbrev-ref HEAD) 2>$null
     $dirty = @(& git -C $dir status --porcelain 2>$null).Count
     $merged = $false

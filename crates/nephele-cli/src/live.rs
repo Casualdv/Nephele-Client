@@ -5980,6 +5980,7 @@ mod tests {
         let mut job = ColumnMeshJob {
             key: (0, 0),
             sections: Vec::new(),
+            biomes: Vec::new(),
             west: Vec::new(),
             east: Vec::new(),
             north: Vec::new(),
