@@ -498,12 +498,23 @@ pane or other small shape. Cross-plants stay on their separate crossed-quad path
   report their real height. They are also in `is_transparent`. The mesher still
   draws the crossed quads; the shape table is what stops culling/AO.
 - **Biome grass/foliage tint** is per block position and blended 3x3 at biome
-  edges (`tint_for_block` + `BiomeColorizer`). There is no extra vertex
-  attribute: `Vertex.anim` packs `animation index + 1` in bits 0..6, a tint-mask
-  bit 7 and 0xRRGGBB in bits 8..31, so `NO_ANIMATION` is `0xFFFFFF00`. Grass
-  sides store the overlay coverage in their alpha channel and set the mask bit,
-  which lets the shader tint the grass pixels without tinting the dirt below.
-  The shader decodes the word and multiplies before fog.
+  edges (`tint_for_block` + `BiomeColorizer`). **Two separate vertex fields, not
+  a packed word**: `Vertex.anim` is the animation index or `NO_ANIMATION =
+  u32::MAX`, and `Vertex.tint` is packed `0xRRGGBB` (white = no-op). The mask is
+  a *separate* texture array (`TextureArray::tint_mask_pixels`), packed exactly
+  like the block pixels — 4x4 tiles per 64x64 layer — and sampled with the same
+  packed UV and `slot / 16`, so there is one slot model everywhere. Alpha stays
+  free for cutout: do **not** move the mask into the texture's alpha channel.
+  That variant was tried on `render-shapes` and would have forced alpha to 1 on
+  every tinted tile, making leaf cutouts opaque.
+  - Tinted tiles are named by `default_tint_mask`: grass_top, tallgrass, fern,
+    the double-plant grass/fern tiles, water_still, vine, waterlily and every
+    `leaves_*`. Grass sides get a per-pixel mask from the overlay's coverage.
+  - `tint_for_block` picks the colour per id/meta: grass 2/31, double plant 175
+    metas 2..3, vine 106 → foliage, lily pad 111 → fixed `0x208030`, leaves 18
+    with the spruce/birch constants, water 8/9. Flowers and saplings are
+    untinted. A greyscale plant missing from either list renders as a white
+    spike — that is the failure mode to check first.
 - **Still on the cube path** (audited 2026-11-05; vanilla renders these as
   non-cubes but the table has no model for them yet): bed 26; rails 27/28/66;
   cobweb 30; piston head 34; redstone wire 55; signs 63/68; ladder 65; levers

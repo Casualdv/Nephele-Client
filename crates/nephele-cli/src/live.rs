@@ -36,7 +36,7 @@ use nephele_protocol::packets::play;
 use nephele_protocol::packets::play::{digging, ItemStack};
 use nephele_protocol::ServerAddress;
 use nephele_render::{
-    append_hand, beams_in_column, biome_fog_color, block_outline, break_overlay_texture,
+    append_hand, beams_in_column, biome_fog_color, block_shape_outline, break_overlay_texture,
     build_beams, build_break_overlay, build_entities, build_hand_item, build_item_mesh, BeaconBeam,
     Camera, ColumnMeshJob, EntityDraw, Environment, HandDraw, HandItem, ItemDraw, LineMesh,
     MeshData, Particles, Renderer, UiBatch,
@@ -1864,6 +1864,15 @@ async fn net_loop(
                 }
 
                 if client.spawned {
+                    // `NEPHELE_TRACE_MOVE=1` prints what we send; pair it with
+                    // the S08 trace below to see whether the server is rejecting
+                    // our position or we are drifting from it.
+                    if std::env::var_os("NEPHELE_TRACE_MOVE").is_some() {
+                        eprintln!(
+                            "[move] sent {:.3} {:.3} {:.3} ground={on_ground} yaw={:.1} pitch={:.1}",
+                            position.x, position.y, position.z, yaw, pitch
+                        );
+                    }
                     client.send_movement_tick(position, yaw, pitch, on_ground)
                         .await.map_err(|err| err.to_string())?;
                 }
@@ -1957,6 +1966,18 @@ async fn net_loop(
                         // for the next tick leaves the camera up to 50 ms
                         // behind and smears a teleport across the map.
                         let mut state = shared.lock().unwrap();
+                        if std::env::var_os("NEPHELE_TRACE_MOVE").is_some() {
+                            eprintln!(
+                                "[move] S08 {:.3} {:.3} {:.3} flags={} us {:.3} {:.3} {:.3}",
+                                position.x,
+                                position.y,
+                                position.z,
+                                relative_flags,
+                                state.player.x,
+                                state.player.y,
+                                state.player.z
+                            );
+                        }
                         state.player.correct_position(position, relative_flags);
                         state.prev_position = [position.x, position.y, position.z];
                         state.yaw = yaw;
@@ -2486,7 +2507,9 @@ impl LiveApp {
 
         {
             let mut state = self.shared.lock().unwrap();
-            state.player.flying = self.options.fly;
+            // `--fly` exists for singleplayer and demos only. Starting a server
+            // session airborne is the fastest way to be kicked for flying.
+            state.player.flying = self.options.fly && self.options.address.is_none();
         }
         println!("Textures: {} layers.", textures.layer_count(),);
 
@@ -2964,7 +2987,14 @@ impl LiveApp {
         let aim_moved = aim != self.drawn_aim;
         if aim_moved {
             let lines = match aim {
-                Some(aim) => block_outline(aim.x, aim.y, aim.z, OUTLINE_COLOR),
+                Some(aim) => {
+                    // Match the selection frame to the block's real shape: a
+                    // single box around a slab or staircase reads as "the game
+                    // thinks this is a full block".
+                    let block = self.world.get_block(aim.x, aim.y, aim.z);
+                    let shape = nephele_world::shapes::block_shape(block.id(), block.meta());
+                    block_shape_outline(aim.x, aim.y, aim.z, shape, OUTLINE_COLOR)
+                }
                 None => LineMesh::default(),
             };
             if let Some(renderer) = self.renderer.as_mut() {
@@ -5174,10 +5204,10 @@ impl ApplicationHandler for LiveApp {
                             Screen::Connect | Screen::Death => self.screen = Screen::Title,
                         },
                         (KeyCode::KeyF, ElementState::Pressed) if self.screen == Screen::Game => {
-                            let mut state = self.shared.lock().unwrap();
-                            state.player.flying = !state.player.flying;
-                            state.player.vy = 0.0;
-                            println!("flying: {}", state.player.flying);
+                            // Flight is not bound to a key: 1.8 uses a double
+                            // tap of space in creative, and flying on a server is
+                            // a kick or a ban. `--fly` still exists for demos and
+                            // singleplayer.
                         }
                         (_, ElementState::Pressed)
                             if self.screen == Screen::Inventory

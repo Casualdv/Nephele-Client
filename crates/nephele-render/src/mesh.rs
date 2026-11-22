@@ -564,6 +564,8 @@ fn blocks_direct_sky(state: BlockState) -> bool {
 
 const FOLIAGE_PINE: u32 = 0x619961;
 const FOLIAGE_BIRCH: u32 = 0x80A755;
+/// `BlockLilyPad` 0x208030 in 1.8 — a fixed colour, not a biome one.
+const LILY_PAD: u32 = 0x208030;
 
 fn tint_for_block(
     atlas: &TextureArray,
@@ -576,6 +578,13 @@ fn tint_for_block(
     let kind = match id {
         2 | 31 => TintKind::Grass,
         8 | 9 => TintKind::Water,
+        // `BlockDoublePlant.colorMultiplier`: only the grass (2) and fern (3)
+        // variants are tinted; sunflower, lilac, rose and paeonia are not.
+        175 if meta == 2 || meta == 3 => TintKind::Grass,
+        // `BlockVine` takes the foliage colour.
+        106 => TintKind::Foliage,
+        // `BlockLilyPad` is a fixed dark green, not a biome colour.
+        111 => return LILY_PAD,
         ids::LEAVES => {
             if meta == 1 {
                 return FOLIAGE_PINE;
@@ -692,11 +701,10 @@ pub fn mesh_column(job: &ColumnMeshJob, atlas: &TextureArray) -> MeshData {
             if is_cross_plant(id) {
                 let layer = layers[2];
                 let anim = anims[2];
-                let block_tint = if id == 31 {
-                    tint_for_block(atlas, job, id, 0, local_x, local_z)
-                } else {
-                    NO_TINT
-                };
+                // Cross plants share the block's tint: tall grass and the
+                // grass/fern double plants are grass-coloured, flowers and
+                // saplings fall through to NO_TINT in `tint_for_block`.
+                let block_tint = tint_for_block(atlas, job, id, meta, local_x, local_z);
                 let bx = (base_x + local_x) as f32;
                 let by = y as f32;
                 let bz = (base_z + local_z) as f32;
@@ -1810,6 +1818,38 @@ mod tests {
             })
         });
         assert!(top_face, "the grass top under a flower must not be culled");
+    }
+
+    #[test]
+    fn plants_carry_their_tint_and_flowers_do_not() {
+        // Every greyscale plant must arrive tinted, or it renders as a white
+        // spike. Flowers and saplings must stay untinted.
+        let mut column = ChunkColumn::empty(0, 0);
+        let mut biomes = [1u8; 256];
+        biomes.fill(1); // plains
+        column.set_biomes(&biomes);
+        column.set_block(2, 64, 2, BlockState::new(31, 0)); // tall grass
+        column.set_block(3, 64, 3, BlockState::new(175, 2)); // double grass
+        column.set_block(4, 64, 4, BlockState::new(106, 0)); // vine
+        column.set_block(5, 64, 5, BlockState::new(111, 0)); // lily pad
+        column.set_block(6, 64, 6, BlockState::new(37, 0)); // dandelion
+        let world = world_with(column.clone());
+        let mesh = build_column_mesh(&column, &world, &atlas());
+
+        let tints: Vec<u32> = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.tint)
+            .filter(|tint| *tint != NO_TINT)
+            .collect();
+        assert!(
+            tints.contains(&LILY_PAD),
+            "the lily pad is a fixed green, not a biome colour: {tints:x?}"
+        );
+        assert!(
+            tints.len() > 4,
+            "tall grass, the double plant and the vine all need a tint: {tints:x?}"
+        );
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub use entity::{
 };
 pub use environment::{biome_fog_color, Environment};
 pub use gpu::{DrawOutcome, Renderer, RendererError, StartupSample, StartupStage, StartupTimings};
-pub use lines::{block_outline, LineMesh, LineVertex};
+pub use lines::{block_outline, block_shape_outline, LineMesh, LineVertex};
 pub use mesh::{
     break_overlay_texture, build_break_overlay, build_column_mesh, build_hand_item,
     build_item_mesh, build_world_mesh, mesh_column, ColumnMeshJob, HandItem, ItemDraw, MeshData,

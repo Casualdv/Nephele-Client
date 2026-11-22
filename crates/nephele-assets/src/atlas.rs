@@ -228,10 +228,14 @@ impl TextureArray {
                 }
             }
 
-            // 1.8 stores grass and foliage as grayscale and tints them at
-            // runtime with the biome colour. Keep the texture raw here; the
-            // mesher/GPU applies the per-block multiplier. Grass sides need a
-            // mask so the dirt pixels below the overlay stay untinted.
+            // 1.8 stores grass, foliage and the plants as greyscale and tints
+            // them at runtime. Keep the texture raw here: the mesher computes
+            // the per-position biome colour and the shader multiplies by the
+            // packed mask (`default_tint_mask` names the tinted tiles). Baking
+            // a colour in here would defeat per-biome tinting, which is what
+            // made plants render as white spikes when they were left unmasked.
+            // Grass sides need a mask so the dirt pixels below the overlay stay
+            // untinted.
             if name == "grass_side" {
                 if let Ok(overlay) = image::open(blocks_dir.join("grass_side_overlay.png")) {
                     let overlay = to_tile(&overlay.to_rgba8());
@@ -407,8 +411,24 @@ impl TextureArray {
     }
 }
 
+/// Which tiles are greyscale in the jar and must be multiplied by a biome
+/// colour.
+///
+/// Vanilla's rules: grass and ferns take the grass colour, leaves and vines take
+/// foliage, water takes the swamp override, and a lily pad is a fixed dark
+/// green. Flowers and saplings are untinted. Missing a name here is what made
+/// tall grass render as white spikes — the texture is grey, so an unmasked tile
+/// is a grey blob.
 fn default_tint_mask(name: &str) -> u8 {
-    if name == "grass_top" || name == "water_still" || name.starts_with("leaves_") {
+    if name == "grass_top"
+        || name == "tallgrass"
+        || name == "fern"
+        || name.starts_with("double_plant_grass_")
+        || name == "water_still"
+        || name == "vine"
+        || name == "waterlily"
+        || name.starts_with("leaves_")
+    {
         255
     } else {
         0
@@ -595,6 +615,75 @@ fn missing_texture() -> RgbaImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Diagnostic, not a gate: load a prepared `textures/blocks` directory and
+    /// print every name the block table asks for that the directory does not
+    /// contain, plus what each cross-plant id actually resolves to.
+    ///
+    /// Run it when a texture looks wrong in-game:
+    ///   $env:NEPHELE_BLOCKS_DIR="...\assets\minecraft\textures\blocks"
+    ///   cargo test -p nephele-assets dump_unresolved -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_unresolved_textures() {
+        use crate::block_textures::face_textures;
+
+        let Ok(dir) = std::env::var("NEPHELE_BLOCKS_DIR") else {
+            eprintln!("set NEPHELE_BLOCKS_DIR to a prepared textures/blocks directory");
+            return;
+        };
+        let array = TextureArray::load_from_dir(std::path::Path::new(&dir)).expect("atlas");
+        println!(
+            "blocks dir: {dir}\ntiles: {}  layers: {}  missing slot: {}",
+            array.layer_count() * TILES_PER_LAYER,
+            array.layer_count(),
+            array.missing
+        );
+        let unresolved = array.unresolved_names();
+        println!("unresolved names ({}): {:?}", unresolved.len(), unresolved);
+
+        for id in [31u16, 175, 37, 38, 106, 111, 6, 2, 3] {
+            let state = nephele_world::BlockState::from_raw(id << 4);
+            match face_textures(state) {
+                Some(faces) => {
+                    let slot = array.slot_or_missing(faces.side);
+                    // Mean colour of the packed tile, so "white spikes" can be
+                    // told apart from "right texture, wrong quad".
+                    let size = array.layer_size() as usize;
+                    let layer = slot as usize / TILES_PER_LAYER as usize;
+                    let local = slot as usize % TILES_PER_LAYER as usize;
+                    let tile_x = (local % TILES_PER_ROW as usize) * 16;
+                    let tile_y = (local / TILES_PER_ROW as usize) * 16;
+                    let pixels = array.pixels();
+                    let (mut r, mut g, mut b, mut a, mut n) = (0u32, 0u32, 0u32, 0u32, 0u32);
+                    for py in 0..16 {
+                        for px in 0..16 {
+                            let row = layer * size + tile_y + py;
+                            let col = tile_x + px;
+                            let at = (row * size + col) * 4;
+                            r += u32::from(pixels[at]);
+                            g += u32::from(pixels[at + 1]);
+                            b += u32::from(pixels[at + 2]);
+                            a += u32::from(pixels[at + 3]);
+                            n += 1;
+                        }
+                    }
+                    println!(
+                        "id {id:>3} meta 0 -> side {:<26} slot {:>3} {:?} mean rgb ({:>3},{:>3},{:>3}) a {:>3}{}",
+                        faces.side,
+                        slot,
+                        array.name_of(slot),
+                        r / n,
+                        g / n,
+                        b / n,
+                        a / n,
+                        if slot == array.missing { "  <-- MISSING" } else { "" }
+                    );
+                }
+                None => println!("id {id:>3} -> no texture at all"),
+            }
+        }
+    }
 
     #[test]
     fn mip_levels_above_the_clamp_would_blend_neighbouring_tiles() {
@@ -784,6 +873,13 @@ mod tests {
             named("stone", white),
             named("leaves_oak", white),
             named("water_still", white),
+            named("tallgrass", white),
+            named("fern", white),
+            named("double_plant_grass_top", white),
+            named("vine", white),
+            named("waterlily", white),
+            named("flower_dandelion", white),
+            named("sapling_oak", white),
         ]);
         // The mask is packed exactly like the block pixels: one 4x4 grid of
         // tiles per layer, so the offset is the packed position, not the slot.
@@ -800,6 +896,15 @@ mod tests {
         assert_eq!(mask_alpha("leaves_oak"), 255);
         assert_eq!(mask_alpha("water_still"), 255);
         assert_eq!(mask_alpha("stone"), 0);
+        // Plants are greyscale in the jar too. Leaving them unmasked is what
+        // made tall grass a white spike, so pin the whole set.
+        assert_eq!(mask_alpha("tallgrass"), 255);
+        assert_eq!(mask_alpha("fern"), 255);
+        assert_eq!(mask_alpha("double_plant_grass_top"), 255);
+        assert_eq!(mask_alpha("vine"), 255);
+        assert_eq!(mask_alpha("waterlily"), 255);
+        assert_eq!(mask_alpha("flower_dandelion"), 0, "flowers are untinted");
+        assert_eq!(mask_alpha("sapling_oak"), 0, "saplings are untinted");
     }
 
     #[test]
