@@ -73,7 +73,7 @@ pub fn decorate<W: GenWorld>(
     }
 
     biome_pre_decorate(world, rand, biome_id, origin_x, origin_z);
-    biome_decorator(world, rand, origin_x, origin_z);
+    biome_decorator(world, rand, biome_id, origin_x, origin_z);
 }
 
 /// `BiomeDecorator.decorate` → `genDecorations`, in vanilla's order. Ores and
@@ -82,6 +82,7 @@ pub fn decorate<W: GenWorld>(
 fn biome_decorator<W: GenWorld>(
     world: &mut W,
     rand: &mut JavaRandom,
+    biome_id: i32,
     origin_x: i32,
     origin_z: i32,
 ) {
@@ -107,6 +108,22 @@ fn biome_decorator<W: GenWorld>(
         let z = origin_z + rand.next_int_bound(16) + 8;
         let y = world.solid_top(x, z);
         sand_patch(world, rand, x, y, z, block::ids::GRAVEL, 6);
+    }
+
+    // Trees. The `nextInt(10)` is drawn unconditionally, even for a biome with
+    // `treesPerChunk = 0`, and it can raise the count to one.
+    let mut count = crate::trees::trees_per_chunk(biome_id);
+    if rand.next_int_bound(10) == 0 {
+        count += 1;
+    }
+    for _ in 0..count {
+        let x = origin_x + rand.next_int_bound(16) + 8;
+        let z = origin_z + rand.next_int_bound(16) + 8;
+        let kind = crate::trees::gen_big_tree_chance(rand, biome_id);
+        let y = world.height(x, z);
+        // `func_180711_a` is the post-generation vine/cocoa scatter; it is a
+        // no-op for every generator ported here.
+        crate::trees::generate(world, rand, x, y, z, kind);
     }
 }
 

@@ -44,7 +44,17 @@ pub trait GenWorld {
     fn set_terrain_populated(&mut self, chunk_x: i32, chunk_z: i32, populated: bool);
 
     /// `World.getHeight(x, z)`: one above the highest light-blocking block of
-    /// the column, read from the chunk's cached height map.
+    /// the column.
+    ///
+    /// **Scanned live, not read from the chunk's cached height map.** Vanilla's
+    /// `World.setBlockState` keeps `Chunk.heightMap` current as it writes, and
+    /// population depends on that: a taiga chunk asks for ten trees, but each
+    /// canopy that goes up raises the column the next tree measures, so most of
+    /// the later attempts fail the "is the volume clear" test and the chunk ends
+    /// up with a handful. A height map computed once before population and never
+    /// refreshed would put all ten on the original ground, stacked through each
+    /// other. `ChunkColumn::height_map_at` is still the right thing for a decoded
+    /// chunk; generation must not use it.
     fn height(&self, x: i32, z: i32) -> i32;
 
     /// `World.getSeaLevel()`.
@@ -202,10 +212,10 @@ impl GenWorld for TestWorld {
     }
 
     fn height(&self, x: i32, z: i32) -> i32 {
-        let (coord, local_x, local_z) = split(x, z);
-        self.chunks
-            .get(&coord)
-            .map(|column| column.height_map_at(local_x, local_z))
+        (0..256)
+            .rev()
+            .find(|y| !self.get_block(x, *y, z).is_air())
+            .map(|y| y + 1)
             .unwrap_or(0)
     }
 
@@ -244,9 +254,10 @@ impl GenWorld for World {
     }
 
     fn height(&self, x: i32, z: i32) -> i32 {
-        let (coord, local_x, local_z) = split(x, z);
-        self.get(coord)
-            .map(|column| column.height_map_at(local_x, local_z))
+        (0..256)
+            .rev()
+            .find(|y| !self.get_block(x, *y, z).is_air())
+            .map(|y| y + 1)
             .unwrap_or(0)
     }
 

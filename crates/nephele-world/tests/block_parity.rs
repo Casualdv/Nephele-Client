@@ -176,6 +176,29 @@ fn is_population_state(raw: u16) -> bool {
     is_population_id(id) || (id == 1 && matches!(raw & 0x0F, 1 | 3 | 5))
 }
 
+/// Strip state the generator never writes but the simulation adds.
+///
+/// `BlockLeaves` stores `CHECK_DECAY` in metadata bit 3. Every tree generator
+/// writes it as `false` (`variant | 8`), and `BlockLeaves.updateTick` clears it
+/// the first time a leaf is randomly ticked in a loaded chunk — so a saved world
+/// holds a mix of both, in the same proportion for oak and spruce, and the split
+/// records how long each chunk stayed in memory rather than what generation
+/// produced. Comparing the bit would charge ~21,000 blocks of runtime state to
+/// the population pass, so it is masked on both sides.
+///
+/// This is the only such bit known to be polluted; anything else masked here has
+/// to be justified the same way, because a real generation difference is exactly
+/// what this harness exists to catch.
+fn generation_state(raw: u16) -> u16 {
+    const LEAVES: u16 = 18;
+    if raw >> 4 == LEAVES {
+        // Bit 3 of the metadata, i.e. 0x8 of the packed state.
+        raw & !0x8
+    } else {
+        raw
+    }
+}
+
 /// Bucket a mismatch at `y` by the blocks on both sides.
 fn bucket(ours: u16, theirs: u16, y: usize) -> Stage {
     let above_sea = y > SEA_LEVEL as usize;
@@ -348,7 +371,8 @@ impl Report {
         reference_top: u16,
         theirs: u16,
     ) {
-        let ours = column.get_block(x, y, z).raw();
+        let ours = generation_state(column.get_block(x, y, z).raw());
+        let theirs = generation_state(theirs);
         if ours == theirs {
             return;
         }
@@ -425,6 +449,22 @@ fn describe(entry: &IdDiff) -> String {
         .map(|(state, count)| format!("{} ({count})", state_name(*state)))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The leaf `check_decay` bit is the one piece of saved state generation does not
+/// write, so it is masked; everything else must survive untouched.
+#[test]
+fn only_the_leaf_decay_bit_is_normalised() {
+    let leaves = 18u16 << 4;
+    // Both spruce leaf spellings collapse to the same state.
+    assert_eq!(generation_state(leaves | 1), generation_state(leaves | 9));
+    assert_eq!(generation_state(leaves | 1), leaves | 1);
+    // The variant itself is still distinguished.
+    assert_ne!(generation_state(leaves | 1), generation_state(leaves));
+    // Nothing else is touched, including the log block next to it.
+    for raw in [0u16, 1 << 4, (17 << 4) | 1, (17 << 4) | 9, (3 << 4) | 1] {
+        assert_eq!(generation_state(raw), raw, "{raw:#x} must pass through");
+    }
 }
 
 #[test]

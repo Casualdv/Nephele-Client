@@ -254,12 +254,28 @@ Ported so far, in `decorate.rs` and `ores.rs`:
   redstone, diamond, and lapis (`genStandardOre2`), with `WorldGenMinable`
 - the underwater sand, clay and gravel patches
 
-**Not yet ported, in vanilla's order:** structure pieces, `WorldGenSand`'s
-siblings in the surface half of `genDecorations` (trees and their per-biome
-`genBigTreeChance`, big mushrooms, flowers, tall grass, dead bushes, lilies,
-mushrooms, sugar cane, cacti, springs), animal spawns, the ice/snow sweep, and
-`BiomeGenHills`' emerald and silverfish passes. `features.rs` still holds the old
-single-pass approximations; it is no longer called from the pipeline.
+**Not yet ported, in vanilla's order:** structure pieces, the rest of the surface
+half of `genDecorations` (big mushrooms, flowers, tall grass, dead bushes,
+lilies, mushrooms, sugar cane, cacti, springs), animal spawns, the ice/snow
+sweep, and `BiomeGenHills`' emerald and silverfish passes. `features.rs` still
+holds the old single-pass approximations; it is no longer called from the
+pipeline.
+
+Trees are ported — `WorldGenTaiga1`, `WorldGenTaiga2` and the oak `WorldGenTrees`,
+with `genBigTreeChance`'s per-biome roll. `WorldGenBigTree` is **not**: the
+1-in-10 hills fallback uses the oak generator, which costs those chunks their
+later trees because the draws no longer line up. `trees_per_chunk` covers the
+biomes checked against the reference (taiga family, hills, forest/birch, roofed,
+jungle, savanna) and returns 0 elsewhere; the counts for biomes outside that set
+have not been verified.
+
+**`GenWorld::height` must scan live, not read the chunk's cached height map.**
+Vanilla keeps `Chunk.heightMap` current on every write, and population depends on
+it: a taiga chunk asks for ten trees, but each canopy raises the column the next
+one measures, so most later attempts fail their volume test and the chunk keeps
+only a handful. A map computed once before population put all ten on the original
+ground, stacked through each other — worth 9,500 mismatched blocks on its own.
+
 
 Rules that still hold:
 
@@ -308,13 +324,24 @@ which compares 289 chunks / 18,939,904 blocks of `parity/blocks-random.bin.gz`
 | Population: lakes, dungeons, chest draws, taiga/savanna pre-pass | done | — |
 | Population: ores (all eleven entries) | done | — |
 | Population: underwater sand/clay/gravel patches | done | 422 mismatched blocks |
-| Population: trees, plants, snow | **not ported** | ~50,400 (leaves 44,763 + logs 5,615 alone) |
-| Population bucket, total | — | 220,545 of 18,939,904 blocks (1.164%) |
-| Terrain-only residue | regression guard | 7,319 (0.039% of blocks) |
+| Population: trees (`Taiga1`, `Taiga2`, oak) | done | — |
+| Population: plants, big mushrooms, springs, snow, hills emerald/silverfish | **not ported** | — |
+| Population bucket, total | — | 194,579 of 18,939,904 blocks (1.027%) |
+| Terrain-only residue | regression guard | 6,956 (0.037% of blocks) |
 
 Attribution is by block id, not by reference state (see `bucket()` in
 `block_parity.rs`), so a population block misplaced where vanilla has stone is
 filed as population rather than inflating the terrain guard.
+
+**The harness masks one metadata bit, and only one.** `BlockLeaves` stores
+`CHECK_DECAY` in bit 3. Generators always write it as `false`; `BlockLeaves
+.updateTick` clears it the first time a leaf is randomly ticked in a loaded
+chunk. The fixture therefore holds a ~53/47 mix of both spellings, in the same
+proportion for oak and spruce, which records how long each chunk stayed in memory
+rather than what generation produced. `generation_state()` masks that bit on both
+sides, and `only_the_leaf_decay_bit_is_normalised` pins it so nothing else can be
+quietly masked later. Charging the bit to generation would have read as ~21,000
+extra population mismatches.
 
 **Where the remaining population error actually is.** It is not spread evenly.
 The per-chunk distribution is bimodal: the median chunk has 245 population

@@ -42,6 +42,7 @@ pub mod save;
 pub mod shapes;
 pub mod surface;
 pub mod terrain;
+pub mod trees;
 pub mod world;
 pub mod worldgen;
 
